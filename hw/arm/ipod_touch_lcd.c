@@ -5,7 +5,7 @@
 
 static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
 {
-    // fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
+    //fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
 
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
     switch(addr)
@@ -18,7 +18,7 @@ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
         case 0x14:
             return s->unknown1;
         case 0x18:
-            return s->unknown2;
+            return s->render;
 
         case 0x20:
             return s->wnd_con;
@@ -68,7 +68,7 @@ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
 static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
-    // fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, val, addr);
+    //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, (uint32_t)val, addr);
 
     switch(addr) {
         case 0x4:
@@ -82,7 +82,7 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             s->unknown1 = val;
             break;
         case 0x18:
-            s->unknown2 = val;
+            s->render = val;
             qemu_irq_lower(s->irq);
             break;
 
@@ -248,7 +248,10 @@ static void refresh_timer_tick(void *opaque)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
 
-    qemu_irq_raise(s->irq);
+    if (s->render == 0x1)
+        qemu_irq_raise(s->irq);
+    else if (s->render == 0xFF)
+        qemu_irq_lower(s->irq);
 
     timer_mod(s->refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / LCD_REFRESH_RATE_FREQUENCY);
 }
@@ -273,7 +276,7 @@ static void s5l8900_lcd_init(Object *obj)
     DeviceState *dev = DEVICE(sbd);
     IPodTouchLCDState *s = IPOD_TOUCH_LCD(dev);
 
-    memory_region_init_io(&s->iomem, obj, &lcd_ops, s, "lcd", 0x1000);
+    memory_region_init_io(&s->iomem, obj, &lcd_ops, s, "lcd", 0x10000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
 }

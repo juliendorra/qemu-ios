@@ -27,7 +27,7 @@ typedef struct IPodTouchLCDState
     uint32_t lcd_con;
     uint32_t lcd_con2;
     uint32_t unknown1;
-    uint32_t unknown2;
+    uint32_t render;
 
     uint32_t wnd_con;
 
