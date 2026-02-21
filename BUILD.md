@@ -141,9 +141,6 @@ mkdir -p /tmp/icon_work
 rsvg-convert -w 1024 -h 1024 --keep-aspect-ratio -b none \
     icon/IPod_app_iPhone_OS_icon.svg -o /tmp/icon_work/icon.png
 
-# Pad to exact 1024x1024 (the SVG is slightly non-square)
-sips -p 1024 1024 /tmp/icon_work/icon.png --out /tmp/icon_work/icon.png
-
 # Generate the .iconset with all required sizes
 ICONSET="/tmp/icon_work/AppIcon.iconset"
 mkdir -p "$ICONSET"
