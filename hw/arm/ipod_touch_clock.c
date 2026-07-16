@@ -54,6 +54,11 @@ static void s5l8900_clock_init(Object *obj)
     DeviceState *dev = DEVICE(sbd);
     IPodTouchClockState *s = IPOD_TOUCH_CLOCK(dev);
 
+    /*
+     * The direct-iBoot boot path exposes one lock bit per PLL.  The VROM path
+     * needs an aggregate value of one, but it is not selectable until a
+     * compatible 8900-wrapped LLB is available.
+     */
     s->plllock = 1 | 2 | 4 | 8;
 
     uint64_t config0 = 0x0;

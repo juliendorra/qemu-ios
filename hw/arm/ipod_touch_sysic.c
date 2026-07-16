@@ -162,11 +162,13 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
 
     switch (addr) {
         case POWER_ONCTRL:
-            if((val & 0x20) != 0 || (val & 0x4) != 0 || (val & POWER_ID_ADM) != 0) { break; } // make sure that we do not record the 'on' state of some devices so it appears like they are turned on immediately.
-            s->power_state = val;
+            /* POWER_STATE reports domains that are still off. Turning a
+             * domain on completes immediately in this functional model, so
+             * clear the requested bits instead of latching them forever. */
+            s->power_state &= ~val;
             break;
         case POWER_OFFCTRL:
-            s->power_state = val;
+            s->power_state |= val;
             break;
         case GPIO_INTLEVEL ... (GPIO_INTLEVEL + GPIO_NUMINTGROUPS * 4):
         {

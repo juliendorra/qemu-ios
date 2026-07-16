@@ -62,10 +62,13 @@ typedef struct IPodTouchLCDState
     uint8_t *fb_snapshot;      // saved framebuffer content (320*480*4 bytes)
     bool fb_snapshot_valid;    // true if snapshot contains non-black content
     int snapshot_visible_frames;
+    uint32_t retained_scanout_base;
+    bool retained_scanout_valid;
     bool panel_off;            // PMU-powered LCD panel state
 } IPodTouchLCDState;
 
 bool ipod_touch_lcd_framebuffer_is_dark(IPodTouchLCDState *lcd);
 void ipod_touch_lcd_restore_snapshot(IPodTouchLCDState *lcd);
+void ipod_touch_lcd_resume_scanout(IPodTouchLCDState *lcd);
 
 #endif

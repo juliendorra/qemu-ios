@@ -284,6 +284,13 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
     // Store all writes in register file for debug inspection
     s->regs[reg] = val;
     switch (reg) {
+        case PMU_RESUME_STATUS:
+            fprintf(stderr, "[PMU] RESUME_STATUS write <- 0x%02x%s\n",
+                    val, (val & PMU_RESUME_ARMED) ? " (armed)" : "");
+            if (val == 0x40 && s->lcd) {
+                ipod_touch_lcd_resume_scanout(s->lcd);
+            }
+            break;
         case PMU_INT1:
             s->int1 &= ~val;
             pcf50633_update_irq(s);
@@ -333,246 +340,30 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
                 fprintf(stderr, "[LCD] PMU powered panel off\n");
             }
 
-            // Finding #75: Log CPU state at OOCSHDWN write to trace PM caller.
-            if (current_cpu) {
-                CPUARMState *env = &ARM_CPU(current_cpu)->env;
-                uint32_t cpsr = cpsr_read(env);
-                fprintf(stderr, "[PMU] OOCSHDWN write: CPU state at PM suspend\n");
-                fprintf(stderr, "[PMU]   R0=0x%08x R1=0x%08x R2=0x%08x R3=0x%08x\n",
-                        env->regs[0], env->regs[1], env->regs[2], env->regs[3]);
-                fprintf(stderr, "[PMU]   R4=0x%08x R5=0x%08x R6=0x%08x R7=0x%08x\n",
-                        env->regs[4], env->regs[5], env->regs[6], env->regs[7]);
-                fprintf(stderr, "[PMU]   R8=0x%08x R9=0x%08x R10=0x%08x R11=0x%08x\n",
-                        env->regs[8], env->regs[9], env->regs[10], env->regs[11]);
-                fprintf(stderr, "[PMU]   R12=0x%08x SP=0x%08x LR=0x%08x PC=0x%08x\n",
-                        env->regs[12], env->regs[13], env->regs[14], env->regs[15]);
-                fprintf(stderr, "[PMU]   CPSR=0x%08x (I=%d F=%d mode=%02x)\n",
-                        cpsr, (cpsr >> 7) & 1, (cpsr >> 6) & 1, cpsr & 0x1f);
-                // Dump stack to trace call chain (read 64 bytes from SP)
-                uint32_t sp = env->regs[13];
-                // Convert VA to PA: kernel VA 0xC0000000 -> PA 0x08000000
-                uint32_t sp_pa = sp;
-                if (sp >= 0xC0000000) {
-                    sp_pa = sp - 0xC0000000 + 0x08000000;
-                }
-                fprintf(stderr, "[PMU]   Stack dump (SP=0x%08x, PA=0x%08x):\n", sp, sp_pa);
-                for (int i = 0; i < 16; i++) {
-                    uint32_t word;
-                    cpu_physical_memory_read(sp_pa + i * 4, &word, 4);
-                    fprintf(stderr, "[PMU]     [SP+0x%02x] = 0x%08x\n", i * 4, word);
-                }
-            }
-            // Dump GPMEM and key PMU registers at sleep time
-            fprintf(stderr, "[PMU] GPMEM at sleep: GPMEM0=0x%02x GPMEM1=0x%02x "
-                    "GPMEM2=0x%02x GPMEM3=0x%02x\n",
-                    s->regs[PMU_GPMEM0], s->regs[PMU_GPMEM1],
-                    s->regs[PMU_GPMEM2], s->regs[PMU_GPMEM3]);
             fprintf(stderr, "[PMU] OOCSHDWN=0x%02x OOCWAKE=0x%02x "
-                    "INT1M=0x%02x INT1=0x%02x\n",
-                    val, s->regs[PMU_OOCWAKE], s->int1m, s->int1);
-            // Check for resume address in well-known physical locations
-            // (some Apple platforms store it at a fixed SRAM address)
-            {
-                uint32_t resume_candidates[4];
-                // Check PA 0x0 area (SRAM / bootrom data)
-                cpu_physical_memory_read(0x00000000, &resume_candidates[0], 4);
-                cpu_physical_memory_read(0x00000004, &resume_candidates[1], 4);
-                // Check PA 0x22000000 (SRAM on S5L8900)
-                cpu_physical_memory_read(0x22000000, &resume_candidates[2], 4);
-                cpu_physical_memory_read(0x22000004, &resume_candidates[3], 4);
-                fprintf(stderr, "[PMU] Resume addr candidates: "
-                        "[PA 0x0]=0x%08x [PA 0x4]=0x%08x "
-                        "[PA 0x22000000]=0x%08x [PA 0x22000004]=0x%08x\n",
-                        resume_candidates[0], resume_candidates[1],
-                        resume_candidates[2], resume_candidates[3]);
-            }
-            // Approach #38-39: Patch delay function and get_ticks for PM resume.
-            // Finding #79: The delay function at 0xc04bc460 calls a
-            // Security Modules wrapper at VA 0xc01603ee (PA 0x081603ee)
-            // to poll UART for serial debugger input. Even with the
-            // "enabled" flag cleared (approach #36), this wrapper chains
-            // into a nested timed-wait at 0xc0062462 that reads a data
-            // structure never updated (workqueues frozen). The inner
-            // timer-read loop at 0xc0061650 spins forever.
-            //
-            // Approach #39: Patch the delay function's loop exit branch
-            // at VA 0xc04bc494 (PA 0x084bc494) from BGE (conditional)
-            // to B (unconditional), making it exit on first iteration.
-            //
-            // The delay function at 0xc04bc460 is a combined timeout +
-            // UART serial poll used by "Security Modules v6.6" during
-            // PM resume. Its inner loop:
-            //   0xc04bc488: BL get_ticks
-            //   0xc04bc48c: RSB R0, R4, R0   (R0 = now - target)
-            //   0xc04bc490: CMP R0, #0
-            //   0xc04bc494: BGE exit          ← patch this to B (always)
-            //   0xc04bc498: LDR R3, [UART poll ptr]
-            //   0xc04bc49c: BLX R3            (call UART poll)
-            //
-            // Finding #80: Cannot patch the inner wrapper at 0xc00536d0
-            // because get_ticks() also uses it — patching it breaks the
-            // timer and causes the delay to never exit.
-            //
-            // This approach patches the branch itself: BGE (0x5A00000E)
-            // becomes B (0xEA00000E). The delay function exits immediately
-            // without calling the UART poll at all.
-            // Approach #40: Rewrite get_ticks to read hardware timer directly.
-            //
-            // Finding #81: get_ticks → 0xc00536d0 → big_function(0xc0062462)
-            // is stuck because the kernel timebase structure is frozen.
-            // Instead of understanding the big_function's loop, bypass it
-            // entirely by making get_ticks read TICKSLOW from the hardware
-            // timer at VA 0xe0099000 + 0x84.
-            //
-            // Original get_ticks (0xc04bc410, ARM):
-            //   PUSH {R7,LR}; SUB SP,#8; MOV R0,SP;
-            //   LDR R3,[PC+0x30]; BLX R3; ...epilogue...
-            //
-            // Patched get_ticks (4 ARM instructions = 16 bytes):
-            //   LDR R3, [PC, #4]     ; R3 = 0xe0099000 (timer base VA)
-            //   LDR R0, [R3, #0x84]  ; R0 = TICKSLOW
-            //   BX LR                ; return
-            //   .word 0xe0099000     ; literal pool
-            {
-                static bool getticks_patched = false;
-                if (!getticks_patched) {
-                    uint8_t patch[] = {
-                        0x04, 0x30, 0x9f, 0xe5,  // LDR R3, [PC, #4]
-                        0x84, 0x00, 0x93, 0xe5,  // LDR R0, [R3, #0x84]
-                        0x1e, 0xff, 0x2f, 0xe1,  // BX LR
-                        0x00, 0x90, 0x09, 0xe0,  // .word 0xe0099000
-                    };
-                    cpu_physical_memory_write(0x084bc410, patch, sizeof(patch));
-                    getticks_patched = true;
-                    fprintf(stderr, "[PMU] Patched get_ticks at PA 0x084bc410: "
-                            "direct hardware timer read (bypass frozen timebase)\n");
-                }
-            }
-            // Approach #41: Patch Security Modules serial console check.
-            //
-            // Historical approach #41. Finding #82's claim that no retained
-            // kernel resume exists was later withdrawn: the address-zero
-            // type-4 handoff/remap semantics are still unresolved.
-            // The PM resume path calls a "Security Modules v6.6" function
-            // at VA 0xc000f094 (PA 0x0800f094, Thumb) that loops calling
-            // delay_func + UART poll waiting for serial debugger input.
-            //
-            // The caller at VA 0xc000fc3a loops:
-            //   BL 0xc000f094       ; call secmod check
-            //   LDR R3, [R6, R4]    ; load flag at [0xc01c0f8c]
-            //   CMP R3, #0
-            //   BEQ loop_start      ; if flag==0, keep looping
-            //
-            // Finding #86: Setting [0xc01c0f8c]=1 exits the loop but
-            // the post-loop code uses [R6+0x5F0] as a data pointer
-            // (computed by the secmod function) → panic.
-            //
-            // Better approach: Patch the CALLER at 0xc00203c4 to skip
-            // the entire Security Modules call. The function at 0xc00203c4
-            // (Thumb, PUSH {R4, R7, LR}) calls into the secmod machinery.
-            // Patch it to return immediately.
-            {
-                static bool secmod_patched = false;
-                if (!secmod_patched) {
-                    uint8_t bxlr_thumb[] = {
-                        0x00, 0x20,  // MOVS R0, #0
-                        0x70, 0x47,  // BX LR
-                    };
+                    "INT1M=0x%02x INT1=0x%02x RESUME=0x%02x\n",
+                    val, s->regs[PMU_OOCWAKE], s->int1m, s->int1,
+                    s->regs[PMU_RESUME_STATUS]);
 
-                    // Patch 1: Security Modules function entry at 0xc000f094.
-                    // This Thumb function loops calling delay_func + UART poll
-                    // waiting for serial debugger input. Make it return 0.
-                    cpu_physical_memory_write(0x0800f094, bxlr_thumb,
-                                              sizeof(bxlr_thumb));
-
-                    // Patch 2: Security Modules caller at 0xc00203c4.
-                    // Higher-level function that calls into the secmod machinery.
-                    cpu_physical_memory_write(0x080203c4, bxlr_thumb,
-                                              sizeof(bxlr_thumb));
-
-                    // Patch 3: Disable the debugger protocol handler function.
-                    // Finding #90: The debugger protocol state machine at
-                    // VA 0xc000faf4 (PA 0x0800faf4) is a complex function
-                    // spanning ~0x450 bytes (fc10-10340) with 4+ loop-back
-                    // branches. It processes KDP packets and never exits
-                    // without actual debugger interaction.
-                    //
-                    // The function entry is PUSH {R4-R7, LR} at PA 0x0800faf4.
-                    // Multiple callers dispatch to this function via vtable.
-                    // Patching individual loop branches is whack-a-mole.
-                    //
-                    // Fix: Replace function entry with MOVS R0,#0 + BX LR.
-                    // This catches ALL call paths. The function returns 0
-                    // immediately, and callers handle R0=0 as success.
-                    cpu_physical_memory_write(0x0800faf4, bxlr_thumb,
-                                              sizeof(bxlr_thumb));
-
-                    secmod_patched = true;
-                    fprintf(stderr, "[PMU] Patched Security Modules: "
-                            "entry@f094+caller@203c4=BX LR, "
-                            "debugger handler@faf4=BX LR\n");
-                }
-            }
-            // Approach #43 — Deferred sleep patch (on P press, not at OOCSHDWN).
-            //
-            // Previous approach (#34) pre-patched the sleep function at OOCSHDWN
-            // time so it returned R0=0 immediately. This made the PM resume path
-            // run BEFORE the power button press, so IOPMrootDomain never received
-            // the ONKEY event and the display stayed OFF.
-            //
-            // New approach: let the CPU enter the B . sleep loop normally.
-            // When the user presses P, patch the sleep function at that moment
-            // so the ONKEY event and wake happen simultaneously. The kernel's
-            // PMU interrupt handler then processes ONKEY, triggering the
-            // IOPMrootDomain display-on transition.
-            //
-            // The sleep function patch is applied in pcf50633_set_onkey()
-            // when it detects the CPU is in the sleep loop.
-            //
-            // Still mark that OOCSHDWN fired so the other patches (get_ticks,
-            // SecMod, debugger) remain available for the PM resume path.
+            /*
+             * OOCSHDWN is terminal for the powered application processor.
+             * Do not patch or unwind the retained kernel: the wake reset and
+             * iBoot type-4 handoff are responsible for resuming it.
+             */
             s->oocshdwn_fired = true;
-            fprintf(stderr, "[PMU] OOCSHDWN: sleep function NOT patched "
-                    "(deferred to P press — approach #43)\n");
+            fprintf(stderr, "[PMU] Application processor awaiting power loss\n");
 
             if (s->wake_reset_pending) {
                 s->wake_reset_pending = false;
-                s->int1 |= PMU_INT1_ONKEYF;
+                s->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
+                s->int1 |= PMU_INT1_ONKEYF | PMU_INT1_ONKEYR;
                 pcf50633_update_irq(s);
                 fprintf(stderr, "[WAKE] Completing queued retained-RAM "
                         "SoC reboot after OOCSHDWN\n");
+                ipod_touch_record_retained_crc();
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             }
 
-            // Finding #93 (REVERTED): IOPMrootDomain wake transition patches.
-            //
-            // These patches modified setPowerState and powerChangeDone to
-            // force the IOPMrootDomain wake transition. REVERTED because:
-            //   - BEQ→B unconditional in powerChangeDone affects ALL power
-            //     state transitions, not just SLEEP→ON, corrupting the PM
-            //     state machine during normal pre-sleep transitions.
-            //   - MOVS R3,#0x44 in setPowerState sets wake-related flags
-            //     for ALL transitions, not just SLEEP.
-            //   - This caused a regression: power/home buttons stopped
-            //     working entirely after the patches were applied during
-            //     the first sleep. The PM state machine entered an invalid
-            //     state and could no longer process button events.
-            //
-            // TODO: Find a way to trigger changePowerStateToPriv(ON_STATE=3)
-            // only AFTER the patched sleep returns, without affecting other
-            // PM transitions. Possibilities:
-            //   a) Write flags directly to the IOPMrootDomain instance
-            //      memory (need to find instance address at runtime)
-            //   b) Inject a deferred callback that calls the wake function
-            //   c) Hook the powerChangeDone call specifically during the
-            //      sleep→wake transition
-            {
-                // Patches disabled — keeping the block for future work
-            }
-
-            // Approach #43: VIC cleanup is now scheduled from pcf50633_set_onkey()
-            // when the P press triggers the deferred sleep patch. Not needed here
-            // since the CPU will be in the B . loop until then.
             break;
         }
         default:
@@ -641,10 +432,21 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
             res = s->int5m;
             break;
         case PMU_MBCS1:
+            /* iBoot's warm path requires a valid power-on source while it
+             * verifies the retained image. Model USB presence for that brief
+             * boot phase; normal battery operation remains unchanged. */
+            res = (s->regs[PMU_RESUME_STATUS] & PMU_RESUME_WAKE) ? 1 : 0;
+            break;
+        case PMU_ADCS1:
+            /* 10-bit BATSNS result: 648 / 1023 * 6 V = 3.80 V. */
+            res = 0xa2;
+            break;
+        case PMU_ADCS2:
             res = 0;
             break;
-        case PMU_ADCC1:
-            res = 0;
+        case PMU_ADCS3:
+            /* Conversion complete; BATSNS result low bits are zero. */
+            res = 0x80;
             break;
         case PMU_RTCSC:
             res = int_to_bcd(tm.tm_sec);
@@ -670,8 +472,10 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
         case 0x69:
             res = 0;
             break;
-        case 0x76:
-            res = 0;
+        case PMU_RESUME_STATUS:
+            res = s->regs[PMU_RESUME_STATUS];
+            fprintf(stderr, "[PMU] RESUME_STATUS read -> 0x%02x%s\n",
+                    res, (res & PMU_RESUME_ARMED) ? " (armed)" : "");
             break;
         default:
             res = 0;

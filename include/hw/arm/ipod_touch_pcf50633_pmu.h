@@ -37,7 +37,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 #define PMU_INT1_ONKEYF  0x80   // ONKEY falling edge (pressed)
 
 #define PMU_MBCS1 0x4B
-#define PMU_ADCC1 0x57
+#define PMU_ADCC1 0x54
+#define PMU_ADCS1 0x55
+#define PMU_ADCS2 0x56
+#define PMU_ADCS3 0x57
 
 // RTC registers
 #define PMU_RTCSC 0x59
@@ -55,6 +58,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 #define PMU_GPMEM1   0x68
 #define PMU_GPMEM2   0x69
 #define PMU_GPMEM3   0x6A
+
+/* Apple/iBoot retained-resume state. The kernel leaves bit 7 set before
+ * OOCSHDWN, the PMU power-on path supplies bit 5, and iBoot clears bit 7 and
+ * sets bit 6 when consuming the token. */
+#define PMU_RESUME_STATUS 0x76
+#define PMU_RESUME_WAKE   0x20
+#define PMU_RESUME_ARMED  0x80
 
 // PMU interrupt GPIO on S5L8900: GPIO interrupt 0x55 = group 2, bit 21
 #define PMU_INT_GPIO_GROUP    2
@@ -113,6 +123,9 @@ void pcf50633_set_onkey(Pcf50633State *s, bool pressed);
 // temporary wake trampoline was installed. Power, Home, and touch input can
 // all use this; ONKEY signaling remains separate.
 bool pcf50633_resume_from_sleep(Pcf50633State *s);
+
+/* Record the retained-memory checksum immediately before an AP reset. */
+void ipod_touch_record_retained_crc(void);
 
 // Re-evaluate PMU nIRQ output. Call after SYSIC clears GPIO_INTSTAT for
 // the PMU's GPIO group — if the PMU still has pending interrupts, it will

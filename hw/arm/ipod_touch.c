@@ -1,6 +1,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/crc32c.h"
 #include "qemu-common.h"
 #include "hw/arm/boot.h"
 #include "exec/address-spaces.h"
@@ -22,6 +23,32 @@
 // Global pointer to machine state for wake assist timer access from key handler
 IPodTouchMachineState *g_ipod_touch_nms = NULL;
 
+static uint32_t ipod_touch_retained_crc(void)
+{
+    const size_t chunk_size = 1024 * 1024;
+    uint8_t *chunk = g_malloc(chunk_size);
+    uint32_t crc = 0;
+
+    for (hwaddr offset = 0; offset < 0x8000000; offset += chunk_size) {
+        cpu_physical_memory_read(RAM_MEM_BASE + offset, chunk, chunk_size);
+        crc = crc32c(crc, chunk, chunk_size);
+    }
+    g_free(chunk);
+    return crc;
+}
+
+void ipod_touch_record_retained_crc(void)
+{
+    if (!g_ipod_touch_nms) {
+        return;
+    }
+    g_ipod_touch_nms->retained_crc_before_reset =
+        ipod_touch_retained_crc();
+    g_ipod_touch_nms->retained_crc_valid = true;
+    fprintf(stderr, "[WAKE] Retained LPDDR CRC32C before AP reset: 0x%08x\n",
+            g_ipod_touch_nms->retained_crc_before_reset);
+}
+
 static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
 {
     return 0;
@@ -38,11 +65,14 @@ static const MemoryRegionOps tvout_workaround_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-static void allocate_ram(MemoryRegion *top, const char *name, uint32_t addr, uint32_t size)
+static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
+                                  uint32_t addr, uint32_t size)
 {
-        MemoryRegion *sec = g_new(MemoryRegion, 1);
-        memory_region_init_ram(sec, NULL, name, size, &error_fatal);
-        memory_region_add_subregion(top, addr, sec);
+    MemoryRegion *sec = g_new(MemoryRegion, 1);
+
+    memory_region_init_ram(sec, NULL, name, size, &error_fatal);
+    memory_region_add_subregion(top, addr, sec);
+    return sec;
 }
 
 static uint32_t align_64k_high(uint32_t addr)
@@ -71,14 +101,54 @@ static void ipod_touch_cpu_setup(MachineState *machine, MemoryRegion **sysmem, A
     object_unref(cpuobj);
 }
 
+static void ipod_touch_install_8900_ops(void)
+{
+    const uint32_t verify_stub[] = {
+        0xe3b00001, /* MOVS R0, #1 */
+        0xe12fff1e, /* BX LR */
+    };
+    const uint32_t decrypt_stub[] = {
+        0xe59f1100, /* LDR R1, [PC, #0x100] */
+        0xe5810000, /* STR R0, [R1] */
+        0xe3b00001, /* MOVS R0, #1 */
+        0xe12fff1e, /* BX LR */
+    };
+    const uint32_t engine_base = ENGINE_8900_MEM_BASE;
+
+    cpu_physical_memory_write(LLB_BASE + 0x80, verify_stub,
+                              sizeof(verify_stub));
+    cpu_physical_memory_write(LLB_BASE + 0x100, decrypt_stub,
+                              sizeof(decrypt_stub));
+    cpu_physical_memory_write(LLB_BASE + 0x208, &engine_base,
+                              sizeof(engine_base));
+}
+
 static void ipod_touch_cpu_reset(void *opaque)
 {
     IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE((MachineState *)opaque);
+    bool retained_wake = nms->retained_crc_valid;
     ARMCPU *cpu = nms->cpu;
     CPUState *cs = CPU(cpu);
     uint8_t *iboot_data = NULL;
     unsigned long iboot_size = 0;
     uint8_t *volatile_boot_ram;
+
+    if (nms->low_vrom_alias && nms->low_ram_alias) {
+        memory_region_set_enabled(nms->low_vrom_alias, false);
+        /* Address zero is retained LPDDR only for the type-4 wake handoff.
+         * Exposing it during a normal cold boot breaks early kernel DMA. */
+        memory_region_set_enabled(nms->low_ram_alias, retained_wake);
+    }
+
+    if (nms->retained_crc_valid) {
+        uint32_t crc_after_reset = ipod_touch_retained_crc();
+
+        fprintf(stderr, "[WAKE] Retained LPDDR CRC32C at reset: 0x%08x (%s)\n",
+                crc_after_reset,
+                crc_after_reset == nms->retained_crc_before_reset ?
+                "stable" : "CHANGED");
+        nms->retained_crc_valid = false;
+    }
 
     /*
      * A real OOCSHDWN wake reloads iBoot after the application processor has
@@ -99,9 +169,10 @@ static void ipod_touch_cpu_reset(void *opaque)
         g_free(iboot_data);
     }
 
-    volatile_boot_ram = g_malloc0(0x10000);
-    cpu_physical_memory_write(SRAM1_MEM_BASE, volatile_boot_ram, 0x10000);
+    volatile_boot_ram = g_malloc0(0x30000);
+    cpu_physical_memory_write(LLB_BASE, volatile_boot_ram, 0x30000);
     g_free(volatile_boot_ram);
+    ipod_touch_install_8900_ops();
 
     if (nms->spi2_state && nms->spi2_state->mt &&
         nms->spi2_state->mt->pmu) {
@@ -120,21 +191,14 @@ static void ipod_touch_cpu_reset(void *opaque)
         mt->wake_unwind_active = 0;
     }
     if (nms->lcd_state) {
-        static const uint32_t framebuffer_bases[] = {
-            0x0fe00000, 0x0f400000, 0x0f496000,
-        };
-        uint8_t *blank_framebuffer = g_malloc0(FB_SIZE);
-
-        for (int i = 0; i < ARRAY_SIZE(framebuffer_bases); i++) {
-            cpu_physical_memory_write(framebuffer_bases[i],
-                                      blank_framebuffer, FB_SIZE);
-        }
-        g_free(blank_framebuffer);
-
         nms->lcd_state->panel_off = false;
         nms->lcd_state->invalidate = 1;
-        nms->lcd_state->fb_snapshot_valid = false;
-        nms->lcd_state->snapshot_visible_frames = 0;
+        if (!retained_wake) {
+            nms->lcd_state->fb_snapshot_valid = false;
+            nms->lcd_state->snapshot_visible_frames = 0;
+            nms->lcd_state->retained_scanout_base = 0;
+            nms->lcd_state->retained_scanout_valid = false;
+        }
     }
     nms->wake_assist_remaining = 0;
 
@@ -243,30 +307,64 @@ static const MemoryRegionOps mbx_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-static void ipod_touch_memory_setup(MachineState *machine, MemoryRegion *sysmem, AddressSpace *nsas)
+static void ipod_touch_memory_setup(MachineState *machine, MemoryRegion *sysmem,
+                                    AddressSpace *nsas)
 {
     IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(machine);
     DriveInfo *dinfo;
 
+    /* VROM copies its executable helpers into the 128 KiB SRAM0 window. */
+    allocate_ram(sysmem, "sram0", LLB_BASE, 0x20000);
     allocate_ram(sysmem, "sram1", SRAM1_MEM_BASE, 0x10000);
 
-    // allocate UART ram
-    allocate_ram(sysmem, "ram", RAM_MEM_BASE, 0x8000000);
+    MemoryRegion *main_ram = allocate_ram(sysmem, "ram", RAM_MEM_BASE,
+                                          0x8000000);
 
     // load the bootrom (vrom)
     uint8_t *file_data = NULL;
     unsigned long fsize;
     if (g_file_get_contents(nms->bootrom_path, (char **)&file_data, &fsize, NULL)) {
-        allocate_ram(sysmem, "vrom", VROM_MEM_BASE, 0x10000);
+        MemoryRegion *vrom = allocate_ram(sysmem, "vrom", VROM_MEM_BASE,
+                                           0x10000);
+
         address_space_rw(nsas, VROM_MEM_BASE, MEMTXATTRS_UNSPECIFIED, (uint8_t *)file_data, fsize, 1);
+
+        nms->low_vrom_alias = g_new(MemoryRegion, 1);
+        memory_region_init_alias(nms->low_vrom_alias, OBJECT(machine),
+                                 "vrom-low-alias", vrom, 0, 0x10000);
+        memory_region_add_subregion_overlap(sysmem, 0,
+                                            nms->low_vrom_alias, 1);
     }
 
-    // patch the address table to point to our own routines
-    uint32_t *data = malloc(4);
-    data[0] = LLB_BASE + 0x80;
-    address_space_rw(nsas, 0x2000008c, MEMTXATTRS_UNSPECIFIED, (uint8_t *)data, 4, 1);
-    data[0] = LLB_BASE + 0x100;
-    address_space_rw(nsas, 0x20000090, MEMTXATTRS_UNSPECIFIED, (uint8_t *)data, 4, 1);
+    /* Reset maps VROM at zero. iBoot later remaps retained LPDDR there;
+     * type-4 disables the MMU and branches to the kernel trampoline at zero. */
+    nms->low_ram_alias = g_new(MemoryRegion, 1);
+    memory_region_init_alias(nms->low_ram_alias, OBJECT(machine),
+                             "ram-low-alias", main_ram, 0, 0x8000000);
+    memory_region_set_enabled(nms->low_ram_alias, false);
+    memory_region_add_subregion_overlap(sysmem, 0, nms->low_ram_alias, 0);
+
+    /* The dumped VROM delegates image verification/decryption to two
+     * device-specific 8900 service entries that are not present in the dump. */
+    uint32_t service_entry = LLB_BASE + 0x80;
+    address_space_rw(nsas, VROM_MEM_BASE + 0x8c,
+                     MEMTXATTRS_UNSPECIFIED, (uint8_t *)&service_entry,
+                     sizeof(service_entry), true);
+    service_entry = LLB_BASE + 0x100;
+    address_space_rw(nsas, VROM_MEM_BASE + 0x90,
+                     MEMTXATTRS_UNSPECIFIED, (uint8_t *)&service_entry,
+                     sizeof(service_entry), true);
+
+    /* VROM calls the same unavailable services directly while loading LLB.
+     * Branch to the SRAM shims; BX LR there returns to VROM's caller. */
+    uint32_t service_branch = 0xea7ffe7b; /* 0x2000068c -> 0x22000080 */
+    address_space_rw(nsas, VROM_MEM_BASE + 0x68c,
+                     MEMTXATTRS_UNSPECIFIED, (uint8_t *)&service_branch,
+                     sizeof(service_branch), true);
+    service_branch = 0xea7ffe54; /* 0x200007a8 -> 0x22000100 */
+    address_space_rw(nsas, VROM_MEM_BASE + 0x7a8,
+                     MEMTXATTRS_UNSPECIFIED, (uint8_t *)&service_branch,
+                     sizeof(service_branch), true);
 
     // load iBoot
     file_data = NULL;
@@ -301,7 +399,12 @@ static void ipod_touch_memory_setup(MachineState *machine, MemoryRegion *sysmem,
         abort();
     }
 
-    if(!pflash_cfi02_register(NOR_MEM_BASE, "nor", 1024 * 1024, dinfo ? blk_by_legacy_dinfo(dinfo) : NULL, 4096, 1, 2, 0x00bf, 0x273f, 0x0, 0x0, 0x555, 0x2aa, 0)) {
+    BlockBackend *nor_blk = blk_by_legacy_dinfo(dinfo);
+
+    if (!pflash_cfi02_register(NOR_MEM_BASE, "nor", 1024 * 1024,
+                               nor_blk,
+                               4096, 1, 2,
+                               0x00bf, 0x273f, 0x0, 0x0, 0x555, 0x2aa, 0)) {
         printf("Error registering NOR flash!\n");
         abort();
     }
@@ -488,9 +591,12 @@ static void ipod_touch_key_event(void *opaque, int keycode)
             (cpsr & CPSR_I) && (cpsr & CPSR_F);
 
         if (in_poweroff_loop) {
-            /* The current PMU model exposes ONKEY as its only boot-visible
-             * wake latch. Use it for both physical wake buttons. */
-            s->pmu->int1 |= PMU_INT1_ONKEYF;
+            /* Bit 7 was armed by the kernel before OOCSHDWN and must remain
+             * set until iBoot consumes the retained token. Carry a complete
+             * press/release gesture across reset; the host release happens
+             * while iBoot is running and was previously swallowed. */
+            s->pmu->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
+            s->pmu->int1 |= PMU_INT1_ONKEYF | PMU_INT1_ONKEYR;
             pcf50633_update_irq(s->pmu);
             if (keycode == 25) {
                 s->suppress_power_release = true;
@@ -499,6 +605,7 @@ static void ipod_touch_key_event(void *opaque, int keycode)
             }
             fprintf(stderr, "[WAKE] %s requested retained-RAM SoC reboot\n",
                     keycode == 25 ? "Power" : "Home");
+            ipod_touch_record_retained_crc();
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             return;
         }
@@ -1047,7 +1154,8 @@ static void ipod_touch_machine_init(MachineState *machine)
 
     // init spis
     set_spi_base(0);
-    sysbus_create_simple("s5l8900spi", SPI0_MEM_BASE, s5l8900_get_irq(nms, S5L8900_SPI0_IRQ));
+    sysbus_create_simple("s5l8900spi", SPI0_MEM_BASE,
+                         s5l8900_get_irq(nms, S5L8900_SPI0_IRQ));
 
     set_spi_base(1);
     sysbus_create_simple("s5l8900spi", SPI1_MEM_BASE, s5l8900_get_irq(nms, S5L8900_SPI1_IRQ));
@@ -1123,35 +1231,6 @@ static void ipod_touch_machine_init(MachineState *machine)
     iomem = g_new(MemoryRegion, 1);
     memory_region_init_io(iomem, OBJECT(s), &usb_phys_ops, usb_state, "usbphys", 0x40);
     memory_region_add_subregion(sysmem, USBPHYS_MEM_BASE, iomem);
-
-    // init 8900 OPS
-    allocate_ram(sysmem, "8900ops", LLB_BASE, 0x1000);
-
-    // patch the instructions related to 8900 decryption
-    uint32_t *data = malloc(sizeof(uint32_t) * 2);
-    data[0] = 0xe3b00001; // MOVS R0, #1
-    data[1] = 0xe12fff1e; // BX LR
-    address_space_rw(nsas, LLB_BASE + 0x80, MEMTXATTRS_UNSPECIFIED, (uint8_t *)data, sizeof(uint32_t) * 2, 1);
-
-    /*
-    load the decryption logic in memory. These bytes correspond to the following ARMv6 instructions:
-
-        LDR r1,[pc,#0x100]
-        STR r0,[r1]
-        MOVS R0, #1
-        BX lr
-    */
-    data = malloc(sizeof(uint32_t) * 4);
-    data[0] = 0xE59F1100; // LDR r1,[pc,#0x100]
-    data[1] = 0xE5810000; // STR r0,[r1]
-    data[2] = 0xE3B00001; // MOVS R0, #1
-    data[3] = 0xE12FFF1E; // BX lr
-    address_space_rw(nsas, LLB_BASE + 0x100, MEMTXATTRS_UNSPECIFIED, (uint8_t *)data, sizeof(uint32_t) * 4, 1);
-
-    // contains some constants
-    data = malloc(4);
-    data[0] = ENGINE_8900_MEM_BASE; // engine base address
-    address_space_rw(nsas, LLB_BASE + 0x208, MEMTXATTRS_UNSPECIFIED, (uint8_t *)data, 4, 1);
 
     // init two pl080 DMAC0 devices
     dev = qdev_new("pl080");

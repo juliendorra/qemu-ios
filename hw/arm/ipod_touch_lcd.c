@@ -168,6 +168,48 @@ static void draw_line32_32(void *opaque, uint8_t *d, const uint8_t *s, int width
     } while (-- width != 0);
 }
 
+static int lcd_visible_sample_count(uint32_t base)
+{
+    static const uint32_t check_offsets[] = {
+        (240 * FB_WIDTH + 160) * FB_BPP,
+        (100 * FB_WIDTH + 160) * FB_BPP,
+        (400 * FB_WIDTH + 100) * FB_BPP,
+        (450 * FB_WIDTH +  80) * FB_BPP,
+        (450 * FB_WIDTH + 160) * FB_BPP,
+        (460 * FB_WIDTH + 160) * FB_BPP,
+    };
+    int visible_count = 0;
+
+    for (int i = 0; i < ARRAY_SIZE(check_offsets); i++) {
+        uint8_t px[FB_BPP];
+
+        cpu_physical_memory_read(base + check_offsets[i], px, sizeof(px));
+        if (px[0] || px[1] || px[2]) {
+            visible_count++;
+        }
+    }
+    return visible_count;
+}
+
+static uint64_t lcd_brightness_score(uint32_t base)
+{
+    uint64_t score = 0;
+
+    /* A coarse whole-screen grid distinguishes a complete foreground frame
+     * from a white-content frame whose navigation and dock have already
+     * faded to black. */
+    for (int y = 20; y < FB_HEIGHT; y += 40) {
+        for (int x = 20; x < FB_WIDTH; x += 40) {
+            uint8_t px[FB_BPP];
+            uint32_t offset = (y * FB_WIDTH + x) * FB_BPP;
+
+            cpu_physical_memory_read(base + offset, px, sizeof(px));
+            score += px[0] + px[1] + px[2];
+        }
+    }
+    return score;
+}
+
 static void lcd_refresh(void *opaque)
 {
     //fprintf(stderr, "%s: refreshing LCD screen\n", __func__);
@@ -219,37 +261,47 @@ static void lcd_refresh(void *opaque)
     }
     lcd->invalidate = 0;
 
+    /* Track the brightest complete OS buffer. During the sleep fade the
+     * active buffer becomes status-bar-only or partially black, while an
+     * inactive triple buffer still retains the foreground frame. */
+    {
+        static const uint32_t os_bases[] = { 0x0f400000, 0x0f496000 };
+        uint32_t candidate = 0;
+        int best_visible_count = 0;
+        uint64_t best_brightness = 0;
+
+        for (int i = 0; i < ARRAY_SIZE(os_bases); i++) {
+            int visible_count = lcd_visible_sample_count(os_bases[i]);
+            uint64_t brightness = lcd_brightness_score(os_bases[i]);
+
+            if (visible_count >= 4 && brightness > best_brightness) {
+                candidate = os_bases[i];
+                best_visible_count = visible_count;
+                best_brightness = brightness;
+            }
+        }
+        if (candidate && best_visible_count >= 4) {
+            lcd->retained_scanout_base = candidate;
+            lcd->retained_scanout_valid = true;
+        }
+    }
+
     // Save a framebuffer snapshot once the home screen has remained visible
     // for two seconds. Capturing the first non-black frame locks in the
     // SpringBoard boot overlay (Apple logo with dimmed icons), while updating
     // forever lets the auto-lock fade overwrite a good image.
     if (lcd->fb_snapshot && !lcd->fb_snapshot_valid) {
         static const uint32_t known_bases[] = {
-            0x0fe00000, 0x0f400000, 0x0f496000
-        };
-        static const uint32_t check_offsets[] = {
-            (240 * FB_WIDTH + 160) * FB_BPP,  // center
-            (100 * FB_WIDTH + 160) * FB_BPP,  // upper middle
-            (400 * FB_WIDTH + 100) * FB_BPP,  // lower area
-            (450 * FB_WIDTH +  80) * FB_BPP,  // dock area left
-            (450 * FB_WIDTH + 160) * FB_BPP,  // dock area center
-            (460 * FB_WIDTH + 160) * FB_BPP,  // dock area lower
+            /* 0x0fe00000 belongs to iBoot and is overwritten on every wake. */
+            0x0f400000, 0x0f496000
         };
         uint32_t visible_base = 0;
         int best_visible_count = 0;
 
-        for (int b = 0; b < 3; b++) {
+        for (int b = 0; b < ARRAY_SIZE(known_bases); b++) {
             uint32_t base = known_bases[b];
-            if (base == 0) continue;
-            int visible_count = 0;
-            for (int c = 0; c < 6; c++) {
-                uint8_t px[FB_BPP];
-                cpu_physical_memory_read(base + check_offsets[c],
-                                         px, FB_BPP);
-                if (px[0] || px[1] || px[2]) {
-                    visible_count++;
-                }
-            }
+            int visible_count = lcd_visible_sample_count(base);
+
             if (visible_count > best_visible_count) {
                 best_visible_count = visible_count;
                 visible_base = base;
@@ -266,6 +318,8 @@ static void lcd_refresh(void *opaque)
             2 * LCD_REFRESH_RATE_FREQUENCY) {
             cpu_physical_memory_read(visible_base, lcd->fb_snapshot, FB_SIZE);
             lcd->fb_snapshot_valid = true;
+            lcd->retained_scanout_base = visible_base;
+            lcd->retained_scanout_valid = true;
             fprintf(stderr, "[LCD] Captured stable framebuffer snapshot "
                     "(base=0x%08x, %d/6 visible after %d frames — locked)\n",
                     visible_base, best_visible_count,
@@ -333,6 +387,26 @@ void ipod_touch_lcd_restore_snapshot(IPodTouchLCDState *lcd)
     fprintf(stderr, "[WAKE] Restored stable framebuffer snapshot\n");
 }
 
+void ipod_touch_lcd_resume_scanout(IPodTouchLCDState *lcd)
+{
+    if (!lcd || !lcd->retained_scanout_valid) {
+        return;
+    }
+
+    /*
+     * LPDDR retains the foreground surface across OOCSHDWN, but the CLCD
+     * scanout register is in the reset application-processor domain. iBoot
+     * temporarily points it at its own buffer. Restore the retained surface
+     * when iBoot consumes the type-4 token instead of copying framebuffer
+     * contents or suspending the emulator.
+     */
+    lcd->w1_framebuffer_base = lcd->retained_scanout_base;
+    lcd->panel_off = false;
+    lcd->invalidate = 1;
+    fprintf(stderr, "[WAKE] Restored retained CLCD scanout base 0x%08x\n",
+            lcd->retained_scanout_base);
+}
+
 static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int buttons_state)
 {
     // convert x and y to fractional numbers
@@ -395,6 +469,8 @@ static void s5l8900_lcd_realize(DeviceState *dev, Error **errp)
     s->fb_snapshot = g_malloc0(FB_SIZE);
     s->fb_snapshot_valid = false;
     s->snapshot_visible_frames = 0;
+    s->retained_scanout_base = 0;
+    s->retained_scanout_valid = false;
 
     // add mouse handler
     qemu_add_mouse_event_handler(ipod_touch_lcd_mouse_event, s, 1, "iPod Touch Touchscreen");
