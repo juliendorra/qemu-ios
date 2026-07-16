@@ -171,9 +171,10 @@ void pcf50633_update_irq(Pcf50633State *s)
 {
     if (!s->sysic) return;
 
-    bool onkey_pending = s->int1 & (PMU_INT1_ONKEYF | PMU_INT1_ONKEYR);
-    bool other_pending = (s->int1 & ~s->int1m & ~(PMU_INT1_ONKEYF | PMU_INT1_ONKEYR)) ||
-                         (s->int2 & ~s->int2m) ||
+    bool onkey_pending = s->int2 & (PMU_INT2_ONKEYF | PMU_INT2_ONKEYR);
+    bool other_pending = (s->int1 & ~s->int1m) ||
+                         (s->int2 & ~s->int2m &
+                          ~(PMU_INT2_ONKEYF | PMU_INT2_ONKEYR)) ||
                          (s->int3 & ~s->int3m) ||
                          (s->int4 & ~s->int4m) ||
                          (s->int5 & ~s->int5m);
@@ -245,12 +246,15 @@ bool pcf50633_resume_from_sleep(Pcf50633State *s)
 void pcf50633_set_onkey(Pcf50633State *s, bool pressed)
 {
     if (pressed) {
-        s->int1 |= PMU_INT1_ONKEYF;
+        s->regs[PMU_OOCSTAT] &= ~PMU_OOCSTAT_ONKEY;
+        s->int2 |= PMU_INT2_ONKEYF;
     } else {
-        s->int1 |= PMU_INT1_ONKEYR;
+        s->regs[PMU_OOCSTAT] |= PMU_OOCSTAT_ONKEY;
+        s->int2 |= PMU_INT2_ONKEYR;
     }
-    fprintf(stderr, "[PMU] ONKEY %s  int1=0x%02x\n",
-            pressed ? "pressed" : "released", s->int1);
+    fprintf(stderr, "[PMU] ONKEY %s  int2=0x%02x oocstat=0x%02x\n",
+            pressed ? "pressed" : "released", s->int2,
+            s->regs[PMU_OOCSTAT]);
 
     pcf50633_update_irq(s);
 }
@@ -365,8 +369,8 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
             if (s->wake_reset_pending) {
                 s->wake_reset_pending = false;
                 s->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
-                s->int2 |= PMU_INT2_WAKE_BUTTONS;
-                s->retained_int2_wake |= PMU_INT2_WAKE_BUTTONS;
+                s->int2 |= PMU_INT2_EXTON1R;
+                s->retained_int2_wake |= PMU_INT2_EXTON1R;
                 s->retained_int2_reexposed = false;
                 fprintf(stderr, "[WAKE] Completing queued retained-RAM "
                         "SoC reboot after OOCSHDWN\n");
@@ -392,23 +396,15 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
 
     switch(s->cmd) {
         case PMU_INT1:
-            if (s->int1_shadow) {
-                // Return shadow value saved during wake (INT1 was already
-                // cleared to de-assert nIRQ; shadow preserves the ONKEY bits
-                // for the kernel's deferred workqueue).
-                res = s->int1_shadow;
-                s->int1_shadow = 0;
-                fprintf(stderr, "[PMU] INT1 read -> 0x%02x (from SHADOW, wake path)\n", res);
-            } else {
-                res = s->int1;
-                s->int1 = 0;
-                fprintf(stderr, "[PMU] INT1 read -> 0x%02x (cleared)\n", res);
-            }
+            res = s->int1;
+            s->int1 = 0;
+            fprintf(stderr, "[PMU] INT1 read -> 0x%02x (cleared)\n", res);
             pcf50633_update_irq(s);  // may de-assert nIRQ
             break;
         case PMU_INT2:
-            res = s->int2;
+            res = s->int2 | s->int2_shadow;
             s->int2 = 0;
+            s->int2_shadow = 0;
             if (s->retained_int2_reexposed &&
                 (res & s->retained_int2_wake)) {
                 /* iBoot and the retained-resume prologue have both touched
@@ -532,6 +528,7 @@ static void pcf50633_init(Object *obj)
     s->int3m = 0xFF;
     s->int4m = 0xFF;
     s->int5m = 0xFF;
+    s->regs[PMU_OOCSTAT] = PMU_OOCSTAT_ONKEY;
     s->post_sleep_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
         pmu_post_sleep_vic_cleanup, s);
 }

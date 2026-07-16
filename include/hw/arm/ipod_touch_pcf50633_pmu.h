@@ -31,15 +31,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 #define PMU_INT1_ADPREM  0x02
 #define PMU_INT1_USBINS  0x04
 #define PMU_INT1_USBREM  0x08
-#define PMU_INT1_ALARM   0x10
-#define PMU_INT1_SECOND  0x20
-#define PMU_INT1_ONKEYR  0x40   // ONKEY rising edge (released)
-#define PMU_INT1_ONKEYF  0x80   // ONKEY falling edge (pressed)
+#define PMU_INT1_ALARM   0x40
+#define PMU_INT1_SECOND  0x80
 
-/* The ApplePCF50635 retained-wake decoder consumes Power/Home from the low
- * two bits of its second wake-event byte. These are distinct from the live
- * ONKEY edge bits used to enter sleep. */
-#define PMU_INT2_WAKE_BUTTONS 0x03
+// INT2 bits
+#define PMU_INT2_ONKEYR  0x01   // ONKEY rising edge (released)
+#define PMU_INT2_ONKEYF  0x02   // ONKEY falling edge (pressed)
+#define PMU_INT2_EXTON1R 0x04   // N45 board-level wake-button latch
 
 #define PMU_MBCS1 0x4B
 #define PMU_ADCC1 0x54
@@ -59,6 +57,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 // PMU control registers (PCF50633)
 #define PMU_OOCSHDWN 0x0C   // Standby/shutdown control
 #define PMU_OOCWAKE  0x0D   // Wake-up source config
+#define PMU_OOCSTAT  0x12   // ONKEY and external wake-input state
+#define PMU_OOCSTAT_ONKEY 0x01 // 1 = released, 0 = pressed
 #define PMU_GPMEM0   0x67   // Battery-backed general-purpose memory
 #define PMU_GPMEM1   0x68
 #define PMU_GPMEM2   0x69
@@ -97,10 +97,10 @@ typedef struct Pcf50633State {
 	uint8_t int3m;
 	uint8_t int4m;
 	uint8_t int5m;
-	// Shadow register: holds INT1 value saved during wake so the kernel's
-	// deferred workqueue can read ONKEY even after INT1 has been cleared
+	// Shadow register: holds INT2 value saved during wake so the kernel's
+	// deferred workqueue can read ONKEY even after INT2 has been cleared
 	// to de-assert nIRQ (breaking the CPSID IF chicken-and-egg).
-	uint8_t int1_shadow;
+	uint8_t int2_shadow;
 	// General-purpose register file (captures all writes for debugging)
 	uint8_t regs[256];
 	// Post-sleep VIC cleanup timer (finding #66: clear stale priority stack)

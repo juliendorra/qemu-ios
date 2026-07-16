@@ -86,7 +86,7 @@ static void pmu_reassert_callback(void *opaque)
 {
     IPodTouchSYSICState *s = (IPodTouchSYSICState *)opaque;
     if (s->pmu) {
-        bool had_onkey = s->pmu->int1 & (PMU_INT1_ONKEYF | PMU_INT1_ONKEYR);
+        bool had_onkey = s->pmu->int2 & (PMU_INT2_ONKEYF | PMU_INT2_ONKEYR);
 
         // Clear pending INT bits so the kernel's idle loop uses F=0 path.
         if (s->pmu->int1 || s->pmu->int2 || s->pmu->int3 ||
@@ -193,9 +193,9 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
             if (group == PMU_INT_GPIO_GROUP && s->pmu
                 && s->pmu_wake_clear_active) {
                 s->pmu_wake_clear_active = false;  // one-shot
-                fprintf(stderr, "[SYSIC] Wake shadow-clear: INT1=0x%02x saved to shadow, "
-                        "clearing INT1-5 to de-assert nIRQ\n", s->pmu->int1);
-                s->pmu->int1_shadow = s->pmu->int1;
+                fprintf(stderr, "[SYSIC] Wake shadow-clear: INT2=0x%02x saved to shadow, "
+                        "clearing INT1-5 to de-assert nIRQ\n", s->pmu->int2);
+                s->pmu->int2_shadow = s->pmu->int2;
                 s->pmu->int1 = 0;
                 s->pmu->int2 = 0;
                 s->pmu->int3 = 0;

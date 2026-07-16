@@ -565,6 +565,13 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
 
     if (keycode == 153 && s->suppress_power_release) {
+        if (s->pmu) {
+            /* The AP may still be in iBoot, but the always-on PMU sees the
+             * physical key release and retains that edge for the kernel. */
+            s->pmu->regs[PMU_OOCSTAT] |= PMU_OOCSTAT_ONKEY;
+            s->pmu->int2 |= PMU_INT2_ONKEYR;
+            s->pmu->retained_int2_wake |= PMU_INT2_ONKEYR;
+        }
         s->suppress_power_release = false;
         return;
     }
@@ -596,8 +603,15 @@ static void ipod_touch_key_event(void *opaque, int keycode)
              * edges were consumed while entering sleep; retained Power/Home
              * wake is reported in the second ApplePCF50635 event byte. */
             s->pmu->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
-            s->pmu->int2 |= PMU_INT2_WAKE_BUTTONS;
-            s->pmu->retained_int2_wake |= PMU_INT2_WAKE_BUTTONS;
+            if (keycode == 25) {
+                s->pmu->regs[PMU_OOCSTAT] &= ~PMU_OOCSTAT_ONKEY;
+                s->pmu->int2 |= PMU_INT2_ONKEYF | PMU_INT2_EXTON1R;
+                s->pmu->retained_int2_wake |=
+                    PMU_INT2_ONKEYF | PMU_INT2_EXTON1R;
+            } else {
+                s->pmu->int2 |= PMU_INT2_EXTON1R;
+                s->pmu->retained_int2_wake |= PMU_INT2_EXTON1R;
+            }
             s->pmu->retained_int2_reexposed = false;
             if (keycode == 25) {
                 s->suppress_power_release = true;
@@ -623,8 +637,14 @@ static void ipod_touch_key_event(void *opaque, int keycode)
         ipod_touch_lcd_framebuffer_is_dark(s->lcd)) {
         s->pmu->wake_reset_pending = true;
         if (keycode == 25) {
+            s->pmu->regs[PMU_OOCSTAT] &= ~PMU_OOCSTAT_ONKEY;
+            s->pmu->int2 |= PMU_INT2_ONKEYF | PMU_INT2_EXTON1R;
+            s->pmu->retained_int2_wake |=
+                PMU_INT2_ONKEYF | PMU_INT2_EXTON1R;
             s->suppress_power_release = true;
         } else {
+            s->pmu->int2 |= PMU_INT2_EXTON1R;
+            s->pmu->retained_int2_wake |= PMU_INT2_EXTON1R;
             s->suppress_home_release = true;
         }
         fprintf(stderr, "[WAKE] %s queued during OOCSHDWN transition\n",
