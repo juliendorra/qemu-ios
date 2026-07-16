@@ -592,12 +592,13 @@ static void ipod_touch_key_event(void *opaque, int keycode)
 
         if (in_poweroff_loop) {
             /* Bit 7 was armed by the kernel before OOCSHDWN and must remain
-             * set until iBoot consumes the retained token. Carry a complete
-             * press/release gesture across reset; the host release happens
-             * while iBoot is running and was previously swallowed. */
+             * set until iBoot consumes the retained token. The live ONKEY
+             * edges were consumed while entering sleep; retained Power/Home
+             * wake is reported in the second ApplePCF50635 event byte. */
             s->pmu->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
-            s->pmu->int1 |= PMU_INT1_ONKEYF | PMU_INT1_ONKEYR;
-            pcf50633_update_irq(s->pmu);
+            s->pmu->int2 |= PMU_INT2_WAKE_BUTTONS;
+            s->pmu->retained_int2_wake |= PMU_INT2_WAKE_BUTTONS;
+            s->pmu->retained_int2_reexposed = false;
             if (keycode == 25) {
                 s->suppress_power_release = true;
             } else {

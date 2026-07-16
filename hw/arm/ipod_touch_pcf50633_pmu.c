@@ -183,8 +183,9 @@ void pcf50633_update_irq(Pcf50633State *s)
         s->sysic->gpio_int_status[PMU_INT_GPIO_GROUP] |= (1 << PMU_INT_GPIO_BIT);
         s->sysic->gpio_int_level[PMU_INT_GPIO_GROUP] |= (1 << PMU_INT_GPIO_BIT);
         qemu_irq_raise(s->sysic->gpio_irqs[PMU_INT_GPIO_GROUP]);
-        fprintf(stderr, "[PMU] nIRQ assert: int1=0x%02x mask=0x%02x\n",
-                s->int1, s->int1m);
+        fprintf(stderr, "[PMU] nIRQ assert: int1=0x%02x int2=0x%02x "
+                "masks=%02x/%02x\n",
+                s->int1, s->int2, s->int1m, s->int2m);
     } else {
         // De-assert nIRQ: clear GPIO status + level bits and lower IRQ line
         s->sysic->gpio_int_level[PMU_INT_GPIO_GROUP] &= ~(1 << PMU_INT_GPIO_BIT);
@@ -287,8 +288,15 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
         case PMU_RESUME_STATUS:
             fprintf(stderr, "[PMU] RESUME_STATUS write <- 0x%02x%s\n",
                     val, (val & PMU_RESUME_ARMED) ? " (armed)" : "");
-            if (val == 0x40 && s->lcd) {
-                ipod_touch_lcd_resume_scanout(s->lcd);
+            if (val == 0x40) {
+                /* iBoot has consumed the read-clear interrupt status and is
+                 * committing its type-4 branch. Re-expose the retained PMU
+                * wake cause for the kernel's resume decoder. */
+                s->int2 |= s->retained_int2_wake;
+                s->retained_int2_reexposed = true;
+                if (s->lcd) {
+                    ipod_touch_lcd_resume_scanout(s->lcd);
+                }
             }
             break;
         case PMU_INT1:
@@ -341,8 +349,9 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
             }
 
             fprintf(stderr, "[PMU] OOCSHDWN=0x%02x OOCWAKE=0x%02x "
-                    "INT1M=0x%02x INT1=0x%02x RESUME=0x%02x\n",
-                    val, s->regs[PMU_OOCWAKE], s->int1m, s->int1,
+                    "INT1=%02x/%02x INT2=%02x/%02x RESUME=0x%02x\n",
+                    val, s->regs[PMU_OOCWAKE], s->int1, s->int1m,
+                    s->int2, s->int2m,
                     s->regs[PMU_RESUME_STATUS]);
 
             /*
@@ -356,8 +365,9 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
             if (s->wake_reset_pending) {
                 s->wake_reset_pending = false;
                 s->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
-                s->int1 |= PMU_INT1_ONKEYF | PMU_INT1_ONKEYR;
-                pcf50633_update_irq(s);
+                s->int2 |= PMU_INT2_WAKE_BUTTONS;
+                s->retained_int2_wake |= PMU_INT2_WAKE_BUTTONS;
+                s->retained_int2_reexposed = false;
                 fprintf(stderr, "[WAKE] Completing queued retained-RAM "
                         "SoC reboot after OOCSHDWN\n");
                 ipod_touch_record_retained_crc();
@@ -399,6 +409,21 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
         case PMU_INT2:
             res = s->int2;
             s->int2 = 0;
+            if (s->retained_int2_reexposed &&
+                (res & s->retained_int2_wake)) {
+                /* iBoot and the retained-resume prologue have both touched
+                 * the reset VIC domain. Complete that domain reset before
+                 * deferred kernel resume work starts using GPIO IRQs. */
+                if (s->vic0) {
+                    pl192_reset_priority((PL192State *)s->vic0);
+                }
+                if (s->vic1) {
+                    pl192_reset_priority((PL192State *)s->vic1);
+                }
+                s->retained_int2_wake = 0;
+                s->retained_int2_reexposed = false;
+            }
+            fprintf(stderr, "[PMU] INT2 read -> 0x%02x (cleared)\n", res);
             pcf50633_update_irq(s);
             break;
         case PMU_INT3:

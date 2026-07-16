@@ -12,12 +12,12 @@
 #define TYPE_PCF50633                 "pcf50633"
 OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 
-// Apple-remapped interrupt status registers (read-clears)
-#define PMU_INT1  0x13
-#define PMU_INT2  0x14
-#define PMU_INT3  0x15
-#define PMU_INT4  0x16
-#define PMU_INT5  0x17
+// PCF50633/ApplePCF50635 interrupt status registers (read-clears)
+#define PMU_INT1  0x02
+#define PMU_INT2  0x03
+#define PMU_INT3  0x04
+#define PMU_INT4  0x05
+#define PMU_INT5  0x06
 
 // Interrupt mask registers (standard PCF50633 addresses — NOT remapped by Apple)
 #define PMU_INT1M 0x07
@@ -35,6 +35,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 #define PMU_INT1_SECOND  0x20
 #define PMU_INT1_ONKEYR  0x40   // ONKEY rising edge (released)
 #define PMU_INT1_ONKEYF  0x80   // ONKEY falling edge (pressed)
+
+/* The ApplePCF50635 retained-wake decoder consumes Power/Home from the low
+ * two bits of its second wake-event byte. These are distinct from the live
+ * ONKEY edge bits used to enter sleep. */
+#define PMU_INT2_WAKE_BUTTONS 0x03
 
 #define PMU_MBCS1 0x4B
 #define PMU_ADCC1 0x54
@@ -82,6 +87,10 @@ typedef struct Pcf50633State {
 	uint8_t int3;
 	uint8_t int4;
 	uint8_t int5;
+	// Wake cause retained across iBoot's read-clear and re-exposed when iBoot
+	// commits the type-4 handoff to the retained kernel.
+	uint8_t retained_int2_wake;
+	bool retained_int2_reexposed;
 	// Interrupt mask registers
 	uint8_t int1m;
 	uint8_t int2m;

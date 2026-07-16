@@ -212,7 +212,21 @@ static void ipod_touch_i2c_init(Object *obj)
 
 static void ipod_touch_i2c_reset(DeviceState *d)
 {
-    
+    IPodTouchI2CState *s = IPOD_TOUCH_I2C(d);
+
+    if (s->active) {
+        i2c_end_transfer(s->bus);
+    }
+    s->control = 0;
+    s->status = 0;
+    s->address = 0;
+    s->datashift = 0;
+    s->line_ctrl = 0;
+    s->iicreg20 = 0;
+    s->active = 0;
+    s->ibmr = 0;
+    s->data = 0;
+    qemu_irq_lower(s->irq);
 }
 
 static void ipod_touch_i2c_class_init(ObjectClass *klass, void *data)
