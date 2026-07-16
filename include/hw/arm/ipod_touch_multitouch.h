@@ -57,6 +57,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
 #define MT_CMD_SHORT_CONTROL_WRITE   0xE4
 #define MT_CMD_SHORT_CONTROL_READ    0xE6
 #define MT_CMD_FRAME_READ            0xEA
+#define MT_CMD_READ_INTERRUPT_DATA   0xEB
+#define MT_REPLY_INTERRUPT_DATA      0xE1
 
 // frame types
 #define MT_FRAME_TYPE_PATH 0x44
@@ -134,6 +136,8 @@ typedef struct MTFrame {
     FingerData finger_data; // TODO we assume one finger for now
     uint8_t checksum1;
     uint8_t checksum2;
+    /* Interrupt packets are transferred in four-byte-aligned SPI reads. */
+    uint8_t padding;
 } __attribute__((__packed__)) MTFrame;
 
 typedef struct IPodTouchMultitouchState {
@@ -144,6 +148,7 @@ typedef struct IPodTouchMultitouchState {
     uint32_t buf_size;
     uint32_t buf_ind;
     uint32_t in_buffer_ind;
+    bool frame_data_pending;
     uint8_t hbpp_atn_ack_response[2];
     MTFrame *next_frame;
     uint32_t frame_counter;

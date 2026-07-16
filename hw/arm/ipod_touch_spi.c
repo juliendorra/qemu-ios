@@ -243,6 +243,8 @@ static void s5l8900_spi_reset(DeviceState *d)
 	memset(s->regs, 0, sizeof(s->regs));
     fifo8_reset(&s->tx_fifo);
     fifo8_reset(&s->rx_fifo);
+    s->last_irq = 0;
+    qemu_irq_lower(s->irq);
 }
 
 static uint32_t base_addr = 0;

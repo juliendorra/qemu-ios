@@ -63,7 +63,13 @@ static void prepare_report_info_response(IPodTouchMultitouchState *s, uint8_t re
         report_length = MT_REPORT_SENSOR_DIMENSIONS_SIZE;
     }
     else {
-        hw_error("Unknown report ID 0x%02x\n", report_id);
+        /* A real controller reports an unsupported selector to the guest;
+         * it does not terminate the whole machine.  The resumed driver asks
+         * about optional reports that cold boot does not enumerate. */
+        s->out_buffer[2] = 1;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "iPod multitouch: unsupported report-info ID 0x%02x\n",
+                      report_id);
     }
 
     s->out_buffer[3] = (report_length & 0xFF);
@@ -104,7 +110,10 @@ static void prepare_short_control_response(IPodTouchMultitouchState *s, uint8_t 
         ob_int32[1] = MT_SENSOR_SURFACE_HEIGHT;
     }
     else {
-        hw_error("Unknown report ID 0x%02x\n", report_id);
+        s->out_buffer[2] = 1;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "iPod multitouch: unsupported short-control ID 0x%02x\n",
+                      report_id);
     }
 
     // compute and set the checksum
@@ -129,7 +138,22 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
         return 0;
     }
 
-    if(s->cur_cmd == 0) {
+    if (s->cur_cmd == 0 && s->frame_data_pending && s->next_frame) {
+        /* READ_INTERRUPT_DATA returns a 16-byte length reply first.  The
+         * guest then performs a separate, dummy-filled SPI read for the
+        * aligned interrupt packet itself. */
+        s->cur_cmd = 0xff; /* internal packet-read state */
+        s->buf_size = sizeof(MTFrame) - sizeof(MTFrameLengthPacket);
+        free(s->out_buffer);
+        free(s->in_buffer);
+        s->out_buffer = malloc(s->buf_size);
+        memcpy(s->out_buffer, &s->next_frame->frame_packet, s->buf_size);
+        s->buf_ind = 0;
+        s->in_buffer = malloc(s->buf_size);
+        s->in_buffer_ind = 0;
+        s->frame_data_pending = false;
+    }
+    else if(s->cur_cmd == 0) {
         // we're currently not in a command - start a new command
         s->cur_cmd = value;
         s->out_buffer = malloc(0x100);
@@ -200,9 +224,41 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
             s->buf_size = 16;
         }
         else if(value == MT_CMD_FRAME_READ) {
-            s->buf_size = sizeof(MTFrame);
-            free(s->out_buffer);
-            s->out_buffer = (uint8_t *) s->next_frame;
+            /* The iPod OS 1.x driver follows the two-stage EB transaction
+             * with the original EA frame read.  Padding belongs only to the
+             * aligned EB packet, not this 75-byte legacy response. */
+            s->buf_size = sizeof(MTFrame) - sizeof(s->next_frame->padding);
+            if (s->next_frame) {
+                free(s->out_buffer);
+                s->out_buffer = (uint8_t *)s->next_frame;
+            } else {
+                /* The driver can poll the legacy frame command immediately
+                 * after consuming an interrupt packet.  No queued frame is
+                 * a normal empty result, not a host-fatal NULL response. */
+                memset(s->out_buffer, 0, s->buf_size);
+            }
+        }
+        else if (value == MT_CMD_READ_INTERRUPT_DATA) {
+            s->buf_size = sizeof(MTFrameLengthPacket);
+            if (s->next_frame) {
+                memcpy(s->out_buffer, &s->next_frame->frame_length,
+                       sizeof(MTFrameLengthPacket));
+                /* The queued object remains the original all-EA legacy
+                 * frame.  Only the EB length transaction uses the E1 reply
+                 * marker, with a checksum over that distinct header. */
+                s->out_buffer[0] = MT_REPLY_INTERRUPT_DATA;
+                s->out_buffer[14] = 0;
+                s->out_buffer[15] = 0;
+                uint16_t checksum = 0;
+                for (int i = 0; i < 14; i++) {
+                    checksum += s->out_buffer[i];
+                }
+                s->out_buffer[14] = checksum & 0xff;
+                s->out_buffer[15] = checksum >> 8;
+                s->frame_data_pending = true;
+            } else {
+                memset(s->out_buffer, 0, s->buf_size);
+            }
         }
         else {
             qemu_log_mask(LOG_GUEST_ERROR,
@@ -264,6 +320,20 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
             s->hbpp_atn_ack_response[1] = 0xD1;
         }
 
+        if (s->cur_cmd == 0xff) {
+            free(s->out_buffer);
+            free(s->in_buffer);
+            free(s->next_frame);
+            s->out_buffer = NULL;
+            s->in_buffer = NULL;
+            s->next_frame = NULL;
+        } else if (s->cur_cmd == MT_CMD_FRAME_READ && s->next_frame &&
+                   s->out_buffer == (uint8_t *)s->next_frame) {
+            free(s->next_frame);
+            s->next_frame = NULL;
+            s->out_buffer = NULL;
+        }
+
         // we're done with the command
         s->cur_cmd = 0;
         s->buf_size = 0;
@@ -292,13 +362,15 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
     frame->frame_length.checksum2 = (checksum >> 8) & 0xFF;
 
     // create the frame packet
+    /* E1 identifies the 16-byte length reply.  The legacy Z2 frame itself
+     * retains the EA marker expected by the iPod OS 1.x driver. */
     frame->frame_packet.cmd = MT_CMD_FRAME_READ;
     frame->frame_packet.length1 = (data_len & 0xFF);
     frame->frame_packet.length2 = (data_len >> 8) & 0xFF;
 
     checksum = 0;
     for(int i = 0; i < 4; i++) {
-        checksum += ((uint8_t *) &frame->frame_length)[i];
+        checksum += ((uint8_t *) &frame->frame_packet)[i];
     }
 
     // the first five bytes have to sum up to 0.
@@ -430,6 +502,7 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
     s->buf_size = 0;
     s->buf_ind = 0;
     s->in_buffer_ind = 0;
+    s->frame_data_pending = false;
     memset(s->hbpp_atn_ack_response, 0,
            sizeof(s->hbpp_atn_ack_response));
     s->frame_counter = 0;
