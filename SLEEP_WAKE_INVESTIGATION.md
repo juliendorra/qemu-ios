@@ -2057,3 +2057,198 @@ use ONKEYF as the current PMU model's generic boot-visible wake latch.
 | `hw/arm/ipod_touch_lcd.c` | Panel-off black output, active-scanout transition detection, stable-startup capture, and boot-time touch suppression |
 | `hw/arm/ipod_touch_multitouch.c` | Volatile device reset, safe idle/unknown SPI handling, timer/frame/IRQ cleanup across SoC power cycles |
 | `hw/intc/pl192.c` | `pl192_reset_priority()` API for post-sleep cleanup; removed VECTADDR hot-path tracing |
+
+---
+
+## Phase 10: Retained iBoot Type-4 Resume and Reset-Domain Completion
+
+Phase 9 correctly made OOCSHDWN terminal, but its reset still behaved like a
+normal boot: it reloaded iBoot without exposing retained LPDDR at physical
+address zero. It also cleared scanout memory and allowed historical
+OOCSHDWN-time kernel patches to remain in the retained image. Those details
+explained the long wake, lost foreground application, and misleading visual
+results. This phase supersedes those parts of Phase 9.
+
+### Proven type-4 handoff
+
+The wake reset now maps the first 128 MiB of retained LPDDR at physical address
+zero for iBoot's MMU-off type-4 branch. A complete wake trace shows:
+
+```text
+[WAKE] Retained LPDDR CRC32C before AP reset: 0xf8ed1fbc
+[WAKE] Retained LPDDR CRC32C at reset: 0xf8ed1fbc (stable)
+[PMU] RESUME_STATUS read -> 0xa0 (armed + wake)
+[PMU] RESUME_STATUS write <- 0x80 (armed)
+[PMU] RESUME_STATUS write <- 0x40
+pmu wake events:
+System Wake
+AppleMultitouchZ2SPI: downloaded 49128 bytes of firmware data
+```
+
+There is no second `Darwin Kernel Version` line and no SpringBoard launch in
+that wake interval. iBoot consumes the retained token and returns to the
+existing kernel session. The full 128 MiB checksum is identical immediately
+before and at the AP reset boundary.
+
+The SYSIC power registers were also corrected. `POWER_STATE` represents
+domains that remain off: `POWER_OFFCTRL` sets bits and `POWER_ONCTRL` clears
+them. The retained kernel had previously polled an incorrectly latched bit 2
+forever.
+
+### No retained-kernel patching
+
+OOCSHDWN no longer rewrites `get_ticks`, Security Modules, KDP, or the terminal
+sleep function. It marks the panel off, records the terminal state, and waits
+for application-processor power loss. Wake resets CPU/volatile boot state,
+reloads pristine iBoot, resets multitouch protocol state, and retains LPDDR.
+
+This is not the rejected host-side `vm_stop()`/`vm_start()` suspension and it
+does not return from the kernel's terminal `b .` loop.
+
+### Exact cause of the leaked status bar
+
+The shutdown compositor uses two OS VRAM buffers at `0x0f400000` and
+`0x0f496000`. During the fade, one can contain only the status bar while the
+other still contains the complete foreground surface. The older QEMU model
+kept scanning the active status-bar buffer after PMU panel-off, which leaked
+the bar while the real panel should have been black.
+
+Panel-off now produces a uniformly black host surface. On wake, another reset
+domain mattered: iBoot temporarily points the CLCD scanout register at its own
+`0x0fe00000` framebuffer. The type-4 kernel retains OS VRAM but does not
+rewrite that emulated register soon enough. Selecting iBoot's buffer produced
+a white screen; selecting the shutdown buffer reproduced the leaked bar.
+
+The emulator now records likely OS scanout buffers before sleep and restores
+the CLCD scanout register when iBoot consumes the type-4 token (`0x40`). Pixels
+are not copied and LPDDR is not modified. The iBoot framebuffer is deliberately
+excluded because iBoot overwrites it on every wake. This is still an
+investigatory approximation: it can avoid the white iBoot buffer and the
+status-bar-only shutdown buffer, but it has not reliably restored the actual
+foreground application (Safari in the current test). The missing work is in
+the retained display/power-domain resume, not in preserving framebuffer bytes.
+
+### Manual and timed validation
+
+| Acceptance check | Observed result |
+|---|---|
+| Guest-owned sleep | `System Sleep`, driver shutdown, `OOCSHDWN=0x02` |
+| Panel while asleep | Uniform black; no retained status bar |
+| Timed sleep then P | Same OOCSHDWN/reset/type-4 path as manual sleep |
+| Retained memory | Full 128 MiB CRC32C stable across every tested AP reset |
+| Boot identity | `System Wake`; no new Darwin kernel or SpringBoard launch |
+| Foreground scanout | **Unresolved:** retained kernel/process memory survives, but the visible buffer can fall back to a stale SpringBoard home frame instead of Safari |
+| Touch after wake | Multitouch firmware reload and host `mouse DOWN` / `mouse UP` callbacks observed; reliable guest-side cancellation of the next idle transition remains unresolved |
+| Crash/root regression | Cold boot mounts root and reaches SpringBoard after restoring committed SPI FIFO behavior |
+
+The wake still traverses the available iBoot image and is slower than real
+hardware, but it is now a retained-kernel wake rather than a normal kernel
+load.
+
+### VROM/NOR/LLB investigation and current boundary
+
+The address-zero VROM alias, SRAM0/SRAM1 layout, and missing 8900 service shims
+were modeled far enough for the dumped VROM to execute and issue its SPI NOR
+sequence. It read the supplied NOR catalog's `IMG2` header. The supplied
+artifacts do not, however, contain the 8900-wrapped LLB that this VROM expects;
+the catalog contains image records and VROM falls back toward DFU. There is no
+separate compatible LLB in the repository.
+
+Experimental generic SPI FIFO changes made while tracing VROM also prevented
+the cold kernel from mounting its NAND root. They were rejected and the
+committed SPI controller behavior was restored. Production wake therefore
+starts from a pristine reloaded iBoot image, with the real type-4 retained
+handoff after that point. Starting at VROM/NOR remains feasible only when a
+compatible user-supplied LLB/firmware set is available.
+
+### Accuracy verdict
+
+| Area | Current implementation |
+|---|---|
+| Sleep entry | Guest-owned driver shutdown and PMU OOCSHDWN |
+| AP power loss | Functional reset domain; CPU and volatile boot/protocol state reset |
+| Main LPDDR | Retained and checksum-verified |
+| Wake cause | PMU retained status plus ONKEYF approximation for Power/Home |
+| Boot chain | Reloaded iBoot, not yet VROM → NOR → LLB |
+| Resume | Genuine iBoot type-4 handoff to retained kernel |
+| Display | Panel-off black is correct; retained CLCD register restoration is partial and foreground-app recovery is unresolved |
+| Touch | Controller reset and guest firmware reload work; immediately usable post-wake input is not yet proven reliable |
+
+The honest description is: **guest-driven sleep with a functional S5L8900 AP
+power cycle and genuine retained-kernel type-4 resume, but not cycle-accurate
+boot-ROM or complete peripheral-domain emulation.** The CLCD fix models a
+missing reset-domain register restoration; it is not host suspension or pixel
+repainting.
+
+## Performance Optimization Plan
+
+The two visible performance problems have different causes and should be
+measured separately:
+
+- Display refresh is explicitly capped at **10 Hz** by
+  `LCD_REFRESH_RATE_FREQUENCY` in `include/hw/arm/ipod_touch_lcd.h`. This is an
+  emulator setting, not an M2 hardware limit.
+- CPU/device speed is dominated by single-vCPU TCG translation and emulated
+  device polling. The current development build also enables assertions,
+  diagnostic logging, and a debug-oriented configuration. One emulated CPU
+  mainly uses one host core, so additional host cores do not directly improve
+  guest execution.
+
+Optimization must not hide correctness bugs. Every stage below keeps manual
+and timed sleep on the same guest-owned OOCSHDWN/type-4 path and reruns the
+sleep/wake acceptance checks.
+
+### Recommended order
+
+| Priority | Change | Why this order | Measurement / acceptance |
+|---|---|---|---|
+| 1 | Raise the LCD presentation timer from 10 Hz to 60 Hz | Removes the known artificial UI cap immediately and is independent of CPU emulation | Scrolling/animation can present up to 60 frames/s; no accelerated guest timers or input regressions |
+| 2 | Redraw only on dirty framebuffer/palette/display state | A blind 60 Hz full redraw would waste the same host core needed by TCG | Idle display consumes negligible CPU; changed regions appear on the next presentation tick; no stale frames |
+| 3 | Use the real `arm1176` CPU model as the default performance baseline | `-cpu max` may expose a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
+| 4 | Produce a release build and remove hot-path diagnostics | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
+| 5 | Stop executing the terminal `b .` after OOCSHDWN | The sleeping CPU currently burns one host core even though real AP power is off | Near-zero QEMU CPU use while asleep; P/H still initiates the retained AP reset and type-4 handoff; RAM CRC stays stable |
+| 6 | Profile an awake workload and fix the largest emulated-device polling loops | Overall slowness cannot be attributed safely without sampling a representative boot/UI trace | Record boot-to-SpringBoard time, app-launch latency, scrolling frame rate, vCPU samples, and top MMIO addresses before each change; improve one identified hotspot at a time |
+| 7 | Evaluate a newer QEMU/TCG base and safe translation settings | This is higher-risk and should follow local hot-path fixes so behavior changes remain attributable | Same firmware and acceptance suite, with repeatable speedup and no boot, NAND, touch, display, or resume regression |
+| 8 | Reassess host hardware only after the software baseline is optimized | Buying a faster Mac cannot remove the 10 Hz cap or pathological polling | Run the same release benchmark on M2 and candidate Macs; use single-core improvement, not total core count, as the primary predictor |
+
+### Benchmark protocol
+
+Use one reproducible release configuration and record at least three runs of
+each result:
+
+1. Host seconds from QEMU start to usable SpringBoard.
+2. Host seconds to open Safari and display its first complete frame.
+3. Presented frames per second during a fixed scroll/animation gesture.
+4. QEMU CPU percentage while idle awake, actively scrolling, and fully asleep.
+5. Host-to-guest time ratio over a fixed 60-second guest interval.
+6. Manual and timed sleep results: black panel, stable retained-RAM checksum,
+   type-4 `System Wake`, foreground application survival, and immediately
+   working touch.
+
+The current recommendation is therefore to keep the M2 as the development
+baseline. It should be capable of a much better result than the current build;
+the explicit refresh cap, debug overhead, sleeping busy-loop, and any awake
+polling hotspots must be removed or measured before declaring host hardware the
+limiting factor. A faster single-core Mac may improve TCG throughput, but it
+cannot by itself make the emulation accurate or guarantee original-hardware
+speed.
+
+## iPhone OS 1.0 / Original iPhone Feasibility
+
+An original-iPhone (M68AP) variant is feasible as a follow-on machine because
+it shares the S5L8900 generation and much of the current PMU, LCD, SPI,
+multitouch, NAND, and retained-resume work. It is not a firmware-only rename of
+the N45AP iPod touch machine. A useful demo requires:
+
+1. A separate `iPhone-2G`/M68AP machine definition and device-tree identity.
+2. User-supplied matching boot ROM, NOR/LLB/iBoot, kernel cache, and root
+   filesystem artifacts.
+3. M68-specific GPIO/button, camera, USB, and baseband-facing stubs sufficient
+   for iPhone OS 1.0 to finish booting.
+4. Validation of its PMU wake token and type-4 path against the retained-resume
+   model proven here.
+
+Telephony does not need to be fully emulated for a UI/demo target; a controlled
+"no service" baseband stub is a reasonable first milestone. The largest
+current blocker to an exact first-stage boot remains the matching LLB/artifact
+set, not the retained-kernel mechanism.
