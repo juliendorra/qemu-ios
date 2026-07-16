@@ -7,6 +7,7 @@
 #include "hw/core/cpu.h"        // current_cpu
 #include "target/arm/cpu.h"     // ARM_CPU, CPUARMState, cpsr_read
 #include "exec/exec-all.h"     // tb_flush
+#include "sysemu/runstate.h"
 
 // Delay after OOCSHDWN write before cleaning up VIC state.
 // The patched sleep function returns immediately; this delay ensures
@@ -244,7 +245,6 @@ void pcf50633_set_onkey(Pcf50633State *s, bool pressed)
 {
     if (pressed) {
         s->int1 |= PMU_INT1_ONKEYF;
-        pcf50633_resume_from_sleep(s);
     } else {
         s->int1 |= PMU_INT1_ONKEYR;
     }
@@ -326,6 +326,13 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
             break;
         case PMU_OOCSHDWN:
         {
+            if (s->lcd) {
+                IPodTouchLCDState *lcd = s->lcd;
+                lcd->panel_off = true;
+                lcd->invalidate = 1;
+                fprintf(stderr, "[LCD] PMU powered panel off\n");
+            }
+
             // Finding #75: Log CPU state at OOCSHDWN write to trace PM caller.
             if (current_cpu) {
                 CPUARMState *env = &ARM_CPU(current_cpu)->env;
@@ -443,8 +450,9 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
             }
             // Approach #41: Patch Security Modules serial console check.
             //
-            // Finding #82 analysis confirmed: patching sleep func to return
-            // is the correct approach (no kernel resume entry point exists).
+            // Historical approach #41. Finding #82's claim that no retained
+            // kernel resume exists was later withdrawn: the address-zero
+            // type-4 handoff/remap semantics are still unresolved.
             // The PM resume path calls a "Security Modules v6.6" function
             // at VA 0xc000f094 (PA 0x0800f094, Thumb) that loops calling
             // delay_func + UART poll waiting for serial debugger input.
@@ -526,6 +534,15 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
             s->oocshdwn_fired = true;
             fprintf(stderr, "[PMU] OOCSHDWN: sleep function NOT patched "
                     "(deferred to P press — approach #43)\n");
+
+            if (s->wake_reset_pending) {
+                s->wake_reset_pending = false;
+                s->int1 |= PMU_INT1_ONKEYF;
+                pcf50633_update_irq(s);
+                fprintf(stderr, "[WAKE] Completing queued retained-RAM "
+                        "SoC reboot after OOCSHDWN\n");
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            }
 
             // Finding #93 (REVERTED): IOPMrootDomain wake transition patches.
             //

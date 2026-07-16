@@ -97,6 +97,9 @@ typedef struct Pcf50633State {
 	IPodTouchSYSICState *sysic;
 	// Approach #43: deferred sleep patch — true after OOCSHDWN fires
 	bool oocshdwn_fired;
+	// A Power/Home press received during the final display-off transition.
+	// Complete OOCSHDWN first, then perform the retained-RAM SoC reboot.
+	bool wake_reset_pending;
 	// True while the guest sleep-loop trampoline is installed. The cleanup
 	// callback restores the original instructions for the next sleep cycle.
 	bool sleep_func_patched;

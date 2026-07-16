@@ -3,7 +3,6 @@
 #include "ui/console.h"
 #include "hw/display/framebuffer.h"
 #include "exec/address-spaces.h"
-#include "sysemu/runstate.h"
 
 static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -183,7 +182,7 @@ static void lcd_refresh(void *opaque)
     if (!lcd || !lcd->con || !surface_bits_per_pixel(surface))
         return;
 
-    if (lcd->forced_blank) {
+    if (lcd->panel_off) {
         memset(surface_data(surface), 0,
                surface_stride(surface) * surface_height(surface));
         dpy_gfx_update(lcd->con, 0, 0,
@@ -288,9 +287,6 @@ static const GraphicHwOps s5l8900_gfx_ops = {
 
 bool ipod_touch_lcd_framebuffer_is_dark(IPodTouchLCDState *lcd)
 {
-    static const uint32_t known_bases[] = {
-        0x0fe00000, 0x0f400000, 0x0f496000,
-    };
     static const uint32_t check_offsets[] = {
         (240 * FB_WIDTH + 160) * FB_BPP,
         (100 * FB_WIDTH + 160) * FB_BPP,
@@ -299,18 +295,22 @@ bool ipod_touch_lcd_framebuffer_is_dark(IPodTouchLCDState *lcd)
         (450 * FB_WIDTH + 160) * FB_BPP,
         (460 * FB_WIDTH + 160) * FB_BPP,
     };
-    /* The controller rotates through three buffers. One can be blank while
-     * another is currently visible, so classify auto-lock only when every
-     * known buffer is dark. */
-    for (int b = 0; b < ARRAY_SIZE(known_bases); b++) {
-        for (int i = 0; i < ARRAY_SIZE(check_offsets); i++) {
-            uint8_t pixel[FB_BPP];
+    uint32_t active_base = lcd->w1_framebuffer_base;
 
-            cpu_physical_memory_read(known_bases[b] + check_offsets[i],
-                                     pixel, sizeof(pixel));
-            if (pixel[0] || pixel[1] || pixel[2]) {
-                return false;
-            }
+    if (!active_base) {
+        return false;
+    }
+
+    /* Inspect the buffer that is actually scanned out. Inactive triple
+     * buffers can retain a bright home screen after the visible buffer has
+     * entered the status-bar-only OOCSHDWN transition. */
+    for (int i = 0; i < ARRAY_SIZE(check_offsets); i++) {
+        uint8_t pixel[FB_BPP];
+
+        cpu_physical_memory_read(active_base + check_offsets[i],
+                                 pixel, sizeof(pixel));
+        if (pixel[0] || pixel[1] || pixel[2]) {
+            return false;
         }
     }
     return true;
@@ -346,32 +346,9 @@ static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int bu
     lcd->mt->touch_y = fy;
 
     if(buttons_state && !lcd->mt->touch_down) {
-        if (lcd->forced_blank) {
-            lcd->forced_blank = false;
-            lcd->invalidate = 1;
-            lcd->mt->display_sleep_requested = false;
-            lcd->mt->swallow_wake_touch = true;
-            vm_start();
-            fprintf(stderr, "[DISPLAY] Click woke host-side display; "
-                    "next click is touch input\n");
-            return;
-        }
-
-        bool waking_display = lcd->mt->display_sleep_requested;
-
-        if (waking_display) {
-            lcd->mt->display_sleep_requested = false;
-            lcd->mt->swallow_wake_touch = true;
-            ipod_touch_lcd_restore_snapshot(lcd);
-            if (lcd->mt->pmu) {
-                ipod_touch_prepare_pmu_wake(lcd->mt);
-                lcd->mt->alternate_wake_via_power = true;
-                pcf50633_set_onkey(lcd->mt->pmu, true);
-                pcf50633_resume_from_sleep(lcd->mt->pmu);
-            }
-            ipod_touch_start_wake_assist();
-            fprintf(stderr, "[TOUCH] wake click at (%.3f, %.3f); "
-                    "touch frame intentionally deferred\n", fx, fy);
+        if (!lcd->fb_snapshot_valid) {
+            fprintf(stderr, "[TOUCH] Ignoring input until display/driver "
+                    "startup is stable\n");
             return;
         }
 

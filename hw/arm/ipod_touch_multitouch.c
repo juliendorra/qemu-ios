@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_multitouch.h"
+#include "qemu/log.h"
 
 static void prepare_interface_version_response(IPodTouchMultitouchState *s) {
     memset(s->out_buffer + 1, 0, 15);
@@ -122,6 +123,12 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
 
     //printf("<MULTITOUCH> Got value: 0x%02x\n", value);
 
+    /* The SPI controller can clock zero padding while the device is idle,
+     * especially while the guest driver reinitializes after a power cycle. */
+    if (s->cur_cmd == 0 && value == 0) {
+        return 0;
+    }
+
     if(s->cur_cmd == 0) {
         // we're currently not in a command - start a new command
         s->cur_cmd = value;
@@ -198,7 +205,11 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
             s->out_buffer = (uint8_t *) s->next_frame;
         }
         else {
-            hw_error("Unknown command 0x%02x!", value);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "iPod multitouch: ignoring unknown command 0x%02x\n",
+                          value);
+            s->buf_size = 1;
+            s->out_buffer[0] = 0;
         }
     }
 
@@ -394,9 +405,52 @@ static void ipod_touch_multitouch_realize(SSIPeripheral *d, Error **errp)
     s->last_frame_timestamp = 0;
 }
 
+static void ipod_touch_multitouch_reset(DeviceState *dev)
+{
+    IPodTouchMultitouchState *s = IPOD_TOUCH_MULTITOUCH(dev);
+
+    timer_del(s->touch_timer);
+    timer_del(s->touch_end_timer);
+
+    if (s->out_buffer &&
+        s->out_buffer != (uint8_t *)s->next_frame) {
+        free(s->out_buffer);
+    }
+    free(s->in_buffer);
+    free(s->next_frame);
+
+    s->cur_cmd = 0;
+    s->out_buffer = NULL;
+    s->in_buffer = NULL;
+    s->next_frame = NULL;
+    s->buf_size = 0;
+    s->buf_ind = 0;
+    s->in_buffer_ind = 0;
+    memset(s->hbpp_atn_ack_response, 0,
+           sizeof(s->hbpp_atn_ack_response));
+    s->frame_counter = 0;
+    s->touch_down = false;
+    s->display_sleep_requested = false;
+    s->alternate_wake_via_power = false;
+    s->swallow_wake_touch = false;
+    s->wake_unwind_active = 0;
+    s->touch_x = 0;
+    s->touch_y = 0;
+    s->prev_touch_x = 0;
+    s->prev_touch_y = 0;
+    s->last_frame_timestamp = 0;
+
+    if (s->sysic) {
+        s->sysic->gpio_int_status[4] &= ~(1 << 27);
+        qemu_irq_lower(s->sysic->gpio_irqs[4]);
+    }
+}
+
 static void ipod_touch_multitouch_class_init(ObjectClass *klass, void *data)
 {
+    DeviceClass *dc = DEVICE_CLASS(klass);
     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
+    dc->reset = ipod_touch_multitouch_reset;
     k->realize = ipod_touch_multitouch_realize;
     k->transfer = ipod_touch_multitouch_transfer;
 }

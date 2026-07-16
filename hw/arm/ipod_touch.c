@@ -1,5 +1,6 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu-common.h"
 #include "hw/arm/boot.h"
 #include "exec/address-spaces.h"
@@ -75,6 +76,67 @@ static void ipod_touch_cpu_reset(void *opaque)
     IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE((MachineState *)opaque);
     ARMCPU *cpu = nms->cpu;
     CPUState *cs = CPU(cpu);
+    uint8_t *iboot_data = NULL;
+    unsigned long iboot_size = 0;
+    uint8_t *volatile_boot_ram;
+
+    /*
+     * A real OOCSHDWN wake reloads iBoot after the application processor has
+     * lost power, while SDRAM containing the kernel sleep image is retained.
+     * The old reset handler jumped back into the already-used iBoot RAM, so
+     * its stale heap immediately panicked on the second entry. Recreate the
+     * volatile boot memory on every SoC reset without clearing main SDRAM.
+     */
+    volatile_boot_ram = g_malloc0(0x400000);
+    cpu_physical_memory_write(IBOOT_BASE, volatile_boot_ram, 0x400000);
+    g_free(volatile_boot_ram);
+
+    if (!g_file_get_contents(nms->iboot_path, (char **)&iboot_data,
+                             &iboot_size, NULL)) {
+        error_report("Unable to reload iBoot from %s", nms->iboot_path);
+    } else {
+        cpu_physical_memory_write(IBOOT_BASE, iboot_data, iboot_size);
+        g_free(iboot_data);
+    }
+
+    volatile_boot_ram = g_malloc0(0x10000);
+    cpu_physical_memory_write(SRAM1_MEM_BASE, volatile_boot_ram, 0x10000);
+    g_free(volatile_boot_ram);
+
+    if (nms->spi2_state && nms->spi2_state->mt &&
+        nms->spi2_state->mt->pmu) {
+        IPodTouchMultitouchState *mt = nms->spi2_state->mt;
+        Pcf50633State *pmu = nms->spi2_state->mt->pmu;
+
+        pmu->oocshdwn_fired = false;
+        pmu->wake_reset_pending = false;
+        pmu->sleep_func_patched = false;
+        if (pmu->post_sleep_timer) {
+            timer_del(pmu->post_sleep_timer);
+        }
+        mt->display_sleep_requested = false;
+        mt->alternate_wake_via_power = false;
+        mt->swallow_wake_touch = false;
+        mt->wake_unwind_active = 0;
+    }
+    if (nms->lcd_state) {
+        static const uint32_t framebuffer_bases[] = {
+            0x0fe00000, 0x0f400000, 0x0f496000,
+        };
+        uint8_t *blank_framebuffer = g_malloc0(FB_SIZE);
+
+        for (int i = 0; i < ARRAY_SIZE(framebuffer_bases); i++) {
+            cpu_physical_memory_write(framebuffer_bases[i],
+                                      blank_framebuffer, FB_SIZE);
+        }
+        g_free(blank_framebuffer);
+
+        nms->lcd_state->panel_off = false;
+        nms->lcd_state->invalidate = 1;
+        nms->lcd_state->fb_snapshot_valid = false;
+        nms->lcd_state->snapshot_visible_frames = 0;
+    }
+    nms->wake_assist_remaining = 0;
 
     cpu_reset(cs);
 
@@ -395,51 +457,12 @@ static void ipod_touch_key_event(void *opaque, int keycode)
 {
     bool do_irq = false;
     bool is_power = false;
-    bool power_event_needs_assist = false;
-    bool waking_display = false;
     int gpio_group = 0, gpio_selector = 0;
 
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
 
-    /*
-     * Real OOCSHDWN cuts power to the complete SoC. Returning from its final
-     * loop can restore a picture, but iPhone OS has already powered the touch
-     * driver and other devices off. For interactive emulation, make P a host-
-     * side display sleep: the guest stays scheduled and all input drivers stay
-     * alive. Handle it before changing any guest-visible GPIO state.
-     */
-    if (s->lcd && keycode == 25) {
-        if (s->suppress_power_release) {
-            return;
-        }
-        s->lcd->forced_blank = !s->lcd->forced_blank;
-        s->lcd->invalidate = 1;
-        s->display_sleep_requested = s->lcd->forced_blank;
-        s->suppress_power_release = true;
-        fprintf(stderr, "[DISPLAY] Power toggled host-side display %s\n",
-                s->lcd->forced_blank ? "OFF" : "ON");
-        if (s->lcd->forced_blank) {
-            /* Suspended stops guest time but keeps host input dispatch live. */
-            vm_stop(RUN_STATE_SUSPENDED);
-        } else {
-            vm_start();
-        }
-        return;
-    }
     if (keycode == 153 && s->suppress_power_release) {
         s->suppress_power_release = false;
-        return;
-    }
-    if (s->lcd && s->lcd->forced_blank && keycode == 35) {
-        if (s->suppress_home_release) {
-            return;
-        }
-        s->lcd->forced_blank = false;
-        s->lcd->invalidate = 1;
-        s->display_sleep_requested = false;
-        s->suppress_home_release = true;
-        vm_start();
-        fprintf(stderr, "[DISPLAY] Home woke host-side display\n");
         return;
     }
     if (keycode == 35 && s->suppress_home_release) {
@@ -447,6 +470,57 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     }
     if (keycode == 163 && s->suppress_home_release) {
         s->suppress_home_release = false;
+        return;
+    }
+
+    /*
+     * OOCSHDWN is a real application-processor power loss. Wake therefore
+     * starts a new SoC boot with retained SDRAM instead of returning from the
+     * kernel's terminal B . loop. Pristine iBoot/SRAM are restored by the
+     * machine reset callback; the MOSX/SUSP markers in main RAM survive.
+     */
+    if ((keycode == 25 || keycode == 35) && s->cpu && s->pmu &&
+        s->pmu->oocshdwn_fired) {
+        CPUARMState *env = &ARM_CPU(s->cpu)->env;
+        uint32_t pc = env->regs[15];
+        uint32_t cpsr = cpsr_read(env);
+        bool in_poweroff_loop = pc >= 0xc005a6c0 && pc <= 0xc005a6d8 &&
+            (cpsr & CPSR_I) && (cpsr & CPSR_F);
+
+        if (in_poweroff_loop) {
+            /* The current PMU model exposes ONKEY as its only boot-visible
+             * wake latch. Use it for both physical wake buttons. */
+            s->pmu->int1 |= PMU_INT1_ONKEYF;
+            pcf50633_update_irq(s->pmu);
+            if (keycode == 25) {
+                s->suppress_power_release = true;
+            } else {
+                s->suppress_home_release = true;
+            }
+            fprintf(stderr, "[WAKE] %s requested retained-RAM SoC reboot\n",
+                    keycode == 25 ? "Power" : "Home");
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            return;
+        }
+    }
+
+    /*
+     * The guest can spend several seconds in its display-off/driver-shutdown
+     * transition before the final OOCSHDWN write. If Power or Home arrives in
+     * that interval, remember the hardware wake request and let shutdown
+     * finish. The PMU will reset the SoC immediately after OOCSHDWN.
+     */
+    if ((keycode == 25 || keycode == 35) && s->lcd && s->pmu &&
+        !s->pmu->oocshdwn_fired &&
+        ipod_touch_lcd_framebuffer_is_dark(s->lcd)) {
+        s->pmu->wake_reset_pending = true;
+        if (keycode == 25) {
+            s->suppress_power_release = true;
+        } else {
+            s->suppress_home_release = true;
+        }
+        fprintf(stderr, "[WAKE] %s queued during OOCSHDWN transition\n",
+                keycode == 25 ? "Power" : "Home");
         return;
     }
 
@@ -485,56 +559,8 @@ static void ipod_touch_key_event(void *opaque, int keycode)
         ARMCPU *arm_cpu = ARM_CPU(s->cpu);
         CPUARMState *env = &arm_cpu->env;
         uint32_t cpsr = cpsr_read(env);
-        /*
-         * After the first deep-sleep resume, the idle path can still have IRQ
-         * masked when the next Power event arrives.  FIQ becomes live only by
-         * key release on some runs, while it is already live at key-down on
-         * others.  Assist whichever edge first observes the stable state.
-         */
-        power_event_needs_assist =
-            is_power && (cpsr & CPSR_I) && !(cpsr & CPSR_F);
         fprintf(stderr, "[BTN] keycode=%d  PC=0x%08x  I=%d F=%d  power=%d\n",
                 keycode, env->regs[15], (cpsr >> 7) & 1, (cpsr >> 6) & 1, is_power);
-    }
-
-    /*
-     * Display-off can complete before the guest reaches its hardware sleep
-     * loop. Remember the user's intent so a following Power, Home, or touch
-     * event can wake the visible display even from that intermediate state.
-     */
-    if (keycode == 25) {
-        bool framebuffers_dark = s->lcd &&
-            ipod_touch_lcd_framebuffer_is_dark(s->lcd);
-
-        waking_display = s->display_sleep_requested || framebuffers_dark;
-        s->display_sleep_requested = !waking_display;
-    } else if (keycode == 35 && s->display_sleep_requested) {
-        waking_display = true;
-        s->display_sleep_requested = false;
-    }
-
-    if (waking_display && s->lcd) {
-        ipod_touch_lcd_restore_snapshot(s->lcd);
-    }
-
-    /* Home is a valid wake source on the device.  While the display-off
-     * transition is pending, mirror its press through ONKEY as well so the
-     * guest power manager cancels that transition instead of blanking the
-     * framebuffer again after the Home GPIO event. */
-    if (keycode == 35 && waking_display && s->pmu) {
-        ipod_touch_prepare_pmu_wake(s);
-        s->alternate_wake_via_power = true;
-        pcf50633_set_onkey(s->pmu, true);
-    } else if (keycode == 163 && s->alternate_wake_via_power && s->pmu) {
-        pcf50633_set_onkey(s->pmu, false);
-        s->alternate_wake_via_power = false;
-    }
-
-    /* Auto-lock is not the deep-sleep loop, but it parks the kernel with
-     * interrupts masked in the same way. Only assist a press while the LCD is
-     * actually dark, so a normal Power press can still enter sleep cleanly. */
-    if (power_event_needs_assist || waking_display) {
-        ipod_touch_start_wake_assist();
     }
 
     if(do_irq) {
@@ -891,25 +917,11 @@ static void ipod_touch_key_event(void *opaque, int keycode)
         }
     }
 
-    // Signal the PMU for power button events (ONKEY).
-    // Approach #31: shadow-clear + stale interrupt cleanup.
+    // Signal the PMU for normal, guest-owned Power transitions. Deep-sleep
+    // wake is handled above as an SoC reboot and never reaches this block.
     if (s->pmu && is_power) {
-        // Mark wake sequence active so SYSIC knows to do shadow-clear
-        // when the kernel acks the PMU GPIO interrupt.
         if (keycode == 25 && s->sysic) {
-            ipod_touch_clear_pmu_irq_latch(s);
-            s->sysic->pmu_wake_clear_active = true;
-
-            // Finding #64: Clear stale multitouch interrupt left over from
-            // pre-sleep touch activity.  Without this, the pending GPIO G4
-            // IRQ keeps the kernel in CPSID IF idle after wake.
-            if (s->sysic->gpio_int_status[4] & (1 << 27)) {
-                fprintf(stderr, "[WAKE] Clearing stale INTSTAT[4] bit 27 "
-                        "(multitouch, was 0x%08x)\n",
-                        s->sysic->gpio_int_status[4]);
-                s->sysic->gpio_int_status[4] &= ~(1 << 27);
-                qemu_irq_lower(s->sysic->gpio_irqs[4]);
-            }
+            s->sysic->pmu_wake_clear_active = false;
         }
         if (keycode == 25) {
             pcf50633_set_onkey(s->pmu, true);
