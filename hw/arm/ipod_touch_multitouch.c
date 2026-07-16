@@ -224,13 +224,20 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
             s->buf_size = 16;
         }
         else if(value == MT_CMD_FRAME_READ) {
-            /* The iPod OS 1.x driver follows the two-stage EB transaction
-             * with the original EA frame read.  Padding belongs only to the
-             * aligned EB packet, not this 75-byte legacy response. */
-            s->buf_size = sizeof(MTFrame) - sizeof(s->next_frame->padding);
+            /* The direct EA path uses the original 75-byte frame. */
+            s->buf_size = sizeof(MTFrame);
             if (s->next_frame) {
-                free(s->out_buffer);
-                s->out_buffer = (uint8_t *)s->next_frame;
+                size_t data_size = sizeof(MTFramePacket) +
+                                   sizeof(FingerData);
+
+                memcpy(s->out_buffer, &s->next_frame->frame_length,
+                       sizeof(MTFrameLengthPacket));
+                memcpy(s->out_buffer + sizeof(MTFrameLengthPacket),
+                       &s->next_frame->frame_packet, data_size);
+                s->out_buffer[sizeof(MTFrameLengthPacket) + data_size] =
+                    s->next_frame->checksum1;
+                s->out_buffer[sizeof(MTFrameLengthPacket) + data_size + 1] =
+                    s->next_frame->checksum2;
             } else {
                 /* The driver can poll the legacy frame command immediately
                  * after consuming an interrupt packet.  No queued frame is
@@ -327,11 +334,9 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
             s->out_buffer = NULL;
             s->in_buffer = NULL;
             s->next_frame = NULL;
-        } else if (s->cur_cmd == MT_CMD_FRAME_READ && s->next_frame &&
-                   s->out_buffer == (uint8_t *)s->next_frame) {
+        } else if (s->cur_cmd == MT_CMD_FRAME_READ && s->next_frame) {
             free(s->next_frame);
             s->next_frame = NULL;
-            s->out_buffer = NULL;
         }
 
         // we're done with the command

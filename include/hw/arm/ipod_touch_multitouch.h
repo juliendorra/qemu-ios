@@ -136,8 +136,6 @@ typedef struct MTFrame {
     FingerData finger_data; // TODO we assume one finger for now
     uint8_t checksum1;
     uint8_t checksum2;
-    /* Interrupt packets are transferred in four-byte-aligned SPI reads. */
-    uint8_t padding;
 } __attribute__((__packed__)) MTFrame;
 
 typedef struct IPodTouchMultitouchState {
