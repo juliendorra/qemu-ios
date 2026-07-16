@@ -22,7 +22,11 @@ static void s5l8900_st_tick(void *opaque)
     IPodTouchTimerState *s = (IPodTouchTimerState *)opaque;
 
     if (s->status & TIMER_STATE_START) {
-        //fprintf(stderr, "%s: Raising irq\n", __func__);
+        // Finding #72: If the tick fires synchronously during a timer_mod
+        // (e.g., inside the FIQ handler's STATE write), the IRQ line may
+        // still be HIGH from the previous tick (IRQLATCH not yet cleared).
+        // Force a LOW→HIGH edge so the VIC delivers a fresh FIQ.
+        qemu_irq_lower(s->irq);
         qemu_irq_raise(s->irq);
 
         /* schedule next interrupt */
@@ -38,7 +42,6 @@ static void s5l8900_st_tick(void *opaque)
 
 static void s5l8900_timer1_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
-    //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, value, addr);
     IPodTouchTimerState *s = (struct IPodTouchTimerState *) opaque;
 
     switch(addr){
@@ -47,8 +50,7 @@ static void s5l8900_timer1_write(void *opaque, hwaddr addr, uint64_t value, unsi
             s->irqstat = value;
             return;
         case TIMER_IRQLATCH:
-            //fprintf(stderr, "%s: lowering irq\n", __func__);
-            qemu_irq_lower(s->irq);     
+            qemu_irq_lower(s->irq);
             return;
         case TIMER_4 + TIMER_CONFIG:
             s5l8900_st_update(s);
@@ -82,16 +84,14 @@ static uint64_t s5l8900_timer1_read(void *opaque, hwaddr addr, unsigned size)
     uint64_t elapsed_ns, ticks;
 
     switch (addr) {
-        case TIMER_TICKSHIGH:    // needs to be fixed so that read from low first works as well
-
-            elapsed_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 2; // the timer ticks twice as slow as the CPU frequency in the kernel
+        case TIMER_TICKSHIGH:
+        case TIMER_TICKSLOW:
+            // Recalculate on EITHER read so read-low-first also works
+            elapsed_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 2;
             ticks = clock_ns_to_ticks(s->sysclk, elapsed_ns);
-            //printf("TICKS: %lld\n", ticks);
             s->ticks_high = (ticks >> 32);
             s->ticks_low = (ticks & 0xFFFFFFFF);
-            return s->ticks_high;
-        case TIMER_TICKSLOW:
-            return s->ticks_low;
+            return (addr == TIMER_TICKSHIGH) ? s->ticks_high : s->ticks_low;
         case TIMER_IRQSTAT:
             return ~0; // s->irqstat;
         case TIMER_IRQLATCH:

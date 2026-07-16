@@ -7,13 +7,19 @@
 #include "hw/irq.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/reset.h"
+#include "sysemu/runstate.h"
 #include "hw/platform-bus.h"
 #include "hw/block/flash.h"
 #include "hw/qdev-clock.h"
 #include "hw/arm/ipod_touch.h"
 #include "hw/arm/exynos4210.h"
 #include "hw/dma/pl080.h"
+#include "exec/exec-all.h"
+#include "chardev/char.h"
 #include <openssl/aes.h>
+
+// Global pointer to machine state for wake assist timer access from key handler
+IPodTouchMachineState *g_ipod_touch_nms = NULL;
 
 static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -299,17 +305,157 @@ static uint32_t s5l8900_usb_hwcfg[] = {
     0x01f08024
 };
 
+// Wake assist timer: periodically re-enables IRQs after wake so the kernel
+// scheduler can process deferred work (e.g., PMU ONKEY event).
+// The kernel's idle loop disables interrupts (CPSID I) before checking for
+// work.  Without this assist, the deferred PMU handler never runs because
+// the CPU stays with I=1 indefinitely.
+static void wake_assist_timer_cb(void *opaque)
+{
+    IPodTouchMachineState *nms = (IPodTouchMachineState *)opaque;
+    if (!nms->cpu || nms->wake_assist_remaining <= 0) return;
+
+    ARMCPU *arm_cpu = nms->cpu;
+    CPUState *cs = CPU(arm_cpu);
+    CPUARMState *env = &arm_cpu->env;
+    uint32_t cpsr = cpsr_read(env);
+
+    if (cpsr & ((1 << 7) | (1 << 6))) {
+        // I and/or F bit is set — re-enable IRQs and FIQs
+        // Timer (VIC0 IRQ 7) uses FIQ via INTSELECT, so F must be cleared too
+        uint32_t new_cpsr = cpsr & ~((1 << 7) | (1 << 6));  // clear I and F bits
+        cpsr_write(env, new_cpsr, 0xFFFFFFFF, CPSRWriteRaw);
+        tb_flush(cs);
+        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+    }
+
+    nms->wake_assist_remaining--;
+    if (nms->wake_assist_remaining > 0) {
+        // Schedule next pulse in 50ms
+        timer_mod(nms->wake_assist_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                  + 50 * NANOSECONDS_PER_SECOND / 1000);
+    }
+}
+
+void ipod_touch_start_wake_assist(void)
+{
+    IPodTouchMachineState *nms = g_ipod_touch_nms;
+
+    if (!nms || !nms->wake_assist_timer) {
+        return;
+    }
+
+    /*
+     * The resumed kernel passes through its IRQ-masked idle path several
+     * times before the PMU workqueue and timer FIQ settle. Keep reopening
+     * those delivery windows for two seconds; a single CPSIE in the sleep
+     * trampoline is immediately undone by the idle loop.
+     */
+    nms->wake_assist_remaining = 40;
+    timer_mod(nms->wake_assist_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+              + NANOSECONDS_PER_SECOND / 1000);
+    fprintf(stderr, "[WAKE-ASSIST] Scheduled 40 IRQ/FIQ pulses\n");
+}
+
+#define PMU_SUB_IRQ_ENTRY_VA 0xE0248AA0
+
+static void ipod_touch_clear_pmu_irq_latch(IPodTouchMultitouchState *s)
+{
+    uint8_t entry_bytes[4];
+
+    if (!s->cpu || cpu_memory_rw_debug(s->cpu, PMU_SUB_IRQ_ENTRY_VA,
+                                        entry_bytes, sizeof(entry_bytes), 0)) {
+        return;
+    }
+
+    // The guest leaves the PMU sub-IRQ descriptor's "handling" and
+    // "re-run" bytes set after acknowledging ONKEY. If they remain set,
+    // subsequent power events stop at the GPIO handler and never reach the
+    // PMU driver. Clear both before each new ONKEY press.
+    if (entry_bytes[1] || entry_bytes[2]) {
+        entry_bytes[1] = 0;
+        entry_bytes[2] = 0;
+        cpu_memory_rw_debug(s->cpu, PMU_SUB_IRQ_ENTRY_VA,
+                            entry_bytes, sizeof(entry_bytes), 1);
+        fprintf(stderr, "[WAKE] Cleared stale PMU sub-IRQ latch\n");
+    }
+}
+
+void ipod_touch_prepare_pmu_wake(IPodTouchMultitouchState *s)
+{
+    ipod_touch_clear_pmu_irq_latch(s);
+    if (s->sysic) {
+        s->sysic->pmu_wake_clear_active = true;
+    }
+}
+
 static void ipod_touch_key_event(void *opaque, int keycode)
 {
     bool do_irq = false;
+    bool is_power = false;
+    bool power_event_needs_assist = false;
+    bool waking_display = false;
     int gpio_group = 0, gpio_selector = 0;
 
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
+
+    /*
+     * Real OOCSHDWN cuts power to the complete SoC. Returning from its final
+     * loop can restore a picture, but iPhone OS has already powered the touch
+     * driver and other devices off. For interactive emulation, make P a host-
+     * side display sleep: the guest stays scheduled and all input drivers stay
+     * alive. Handle it before changing any guest-visible GPIO state.
+     */
+    if (s->lcd && keycode == 25) {
+        if (s->suppress_power_release) {
+            return;
+        }
+        s->lcd->forced_blank = !s->lcd->forced_blank;
+        s->lcd->invalidate = 1;
+        s->display_sleep_requested = s->lcd->forced_blank;
+        s->suppress_power_release = true;
+        fprintf(stderr, "[DISPLAY] Power toggled host-side display %s\n",
+                s->lcd->forced_blank ? "OFF" : "ON");
+        if (s->lcd->forced_blank) {
+            /* Suspended stops guest time but keeps host input dispatch live. */
+            vm_stop(RUN_STATE_SUSPENDED);
+        } else {
+            vm_start();
+        }
+        return;
+    }
+    if (keycode == 153 && s->suppress_power_release) {
+        s->suppress_power_release = false;
+        return;
+    }
+    if (s->lcd && s->lcd->forced_blank && keycode == 35) {
+        if (s->suppress_home_release) {
+            return;
+        }
+        s->lcd->forced_blank = false;
+        s->lcd->invalidate = 1;
+        s->display_sleep_requested = false;
+        s->suppress_home_release = true;
+        vm_start();
+        fprintf(stderr, "[DISPLAY] Home woke host-side display\n");
+        return;
+    }
+    if (keycode == 35 && s->suppress_home_release) {
+        return;
+    }
+    if (keycode == 163 && s->suppress_home_release) {
+        s->suppress_home_release = false;
+        return;
+    }
+
     if(keycode == 25 || keycode == 153) {
         // power button
+        is_power = true;
         gpio_group = GPIO_BUTTON_POWER_IRQ / NUM_GPIO_PINS;
         gpio_selector = GPIO_BUTTON_POWER_IRQ % NUM_GPIO_PINS;
-        
+
         if(keycode == 25 && (s->gpio_state->gpio_state & (1 << (GPIO_BUTTON_POWER & 0xf))) == 0) {
             s->gpio_state->gpio_state |= (1 << (GPIO_BUTTON_POWER & 0xf));
             do_irq = true;
@@ -333,10 +479,444 @@ static void ipod_touch_key_event(void *opaque, int keycode)
             do_irq = true;
         }
     }
-    
+
+    // Log CPU state for sleep/wake debugging.
+    if (s->cpu) {
+        ARMCPU *arm_cpu = ARM_CPU(s->cpu);
+        CPUARMState *env = &arm_cpu->env;
+        uint32_t cpsr = cpsr_read(env);
+        /*
+         * After the first deep-sleep resume, the idle path can still have IRQ
+         * masked when the next Power event arrives.  FIQ becomes live only by
+         * key release on some runs, while it is already live at key-down on
+         * others.  Assist whichever edge first observes the stable state.
+         */
+        power_event_needs_assist =
+            is_power && (cpsr & CPSR_I) && !(cpsr & CPSR_F);
+        fprintf(stderr, "[BTN] keycode=%d  PC=0x%08x  I=%d F=%d  power=%d\n",
+                keycode, env->regs[15], (cpsr >> 7) & 1, (cpsr >> 6) & 1, is_power);
+    }
+
+    /*
+     * Display-off can complete before the guest reaches its hardware sleep
+     * loop. Remember the user's intent so a following Power, Home, or touch
+     * event can wake the visible display even from that intermediate state.
+     */
+    if (keycode == 25) {
+        bool framebuffers_dark = s->lcd &&
+            ipod_touch_lcd_framebuffer_is_dark(s->lcd);
+
+        waking_display = s->display_sleep_requested || framebuffers_dark;
+        s->display_sleep_requested = !waking_display;
+    } else if (keycode == 35 && s->display_sleep_requested) {
+        waking_display = true;
+        s->display_sleep_requested = false;
+    }
+
+    if (waking_display && s->lcd) {
+        ipod_touch_lcd_restore_snapshot(s->lcd);
+    }
+
+    /* Home is a valid wake source on the device.  While the display-off
+     * transition is pending, mirror its press through ONKEY as well so the
+     * guest power manager cancels that transition instead of blanking the
+     * framebuffer again after the Home GPIO event. */
+    if (keycode == 35 && waking_display && s->pmu) {
+        ipod_touch_prepare_pmu_wake(s);
+        s->alternate_wake_via_power = true;
+        pcf50633_set_onkey(s->pmu, true);
+    } else if (keycode == 163 && s->alternate_wake_via_power && s->pmu) {
+        pcf50633_set_onkey(s->pmu, false);
+        s->alternate_wake_via_power = false;
+    }
+
+    /* Auto-lock is not the deep-sleep loop, but it parks the kernel with
+     * interrupts masked in the same way. Only assist a press while the LCD is
+     * actually dark, so a normal Power press can still enter sleep cleanly. */
+    if (power_event_needs_assist || waking_display) {
+        ipod_touch_start_wake_assist();
+    }
+
     if(do_irq) {
+        // Always raise the GPIO interrupt for all buttons.
+        // The VIC / SYSIC handle delivery during normal operation.
         s->sysic->gpio_int_status[gpio_group] |= (1 << gpio_selector);
         qemu_irq_raise(s->sysic->gpio_irqs[gpio_group]);
+
+        // Schedule auto-lower to create an edge-triggered pulse.
+        timer_mod(s->sysic->gpio_irq_lower_timers[gpio_group],
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPIO_IRQ_PULSE_NS);
+
+        // Force wake from sleep: for Power or Home button, ONLY when
+        // the CPU is truly in the sleep loop (I=1, F=1, AND PC is in
+        // the sleep function at VA 0xc005a6c0-0xc005a6d8).
+        // Just checking I=1 F=1 is NOT sufficient — the PM suspend
+        // code also runs with I=1 F=1 while preparing for sleep, and
+        // triggering wake-assist during suspend causes a data abort
+        // storm (finding #85).
+        if ((is_power || keycode == 35) && s->cpu && (keycode == 25 || keycode == 35)) {  // P or H PRESS
+            ARMCPU *arm_cpu = ARM_CPU(s->cpu);
+            CPUARMState *env = &arm_cpu->env;
+            uint32_t cpsr = cpsr_read(env);
+            uint32_t pc = env->regs[15];
+            bool irqs_disabled = (cpsr & (1 << 7)) && (cpsr & (1 << 6));
+            // The sleep loop is at VA 0xc005a6c0-0xc005a6d8 (PA 0x0805a6c0-0x0805a6d8)
+            // After our OOCSHDWN patch it becomes CPSIE IF + MOV R0,#0 + POP
+            bool in_sleep_func = (pc >= 0xc005a6c0 && pc <= 0xc005a6d8);
+            bool deep_sleep = irqs_disabled && in_sleep_func;
+            if (deep_sleep) {
+                fprintf(stderr, "[BTN] %s PRESS — forcing CPU wake (I=1 F=1, PC=0x%08x, CPSR=0x%08x)\n",
+                        is_power ? "Power" : "Home", pc, cpsr);
+
+                // Power installs the trampoline through ONKEY below. Home has
+                // no PMU event, so resume the guest directly and let its
+                // already-pending Home GPIO event drive the UI wake path.
+                if (!is_power && s->pmu) {
+                    pcf50633_resume_from_sleep(s->pmu);
+                }
+
+                // Historical resume-vector dump retained for future investigation,
+                // but disabled in normal builds because it stalls the wake path.
+#if 0
+                // === DEBUG: Dump guest memory to find resume vector ===
+                // Kernel VA 0xc0000000 → PA 0x08000000 on S5L8900
+                #define KVA_TO_PA(va) ((va) - 0xc0000000 + 0x08000000)
+                static bool dumped_once = false;
+                if (!dumped_once) {
+                    dumped_once = true;
+                    uint8_t membuf[512];
+
+                    // 1) Pre-sleep function at 0xc006155c (the REAL setup function)
+                    //    Called at 0xc005a6bc, returns r0/r1 stored to [R4+0x54]/[R4+0x58]
+                    fprintf(stderr, "\n=== PRE-SLEEP FUNC @ 0xc006155c (512 bytes) ===\n");
+                    cpu_physical_memory_read(KVA_TO_PA(0xc006155c), membuf, 512);
+                    for (int i = 0; i < 512; i += 16) {
+                        fprintf(stderr, "  %08x:", 0xc006155c + i);
+                        for (int j = 0; j < 16; j += 4) {
+                            uint32_t w = membuf[i+j] | (membuf[i+j+1]<<8)
+                                       | (membuf[i+j+2]<<16) | (membuf[i+j+3]<<24);
+                            fprintf(stderr, " %08x", w);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+
+                    // 2) R4 structure at 0xc01d0200 (256 bytes)
+                    //    Pre-sleep function stores return values at +0x54 and +0x58
+                    fprintf(stderr, "\n=== R4 STRUCT @ 0xc01d0200 (256 bytes) ===\n");
+                    cpu_physical_memory_read(KVA_TO_PA(0xc01d0200), membuf, 256);
+                    for (int i = 0; i < 256; i += 16) {
+                        fprintf(stderr, "  %08x:", 0xc01d0200 + i);
+                        for (int j = 0; j < 16; j += 4) {
+                            uint32_t w = membuf[i+j] | (membuf[i+j+1]<<8)
+                                       | (membuf[i+j+2]<<16) | (membuf[i+j+3]<<24);
+                            fprintf(stderr, " %08x", w);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    // Highlight the key values at +0x54 and +0x58
+                    {
+                        uint32_t val54 = membuf[0x54] | (membuf[0x55]<<8)
+                                       | (membuf[0x56]<<16) | (membuf[0x57]<<24);
+                        uint32_t val58 = membuf[0x58] | (membuf[0x59]<<8)
+                                       | (membuf[0x5a]<<16) | (membuf[0x5b]<<24);
+                        fprintf(stderr, "  >> [R4+0x54] = 0x%08x  (pre-sleep r0)\n", val54);
+                        fprintf(stderr, "  >> [R4+0x58] = 0x%08x  (pre-sleep r1)\n", val58);
+                    }
+
+                    // 3) High exception vectors via ARM page table walk
+                    //    SCTLR.V=1 → vectors at 0xFFFF0000, need VA→PA translation
+                    uint64_t sctlr = env->cp15.sctlr_ns;
+                    bool high_vec = (sctlr & SCTLR_V) != 0;
+                    fprintf(stderr, "\n=== SCTLR.V=%d (high_vectors=%s) ===\n",
+                            high_vec, high_vec ? "yes" : "no");
+                    {
+                        // Read TTBR1 (used for kernel VA >= 0x80000000 typically)
+                        uint64_t ttbr0 = env->cp15.ttbr0_ns;
+                        uint64_t ttbr1 = env->cp15.ttbr1_ns;
+                        uint32_t ttbcr_raw = env->cp15.tcr_el[1].raw_tcr;
+                        fprintf(stderr, "  TTBR0=0x%08llx  TTBR1=0x%08llx  TTBCR=0x%08x\n",
+                                (unsigned long long)ttbr0, (unsigned long long)ttbr1,
+                                ttbcr_raw);
+
+                        // Walk page table for 0xFFFF0000
+                        // ARM1176: N = TTBCR[2:0], if N>0, VA >= 2^(32-N) uses TTBR1
+                        uint32_t N = ttbcr_raw & 0x7;
+                        uint32_t vec_va = 0xFFFF0000;
+                        uint32_t ttbr_base;
+                        if (N > 0 && (vec_va >> (32 - N)) != 0) {
+                            ttbr_base = (uint32_t)(ttbr1 & 0xFFFFC000);
+                        } else {
+                            ttbr_base = (uint32_t)(ttbr0 & ~((1 << (14 - N)) - 1));
+                        }
+                        uint32_t l1_index = (vec_va >> 20);
+                        uint32_t l1_desc_addr = ttbr_base + l1_index * 4;
+                        uint32_t l1_desc;
+                        cpu_physical_memory_read(l1_desc_addr, (uint8_t*)&l1_desc, 4);
+                        fprintf(stderr, "  L1 desc for 0x%08x: addr=0x%08x val=0x%08x type=%d\n",
+                                vec_va, l1_desc_addr, l1_desc, l1_desc & 3);
+
+                        uint32_t vec_pa = 0;
+                        bool got_pa = false;
+                        if ((l1_desc & 3) == 2) {
+                            // Section: PA = l1_desc[31:20] | va[19:0]
+                            vec_pa = (l1_desc & 0xFFF00000) | (vec_va & 0x000FFFFF);
+                            got_pa = true;
+                        } else if ((l1_desc & 3) == 1) {
+                            // Coarse page table: walk L2
+                            uint32_t l2_base = l1_desc & 0xFFFFFC00;
+                            uint32_t l2_index = (vec_va >> 12) & 0xFF;
+                            uint32_t l2_desc_addr = l2_base + l2_index * 4;
+                            uint32_t l2_desc;
+                            cpu_physical_memory_read(l2_desc_addr, (uint8_t*)&l2_desc, 4);
+                            fprintf(stderr, "  L2 desc: addr=0x%08x val=0x%08x type=%d\n",
+                                    l2_desc_addr, l2_desc, l2_desc & 3);
+                            if ((l2_desc & 3) == 1) {
+                                // Large page (64KB)
+                                vec_pa = (l2_desc & 0xFFFF0000) | (vec_va & 0x0000FFFF);
+                                got_pa = true;
+                            } else if ((l2_desc & 2) == 2) {
+                                // Small page (4KB)
+                                vec_pa = (l2_desc & 0xFFFFF000) | (vec_va & 0x00000FFF);
+                                got_pa = true;
+                            }
+                        }
+
+                        if (got_pa) {
+                            fprintf(stderr, "\n=== HIGH VECTORS @ VA=0x%08x PA=0x%08x ===\n",
+                                    vec_va, vec_pa);
+                            cpu_physical_memory_read(vec_pa, membuf, 64);
+                            const char *vn[] = {"Reset","Undef","SWI","PrefAbt",
+                                                "DataAbt","Rsvd","IRQ","FIQ"};
+                            for (int i = 0; i < 32; i += 4) {
+                                uint32_t w = membuf[i] | (membuf[i+1]<<8)
+                                           | (membuf[i+2]<<16) | (membuf[i+3]<<24);
+                                fprintf(stderr, "  %08x: %08x  ; %s vector\n",
+                                        vec_va + i, w, vn[i/4]);
+                            }
+                            // Also dump the handler stubs after vectors (+0x20)
+                            fprintf(stderr, "\n=== VECTOR STUBS @ 0x%08x+0x20 (96 bytes) ===\n",
+                                    vec_va);
+                            cpu_physical_memory_read(vec_pa + 0x20, membuf, 96);
+                            for (int i = 0; i < 96; i += 16) {
+                                fprintf(stderr, "  %08x:", vec_va + 0x20 + i);
+                                for (int j = 0; j < 16; j += 4) {
+                                    uint32_t w = membuf[i+j] | (membuf[i+j+1]<<8)
+                                               | (membuf[i+j+2]<<16) | (membuf[i+j+3]<<24);
+                                    fprintf(stderr, " %08x", w);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        } else {
+                            fprintf(stderr, "  Could not translate 0x%08x to PA\n", vec_va);
+                        }
+                    }
+
+                    // 4) CPU registers
+                    fprintf(stderr, "\n=== CPU REGS ===\n");
+                    for (int i = 0; i <= 15; i++) {
+                        fprintf(stderr, "  R%-2d=0x%08x%s", i, env->regs[i],
+                                (i%4==3) ? "\n" : "  ");
+                    }
+                    fprintf(stderr, "  CPSR=0x%08x  SCTLR=0x%08llx\n",
+                            cpsr, (unsigned long long)sctlr);
+
+                    // 5) Stack at SP
+                    uint32_t sp = env->regs[13];
+                    fprintf(stderr, "\n=== STACK @ SP=0x%08x (PA=0x%08x) ===\n",
+                            sp, KVA_TO_PA(sp));
+                    cpu_physical_memory_read(KVA_TO_PA(sp), membuf, 128);
+                    for (int i = 0; i < 128; i += 16) {
+                        fprintf(stderr, "  %08x:", sp + i);
+                        for (int j = 0; j < 16; j += 4) {
+                            uint32_t w = membuf[i+j] | (membuf[i+j+1]<<8)
+                                       | (membuf[i+j+2]<<16) | (membuf[i+j+3]<<24);
+                            fprintf(stderr, " %08x", w);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+
+                    // 6) PMU register state (captured from OS writes before sleep)
+                    if (s->pmu) {
+                        fprintf(stderr, "\n=== PMU REGISTER STATE ===\n");
+                        fprintf(stderr, "  OOCSHDWN (0x0C) = 0x%02x\n", s->pmu->regs[0x0C]);
+                        fprintf(stderr, "  OOCWAKE  (0x0D) = 0x%02x\n", s->pmu->regs[0x0D]);
+                        fprintf(stderr, "  GPMEM0   (0x67) = 0x%02x\n", s->pmu->regs[0x67]);
+                        fprintf(stderr, "  GPMEM1   (0x68) = 0x%02x\n", s->pmu->regs[0x68]);
+                        fprintf(stderr, "  GPMEM2   (0x69) = 0x%02x\n", s->pmu->regs[0x69]);
+                        fprintf(stderr, "  GPMEM3   (0x6A) = 0x%02x\n", s->pmu->regs[0x6A]);
+                        fprintf(stderr, "  reg 0x76        = 0x%02x\n", s->pmu->regs[0x76]);
+                        // Also dump all non-zero registers for completeness
+                        fprintf(stderr, "  All non-zero regs:");
+                        for (int i = 0; i < 256; i++) {
+                            if (s->pmu->regs[i] != 0) {
+                                fprintf(stderr, " [0x%02x]=0x%02x", i, s->pmu->regs[i]);
+                            }
+                        }
+                        fprintf(stderr, "\n");
+                    }
+
+                    // 7) Dump caller code at the stack return address
+                    //    The sleep function pushed {r4, r7, lr}; lr → caller
+                    {
+                        uint32_t saved_lr = membuf[8] | (membuf[9]<<8)
+                                          | (membuf[10]<<16) | (membuf[11]<<24);
+                        uint32_t caller_addr = saved_lr & ~1;
+                        fprintf(stderr, "\n=== CALLER CODE @ 0x%08x (128 bytes, Thumb=%d) ===\n",
+                                caller_addr, saved_lr & 1);
+                        // Read from -32 to get context before the return point
+                        uint32_t dump_start = caller_addr - 32;
+                        cpu_physical_memory_read(KVA_TO_PA(dump_start), membuf, 128);
+                        for (int ii = 0; ii < 128; ii += 16) {
+                            fprintf(stderr, "  %08x:", dump_start + ii);
+                            for (int jj = 0; jj < 16; jj += 4) {
+                                uint32_t w = membuf[ii+jj] | (membuf[ii+jj+1]<<8)
+                                           | (membuf[ii+jj+2]<<16) | (membuf[ii+jj+3]<<24);
+                                fprintf(stderr, " %08x", w);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                    }
+
+                    // 8) Walk frame pointer chain (Apple Thumb ABI: [FP]=prev_FP, [FP+4]=LR)
+                    fprintf(stderr, "\n=== FRAME POINTER WALK ===\n");
+                    {
+                        // The sleep function pushed {R4, R7, LR}; ADD R7, SP, #0
+                        // So [SP+4] = saved_R7 = caller's frame pointer
+                        // [SP+8] = saved_LR = return address from sleep func
+                        uint32_t walk_fp = membuf[4] | (membuf[5]<<8)
+                                         | (membuf[6]<<16) | (membuf[7]<<24);
+                        uint32_t walk_lr = membuf[8] | (membuf[9]<<8)
+                                         | (membuf[10]<<16) | (membuf[11]<<24);
+                        fprintf(stderr, "  Frame 0 (sleep): SP=0x%08x LR=0x%08x "
+                                "saved_R7(=caller FP)=0x%08x\n",
+                                sp, walk_lr, walk_fp);
+
+                        for (int frame = 1; frame <= 8; frame++) {
+                            if (walk_fp < 0xc0000000 || walk_fp > 0xc1000000) {
+                                fprintf(stderr, "  Frame %d: FP=0x%08x — out of range, stopping\n",
+                                        frame, walk_fp);
+                                break;
+                            }
+                            uint8_t fp_buf[8];
+                            cpu_physical_memory_read(KVA_TO_PA(walk_fp), fp_buf, 8);
+                            uint32_t prev_fp = fp_buf[0] | (fp_buf[1]<<8)
+                                             | (fp_buf[2]<<16) | (fp_buf[3]<<24);
+                            uint32_t ret_lr  = fp_buf[4] | (fp_buf[5]<<8)
+                                             | (fp_buf[6]<<16) | (fp_buf[7]<<24);
+                            uint32_t ret_pc = ret_lr & ~1;
+                            fprintf(stderr, "  Frame %d: FP=0x%08x LR=0x%08x (T=%d) → PC=0x%08x\n",
+                                    frame, walk_fp, ret_lr, ret_lr & 1, ret_pc);
+
+                            // Dump 64 bytes of code around the return address
+                            if (ret_pc >= 0xc0000000 && ret_pc < 0xc1000000) {
+                                uint32_t code_start = ret_pc - 16;
+                                uint8_t code_buf[64];
+                                cpu_physical_memory_read(KVA_TO_PA(code_start), code_buf, 64);
+                                fprintf(stderr, "    Code @ 0x%08x:\n", code_start);
+                                for (int ci = 0; ci < 64; ci += 16) {
+                                    fprintf(stderr, "      %08x:", code_start + ci);
+                                    for (int cj = 0; cj < 16; cj += 4) {
+                                        uint32_t cw = code_buf[ci+cj] | (code_buf[ci+cj+1]<<8)
+                                                    | (code_buf[ci+cj+2]<<16) | (code_buf[ci+cj+3]<<24);
+                                        fprintf(stderr, " %08x", cw);
+                                    }
+                                    // Also show as half-words for Thumb decode
+                                    fprintf(stderr, " |");
+                                    for (int cj = 0; cj < 16; cj += 2) {
+                                        uint16_t hw = code_buf[ci+cj] | (code_buf[ci+cj+1]<<8);
+                                        fprintf(stderr, " %04x", hw);
+                                    }
+                                    fprintf(stderr, "\n");
+                                }
+                            }
+
+                            walk_fp = prev_fp;
+                            if (prev_fp == 0 || prev_fp == walk_fp) {
+                                fprintf(stderr, "  (end of chain)\n");
+                                break;
+                            }
+                        }
+                    }
+
+                    // 9) LCD display state at sleep time
+                    if (s->lcd) {
+                        fprintf(stderr, "\n=== LCD STATE AT SLEEP ===\n");
+                        fprintf(stderr, "  render = 0x%08x (%s)\n", s->lcd->render,
+                                s->lcd->render == 0x1 ? "ON" :
+                                s->lcd->render == 0xFF ? "OFF" : "UNKNOWN");
+                        fprintf(stderr, "  w1_framebuffer_base = 0x%08x\n",
+                                s->lcd->w1_framebuffer_base);
+                        fprintf(stderr, "  lcd_con = 0x%08x  lcd_con2 = 0x%08x\n",
+                                s->lcd->lcd_con, s->lcd->lcd_con2);
+                        fprintf(stderr, "  wnd_con = 0x%08x  unknown1 = 0x%08x\n",
+                                s->lcd->wnd_con, s->lcd->unknown1);
+
+                        // Sample framebuffer content (first 64 pixels = 256 bytes)
+                        if (s->lcd->w1_framebuffer_base) {
+                            uint8_t fb_sample[256];
+                            cpu_physical_memory_read(s->lcd->w1_framebuffer_base,
+                                                    fb_sample, 256);
+                            bool all_zero = true;
+                            bool all_ff = true;
+                            for (int i = 0; i < 256; i++) {
+                                if (fb_sample[i] != 0) all_zero = false;
+                                if (fb_sample[i] != 0xFF) all_ff = false;
+                            }
+                            fprintf(stderr, "  FB sample (first 16 pixels): ");
+                            for (int i = 0; i < 64; i += 4) {
+                                fprintf(stderr, "%02x%02x%02x%02x ",
+                                        fb_sample[i+2], fb_sample[i+1],
+                                        fb_sample[i], fb_sample[i+3]);
+                            }
+                            fprintf(stderr, "\n  FB content: %s\n",
+                                    all_zero ? "ALL BLACK" :
+                                    all_ff ? "ALL WHITE" : "HAS CONTENT");
+                        }
+                    }
+
+                    fprintf(stderr, "=== END DEBUG DUMP ===\n\n");
+                }
+                #undef KVA_TO_PA
+#endif
+
+                // === Approach #43: Deferred sleep patch ===
+                //
+                // Sleep function patch + VIC cleanup + framebuffer restore
+                // are now handled by pcf50633_set_onkey() in the PMU driver.
+                // The ONKEY call happens below at pcf50633_set_onkey(s->pmu, true).
+                //
+                ipod_touch_clear_pmu_irq_latch(s);
+                ipod_touch_start_wake_assist();
+            }
+        }
+    }
+
+    // Signal the PMU for power button events (ONKEY).
+    // Approach #31: shadow-clear + stale interrupt cleanup.
+    if (s->pmu && is_power) {
+        // Mark wake sequence active so SYSIC knows to do shadow-clear
+        // when the kernel acks the PMU GPIO interrupt.
+        if (keycode == 25 && s->sysic) {
+            ipod_touch_clear_pmu_irq_latch(s);
+            s->sysic->pmu_wake_clear_active = true;
+
+            // Finding #64: Clear stale multitouch interrupt left over from
+            // pre-sleep touch activity.  Without this, the pending GPIO G4
+            // IRQ keeps the kernel in CPSID IF idle after wake.
+            if (s->sysic->gpio_int_status[4] & (1 << 27)) {
+                fprintf(stderr, "[WAKE] Clearing stale INTSTAT[4] bit 27 "
+                        "(multitouch, was 0x%08x)\n",
+                        s->sysic->gpio_int_status[4]);
+                s->sysic->gpio_int_status[4] &= ~(1 << 27);
+                qemu_irq_lower(s->sysic->gpio_irqs[4]);
+            }
+        }
+        if (keycode == 25) {
+            pcf50633_set_onkey(s->pmu, true);
+
+        } else if (keycode == 153) {
+            pcf50633_set_onkey(s->pmu, false);
+        }
     }
 }
 
@@ -354,6 +934,12 @@ static void ipod_touch_machine_init(MachineState *machine)
     clock_set_hz(nms->sysclk, 12000000ULL);
 
     nms->cpu = cpu;
+    g_ipod_touch_nms = nms;
+
+    // Initialize wake assist timer (approach #27 complement)
+    nms->wake_assist_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                           wake_assist_timer_cb, nms);
+    nms->wake_assist_remaining = 0;
 
     // setup VICs
     nms->irq = g_malloc0(sizeof(qemu_irq *) * 2);
@@ -398,20 +984,12 @@ static void ipod_touch_machine_init(MachineState *machine)
     // init sysic
     dev = qdev_new("ipodtouch.sysic");
     IPodTouchSYSICState *sysic_state = IPOD_TOUCH_SYSIC(dev);
-    nms->sysic = (IPodTouchSYSICState *) g_malloc0(sizeof(struct IPodTouchSYSICState));
+    nms->sysic = sysic_state;
     memory_region_add_subregion(sysmem, SYSIC_MEM_BASE, &sysic_state->iomem);
     busdev = SYS_BUS_DEVICE(dev);
     for(int grp = 0; grp < GPIO_NUMINTGROUPS; grp++) {
         sysbus_connect_irq(busdev, grp, s5l8900_get_irq(nms, S5L8900_GPIO_IRQS[grp]));
     }
-
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G0_IRQ));
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G1_IRQ));
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G2_IRQ));
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G3_IRQ));
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G4_IRQ));
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G5_IRQ));
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G6_IRQ));
 
     // init GPIO
     dev = qdev_new("ipodtouch.gpio");
@@ -467,6 +1045,7 @@ static void ipod_touch_machine_init(MachineState *machine)
     S5L8900SPIState *spi2_state = S5L8900SPI(dev);
     spi2_state->mt->sysic = sysic_state;
     spi2_state->mt->gpio_state = gpio_state;
+    spi2_state->mt->cpu = CPU(cpu);
     nms->spi2_state = spi2_state;
 
     ipod_touch_memory_setup(machine, sysmem, nsas);
@@ -476,6 +1055,7 @@ static void ipod_touch_machine_init(MachineState *machine)
     IPodTouchLCDState *lcd_state = IPOD_TOUCH_LCD(dev);
     lcd_state->sysmem = sysmem;
     lcd_state->mt = spi2_state->mt;
+    spi2_state->mt->lcd = lcd_state;  // back-pointer for wake display control
     nms->lcd_state = lcd_state;
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_LCD_IRQ));
@@ -598,6 +1178,14 @@ static void ipod_touch_machine_init(MachineState *machine)
 
     // init the PMU
     I2CSlave *pmu = i2c_slave_create_simple(i2c_state->bus, "pcf50633", 0x73);
+    spi2_state->mt->pmu = PCF50633(pmu);
+    // Wire PMU interrupt output to SYSIC (GPIO 0x55 = group 2, bit 21)
+    PCF50633(pmu)->sysic = sysic_state;
+    PCF50633(pmu)->vic0 = nms->vic0;   // For post-sleep VIC cleanup (finding #66)
+    PCF50633(pmu)->vic1 = nms->vic1;
+    PCF50633(pmu)->timer = nms->timer1; // For post-sleep timer restart (finding #71)
+    PCF50633(pmu)->lcd = nms->lcd_state; // For framebuffer restore after wake (finding #92)
+    sysic_state->pmu = PCF50633(pmu);  // SYSIC→PMU callback for GPIO re-assertion
 
     // init the ADM
     dev = qdev_new("ipodtouch.adm");

@@ -10,6 +10,10 @@
 #include "hw/ssi/ssi.h"
 #include "hw/arm/ipod_touch_sysic.h"
 #include "hw/arm/ipod_touch_gpio.h"
+#include "hw/arm/ipod_touch_pcf50633_pmu.h"
+
+// Forward declaration to avoid circular include (lcd.h includes multitouch.h)
+typedef struct IPodTouchLCDState IPodTouchLCDState;
 
 #define TYPE_IPOD_TOUCH_MULTITOUCH                "ipodtouch.multitouch"
 OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
@@ -148,6 +152,15 @@ typedef struct IPodTouchMultitouchState {
     QEMUTimer *touch_end_timer;
     IPodTouchSYSICState *sysic;
     IPodTouchGPIOState *gpio_state;
+    CPUState *cpu;
+    Pcf50633State *pmu;
+    IPodTouchLCDState *lcd;  // for display wake control
+    bool display_sleep_requested;
+    bool alternate_wake_via_power;
+    bool swallow_wake_touch;
+    bool suppress_power_release;
+    bool suppress_home_release;
+    int wake_unwind_active;  // set during stack-unwind wake to skip ONKEY
     float touch_x;
     float touch_y;
     float prev_touch_x;
@@ -157,5 +170,9 @@ typedef struct IPodTouchMultitouchState {
 
 void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s);
 void ipod_touch_multitouch_on_release(IPodTouchMultitouchState *s);
+
+/* Keep IRQ/FIQ delivery open while the guest leaves its masked idle path. */
+void ipod_touch_start_wake_assist(void);
+void ipod_touch_prepare_pmu_wake(IPodTouchMultitouchState *s);
 
 #endif

@@ -11,8 +11,6 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
 
 static void ipod_touch_sdio_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
-    fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, value, addr);
-    
     IPodTouchSDIOState *s = (struct IPodTouchSDIOState *) opaque;
 
     switch(addr) {
@@ -38,8 +36,6 @@ static void ipod_touch_sdio_write(void *opaque, hwaddr addr, uint64_t value, uns
 
 static uint64_t ipod_touch_sdio_read(void *opaque, hwaddr addr, unsigned size)
 {
-    fprintf(stderr, "%s: offset = 0x%08x\n", __func__, addr);
-
     IPodTouchSDIOState *s = (struct IPodTouchSDIOState *) opaque;
 
     switch (addr) {

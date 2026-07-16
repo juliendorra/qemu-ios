@@ -366,6 +366,32 @@ static void pl192_reset(DeviceState *d)
     s->priority = 0x10;
 }
 
+void pl192_reset_priority(PL192State *s)
+{
+    fprintf(stderr, "[VIC] %s: priority reset (stack_i=%d → 0, current=%d → NO_IRQ, "
+            "priority=%d → 0x10, irq_status=0x%08x)\n",
+            s->iomem.name, s->stack_i, s->current, s->priority, s->irq_status);
+    s->stack_i = 0;
+    s->priority_stack[0] = 0x10;
+    s->irq_stack[0] = PL192_NO_IRQ;
+    s->priority = 0x10;
+    s->current = PL192_NO_IRQ;
+    s->current_highest = PL192_NO_IRQ;
+
+    // Force-lower both IRQ and FIQ outputs before update, so that
+    // pl192_update()'s pl192_raise() creates a real LOW→HIGH edge
+    // that the CPU will notice.  Without this, the raise is a NOP
+    // if the output was already HIGH from a stale assertion.
+    if (s->irq) {
+        qemu_irq_lower(s->irq);
+    }
+    if (s->fiq) {
+        qemu_irq_lower(s->fiq);
+    }
+
+    pl192_update(s);
+}
+
 static const MemoryRegionOps pl192_ops = {
     .read = pl192_read,
     .write = pl192_write,

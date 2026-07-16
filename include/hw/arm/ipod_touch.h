@@ -167,6 +167,8 @@ typedef struct {
 	uint32_t kbootargs_pa;
 	uint32_t uart_mmio_pa;
 	ARMCPU *cpu;
+	QEMUTimer *wake_assist_timer;
+	int wake_assist_remaining;   // number of IRQ-enable pulses left
 	char bootrom_path[1024];
 	char iboot_path[1024];
 	char nand_path[1024];

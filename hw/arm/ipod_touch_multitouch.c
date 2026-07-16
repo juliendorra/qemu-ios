@@ -123,7 +123,6 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
     //printf("<MULTITOUCH> Got value: 0x%02x\n", value);
 
     if(s->cur_cmd == 0) {
-        //printf("Starting command 0x%02x\n", value);
         // we're currently not in a command - start a new command
         s->cur_cmd = value;
         s->out_buffer = malloc(0x100);
@@ -194,7 +193,6 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
             s->buf_size = 16;
         }
         else if(value == MT_CMD_FRAME_READ) {
-            printf("Will read frame!\n");
             s->buf_size = sizeof(MTFrame);
             free(s->out_buffer);
             s->out_buffer = (uint8_t *) s->next_frame;

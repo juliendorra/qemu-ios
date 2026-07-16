@@ -77,4 +77,8 @@ struct PL192State {
 
 DeviceState *pl192_manual_init(char *mem_name, ...);
 
+// Reset the VIC priority stack to base state and re-evaluate pending IRQs.
+// Used after sleep/wake to clear stale in-service interrupts (finding #66).
+void pl192_reset_priority(PL192State *s);
+
 #endif

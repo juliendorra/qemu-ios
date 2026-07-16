@@ -14,6 +14,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchLCDState, IPOD_TOUCH_LCD)
 
 #define LCD_REFRESH_RATE_FREQUENCY 10
 
+#define FB_WIDTH  320
+#define FB_HEIGHT 480
+#define FB_BPP    4
+#define FB_SIZE   (FB_WIDTH * FB_HEIGHT * FB_BPP)
+
 typedef struct IPodTouchLCDState
 {
     SysBusDevice parent_obj;
@@ -52,6 +57,15 @@ typedef struct IPodTouchLCDState
     uint32_t w2_qlen;
 
     QEMUTimer *refresh_timer;
+
+    // Framebuffer snapshot for sleep/wake (approach #22)
+    uint8_t *fb_snapshot;      // saved framebuffer content (320*480*4 bytes)
+    bool fb_snapshot_valid;    // true if snapshot contains non-black content
+    int snapshot_visible_frames;
+    bool forced_blank;         // host-side display sleep; guest keeps running
 } IPodTouchLCDState;
+
+bool ipod_touch_lcd_framebuffer_is_dark(IPodTouchLCDState *lcd);
+void ipod_touch_lcd_restore_snapshot(IPodTouchLCDState *lcd);
 
 #endif

@@ -12,6 +12,30 @@
 #define TYPE_PCF50633                 "pcf50633"
 OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 
+// Apple-remapped interrupt status registers (read-clears)
+#define PMU_INT1  0x13
+#define PMU_INT2  0x14
+#define PMU_INT3  0x15
+#define PMU_INT4  0x16
+#define PMU_INT5  0x17
+
+// Interrupt mask registers (standard PCF50633 addresses — NOT remapped by Apple)
+#define PMU_INT1M 0x07
+#define PMU_INT2M 0x08
+#define PMU_INT3M 0x09
+#define PMU_INT4M 0x0A
+#define PMU_INT5M 0x0B
+
+// INT1 bits
+#define PMU_INT1_ADPINS  0x01
+#define PMU_INT1_ADPREM  0x02
+#define PMU_INT1_USBINS  0x04
+#define PMU_INT1_USBREM  0x08
+#define PMU_INT1_ALARM   0x10
+#define PMU_INT1_SECOND  0x20
+#define PMU_INT1_ONKEYR  0x40   // ONKEY rising edge (released)
+#define PMU_INT1_ONKEYF  0x80   // ONKEY falling edge (pressed)
+
 #define PMU_MBCS1 0x4B
 #define PMU_ADCC1 0x57
 
@@ -24,9 +48,72 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 #define PMU_RTCMT 0x5E
 #define PMU_RTCYR 0x5F
 
+// PMU control registers (PCF50633)
+#define PMU_OOCSHDWN 0x0C   // Standby/shutdown control
+#define PMU_OOCWAKE  0x0D   // Wake-up source config
+#define PMU_GPMEM0   0x67   // Battery-backed general-purpose memory
+#define PMU_GPMEM1   0x68
+#define PMU_GPMEM2   0x69
+#define PMU_GPMEM3   0x6A
+
+// PMU interrupt GPIO on S5L8900: GPIO interrupt 0x55 = group 2, bit 21
+#define PMU_INT_GPIO_GROUP    2
+#define PMU_INT_GPIO_BIT      21
+
+typedef struct IPodTouchSYSICState IPodTouchSYSICState;
+
 typedef struct Pcf50633State {
 	I2CSlave i2c;
 	uint32_t cmd;
+	bool has_reg_addr;       // true after first byte (register address) received
+	// Interrupt status registers (read-clears)
+	uint8_t int1;
+	uint8_t int2;
+	uint8_t int3;
+	uint8_t int4;
+	uint8_t int5;
+	// Interrupt mask registers
+	uint8_t int1m;
+	uint8_t int2m;
+	uint8_t int3m;
+	uint8_t int4m;
+	uint8_t int5m;
+	// Shadow register: holds INT1 value saved during wake so the kernel's
+	// deferred workqueue can read ONKEY even after INT1 has been cleared
+	// to de-assert nIRQ (breaking the CPSID IF chicken-and-egg).
+	uint8_t int1_shadow;
+	// General-purpose register file (captures all writes for debugging)
+	uint8_t regs[256];
+	// Post-sleep VIC cleanup timer (finding #66: clear stale priority stack)
+	QEMUTimer *post_sleep_timer;
+	// VIC references for post-sleep cleanup (finding #66)
+	void *vic0;  // PL192State*, forward-declared as void* to avoid header deps
+	void *vic1;
+	// Timer reference for post-sleep restart (finding #71)
+	void *timer;  // IPodTouchTimerState*, forward-declared as void*
+	// LCD reference for framebuffer restore after sleep/wake (finding #92)
+	void *lcd;   // IPodTouchLCDState*, forward-declared as void*
+	// Interrupt output connected to SYSIC GPIO
+	IPodTouchSYSICState *sysic;
+	// Approach #43: deferred sleep patch — true after OOCSHDWN fires
+	bool oocshdwn_fired;
+	// True while the guest sleep-loop trampoline is installed. The cleanup
+	// callback restores the original instructions for the next sleep cycle.
+	bool sleep_func_patched;
 } Pcf50633State;
+
+// Set ONKEY state: call when power button is pressed/released.
+// pressed=true sets ONKEYF (falling edge), pressed=false sets ONKEYR (rising).
+void pcf50633_set_onkey(Pcf50633State *s, bool pressed);
+
+// Resume the guest from its emulated deep-sleep loop. Returns true when the
+// temporary wake trampoline was installed. Power, Home, and touch input can
+// all use this; ONKEY signaling remains separate.
+bool pcf50633_resume_from_sleep(Pcf50633State *s);
+
+// Re-evaluate PMU nIRQ output. Call after SYSIC clears GPIO_INTSTAT for
+// the PMU's GPIO group — if the PMU still has pending interrupts, it will
+// re-assert the GPIO line (level-triggered behavior).
+void pcf50633_update_irq(Pcf50633State *s);
 
 #endif
