@@ -2278,6 +2278,98 @@ boot-ROM or complete peripheral-domain emulation.** The CLCD fix models a
 missing reset-domain register restoration; it is not host suspension or pixel
 repainting.
 
+## Phase 12: N45 Wake-Button Latch and Resumed Z2 Transactions
+
+This phase supersedes two conclusions in Phase 11. First, the PCF50633 Power
+edges are not `INT1=0xc0`: upstream PCF50633 definitions and the guest driver
+agree that `ONKEYR/ONKEYF` are `INT2` bits `0x01/0x02`; `INT1` bits
+`0x40/0x80` are RTC alarm/second. Second, the retained kernel is not stuck
+because QEMU failed to restore CPSR. The address-zero type-4 trampoline at
+physical `0x080607b8` deliberately masks IRQ and FIQ while it restores the
+MMU and retained context. Forcing CPSR from the host was therefore both wrong
+and the cause of earlier critical-section crashes.
+
+The missing wake condition was the N45 board-level wake-button latch. The
+retained device tree contains `button-wake,n45`; its `button_status` platform
+function asks ApplePCF50635 for selector `0x100`. Disassembly shows that this
+selector reads cached `INT2` bit `0x04`, printed by the wake decoder as
+`exton1(buttons)`. Reporting only the generic Power edge (`INT2=0x03`) let
+iBoot resume but did not tell `AppleM68WakeButton` that the wake button was
+active. QEMU now retains `EXTON1R`, models the physical ONKEY state in
+`OOCSTAT`, and re-exposes the complete cause after iBoot consumes the first
+read-clear copy.
+
+A successful trace now reaches the retained kernel's real power-on path:
+
+```text
+[WAKE] Retained LPDDR CRC32C before AP reset: 0x...
+[WAKE] Retained LPDDR CRC32C at reset: 0x... (stable)
+[PMU] INT2 read -> 0x07 (cleared)
+pmu wake events: buttons exton1(buttons)
+System Wake
+AppleMultitouchZ2SPI: enabled power, scheduled bootloading
+AppleMerlotLCD::_lcdEnable: enable: 1
+```
+
+This crosses the old masked-interrupt boundary without rewriting CPSR and is
+the strongest evidence so far that the AP reset/type-4 model is following the
+guest's intended lifecycle.
+
+### Multitouch crash and protocol findings
+
+Once the kernel completed `System Wake`, the old simplified multitouch model
+became the next failure. The resumed driver uses command `0xeb` as a 16-byte
+read-interrupt transaction, then performs a separate four-byte-aligned SPI
+read. Treating every byte of that command as a new opcode desynchronized the
+protocol (`0xeb`, `0x01`, `0xec`, and similar bogus commands) and eventually
+turned a payload byte into report ID `0xbf`; the emulator aborted in
+`hw_error()`.
+
+The model now:
+
+- implements the 16-byte `0xeb` length reply and aligned 60-byte packet read;
+- keeps the original direct `0xea` frame path used after cold boot;
+- gives the two reply formats independent markers and checksums;
+- treats optional/unsupported report selectors as guest errors instead of
+  terminating QEMU;
+- makes an empty legacy frame poll return an empty response rather than
+  dereferencing `NULL`; and
+- clears the SPI FIFO IRQ level and multitouch transaction state in the AP
+  reset domain.
+
+The host crash is fixed. Direct cold-boot touch remains functional (an exact
+QMP tap launches the Music app), and after retained wake the driver reloads
+firmware, enables GPIO group 4 bit 27, requests the `0xeb` packet for every
+generated movement frame, and QEMU remains alive.
+
+### Dead ends and present acceptance boundary
+
+- Preserving an `0xeb` frame for a hypothetical following `0xea` read was
+  wrong for this resumed driver. It repeatedly reread the same frame and
+  starved normal UI timing. `0xeb` frames are now consumed once.
+- Returning `0xe1` versus native `0xea` as the aligned packet marker was A/B
+  tested. Neither marker alone made the lock slider accept the gesture; the
+  stored cold-boot frame must remain all-`0xea`, while only the `0xeb` length
+  reply is synthesized as `0xe1`.
+- Several apparent slider failures were also contaminated by QMP's inverted Y
+  axis. Exact captures corrected the test to the center of the control, but
+  the resumed lock UI still did not complete the drag.
+- A partial/cropped lock-screen transition can appear just before the guest
+  sleeps again. This is not proof of foreground restoration; the decisive
+  result remains that the lock screen does not unlock and the device returns
+  to `OOCSHDWN`.
+- One cold boot produced a kernel panic during this work but was not
+  reproducible on subsequent launches with the same binary; it is recorded as
+  a transient observation, not attributed to the wake patch.
+
+Current honest boundary: manual and timed sleep use the same guest-owned
+`OOCSHDWN`/AP-reset/type-4 path; LPDDR checksums are stable; the wake cause is
+accepted; `System Wake`, LCD enable, and crash-free post-wake Z2 packet reads
+all occur. However, resumed touch frame contents or retained driver/user-space
+state are still rejected before SpringBoard's lock UI, so touch does not yet
+cancel the next idle transition and foreground-app survival is not accepted.
+Performance work remains blocked on that result.
+
 ## Performance Optimization Plan
 
 The two visible performance problems have different causes and should be
