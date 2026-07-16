@@ -2,6 +2,10 @@
 
 This guide covers building the QEMU-based iPod Touch 1G (S5L8900) emulator on **macOS (Apple Silicon)**.
 
+The proposed browser/WebAssembly port, including its bundled classroom and
+source-loaded deployment flavors, is specified in
+[`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](BROWSER_WASM_IMPLEMENTATION_PLAN.md).
+
 ## Prerequisites
 
 ### Homebrew packages
