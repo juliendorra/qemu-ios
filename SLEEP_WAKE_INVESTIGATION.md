@@ -2319,15 +2319,16 @@ guest's intended lifecycle.
 
 Once the kernel completed `System Wake`, the old simplified multitouch model
 became the next failure. The resumed driver uses command `0xeb` as a 16-byte
-read-interrupt transaction, then performs a separate four-byte-aligned SPI
-read. Treating every byte of that command as a new opcode desynchronized the
-protocol (`0xeb`, `0x01`, `0xec`, and similar bogus commands) and eventually
-turned a payload byte into report ID `0xbf`; the emulator aborted in
-`hw_error()`.
+read-interrupt transaction, then performs a separate packet read. Modern Linux
+rounds that read to four bytes, but live disassembly/debugging of the 2007
+Apple driver proves that this guest reads exactly 59 bytes. Treating every byte
+of the command as a new opcode desynchronized the protocol (`0xeb`, `0x01`,
+`0xec`, and similar bogus commands) and eventually turned a payload byte into
+report ID `0xbf`; the emulator aborted in `hw_error()`.
 
 The model now:
 
-- implements the 16-byte `0xeb` length reply and aligned 60-byte packet read;
+- implements the 16-byte `0xeb` length reply and the guest's 59-byte packet;
 - keeps the original direct `0xea` frame path used after cold boot;
 - gives the two reply formats independent markers and checksums;
 - treats optional/unsupported report selectors as guest errors instead of
@@ -2347,10 +2348,18 @@ generated movement frame, and QEMU remains alive.
 - Preserving an `0xeb` frame for a hypothetical following `0xea` read was
   wrong for this resumed driver. It repeatedly reread the same frame and
   starved normal UI timing. `0xeb` frames are now consumed once.
-- Returning `0xe1` versus native `0xea` as the aligned packet marker was A/B
+- Returning `0xe1` versus native `0xea` as the packet marker was A/B
   tested. Neither marker alone made the lock slider accept the gesture; the
   stored cold-boot frame must remain all-`0xea`, while only the `0xeb` length
   reply is synthesized as `0xe1`.
+- Adding a padding byte to match the modern Linux driver's 60-byte aligned
+  read was wrong for this firmware. At `0xc0441620`, the guest computed
+  checksum `0x0655` but read `0x5500` because it treated bytes 57-58 as the
+  final checksum. Removing the padding produces the exact
+  `5 + 52 + 2 = 59` byte layout and reaches the checksum-success branch at
+  `0xc0441650`.
+- Preserving the pre-sleep frame counter and timestamp across the AP reset did
+  not change lock-screen behavior and was reverted.
 - Several apparent slider failures were also contaminated by QMP's inverted Y
   axis. Exact captures corrected the test to the center of the control, but
   the resumed lock UI still did not complete the drag.
@@ -2365,10 +2374,15 @@ generated movement frame, and QEMU remains alive.
 Current honest boundary: manual and timed sleep use the same guest-owned
 `OOCSHDWN`/AP-reset/type-4 path; LPDDR checksums are stable; the wake cause is
 accepted; `System Wake`, LCD enable, and crash-free post-wake Z2 packet reads
-all occur. However, resumed touch frame contents or retained driver/user-space
-state are still rejected before SpringBoard's lock UI, so touch does not yet
-cancel the next idle transition and foreground-app survival is not accepted.
-Performance work remains blocked on that result.
+all occur. The 59-byte frame now passes both kernel checksum validators, enters
+the Z2 virtual handler at `0xc043b46c`, reaches the registered user-client
+callback, and its shared-queue enqueue returns success (`r0=1` at
+`0xc043d6e8`). SpringBoard's lock UI nevertheless does not move or cancel the
+next idle transition. The remaining boundary is therefore after successful
+kernel queue delivery: retained user-space notification/consumption or HID
+plugin state, rather than PMU, IRQ routing, SPI transport, or frame checksum.
+Foreground-app survival is not yet accepted, and performance work remains
+blocked on that result.
 
 ## Performance Optimization Plan
 
