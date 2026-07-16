@@ -2161,6 +2161,104 @@ starts from a pristine reloaded iBoot image, with the real type-4 retained
 handoff after that point. Starting at VROM/NOR remains feasible only when a
 compatible user-supplied LLB/firmware set is available.
 
+## Phase 11: Correct PMU Wake-Status Map and Type-4 Cause Handoff
+
+The retained kernel originally printed an empty wake reason and soon entered
+sleep again even though iBoot had completed a type-4 handoff. The decisive bug
+was not the Power-key edge or the I2C byte transport: QEMU had assigned the
+five read-clear PMU interrupt-status registers to `0x13..0x17`. Disassembly of
+the ApplePCF50635 driver proves that its wake decoder reads `INT1..INT5` from
+`0x02..0x06`. The code at `0xc047754c` decodes the returned bytes as follows:
+
+| Status byte | Bits | Printed wake reason |
+|---|---:|---|
+| `INT1` | `0x40`, `0x10`, `0x04`, `0x01` | RTC, accessory, USB, FireWire |
+| `INT2` | `0x03` | buttons |
+| `INT2` | `0x04`, `0x10`, `0x80` | EXTOn1 buttons, EXTOn2 baseband, EXTOn3 accessory |
+
+The apparently convincing reads at `0x13..0x17` were a false lead. A saved
+guest return address identified their caller as `0xc0475f34`, an unrelated
+read/modify/write routine, not the wake decoder. QEMU was delivering correct
+bytes to the wrong guest register block. Correcting the status addresses to
+`0x02..0x06` also made the normal Power interrupt path read and clear
+`INT1=0xc0` directly.
+
+### Dead ends rejected during this phase
+
+- Holding `INT1` readable for two arbitrary reads failed: iBoot performed only
+  one relevant read in that experiment, the kernel still printed an empty
+  cause, and the device slept again.
+- Moving wake bits inside the old `0x13..0x17` block reached the Apple I2C
+  state machine but could never affect the real decoder.
+- Treating the stack destination as a broken I2C copy was incorrect. Byte-level
+  tracing proved the guest stored the returned bytes in order; the stack
+  buffer belonged to the unrelated `0x13` register-maintenance call.
+- Globally changing I2C interrupt-level behavior broke cold boot/root
+  publication and was reverted. The focused I2C reset-domain cleanup remains.
+
+### Wake-cause lifetime across iBoot
+
+With the register map fixed, the next boundary became visible. iBoot reads and
+clears `INT2=0x03` while selecting retained resume, before the kernel decoder
+runs. QEMU now keeps a separate retained PMU wake-cause latch and re-exposes it
+when iBoot writes `RESUME_STATUS=0x40`, the observed commit point for its
+type-4 branch. This is tied to the boot protocol rather than returning a value
+for an arbitrary number of reads.
+
+A validated trace now contains:
+
+```text
+[PMU] RESUME_STATUS read -> 0xa0 (armed)
+[PMU] INT2 read -> 0x03 (cleared)        # iBoot consumer
+[PMU] RESUME_STATUS write <- 0x40
+[PMU] INT2 read -> 0x03 (cleared)        # retained kernel consumer
+pmu wake events: buttons
+System Wake
+```
+
+The full LPDDR CRC remains stable and no second Darwin kernel or SpringBoard
+launch occurs. This closes the blank wake-reason bug. It does **not** yet close
+the full wake acceptance gate: the current test still returned to OOCSHDWN
+after roughly 20 seconds, and an automated host click did not prove that a
+guest touch event cancelled that idle transition. Foreground scanout survival
+and immediately usable touch therefore remain blockers before performance
+optimization resumes.
+
+### Post-wake touch boundary (still unresolved)
+
+QMP exact input removed macOS pointer scaling from the test. A held center
+touch produces `(0.500, 0.500)`. On cold boot the guest fetches every generated
+SPI frame. Immediately after retained wake, the same test reaches a different
+boundary:
+
+1. AppleMultitouch reloads its 49,128-byte firmware successfully.
+2. The multitouch sub-IRQ entry at `0xE0249360` is enabled and clean
+   (`in-service=0`, `handling=0`, `re-run=0`).
+3. The SYSIC frame status and an explicit low-to-high GPIO edge are generated.
+4. VIC0 does contain stale retained-resume state (`stack_i=1`, current IRQ 22);
+   resetting its priority/in-service stack is correct but not sufficient.
+5. The edge reaches the CPU as pending IRQ `0x2`, proving the emulated
+   touchscreen, SYSIC, and VIC route are connected.
+6. The retained kernel is still executing with both IRQ and FIQ masked
+   (`CPSR I=1 F=1`) in its timer/resume path, never services the pending touch,
+   and returns to OOCSHDWN.
+
+Further rejected experiments:
+
+- Forcing the scheduler timer into auto-recurring mode did not help; the timer
+  was already active (`status=0x3`) and the guest still fetched no frame.
+- Modeling multitouch ATN as a held GPIO level instead of a latched edge did
+  not change dispatch.
+- Clearing the multitouch software sub-IRQ latch was unnecessary because its
+  retained bytes were already clean.
+
+The remaining bug is therefore above the peripheral models: the retained
+kernel context is not completing the exact interrupt-mask/return portion of
+the real type-4 resume. Forcing CPSR bits from the host was tried in earlier
+phases and caused crashes, so it is not an acceptable fix. The next correctness
+work must reconstruct the retained resume trampoline/context restoration (and
+its VIC/CPU mask ordering), not add another input bypass.
+
 ### Accuracy verdict
 
 | Area | Current implementation |
@@ -2168,7 +2266,7 @@ compatible user-supplied LLB/firmware set is available.
 | Sleep entry | Guest-owned driver shutdown and PMU OOCSHDWN |
 | AP power loss | Functional reset domain; CPU and volatile boot/protocol state reset |
 | Main LPDDR | Retained and checksum-verified |
-| Wake cause | PMU retained status plus ONKEYF approximation for Power/Home |
+| Wake cause | Correct `0x02..0x06` status map; button cause retained across iBoot read-clear and re-exposed at the type-4 handoff |
 | Boot chain | Reloaded iBoot, not yet VROM → NOR → LLB |
 | Resume | Genuine iBoot type-4 handoff to retained kernel |
 | Display | Panel-off black is correct; retained CLCD register restoration is partial and foreground-app recovery is unresolved |
@@ -2197,6 +2295,11 @@ measured separately:
 Optimization must not hide correctness bugs. Every stage below keeps manual
 and timed sleep on the same guest-owned OOCSHDWN/type-4 path and reruns the
 sleep/wake acceptance checks.
+
+**Prerequisite zero:** do not begin priorities 1-2 until manual and timed wake
+both remain awake after real guest input, foreground scanout survives, touch
+works immediately, and repeated cycles are crash-free. A successful
+`pmu wake events: buttons` trace is necessary but not sufficient.
 
 ### Recommended order
 
