@@ -4,7 +4,7 @@
 
 Neither the Power (P) nor Home (H) button wakes the emulated iPod Touch once it goes to sleep and the screen goes black. Mouse clicks also have no effect.
 
-## Root Cause (Confirmed)
+## Immediate Symptom (Confirmed)
 
 The guest OS (iPhone OS 1.x) **disables all CPU interrupts** when it enters display sleep:
 
@@ -18,48 +18,122 @@ CPSR = 0xa00000d3
 
 The CPU is actively executing code in a sleep loop with **both IRQs and FIQs masked**. No interrupt of any kind — regardless of source — can be taken by the CPU in this state.
 
-## Executive Summary — Current Interactive Strategy
+## Executive Summary — Genuine Device Sleep Strategy
 
-### Why everything breaks after wake — the unifying explanation
+### Underlying bug: components without a complete power lifecycle
 
-**On real S5L8900 hardware, "sleep" = full SoC power-off.** The kernel writes `OOCSHDWN=0x02` to the PMU, which physically cuts power to the CPU. The `b .` infinite loop at PA 0x0805A6D0 is just "spin until power dies." Wake is a **cold boot** — the bootrom at PA 0x20000000 runs from scratch. iBoot then checks for sleep markers (`"MOSX"` + `"SUSP"` at PA `0x08000080`), verifies an `iBootSleepValid` token at PA `0x08000090`, and calls `boot(type=4, addr=0)` — which **reboots via the bootrom**, not a kernel resume (finding #82).
+The underlying bug was that QEMU emulated the individual components, but not
+the device's complete power lifecycle.
 
-**There is no usable kernel resume entry point** (finding #82). iBoot-204's
-warm path is a clean reboot rather than suspend-to-RAM. Returning from the
-terminal sleep loop can restore CPU execution and a framebuffer, but it does
-not undo the guest's earlier device shutdown. In particular,
-`AppleMultitouchZ2SPI` has already disabled power, so the restored screen is
-visible but subsequent clicks never produce guest multitouch frame reads.
+What the real device expects:
 
-**We can't simulate the full iBoot warm boot path** because it requires a complete SoC power cycle (CPU reset, bootrom, iBoot from NOR, kernel from NAND). So we took a pragmatic shortcut: patch `b .` to return to its caller, forcing the kernel through a PM resume code path **that was never designed to execute from this state.**
+1. iPod OS powers down LCD, multitouch, USB, timers, and other drivers.
+2. It masks IRQ and FIQ.
+3. It writes `OOCSHDWN=0x02` to the PCF50633 PMU.
+4. The S5L8900 application processor loses power. The terminal `b .` loop is
+   never supposed to return.
+5. A wake button powers the processor back up and restarts the boot chain with
+   selected RAM retained.
+6. iBoot recognizes the `"MOSX"`/`"SUSP"` markers and `iBootSleepValid` token,
+   then enters its type-4 handoff path.
 
-Every fix we've had to make is a consequence of this single hack:
+What QEMU previously did:
 
-| Fix needed | Why | Root cause |
-|-----------|-----|-----------|
-| CPSIE IF (re-enable interrupts) | Kernel disabled IRQ+FIQ before `b .`, expecting power to die | Resume path assumes iBoot re-initialized CPU with IRQs enabled |
-| VIC priority stack reset | Kernel acked an IRQ but never wrote EOI before sleep | Resume path assumes clean VIC state from cold boot |
-| Timer force-restart | Sleep prep stopped the timer | Resume path assumes iBoot restarted timers |
-| Security Modules entry/caller patch | PM resume serial console check loops forever waiting for debugger input | On real hardware, iBoot set a flag or the UART has actual data |
-| Debugger handler entry patch | KDP debugger protocol state machine has 4+ loop-back branches, never exits without debugger | On real boot, these paths aren't reached or exit via hardware state |
-| get_ticks rewrite | Kernel timebase structure frozen at pre-sleep values, big_function at 0xc0062462 spins | On real boot, iBoot re-initialized the timebase; FIQ handler updates it from scratch |
-| Framebuffer snapshot restore | Kernel switches to blank framebuffer as last step of screen-off animation | On real boot, iBoot redraws or the kernel's display-on path runs properly |
+- Stored the PMU register value but did not remove SoC power.
+- Left the CPU spinning forever with IRQ and FIQ masked.
+- Continued scanning out the last framebuffer, causing the leaked status bar.
+- Delivered P/H as interrupts to a CPU deliberately unable to accept them.
+- Preserved volatile iBoot and peripheral state that real power loss would
+  erase.
 
-It's a cascade from one root cause: **we're making the kernel "return" from a function that was meant to be the CPU's last instruction before power death.** Every piece of state the real resume path (bootrom → iBoot → kernel) would have set up is missing or stale. Restoring only CPU, interrupt, timer, and framebuffer state is therefore insufficient for an interactive demo.
+That combination explains the apparently dead device. Returning from the
+terminal loop could restore CPU execution and pixels, but it could not undo the
+guest's earlier device shutdown. In particular, `AppleMultitouchZ2SPI` had
+already disabled power, so the restored screen did not imply working touch.
+
+### Why it was so hard
+
+Several partial fixes produced convincing false positives:
+
+- Restoring framebuffer memory made the screen visible, but the guest
+  touchscreen driver remained powered off.
+- Forcing IRQ/FIQ delivery moved the CPU but corrupted kernel critical sections
+  and caused crashes.
+- Returning from the terminal sleep function skipped the power cycle the
+  kernel expected.
+- Resetting the CPU initially reached iBoot, but reused iBoot's dirty heap and
+  panicked.
+- Resetting iBoot without resetting multitouch left the guest driver and
+  emulated controller disagreeing about their protocol state.
+- The LCD uses triple buffering, so inactive buffers could look awake while
+  the active scanout showed only the status bar.
+- Input could arrive during the fade, after OOCSHDWN, or during iBoot: three
+  states requiring different handling.
+- The host-side QEMU suspension fix avoided all of this, which is why it
+  appeared reliable, but it intercepted only manual P and missed timed sleep.
+
+### Accuracy of the current implementation
+
+The current implementation is a functional power-cycle emulation, not the
+previous host-suspension trick, but it is not yet cycle-accurate.
+
+| Area | Current accuracy |
+|------|------------------|
+| Guest P/timer shutdown | Proper: iPod OS performs its own driver shutdown and `OOCSHDWN` |
+| LCD power-off | Properly modeled; output becomes completely black |
+| Masked terminal loop | Correctly recognized as awaiting power loss |
+| P/H wake | Approximated with the PMU's generic `ONKEYF` latch |
+| RAM retention | Main SDRAM is retained |
+| Volatile memory | iBoot RAM, SRAM, and scanout buffers are cleared/reloaded |
+| Peripheral reset | Multitouch/SPI is reset; not every SoC peripheral has a complete power-domain reset |
+| Boot chain | Starts from reloaded iBoot, not the real bootrom/NOR sequence |
+| Resume semantics | Boots kernel/SpringBoard instead of restoring the foreground application |
+
+The honest verdict is: **sleep entry is genuinely guest-driven; wake is a
+hardware-informed approximation of the missing S5L8900 power cycle.** Wake
+latency and loss of the foreground application are the strongest evidence that
+it is not yet complete.
+
+A faithful implementation should begin at the bootrom, model the reset domains
+and wake-cause registers exercised by this path, and reproduce iBoot's exact
+type-4 retained-memory handoff. It is not yet proven where `boot(type=4,
+addr=0)` transfers control after MMU shutdown: the earlier inference that
+`BLX 0` necessarily means a clean boot ignored the possibility of an
+S5L8900 low-memory/remap alias. The current emulator has no mapping at physical
+address zero and skips the bootrom by resetting directly to `IBOOT_BASE`, so it
+cannot settle that question (corrected finding #82).
 
 ### Implemented strategy
 
-For reliable interactive use, the emulator intercepts the host P key before
-any guest GPIO or PMU state changes. P blanks the host display surface and
-places QEMU in `RUN_STATE_SUSPENDED`: guest time stops, but host input remains
-enabled. A second P, H, or click resumes the VM and redraws the live guest
-framebuffer. A wake click is consumed deliberately so it cannot also launch an
-app; the next click is normal touch input.
+The host-suspend shortcut from approach #44 is rejected and removed. P is once
+again delivered to iPod OS through GPIO and PCF50633 ONKEY, and both manual P
+and the idle timer reach the guest's real `OOCSHDWN=0x02` path.
 
-This strategy preserves the complete guest/device state for an arbitrary
-sleep duration and is much faster than the experimental deep-sleep repair.
-The OOCSHDWN investigation and trampoline remain useful research, but are not
-used by the normal P-button path.
+The current wake model emulates application-processor power loss:
+
+1. OOCSHDWN powers the emulated LCD panel off, producing a completely black
+   output instead of leaking the last status-bar framebuffer.
+2. P or H at the terminal `b .` loop requests a SoC reset. A press during the
+   preceding status-bar-only transition is detected from the active scanout,
+   queued, and completed immediately after OOCSHDWN.
+3. Main SDRAM and the `MOSX`/`SUSP` sleep markers are retained.
+4. Volatile iBoot RAM (4 MiB) and SRAM (64 KiB) are cleared, and a pristine
+   iBoot image is reloaded before CPU reset. This fixes the first reset
+   prototype's `heap error: free` panic.
+5. The three scanout buffers are cleared on reset so stale retained pixels
+   cannot mark the UI ready before iBoot/SpringBoard redraws.
+6. Volatile SPI/multitouch protocol state is reset so the freshly booted guest
+   driver can download firmware and receive touch frames again.
+7. Touches during the Apple-logo/startup interval are ignored until the
+   SpringBoard framebuffer has been stable for two seconds. Idle SPI padding
+   and unsupported bytes are non-fatal, matching hardware behavior.
+8. The present PMU model has one boot-visible wake latch, ONKEYF, so both P and
+   H map to that generic latch across the reset.
+
+This is a guest-driven sleep and SoC/iBoot wake. It currently follows the
+emulator's existing iBoot boot path rather than preserving a foreground app as
+an instantaneous software resume; refining the exact iBoot type-4 semantics is
+future accuracy work.
 
 ### Timeline of progress
 
@@ -74,36 +148,37 @@ used by the normal P-button path.
 | 7. PM suspend bypass | #31–#33 | INT1 shadow (chicken-and-egg fix), pre-patch sleep function on OOCSHDWN, VIC priority stack cleanup | Bypasses the B . loop entirely. VIC IRQ delivery confirmed working. |
 | 8. Sleep function return value | #34–#37 | CPSIE IF + MOV R0,#0 + POP; auto-recurring timer; CPU register tracing; force-enable IRQ/FIQ in post-sleep callback | Sleep function returns with R0=0 (PM success path). Timer FIQs fire. VIC priority reset. But PM resume stuck in "Security Modules" serial console check. |
 | 9. Serial console bypass | #38–#39 | Patch UART poll wrapper to return -1; patch delay function BGE→B unconditional; patch inner wrapper 0xc00536d0 (broke get_ticks) | Delay function exits, but get_ticks itself is stuck in big_function at 0xc0062462. Kernel timebase structure frozen — FIQ handler not updating it. Each fix reveals the next stale state assumption. |
-| 10. get_ticks bypass + bootrom/iBoot analysis | #40 | Rewrote get_ticks to read hardware timer directly; fixed QEMU timer TICKSLOW stale value bug; analyzed bootrom + iBoot warm boot path | get_ticks unblocked, CPU progresses past delay function. But Security Modules serial console check loops indefinitely. iBoot analysis reveals NO kernel resume — warm boot = clean reboot. |
+| 10. get_ticks bypass + bootrom/iBoot analysis | #40 | Rewrote get_ticks to read hardware timer directly; fixed QEMU timer TICKSLOW stale value bug; analyzed bootrom + iBoot warm boot path | get_ticks unblocked. The initial conclusion that type 4 was necessarily a clean reboot was later withdrawn because the meaning of address zero after the handoff/remap was not established (corrected finding #82). |
 | 11. Security Modules + KDP bypass | #41 | Patch secmod entry+caller, KDP BL, outer loop, debugger wait loop | No panics but **CPU stuck in debugger protocol loop** (finding #90). BEQ→B patch at 0x10066 loops back via disconnect handler at 0x10080. Previous "success" was false positive. |
 | 12. Deferred input wake | #43 | Install the sleep-return trampoline only when wake input arrives; clean VIC/timer state; restore framebuffer and original sleep instructions; reconnect the 40-pulse wake assist | Restores a visible screen, but real interaction still fails because the guest disabled `AppleMultitouchZ2SPI` before OOCSHDWN. Also exposed a panic when normal H started wake assist outside sleep. |
-| 13. Host display suspend | #44 | Intercept P before guest GPIO/PMU handling; blank the host surface; suspend guest time while retaining host input; resume on P/H/click; consume wake clicks | Fully interactive and fast. Long-duration click wake followed by a separate Safari tap reads all four touch frames. Normal H no longer crashes. |
+| 13. Host display suspend | #44 | Intercept P before guest GPIO/PMU handling; blank the host surface; suspend guest time while retaining host input; resume on P/H/click | **Rejected workaround.** It made manual P look reliable but bypassed device sleep entirely and did nothing for timed OOCSHDWN. |
+| 14. Naive retained-RAM reset | #45a | Issue QEMU system reset from the terminal sleep loop while preserving main RAM | Reached `iBoot start`, proving the power-cycle direction, but reused dirty iBoot heap RAM and panicked with `heap error: free`. |
+| 15. Pristine iBoot power cycle | #45b | Clear/reload the 4 MiB iBoot region and 64 KiB SRAM on reset; preserve main SDRAM; model PMU panel power | iBoot and the kernel boot successfully from P/H; timed sleep is fully black with no status-bar leak. |
+| 16. Volatile input/reset race fixes | #45c | Reset SPI/multitouch state; ignore boot-time touches/idle padding; inspect active scanout; queue P/H during final shutdown; clear scanout buffers; carry generic wake latch | P sleep→P wake→Safari and status-bar transition→H queued wake→Safari both pass. Removed the fatal unknown-command crash. |
 
 ### Current state (validated July 2026)
 
 Direct GUI/QMP validation with the current working tree confirms:
 
-- Normal touch produces the complete START, MOVED, ENDED, FULL_END sequence
-  and opens Safari.
-- P immediately produces a fully black 320 × 480 output without sending a
-  guest PMU/GPIO event.
-- While black, QEMU is suspended, guest time does not advance, and host input
-  remains enabled.
-- After more than the previous auto-lock interval, click wakes the display;
-  a separate second click produces all four guest touch frames and opens
-  Safari.
-- A second P resumes the suspended VM and restores the live display.
-- H resumes the suspended VM and is consumed as a wake-only event.
-- Normal H no longer starts the IRQ/FIQ wake assist unconditionally; the
-  kernel panic observed after opening Safari is gone.
-- Power and Home key-repeat/release suppression prevents one physical press
-  from toggling twice or leaking a guest-visible release.
-- Temporary per-frame diagnostic logging was removed after validation.
-- Existing hot-path logging reductions keep boot and interaction responsive.
+- Normal touch opens Safari before sleep.
+- Manual P is delivered to the guest PMU; iPod OS reads ONKEY and writes
+  `OOCSHDWN=0x02` itself.
+- Untouched timed sleep reaches the same OOCSHDWN loop.
+- PMU panel-off output is completely black; the stale status bar is gone.
+- P wake reloads pristine iBoot, boots SpringBoard, reinitializes multitouch,
+  and a post-wake tap visibly opens Safari.
+- H pressed during the status-bar-only transition is queued through OOCSHDWN,
+  reaches the same retained-RAM SoC reset path, and a post-boot tap visibly
+  opens Safari.
+- No `RUN_STATE_SUSPENDED`, `vm_stop()`, or host-side P toggle remains.
+- Normal P/H no longer run the unconditional IRQ/FIQ assist that caused the
+  earlier kernel panic or stalled a legitimate sleep transition.
+- Idle `0x00` SPI clocks and unsupported multitouch commands no longer abort
+  the emulator.
 
-The older OOCSHDWN trampoline can restore a visible framebuffer, but its touch
-driver remains guest-disabled. Treat it as an experimental diagnostic path,
-not as successful interactive resume.
+The older OOCSHDWN trampoline remains documented as an experimental dead end:
+it can restore a visible framebuffer, but the guest has already powered the
+touch driver off.
 
 ### Confirmed DEAD ENDS — never retry these
 
@@ -122,16 +197,21 @@ not as successful interactive resume.
 | Unmasking FIQ (F bit) | Causes immediate FIQ, corrupts state | tested |
 | Patching inner wrapper 0xc00536d0 | Shared with get_ticks() — breaks timer reads | #38 iter 2 |
 | Patching individual blocking functions one by one | Each fix reveals the next stale state; cascade never ends | #34–#39 |
-| Simulating iBoot warm boot path | iBoot-204 warm boot = clean reboot (boot(4,0,0) → PA 0), NOT kernel resume. No kernel resume entry point exists. Would require full SoC power cycle simulation. | Analysis of bootrom + iBoot |
+| Returning from OOCSHDWN instead of power cycling | The guest has already powered devices off; CPU/VIC/timer/framebuffer repair cannot restore driver state | #20–#43 |
+| Host-side QEMU suspension | Bypasses iPod sleep and cannot handle the independent timer-triggered OOCSHDWN path | #44 |
+| Resetting into already-used iBoot RAM | Stale volatile heap metadata causes `heap error: free` | #45a |
 
 ### Recommendation — next steps
 
-Keep the host-display suspend path as the N45AP demo default and add a small
-repeatable smoke test for P→P, P→H, and P→click→second click. If authentic
-hardware shutdown is revisited, implement the full bootrom/iBoot power-cycle
-contract rather than extending the guest-return trampoline. The existing guest
-addresses are firmware-specific and must move into guarded board/firmware
-profiles before the M68AP/iPhone 1.0 work.
+Keep the guest OOCSHDWN plus retained-RAM iBoot reset as the N45AP default and
+add a repeatable smoke test for manual-P and timed sleep, P/H wake, complete
+boot, and visible Safari interaction. The next accuracy milestone is to execute
+and trace the real bootrom/NOR/LLB/iBoot wake path, including the address-zero
+mapping and any memory-remap writes, to determine and reproduce the type-4
+retained-memory handoff. Foreground application retention, low wake latency,
+no normal SpringBoard boot, and immediate touch response are the acceptance
+criteria. The existing guest addresses remain firmware-specific and must move
+into guarded board profiles before M68AP work.
 
 ## Detailed Findings
 
@@ -1376,7 +1456,7 @@ When timer tick #2 fires synchronously during a timer_mod (inside the FIQ handle
 With the edge fix (#72), the timer fires once, the FIQ handler clears IRQLATCH but does NOT reprogram the next tick. The kernel's FIQ handler checks PM state "sleeping" and refuses to schedule next tick — timer dies after one tick. **Fix**: Use auto-recurring mode (TIMER_STATE_START without MANUALUPDATE) in the post-sleep timer restart.
 
 ### Finding #74: Sleep function is a one-way trip — NO context save
-The function at 0x806155c is NOT a setjmp/context save — it's a timer read function (hardware counter with retry loop, returns 64-bit time). The function at 0x8061168 is a cache flush (iterates cache sets/ways with MCR instructions). The sleep function just: reads current time, stores it, flushes cache, spins forever. There is NO setjmp/longjmp mechanism. The wake path on real hardware is entirely external (bootloader restores CPU state and jumps to kernel resume entry point). Making the sleep function return is NOT how real wake works, but it's the only option in emulation.
+The function at 0x806155c is NOT a setjmp/context save — it's a timer read function (hardware counter with retry loop, returns 64-bit time). The function at 0x8061168 is a cache flush (iterates cache sets/ways with MCR instructions). The sleep function just: reads current time, stores it, flushes cache, spins forever. There is NO setjmp/longjmp mechanism. The wake path on real hardware is entirely external. Making the sleep function return is NOT how real wake works; it was only a temporary diagnostic strategy before the retained-RAM power-cycle work.
 
 ### Finding #75: CPU state at PM suspend (OOCSHDWN write)
 CPU register dump at OOCSHDWN I2C write:
@@ -1480,7 +1560,7 @@ Patched Thumb wrapper at VA 0xc01603ee (PA 0x081603ee) with `MOVS R0,#1; NEGS R0
 Patched VA 0xc04bc494 (PA 0x084bc494): ARM BGE instruction (0x5A00000E) → B unconditional (0xEA00000E). Makes the delay function exit on first loop iteration without calling UART poll at all.
 **Result**: Delay function exits immediately, but get_ticks (called by delay function's first BL at 0xc04bc474) is stuck in the big_function at 0xc0062462 (finding #81). get_ticks never returns, so the delay function never even reaches the loop.
 
-### Finding #82: iBoot-204 warm boot = clean reboot, NOT kernel resume
+### Finding #82 (corrected): type-4 ends at address zero; target semantics unresolved
 
 **Critical discovery.** Disassembly of the bootrom (`bootrom_s5l8900`, 64KB at PA 0x20000000) and iBoot (`iboot_204_n45ap.bin`, 136KB at PA 0x18000000) reveals:
 
@@ -1509,9 +1589,21 @@ Patched VA 0xc04bc494 (PA 0x084bc494): ARM BGE instruction (0x5A00000E) → B un
 3. `prepare_for_boot(4)` — DMA shutdown, clock gates, GPIO interrupt disable
 4. `disable_caches()` — D-cache and I-cache off
 5. `disable_mmu()` — clear MMU enable bit
-6. `BLX R6` where R6=0 → **jumps to PA 0x00000000** (bootrom / CPU reset vector)
+6. `BLX R6` where R6=0 → transfers control to address `0x00000000` after
+   caches and the MMU have been disabled.
 
-**Conclusion: There is NO kernel resume entry point.** iBoot's warm boot path just reboots the entire system via the bootrom. The kernel stores sleep markers ("MOSX"/"SUSP") but iBoot doesn't use them to jump to a kernel resume address — it jumps to PA 0 (full reboot). This confirms that our approach of patching the sleep function to return is the correct strategy.
+**Original conclusion, now withdrawn:** this was initially interpreted as an
+unconditional jump to the bootrom and therefore proof of a clean reboot with no
+kernel resume. That interpretation did not establish what physical address
+zero maps to at this point in the S5L8900 boot sequence. A low-memory alias or
+memory-remap operation can make `BLX 0` a retained-context handoff instead.
+
+The current QEMU machine cannot answer this dynamically because it has no
+mapping at physical address zero and its reset callback jumps directly to
+`IBOOT_BASE`, bypassing the real bootrom/NOR/LLB path. Therefore the proven
+facts are limited to the marker/token validation, the type-4 call, and the
+final transfer to address zero. Whether that transfer resumes retained kernel
+state remains an open reverse-engineering and emulation task.
 
 **Verified in QEMU:** The kernel DOES write the sleep markers before OOCSHDWN:
 - PA 0x08000080 = 0x4D4F5358 ("MOSX") ✓
@@ -1774,32 +1866,37 @@ The `setPowerState` at VA 0xC015E744 sets `[self+0x8C]` with `MOVS R3, #8` (only
 
 ## Phase 8: Auto-Lock Display Recovery (Findings #94–95)
 
-### Finding #94: Auto-lock vs OOCSHDWN sleep — two different display-off paths
+### Finding #94 (corrected): auto-lock is the lead-in to OOCSHDWN
 
-**Critical discovery.** The screen going dark after idle is NOT the OOCSHDWN full-sleep path. It is the iOS **auto-lock** feature (≈60 second idle timeout). Auto-lock:
-1. Plays a fade-to-black animation (kernel writes progressively darker pixels to all 3 framebuffers)
-2. Ends with all 3 framebuffers fully black (`0xFF000000` = opaque black in ARGB)
-3. CPU continues running (NOT halted) — kernel idle loop at 0xc0061650 with I=1 F=0
-4. OOCSHDWN is **never** written to the PMU
-5. Our 7 OOCSHDWN patches **never fire**
-6. Timer FIQs continue, scheduler runs, but all user processes are blocked on IOKit events
+The original observation stopped too early and incorrectly classified timed
+auto-lock as a separate terminal state. A complete untouched run confirms this
+sequence:
 
-**Evidence from debug log:**
+1. SpringBoard performs its fade/lock transition and leaves a mostly black
+   framebuffer; the status bar can remain in the last scanout buffer.
+2. IOKit powers down LCD, multitouch, USB, SDIO, GPU, and other clients.
+3. The kernel masks IRQ and FIQ and writes `OOCSHDWN=0x02`.
+4. CPU execution reaches the terminal loop at `0xc005a6d0`, where real
+   hardware expects application-processor power to disappear.
+
+The leaked status bar in the QEMU window was not a distinct guest sleep mode.
+It was an LCD device-model bug: QEMU kept scanning out framebuffer memory after
+the PMU had powered the panel off. OOCSHDWN now marks the emulated panel off,
+and a pre-wake screenshot is uniformly black.
+
+**Earlier incomplete evidence:**
 ```
 [BTN] keycode=25  PC=0xc0061650  I=1 F=1  power=1   ← first P press, already dark
 [PMU] ONKEY pressed  int1=0x80
 ...
-(no OOCSHDWN message anywhere in log)
+(no OOCSHDWN message in the observation window)
 ```
 
-**Auto-lock idle state:** CPU alternates between PCs 0xc0061650 (timer read), 0xc0160400 (UART function), 0xc016048c (UART), 0xc048e7c0 (IOKit). CPSR I=1 means GPIO IRQs (including power button) are masked. Only FIQs (timer) reach the CPU.
-
-**After multiple P presses:** CPU eventually reaches I=0 F=0 at 0xc048e7c0 (some IOKit function), meaning IRQs are processed. ONKEY events accumulate in PMU INT1 and are partially read-cleared by the kernel. But the kernel never initiates OOCSHDWN because:
-1. The GPIO ISR for power button is acknowledge-only (finding #31) — no PMU dispatch
-2. Even when INT1 is read, the PM state machine doesn't transition to OOCSHDWN from auto-lock state
-3. Auto-lock → sleep requires additional conditions beyond just power button press
-
-**Implication:** Pressing P to "sleep" the device was always the auto-lock timer, not the P press. The user's P press coincided with the auto-lock timeout giving the appearance that P triggered sleep.
+That trace captured the IOKit transition before its final PMU write. Later
+controlled runs observed `AppleMultitouchZ2SPI: disabled power`, `pmu go hib`,
+the OOCSHDWN write, and PC `0xc005a6d0`. Manual P also reaches OOCSHDWN after
+the guest consumes the ONKEY event; it is slower than the former host blank
+because iPod OS performs its real shutdown sequence.
 
 ### Finding #95: Framebuffer snapshot overwritten by fade-to-black animation
 
@@ -1819,9 +1916,10 @@ pixels to remain visible for 20 consecutive LCD refreshes (two seconds). It
 then locks the first stable frame. This avoids both the fade-to-black frames
 and the earlier SpringBoard boot overlay (Apple logo with dimmed icons).
 
-### Approach #42: Framebuffer restore on power button press (finding #94 workaround)
+### Approach #42: Framebuffer restore on power button press — superseded
 
-**Goal:** Make the display show content when P is pressed after auto-lock, since the IOKit display notification chain doesn't work in our emulation.
+**Historical goal:** Make the display show content when P is pressed after the
+apparent auto-lock state. This was a visual workaround, not device wake.
 
 **Implementation:** In `ipod_touch_key_event()`, when P is pressed (keycode=25):
 1. Check if `fb_snapshot_valid` is true
@@ -1843,6 +1941,10 @@ and the earlier SpringBoard boot overlay (Apple logo with dimmed icons).
 - HMP-injected touch is processed and acknowledged after wake, but launching a
   specific icon with macOS GUI automation was not confirmed.
 - Repeated end-to-end GUI cycles still need deliberate soak testing.
+
+**Final disposition:** rejected. It can paint a bright screen while the guest
+multitouch driver remains powered off. Approach #45 uses the actual
+OOCSHDWN→SoC reset→pristine iBoot path instead.
 
 ### Approach #42 iter 1 — FAILED: Snapshot capture bug
 
@@ -1872,18 +1974,86 @@ During disassembly analysis this session, two previously-labeled patches were re
 
 ---
 
+## Phase 9: Genuine OOCSHDWN Power Cycle (Approach #45)
+
+### Trigger for revisiting the accepted result
+
+The host-suspend build appeared to fix P but timed sleep still showed the last
+status bar on a black framebuffer and could not wake with P or H. This proved
+that approach #44 had only hidden one entry path and was not device sleep.
+
+### Reproduction and corrected model
+
+An untouched controlled run eventually logged the complete sequence:
+
+```
+AppleMultitouchZ2SPI: disabled power
+pmu go hib
+[LCD] PMU powered panel off
+[PMU] OOCSHDWN=0x02
+PC=0xc005a6d0, CPSR I=1 F=1
+```
+
+This corrected finding #94: the status-bar-only frame is an intermediate
+scanout during the shutdown sequence, and timed auto-lock does ultimately
+reach OOCSHDWN.
+
+### Reset experiment and iBoot heap failure
+
+Issuing a QEMU system reset from the terminal loop preserved SDRAM and reached
+`iBoot start`, but iBoot panicked with `heap error: free`. The old reset
+handler jumped into the already-used writable iBoot region. Real hardware
+reloads iBoot after application-processor power loss.
+
+The reset handler now clears/reloads the 4 MiB iBoot region, clears 64 KiB of
+volatile SRAM, preserves main SDRAM/sleep markers, and resets the CPU to the
+emulator's existing iBoot entry. This removed the heap panic and booted the
+kernel/SpringBoard reliably.
+
+### LCD and input power-domain fixes
+
+- OOCSHDWN marks the panel powered off; refresh emits a fully black surface.
+- Reset clears the three volatile scanout buffers so retained pixels cannot
+  falsely mark SpringBoard ready.
+- The SPI/multitouch controller resets command buffers, frame counters,
+  timers, touch state, and its GPIO frame IRQ.
+- Idle zero clocks and unknown commands no longer call `hw_error()`.
+- Host touch is ignored until a bright framebuffer has remained stable for
+  two seconds after reset.
+
+### P/H transition race
+
+P or H can arrive after the visible buffer has become status-bar-only but
+before the guest writes OOCSHDWN. Checking all triple buffers was wrong because
+inactive buffers retain old bright frames. The wake detector now samples the
+active `w1_framebuffer_base`, records `wake_reset_pending`, lets the guest
+finish device shutdown, and resets immediately after OOCSHDWN. Both buttons
+use ONKEYF as the current PMU model's generic boot-visible wake latch.
+
+### Final direct validation
+
+| Sequence | Result |
+|----------|--------|
+| Normal boot → Safari tap | Safari opens |
+| P → guest ONKEY read → OOCSHDWN | Guest owns shutdown; no host suspension |
+| OOCSHDWN screenshot | Uniform black; no status bar |
+| OOCSHDWN → P → iBoot → Safari tap | Safari opens; multitouch reinitialized |
+| Status-bar transition → H | H queued, guest completes OOCSHDWN, reset starts |
+| Queued H → iBoot → stable-frame marker → Safari tap | Safari opens; no crash |
+| Tap during Apple-logo interval | Ignored until driver/display startup is stable |
+
 ## Files Modified
 
 | File | Changes |
 |------|---------|
 | `include/hw/arm/ipod_touch_sysic.h` | Added `QEMUTimer`, `GPIOIRQLowerInfo` for auto-lower timers; `Pcf50633State *pmu` pointer; `pmu_reassert_timer`; `pmu_onkey_reinject_timer` (approach #30); `PMU_REASSERT_DELAY_NS` constant (200ms) |
 | `hw/arm/ipod_touch_sysic.c` | Added `gpio_irq_auto_lower()` callback + timer init; GPIO_INTSTAT write handler with auto-clear of PMU INT1-5 (approach #17); deferred `pmu_reassert_callback()` with ONKEY tracking; `pmu_onkey_reinject_callback()` for delayed re-injection (approach #30); debug logging for group 2 MMIO ops |
-| `hw/arm/ipod_touch.c` | Deferred deep-sleep wake; PMU latch cleanup; P/Home wake routing; connected 40-pulse IRQ/FIQ wake assist; framebuffer restore; disabled the historical hot-path memory dump |
+| `hw/arm/ipod_touch.c` | Guest-owned P handling; active-scanout P/H transition queue; retained-SDRAM SoC reset; pristine iBoot/SRAM reload; volatile scanout clearing; boot-input gating state |
 | `include/hw/arm/ipod_touch_multitouch.h` | Added `CPUState *cpu`, `Pcf50633State *pmu`, `IPodTouchLCDState *lcd` (forward decl), `wake_unwind_active` fields |
-| `include/hw/arm/ipod_touch_pcf50633_pmu.h` | Apple-remapped INT1-5 (0x13-0x17), standard masks (0x07-0x0B), ONKEY bits, SYSIC pointer, GPIO 0x55 constants; `uint8_t regs[256]` for register capture; PMU_OOCSHDWN, PMU_OOCWAKE, PMU_GPMEM0-3 defines |
-| `hw/arm/ipod_touch_pcf50633_pmu.c` | Full rewrite: proper I2C write handler, INT read-clears, level-triggered nIRQ, ONKEY→GPIO interrupt, mask-bypass; `s->regs[reg] = val` in write handler for debug capture; OOCSHDWN sleep pre-patch (approaches #32-34); VIC cleanup timer; CPU register dump at OOCSHDWN (finding #75); timer restart in auto-recurring mode |
+| `include/hw/arm/ipod_touch_pcf50633_pmu.h` | PMU interrupt/register model, OOCSHDWN state, retained-RAM reset queue, historical trampoline/timer state retained for investigation |
+| `hw/arm/ipod_touch_pcf50633_pmu.c` | PMU interrupt model plus OOCSHDWN panel-off and queued SoC-reset handoff; historical return-trampoline path remains documented but is not used by normal P/H wake |
 | `hw/arm/ipod_touch_timer.c` | Timer tick logging; IRQLATCH logging; IRQ edge fix (lower+raise in tick callback, finding #72); Timer write MMIO logging for TIMER_4; **TICKSLOW stale value fix** — recalculate ticks on either TICKSHIGH or TICKSLOW read (finding #83) |
-| `include/hw/arm/ipod_touch_pcf50633_pmu.h` | Added `void *timer` for post-sleep timer restart; `void *lcd` for framebuffer restore (finding #92); VIC0/VIC1 pointers; post_sleep_timer; int1_shadow |
-| `include/hw/arm/ipod_touch_lcd.h` | Shared framebuffer dimensions plus stable-snapshot state |
-| `hw/arm/ipod_touch_lcd.c` | Two-second stable framebuffer capture; dark-frame detection; touch wake assist; removed periodic diagnostic scan |
+| `include/hw/arm/ipod_touch_lcd.h` | Shared framebuffer dimensions, stable-startup capture state, and PMU panel-power state |
+| `hw/arm/ipod_touch_lcd.c` | Panel-off black output, active-scanout transition detection, stable-startup capture, and boot-time touch suppression |
+| `hw/arm/ipod_touch_multitouch.c` | Volatile device reset, safe idle/unknown SPI handling, timer/frame/IRQ cleanup across SoC power cycles |
 | `hw/intc/pl192.c` | `pl192_reset_priority()` API for post-sleep cleanup; removed VECTADDR hot-path tracing |
