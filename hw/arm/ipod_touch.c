@@ -862,6 +862,9 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("pl080");
     PL080State *pl080_2 = PL080(dev);
     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem), &error_fatal);
+    /* SPI2 TX uses DMAC1 request input 14. The FIFO stub accepts data
+     * synchronously, so its transmit request remains asserted. */
+    qdev_prop_set_uint32(dev, "request-mask", 1u << 14);
     memory_region_add_subregion(sysmem, DMAC1_MEM_BASE, &pl080_2->iomem);
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_realize(busdev, &error_fatal);
