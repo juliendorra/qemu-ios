@@ -3489,3 +3489,74 @@ Manual packaged testing remains important for a human beginning to drag during
 the wake animation. Movement events should be ignored while the controller is
 off and begin naturally once scanout and firmware are both ready; no frame is
 fabricated and no guest power-management deadline is modified.
+
+## Phase 23: Profile awake timer and TCG cost (2026-07-17)
+
+With retained touch gated at the real controller boundary, work returned to
+performance priority 6. A macOS `sample` capture showed that the UI thread is
+normally blocked in `g_poll`, SDL/Metal contributes little, and the vCPU thread
+spends its time in translated guest code. Idle-awake SpringBoard consumes about
+one host core, so the M2 GPU and total core count are not the present limit.
+
+PC sampling repeatedly found the kernel's ARMv6 idle sequence near
+`0xc005a9c4`: drain the write buffer, execute WFI, then run Apple's 1,200-
+iteration post-WFI delay. The delay is guest code, not an emulator throttle.
+Removing it or skipping WFI would change guest timing without explaining why
+the CPU wakes, so neither was attempted.
+
+An opt-in timer counter build then measured the S5L8900 Timer 4 interface. The
+guest programs one-shot deadlines (`START | MANUALUPDATE`), normally produces
+hundreds rather than 10,000 interrupts per virtual second, and clears the latch
+once per delivered tick. The old 1,000-count minimum therefore does not create
+a fixed 10 kHz interrupt storm during the measured awake workload. By contrast,
+the free-running `TICKSLOW`/`TICKSHIGH` pair is read tens of thousands of times
+per virtual second and substantially more during early boot. The temporary
+counters were removed after the measurement.
+
+Two profiling paths were deliberately rejected:
+
+- QEMU's `hotpages,io=on` TCG plugin instrumented every memory access and was
+  so intrusive that the guest did not reach SpringBoard within 120 seconds.
+  Its partial-boot MMIO ranking (Timer 1, NAND, DMA, ECC, then VIC) is useful
+  only for orientation, not as an optimization verdict. The bundled plugin
+  Makefile also passes Linux's `-soname` to macOS `ld`; a manually built
+  `.dylib` was required for this experiment.
+- Replacing `clock_ns_to_ticks()` on every free-running counter read with an
+  exact constant-frequency calculation appeared promising, because our prior
+  read-order fix recalculates on both high and low reads. A controlled headless
+  A/B measured 89.0% of one core for the installed baseline and 89.6% for the
+  candidate. The change produced no speedup and was reverted.
+
+The next optimization must therefore sample translated blocks and MMIO with
+lower overhead over a clearly delimited, fully booted workload. It should test
+whether repeated WFI returns are driven by another interrupt source and compare
+the `arm1176` baseline against `-cpu max`; it must not alter guest timer ratios,
+idle loops, or sleep deadlines without a measured hardware-model error.
+
+A code-only `hotblocks,inline=true` run was light enough to reach SpringBoard
+in 12.059 seconds and then sample another 15 seconds. Its hottest kernel blocks
+were decoded rather than guessed:
+
+- `0xc00570ba`/`0xc00570c8` walk a linked list and compare address ranges. This
+  is ordinary guest virtual-memory lookup work, not an emulated-device poll.
+- `0xc00611c4` cleans successive 32-byte cache lines with ARM1176 DCCMVAC.
+  QEMU already registers DCCMVAC as `ARM_CP_NOP`, so the translated loop does
+  not call a device helper or end its translation block. The remaining loop
+  instructions are genuine guest work; a PC-specific loop skip would be a
+  brittle benchmark hack and was rejected.
+- `0xc005a9cc` is the already identified 1,200-iteration post-WFI delay.
+
+The planned CPU-model comparison also showed identical idle-awake host use:
+89.0% for the board's `arm1176` and 89.0% for `-cpu max`. The broader `max`
+model is therefore neither faster in this workload nor hardware-faithful, so
+the default remains `arm1176`. Forcing `-accel tcg,thread=single` reduced host
+CPU only by making the guest slower: SpringBoard took 22.544 seconds instead
+of the usual roughly 12 seconds. Single-thread TCG is not an optimization for
+this build and will not be added to the launcher.
+
+These results move the likely high-value work to priority 7: compare a modern
+QEMU/TCG AArch64 backend using the same firmware and benchmark, while keeping
+the current tree as the correctness oracle. Before a forward port, a second
+profile should delimit an interactive scroll rather than idle SpringBoard so
+display/cache-maintenance costs can be separated from normal VM and scheduler
+work.
