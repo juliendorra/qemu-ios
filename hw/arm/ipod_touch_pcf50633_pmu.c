@@ -181,8 +181,13 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
 {
     Pcf50633State *s = PCF50633(i2c);
 
-    time_t t = time(NULL);
-    struct tm tm = *localtime(&t);
+    struct tm tm;
+
+    /* The PCF50633 RTC stores an absolute UTC wall clock. iPod OS applies
+     * the user-selected timezone itself. Returning host local time here made
+     * Paris daylight time get added twice (+2 hours in summer). Use QEMU's
+     * RTC clock so the standard -rtc base/clock options also remain valid. */
+    qemu_get_timedate(&tm, 0);
 
     int res = 0;
 

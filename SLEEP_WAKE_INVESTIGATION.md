@@ -3330,3 +3330,23 @@ This validates cold-boot and post-wake input transport. Manual slider feel in
 the packaged app remains the user-facing acceptance test; the automation
 proves frame cadence, coordinate delivery, release preservation, and retained
 driver recovery rather than inferring unlock state from a screenshot.
+
+## Phase 20: Stop applying the host timezone twice (2026-07-17)
+
+Manual testing found that date and minutes matched the host, but selecting the
+Paris timezone left the displayed hour exactly two hours ahead during summer.
+The PMU RTC implementation called `localtime()` and exposed the host's CEST
+wall clock. iPod OS correctly treated the hardware RTC as UTC and then applied
+its selected `Europe/Paris` offset, adding the same two hours a second time.
+
+The PCF50633 read path now uses `qemu_get_timedate(&tm, 0)`. QEMU defaults its
+RTC base to UTC, while still honoring explicit `-rtc base=...` and clock
+options. The guest remains solely responsible for timezone and daylight-saving
+presentation.
+
+The automated post-wake screenshot provided a cross-check without changing
+guest settings: at 15:50 CEST (13:50 UTC), the disposable NAND's default
+Cupertino timezone displayed 6:50 AM, exactly UTC minus seven hours. Under the
+old local-time feed it would have displayed 8:50 AM. A Paris-configured guest
+should correspondingly display 15:50 rather than 17:50; final confirmation is
+left to the installed app because timezone preferences live in its NAND.
