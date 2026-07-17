@@ -108,6 +108,44 @@ mean as the conservative expectation and repeat the benchmark when comparing
 machines or further compiler changes. This boot test excludes SDL rendering;
 frame-presentation performance must be measured separately.
 
+### Experimental QEMU 11 forward-port build
+
+The isolated `codex/qemu-11-port` branch is based on upstream QEMU 11.0.2.
+It compiles and reaches SpringBoard, but it is not yet the engine installed in
+`/Applications/iPod Touch.app`; complete the GUI and retained sleep/wake matrix
+in `SLEEP_WAKE_INVESTIGATION.md` before promoting it.
+
+Configure it in a separate worktree and build directory:
+
+```bash
+mkdir build-ipod
+cd build-ipod
+
+../configure \
+    --target-list=arm-softmmu \
+    --enable-sdl \
+    --disable-cocoa \
+    --disable-slirp \
+    --disable-docs \
+    --disable-debug-info \
+    --enable-lto \
+    --extra-cflags="-I/opt/homebrew/opt/openssl@3/include" \
+    --extra-ldflags="-L/opt/homebrew/opt/openssl@3/lib -lcrypto"
+
+ninja qemu-system-arm
+```
+
+The resulting binary is `build-ipod/qemu-system-arm`. The first controlled
+headless test used the installed firmware and packed NAND, followed the real
+VROM/NOR/LLB/iBoot/kernel chain, and reached the SpringBoard serial marker in
+6.087 seconds. The key forward-port compatibility detail is DMAC0 request 2:
+the iPod NAND FIFO stub is always ready, while modern PL080 correctly waits for
+a peripheral request. The port models that one permanent request explicitly
+instead of restoring the old fork's global request-check bypass.
+
+Do not include `build-ipod/` in commits. It is a local build product and, on
+the port branch, is intentionally left untracked.
+
 ### Prepare firmware
 
 ```bash

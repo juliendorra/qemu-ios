@@ -3560,3 +3560,70 @@ the current tree as the correctness oracle. Before a forward port, a second
 profile should delimit an interactive scroll rather than idle SpringBoard so
 display/cache-maintenance costs can be separated from normal VM and scheduler
 work.
+
+## Phase 24: QEMU 11 forward port reaches SpringBoard (2026-07-17)
+
+Priority 7 began in an isolated QEMU 11.0.2 source and build tree. The
+known-good QEMU 6.2 app and repository branch remained untouched while the
+iPod machine and its custom devices were adapted to the modern header layout,
+reset API, input API, Meson device lists, and ARM machine QOM interfaces. The
+port is native arm64, uses TCG with LTO and SDL, and executes the existing
+VROM, NOR, LLB, iBoot, NAND, and kernel artifacts rather than substituting a
+host-side boot path.
+
+The first linked binary exposed the `iPod-Touch` machine and progressed through
+`FIL_Init`, `BUF_Init`, `VFL_Init`, and `FTL_Init`, but never printed
+`VFL_Open`. Timer instrumentation ruled out the initial timing theory: Timer 4
+was programmed with a count of 120,000, fired about every 12 ms, and was
+acknowledged by the guest. ADM was not yet touched. iBoot PC samples alternated
+between its stable high-low-high free-running timer read and UART/event polling,
+which showed that it was waiting for an asynchronous task rather than trapped
+in a bad instruction.
+
+A marker-triggered QMP harness then stopped the old and new engines immediately
+after the identical `FTL_Init [OK]` serial boundary. Guest code, scheduler
+nodes, timer state, and most VIC state matched. One decisive difference
+remained: the current engine had VIC0 source 16 asserted (`0x00010080` raw
+status), while QEMU 11 had only Timer 4 source 7 (`0x00000080`). Source 16 is
+DMAC0. Its channel 0 was waiting to copy 512 bytes from the NAND FIFO at
+`0x38a00080` into iBoot RAM with peripheral-to-memory flow control and source
+request ID 2.
+
+This was a compatibility defect with a clear history. The old fork had
+commented out PL080 request checks for both peripheral flow directions.
+Upstream QEMU 11 enforces those checks, but this PL080 model exposes no request
+input that the iPod NAND stub can drive. Consequently the modern controller
+waited forever for an event that the emulated topology could not produce. The
+port does not restore the old global bypass. It adds a configurable permanent
+request mask and sets only DMAC0 request 2 for the iPod's always-ready NAND
+FIFO stub. The transfer then completes through modern PL080 semantics and
+raises the real DMAC interrupt.
+
+After that fix the same unmodified firmware passed `VFL_Open`, `FTL_Open`,
+mounted HFS, loaded the Darwin kernel, initialized the 49,128-byte Z2 firmware,
+and reached `Configuring SpringBoard for N45AP`. All timer, VIC, ADM, and DMA
+diagnostics were removed before measurement. The clean binary was verified not
+to contain any `[PORT ...]` marker and reached the SpringBoard marker in 6.087
+seconds using the installed packed NAND. This is within, and at the fast end
+of, the current release engine's usual 6–8-second range. Idle-awake sampling
+still lands overwhelmingly in the guest kernel's post-WFI delay, so the port
+did not introduce a new busy host-device loop.
+
+### What is and is not complete
+
+The forward port now compiles, links, follows the real boot chain, and boots
+SpringBoard. It is not yet the packaged engine. Before promotion it must pass
+the same visible and retained correctness matrix as the current build:
+
+1. SDL scanout, Home/Power key input, taps, and a 60 Hz drag after cold boot;
+2. guest-driven manual sleep to OOCSHDWN and retained Power/Home wake;
+3. Z2 firmware reload, immediate post-wake touch, and foreground retention;
+4. guest timed sleep using the identical power-cycle path;
+5. repeated sleep/wake cycles without panic, data abort, or stale scanout;
+6. app-bundle dependency relocation, signing, and launch from `/Applications`.
+
+The old engine remains the correctness oracle and `/Applications/iPod
+Touch.app` must not be replaced until those checks pass. The next repository
+step is to establish a QEMU 11.0.2-based port branch, import the already
+validated device/API changes as reviewable commits, and perform GUI plus
+sleep/wake validation from that branch.
