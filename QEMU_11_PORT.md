@@ -3,8 +3,8 @@
 This document is the working record for moving the iPod Touch 1G machine from
 the current QEMU 6.2 tree to QEMU 11.0.2. It records successful milestones,
 failed theories, disposable diagnostics, and the promotion criteria. The
-current packaged application remains the correctness oracle until every GUI
-and power-lifecycle check below passes.
+packaged application was kept as the correctness oracle until the GUI and
+power-lifecycle checks below passed on 2026-07-17.
 
 ## Repositories and branches
 
@@ -13,8 +13,10 @@ and power-lifecycle check below passes.
 - Port branch: `codex/qemu-11-port`, based on upstream tag `v11.0.2`.
 - Initial machine/API port: `697306b42c`.
 - NAND DMA request fix: `78a43a0d56`.
-- Installed application: still the known-good QEMU 6 engine from
-  `95a3d80040`; do not replace it merely because the port boots headlessly.
+- SPI2 transmit DMA request fix: `efd9ab8b54`.
+- Installed application: QEMU 11.0.2 at clean port revision `efd9ab8b54`,
+  promoted only after cold input, manual sleep/wake, timed sleep/wake, and two
+  consecutive retained-wake cycles passed against the packaged binary.
 
 The main repository's untracked `roms/edk2` directory is user-owned and is not
 part of this port.
@@ -40,8 +42,10 @@ cd /private/tmp/qemu-11-port/build-ipod
 ninja qemu-system-arm
 ```
 
-The OpenSSL path in the port's Meson file is still host-specific and must be
-made relocatable before application packaging.
+The OpenSSL path used while building remains host-specific. Runtime Homebrew
+load paths are relocated by `scripts/install-ipod-app-engine.sh`, which stages
+and verifies the engine and its recursive dylib closure before changing the
+application, then signs and verifies the completed bundle.
 
 ## Milestone 1: machine boots through SpringBoard
 
@@ -73,10 +77,10 @@ run reached `Configuring SpringBoard for N45AP` in 6.087 seconds. All timer,
 DMA, ADM, and VIC diagnostics used to find the boundary were removed before
 the port commits.
 
-## Milestone 2 blocker: kernel display handoff
+## Milestone 2: native multitouch initialization and display handoff
 
-Headless boot success was a false completion boundary. In SDL, QEMU 11 stays
-on the centered Apple logo even though the serial log continues through
+Headless boot success was a false completion boundary. Initially, SDL stayed
+on the centered Apple logo even though the serial log continued through
 SpringBoard, framebuffer user clients, MBX, HID, multitouch, USB, and configd.
 The cold-touch readiness marker never opens because the OS framebuffers do not
 become the active scanout.
@@ -92,7 +96,7 @@ comparison on 2026-07-17:
 | LCD interrupt | Approximately 60 Hz | Approximately 60 Hz |
 | Guest clears LCD status | Yes | Yes, once per frame |
 | Scanout bases | Rotates `0x0fe00000`, `0x0f400000`, `0x0f496000` | Remains `0x0fe00000` |
-| Manual sleep/wake test | Completes retained wake and post-wake drag | Not yet reachable |
+| Manual sleep/wake test | Completes retained wake and post-wake drag | Initially unreachable |
 
 The instrumented QEMU 6 release run reached SpringBoard in 8.529 seconds,
 opened cold input at 13.894 seconds, entered OOCSHDWN after the test's Power
@@ -116,13 +120,44 @@ and acknowledge vertical blanking. Waiting more than 20 seconds after
 SpringBoard, forcing display invalidation, or changing dirty tracking cannot
 create a guest MMIO write that never happened.
 
-The serial comparison also places the next boundary above basic driver attach:
+The serial comparison placed the next boundary above basic driver attach:
 both engines attach `IOMobileFramebufferUserClient`, `AppleMBXUserClient`, and
-the HID clients. The working engine subsequently emits SpringBoard/LayerKit
-diagnostics and starts flipping buffers; the QEMU 11 run has not reached that
-point. The leading hypothesis is therefore a CoreAnimation/MBX userspace
-submission wait or a subtle interrupt/CPU scheduling difference, not an SDL
-copy bug.
+the HID clients. The working engine subsequently emitted SpringBoard/LayerKit
+diagnostics and started flipping buffers; the initial QEMU 11 run had not
+reached that point. This first suggested a CoreAnimation/MBX userspace wait,
+but the later Z2 trace placed the actual boundary earlier.
+
+### Decisive Z2 and DMA evidence
+
+A bounded Z2 command trace made the failure reproducible. Both engines
+completed the same first 32 commands: four groups containing command `0x1a`
+and seven `0x18` transfers. QEMU 6 then issued one more `0x18`, followed by a
+49,117-byte `0x30` firmware transaction and the 261-byte calibration
+transaction. QEMU 11 stopped immediately before that firmware upload.
+
+The stopped QEMU 11 state showed that the final small SPI command had actually
+completed: SPI2 status contained the COMPLETE bit and the controller was in
+DMA mode. DMAC1 channel 3, however, was still enabled with this state:
+
+```text
+source         0x088b6000
+destination    0x3d200010  (SPI2 TXDATA)
+LLI            0x08a18010
+control        0x04089c00  (3072 units still pending)
+configuration  0x00008b81
+```
+
+Configuration `0x8b81` is memory-to-peripheral flow control with destination
+request ID 14. The historical QEMU fork globally bypassed PL080 request
+checks, so the transfer ran without an explicit SPI request. QEMU 11 correctly
+waited forever. The NAND milestone had deliberately enabled only DMAC0 request
+2, leaving this second hidden dependency exposed.
+
+The final fix keeps PL080 flow-control checking intact and declares only
+DMAC1 request 14 permanently asserted. That is appropriate for the current
+SPI2 FIFO stub because it consumes TXDATA synchronously. The native driver
+then performs its real firmware and calibration DMA transfers, completes Z2
+initialization, and SpringBoard programs the normal rotating scanout buffers.
 
 ### Rejected fixes and false leads
 
@@ -140,25 +175,38 @@ copy bug.
   ARM/TCG or display-core compatibility patch.
 - The QEMU 11 guest is not generally frozen: serial services continue well
   after SpringBoard configuration.
+- A bounded MBX trace was a dead end. Adding it changed timing enough to expose
+  an early USB PHY registration panic before MBX executed. Removing the probe
+  restored the stable Apple-logo stall; no MBX workaround was retained.
+- Waiting an additional minute did not advance the stalled Z2 sequence.
+- The QEMU 6 and QEMU 11 SPI FIFO pop APIs have equivalent semantics, so the
+  modern FIFO rename was not the cause.
+- The first request-mask experiment used bit 13 due to a manual decode error.
+  A second live DMAC dump still showed all 3,072 units pending; decoding
+  `(0x8b81 >> 6) & 0x1f` correctly yielded request 14. No bit-13 change was
+  committed.
+- Every `[PORT11 MT]`, LCD, MBX, and DMA diagnostic was removed before the
+  clean release build.
 
-### Next experiments
+### Promotion validation
 
-1. Trace MBX reads and writes around `AppleMBXUserClient::attach` in both
-   engines, suppressing repetitive reads and comparing the first divergent
-   register/value rather than dumping all MMIO.
-2. Stop both engines at that divergence and compare CPU PC/registers, VIC
-   nesting/priority, LCD registers, and the relevant userspace wait object.
-3. If MBX matches, compare QEMU 6 and QEMU 11 `arm1176` CPU properties and
-   exception-return/interrupt behavior at the first missed display submission.
-4. Fix the first modeled hardware contract that differs. Do not synthesize a
-   flip, wake SpringBoard from the host, or patch guest RAM.
-5. Remove every `[PORT ...]` diagnostic and verify the release binary contains
-   none before making a port commit.
+The clean port binary and then the exact installed binary were tested through
+QMP-driven 60 Hz drags and guest serial/hardware markers. For the installed
+revision, a representative manual cycle reached SpringBoard in 6.771 seconds,
+cold input readiness in 11.740 seconds, OOCSHDWN 20.591 seconds after Power,
+`System Wake` 11.549 seconds after Home, and retained touch readiness in 12.399
+seconds. A separate no-key run entered timed OOCSHDWN after 79.541 seconds and
+also completed retained wake and post-wake drag. A same-process test completed
+two consecutive manual sleep/wake/Z2-reload/drag cycles.
+
+The automated log scanner's literal `panic` result is a known false positive
+from the guest text `Panic Fail Count: 0`; the runs contained no kernel panic,
+data abort, assertion failure, or QEMU crash.
 
 ## Promotion matrix
 
-The QEMU 11 engine may replace the packaged engine only after all of these pass
-with the normal application NAND and a disposable copy:
+The QEMU 11 engine replaced the packaged engine after these checks passed with
+the normal application resources and a disposable NAND copy:
 
 1. Cold SDL boot reaches the lock/home screen with no stale Apple logo.
 2. Home and Power keys work through QEMU's modern input API.
@@ -173,4 +221,7 @@ with the normal application NAND and a disposable copy:
 9. The binary and dynamic libraries are relocated into the app, codesigned,
    launched from `/Applications`, and retested there.
 
-Until then, `/Applications/iPod Touch.app` intentionally remains on QEMU 6.
+Items 1-7 and 9 were exercised directly. Item 8 passed for two consecutive
+home/lock-screen cycles without a status-bar or battery-buffer leak. A longer
+interactive foreground-application soak remains useful ongoing regression
+coverage, but is no longer a forward-port blocker.

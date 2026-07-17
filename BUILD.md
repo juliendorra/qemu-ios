@@ -115,9 +115,11 @@ frame-presentation performance must be measured separately.
 ### Experimental QEMU 11 forward-port build
 
 The isolated `codex/qemu-11-port` branch is based on upstream QEMU 11.0.2.
-It compiles and reaches SpringBoard, but it is not yet the engine installed in
-`/Applications/iPod Touch.app`; complete the GUI and retained sleep/wake matrix
-in `SLEEP_WAKE_INVESTIGATION.md` before promoting it.
+Revision `efd9ab8b54` is the engine installed in
+`/Applications/iPod Touch.app`. Its cold GUI/input, manual and timed
+guest-driven sleep, retained wake, repeated Z2 reload, and post-wake drag
+matrix passed on 2026-07-17. The complete investigation is in
+`QEMU_11_PORT.md`.
 
 Configure it in a separate worktree and build directory:
 
@@ -146,6 +148,22 @@ VROM/NOR/LLB/iBoot/kernel chain, and reached the SpringBoard serial marker in
 the iPod NAND FIFO stub is always ready, while modern PL080 correctly waits for
 a peripheral request. The port models that one permanent request explicitly
 instead of restoring the old fork's global request-check bypass.
+
+The GUI blocker was the analogous SPI2 transmit path. The native Z2 driver
+uses DMAC1 memory-to-peripheral request 14 for its large firmware transfer.
+The synchronous FIFO stub therefore asserts only request 14. With both scoped
+requests modeled, the QEMU 11 engine reaches the home screen and survives
+manual, timed, and repeated retained-wake cycles.
+
+To promote a tested engine into an existing app bundle, use the staged
+installer. It recursively bundles Homebrew dylibs, rejects unresolved runtime
+paths before deployment, signs the app, and verifies the final signature:
+
+```bash
+scripts/install-ipod-app-engine.sh \
+    /private/tmp/qemu-11-port/build-ipod/qemu-system-arm \
+    "/Applications/iPod Touch.app"
+```
 
 Do not include `build-ipod/` in commits. It is a local build product and, on
 the port branch, is intentionally left untracked.
