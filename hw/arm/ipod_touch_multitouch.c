@@ -1,6 +1,11 @@
 #include "hw/arm/ipod_touch_multitouch.h"
 #include "qemu/log.h"
 
+static void ipod_touch_multitouch_inform_frame_ready(
+    IPodTouchMultitouchState *s);
+static void ipod_touch_multitouch_consume_frame(
+    IPodTouchMultitouchState *s);
+
 static void prepare_interface_version_response(IPodTouchMultitouchState *s) {
     memset(s->out_buffer + 1, 0, 15);
 
@@ -152,6 +157,7 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
         s->in_buffer = malloc(s->buf_size);
         s->in_buffer_ind = 0;
         s->frame_data_pending = false;
+        ipod_touch_multitouch_consume_frame(s);
     }
     else if(s->cur_cmd == 0) {
         // we're currently not in a command - start a new command
@@ -240,6 +246,7 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
                     s->next_frame->checksum1;
                 s->out_buffer[sizeof(MTFrameLengthPacket) + data_size + 1] =
                     s->next_frame->checksum2;
+                ipod_touch_multitouch_consume_frame(s);
             } else {
                 /* The driver can poll the legacy frame command immediately
                  * after consuming an interrupt packet.  No queued frame is
@@ -332,13 +339,8 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
         if (s->cur_cmd == 0xff) {
             free(s->out_buffer);
             free(s->in_buffer);
-            free(s->next_frame);
             s->out_buffer = NULL;
             s->in_buffer = NULL;
-            s->next_frame = NULL;
-        } else if (s->cur_cmd == MT_CMD_FRAME_READ && s->next_frame) {
-            free(s->next_frame);
-            s->next_frame = NULL;
         }
 
         // we're done with the command
@@ -386,8 +388,8 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
     frame->frame_packet.header.type = MT_FRAME_TYPE_PATH;
     frame->frame_packet.header.frameNum = s->frame_counter;
     frame->frame_packet.header.headerLen = sizeof(MTFrameHeader);
-    uint64_t elapsed_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000;
-    frame->frame_packet.header.timestamp = elapsed_ns;
+    uint64_t elapsed_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    frame->frame_packet.header.timestamp = elapsed_ms;
     frame->frame_packet.header.numFingers = 1;
     frame->frame_packet.header.fingerDataLen = sizeof(FingerData);
 
@@ -399,12 +401,13 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
 
     // compute the velocity
     int diff_x = (int)((x - s->prev_touch_x) * MT_INTERNAL_SENSOR_SURFACE_WIDTH);
-    int diff_y = (int)((x - s->prev_touch_y) * MT_INTERNAL_SENSOR_SURFACE_HEIGHT);
+    int diff_y = (int)((y - s->prev_touch_y) * MT_INTERNAL_SENSOR_SURFACE_HEIGHT);
+    uint64_t elapsed_delta_ms = MAX(elapsed_ms - s->last_frame_timestamp, 1);
+    int64_t velocity_x = (int64_t)diff_x * 1000 / elapsed_delta_ms;
+    int64_t velocity_y = (int64_t)diff_y * 1000 / elapsed_delta_ms;
 
-    // Add 1 to elapsed_ns to prevent crash with error "Floating point exception"
-    // due to click fast on emulator
-    frame->finger_data.velX = diff_x / (elapsed_ns + 1 - s->last_frame_timestamp) * 1000;
-    frame->finger_data.velY = diff_y / (elapsed_ns + 1 - s->last_frame_timestamp) * 1000;
+    frame->finger_data.velX = CLAMP(velocity_x, INT16_MIN, INT16_MAX);
+    frame->finger_data.velY = CLAMP(velocity_y, INT16_MIN, INT16_MAX);
 
     frame->finger_data.x = (int)(x * MT_INTERNAL_SENSOR_SURFACE_WIDTH);
     frame->finger_data.y = (int)(y * MT_INTERNAL_SENSOR_SURFACE_HEIGHT);
@@ -422,7 +425,9 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
     frame->checksum1 = (checksum & 0xFF);
     frame->checksum2 = (checksum >> 8) & 0xFF;
 
-    s->last_frame_timestamp = elapsed_ns;
+    s->last_frame_timestamp = elapsed_ms;
+    s->prev_touch_x = x;
+    s->prev_touch_y = y;
     s->frame_counter += 1;
 
     return frame;
@@ -437,43 +442,112 @@ static void ipod_touch_multitouch_inform_frame_ready(IPodTouchMultitouchState *s
     qemu_irq_raise(s->sysic->gpio_irqs[4]);
 }
 
+static void ipod_touch_multitouch_queue_frame(IPodTouchMultitouchState *s,
+                                               MTFrame *frame)
+{
+    uint8_t event = frame->finger_data.event;
+
+    if (!s->next_frame) {
+        s->next_frame = frame;
+        ipod_touch_multitouch_inform_frame_ready(s);
+        return;
+    }
+
+    /* Motion is level-like state: while ATN is already pending, retain only
+     * the newest position. Never replace the frame whose EB length reply has
+     * already been issued, and never let motion replace a release boundary. */
+    if (event == MT_EVENT_TOUCH_MOVED) {
+        if (!s->frame_data_pending &&
+            s->next_frame->finger_data.event == MT_EVENT_TOUCH_MOVED) {
+            free(s->next_frame);
+            s->next_frame = frame;
+        } else if (!s->deferred_frame ||
+                   s->deferred_frame->finger_data.event ==
+                       MT_EVENT_TOUCH_MOVED) {
+            free(s->deferred_frame);
+            s->deferred_frame = frame;
+        } else {
+            free(frame);
+        }
+        return;
+    }
+
+    /* A release supersedes any deferred movement, but not a previously
+     * queued release boundary. */
+    if (!s->deferred_frame ||
+        s->deferred_frame->finger_data.event == MT_EVENT_TOUCH_MOVED) {
+        free(s->deferred_frame);
+        s->deferred_frame = frame;
+    } else {
+        free(frame);
+    }
+}
+
+static void ipod_touch_multitouch_consume_frame(IPodTouchMultitouchState *s)
+{
+    uint8_t event = s->next_frame->finger_data.event;
+
+    free(s->next_frame);
+    s->next_frame = s->deferred_frame;
+    s->deferred_frame = NULL;
+
+    if (s->next_frame) {
+        ipod_touch_multitouch_inform_frame_ready(s);
+    }
+
+    /* The protocol's final no-contact frame follows consumption of TOUCH_END,
+     * so a slow guest cannot lose the end frame to a host-side timer. */
+    if (event == MT_EVENT_TOUCH_ENDED) {
+        timer_mod(s->touch_end_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      MT_FULL_END_DELAY_NS);
+    }
+}
+
 void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s) {
     s->touch_down = true;
 
-    s->next_frame = get_frame(s, MT_EVENT_TOUCH_START, s->touch_x, s->touch_y, 100, 660, 580, 150);
-    ipod_touch_multitouch_inform_frame_ready(s);
+    ipod_touch_multitouch_queue_frame(
+        s, get_frame(s, MT_EVENT_TOUCH_START, s->touch_x, s->touch_y,
+                     100, 660, 580, 150));
 
-    timer_mod(s->touch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 10);
+    timer_mod(s->touch_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / MT_MOTION_REPORT_HZ);
 }
 
 void ipod_touch_multitouch_on_release(IPodTouchMultitouchState *s) {
-    s->next_frame = get_frame(s, MT_EVENT_TOUCH_ENDED, s->touch_x, s->touch_y, 0, 0, 0, 0);
+    ipod_touch_multitouch_queue_frame(
+        s, get_frame(s, MT_EVENT_TOUCH_ENDED, s->touch_x, s->touch_y,
+                     0, 0, 0, 0));
     s->touch_down = false;
-    ipod_touch_multitouch_inform_frame_ready(s);
 
     timer_del(s->touch_timer);
-    timer_mod(s->touch_end_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 10);
 }
 
 static void touch_timer_tick(void *opaque)
 {
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
 
-    s->next_frame = get_frame(s, MT_EVENT_TOUCH_MOVED, s->touch_x, s->touch_y, 100, 660, 580, 150);
-    ipod_touch_multitouch_inform_frame_ready(s);
+    ipod_touch_multitouch_queue_frame(
+        s, get_frame(s, MT_EVENT_TOUCH_MOVED, s->touch_x, s->touch_y,
+                     100, 660, 580, 150));
 
     if(s->touch_down) {
         // reschedule the timer
-        timer_mod(s->touch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 10);
+        timer_mod(s->touch_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NANOSECONDS_PER_SECOND / MT_MOTION_REPORT_HZ);
     }
 }
 
 static void touch_end_timer_tick(void *opaque)
 {
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
-    s->next_frame = get_frame(s, MT_EVENT_TOUCH_FULL_END, s->touch_x, s->touch_y, 0, 0, 0, 0);
+    ipod_touch_multitouch_queue_frame(
+        s, get_frame(s, MT_EVENT_TOUCH_FULL_END, s->touch_x, s->touch_y,
+                     0, 0, 0, 0));
     s->touch_down = false;
-    ipod_touch_multitouch_inform_frame_ready(s);
 }
 
 static void ipod_touch_multitouch_realize(SSIPeripheral *d, Error **errp)
@@ -501,11 +575,13 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
     }
     free(s->in_buffer);
     free(s->next_frame);
+    free(s->deferred_frame);
 
     s->cur_cmd = 0;
     s->out_buffer = NULL;
     s->in_buffer = NULL;
     s->next_frame = NULL;
+    s->deferred_frame = NULL;
     s->buf_size = 0;
     s->buf_ind = 0;
     s->in_buffer_ind = 0;

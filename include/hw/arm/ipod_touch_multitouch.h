@@ -69,6 +69,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
 #define MT_EVENT_TOUCH_MOVED 0x4
 #define MT_EVENT_TOUCH_ENDED 0x7
 
+#define MT_MOTION_REPORT_HZ 60
+#define MT_FULL_END_DELAY_NS (NANOSECONDS_PER_SECOND / 10)
+
 typedef struct MTFrameLengthPacket
 {
     uint8_t cmd;
@@ -149,6 +152,7 @@ typedef struct IPodTouchMultitouchState {
     bool frame_data_pending;
     uint8_t hbpp_atn_ack_response[2];
     MTFrame *next_frame;
+    MTFrame *deferred_frame;
     uint32_t frame_counter;
     bool touch_down;
     QEMUTimer *touch_timer;

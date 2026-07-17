@@ -3281,3 +3281,52 @@ This result narrows the remaining performance plan:
 4. Revisit timer and clock ratios only with guest-time acceptance tests. The
    existing half-clock counter has upstream rationale and must not be used as
    a global speed knob.
+
+## Phase 19: Raise touch motion cadence without losing protocol frames (2026-07-17)
+
+The perceived 10 Hz touch response was literal: the original Z2 model created
+one `TOUCH_MOVED` frame every 100 ms, independently of the 60 Hz CLCD. Simply
+changing the divisor would have made an existing ownership bug six times more
+likely. Every timer tick assigned a new allocation to `next_frame`, even when
+the guest had not consumed the previous frame or had already received its EB
+length header.
+
+The queue now distinguishes the frame currently advertised to the guest from
+one deferred frame. Repeated motion is coalesced to the newest coordinates,
+but it cannot replace a packet whose length transaction has begun or replace
+a touch-release boundary. A frame is consumed as soon as its bytes have been
+copied into the SPI response buffer; any deferred frame is then promoted and
+generates a fresh ATN edge. `TOUCH_FULL_END` is scheduled only after the guest
+consumes `TOUCH_ENDED`, preventing a slow guest from losing the release frame.
+Reset frees both queue positions.
+
+Motion reports now run at 60 Hz. The same change corrects two velocity defects
+from the 2022 scrolling implementation: Y velocity now subtracts the previous
+Y coordinate instead of X, and multiplication occurs before millisecond
+division so normal velocities do not truncate to zero. Zero-time deltas are
+bounded and results are clamped to the signed 16-bit wire fields. Emitting a
+frame advances the previous coordinate, so stationary periodic reports have
+zero velocity.
+
+### Validation
+
+The optimized release build completed successfully. An SDL/QMP harness waited
+for the normal two-second input-ready gate, then drove a bottom-screen absolute
+drag from `(0.180, 0.140)` to `(0.860, 0.140)` over 0.705 seconds at 60 Hz.
+The press and release reached the Z2 model with the correct coordinates, no
+unknown command, panic, or data abort occurred, and a screenshot showed an
+intact SpringBoard.
+
+The higher-risk retained test also passed:
+
+1. Power sent Merlot Sleep In and the guest reached OOCSHDWN.
+2. Home requested the retained reset and the kernel logged `System Wake`.
+3. Z2 reloaded its 49,128-byte firmware.
+4. One second later, the same 60 Hz drag completed in 0.702 seconds with the
+   correct down/up coordinates.
+5. The post-drag screenshot again showed an intact, responsive SpringBoard.
+
+This validates cold-boot and post-wake input transport. Manual slider feel in
+the packaged app remains the user-facing acceptance test; the automation
+proves frame cadence, coordinate delivery, release preservation, and retained
+driver recovery rather than inferring unlock state from a screenshot.
