@@ -37,6 +37,14 @@ config ARM_VIRT
     select ACPI_CXL
     select ACPI_HMAT
 
+config IPOD_TOUCH
+    bool
+    default y
+    depends on TCG && ARM
+    select I2C
+    select PL192
+    select PFLASH_CFI01
+
 config CUBIEBOARD
     bool
     default y

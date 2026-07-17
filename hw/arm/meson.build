@@ -1,5 +1,31 @@
 arm_ss = ss.source_set()
 arm_common_ss = ss.source_set()
+ipod_crypto = cc.find_library('crypto',
+                              dirs: '/opt/homebrew/opt/openssl@3/lib',
+                              required: true)
+arm_ss.add(when: 'CONFIG_IPOD_TOUCH', if_true: [files(
+  'ipod_touch.c',
+  'ipod_touch_8900_engine.c',
+  'ipod_touch_adm.c',
+  'ipod_touch_aes.c',
+  'ipod_touch_chipid.c',
+  'ipod_touch_clock.c',
+  'ipod_touch_gpio.c',
+  'ipod_touch_lcd.c',
+  'ipod_touch_lcd_panel.c',
+  'ipod_touch_lis302dl.c',
+  'ipod_touch_multitouch.c',
+  'ipod_touch_nand.c',
+  'ipod_touch_nand_ecc.c',
+  'ipod_touch_pcf50633_pmu.c',
+  'ipod_touch_sdio.c',
+  'ipod_touch_sha1.c',
+  'ipod_touch_spi.c',
+  'ipod_touch_sysic.c',
+  'ipod_touch_timer.c',
+  'ipod_touch_tvout.c',
+  'ipod_touch_usb_otg.c',
+), ipod_crypto])
 arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))
 arm_common_ss.add(when: 'CONFIG_ACPI', if_true: files('virt-acpi-build.c'))
 arm_common_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic_boards.c'))
