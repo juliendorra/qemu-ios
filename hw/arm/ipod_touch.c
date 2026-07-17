@@ -852,6 +852,8 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("pl080");
     PL080State *pl080_1 = PL080(dev);
     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem), &error_fatal);
+    /* The NAND FIFO stub is always ready and uses DMAC request input 2. */
+    qdev_prop_set_uint32(dev, "request-mask", 1u << 2);
     memory_region_add_subregion(sysmem, DMAC0_MEM_BASE, &pl080_1->iomem);
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_realize(busdev, &error_fatal);

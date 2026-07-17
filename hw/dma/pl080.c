@@ -138,7 +138,7 @@ again:
             src_id = (ch->conf >> 1) & 0x1f;
             dest_id = (ch->conf >> 6) & 0x1f;
             size = ch->ctrl & 0xfff;
-            req = s->req_single | s->req_burst;
+            req = s->req_single | s->req_burst | s->request_mask;
             switch (flow) {
             case 0:
                 break;
@@ -434,6 +434,7 @@ static void pl081_init(Object *obj)
 static const Property pl080_properties[] = {
     DEFINE_PROP_LINK("downstream", PL080State, downstream,
                      TYPE_MEMORY_REGION, MemoryRegion *),
+    DEFINE_PROP_UINT32("request-mask", PL080State, request_mask, 0),
 };
 
 static void pl080_class_init(ObjectClass *oc, const void *data)

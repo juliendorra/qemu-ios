@@ -58,6 +58,8 @@ struct PL080State {
     uint32_t sync;
     uint32_t req_single;
     uint32_t req_burst;
+    /* Permanently asserted request inputs for always-ready device stubs. */
+    uint32_t request_mask;
     pl080_channel chan[PL080_MAX_CHANNELS];
     int nchannels;
     /* Flag to avoid recursive DMA invocations.  */
