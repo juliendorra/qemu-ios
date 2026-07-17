@@ -6,6 +6,10 @@ The proposed browser/WebAssembly port, including its bundled classroom and
 source-loaded deployment flavors, is specified in
 [`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](BROWSER_WASM_IMPLEMENTATION_PLAN.md).
 
+The active QEMU 11 native forward-port, including its commits, successful NAND
+DMA fix, current GUI blocker, rejected workarounds, and promotion matrix, is
+tracked in [`QEMU_11_PORT.md`](QEMU_11_PORT.md).
+
 ## Prerequisites
 
 ### Homebrew packages
