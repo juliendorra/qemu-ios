@@ -28,9 +28,8 @@ static uint64_t s5l8900_8900_engine_read(void *opaque, hwaddr offset, unsigned s
     return 0;
 }
 
-static void convert_hex_key_to_bin(char *str, uint8_t *bytes, int maxlen)
+static void convert_hex_key_to_bin(const char *str, uint8_t *bytes, int maxlen)
 {
-	int slen = strlen(str);
 	int bytelen = maxlen;
 	int rpos, wpos = 0;
 
@@ -41,41 +40,50 @@ static void convert_hex_key_to_bin(char *str, uint8_t *bytes, int maxlen)
 
 static void s5l8900_8900_engine_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
-	AES_KEY ctx, aes_decrypt_key;
+	AES_KEY aes_decrypt_key;
 	uint8_t aes_key[16];
 
-	unsigned char ramdiskKey[33] = "188458A6D15034DFE386F23B61D43774";
-	unsigned char ramdiskiv[1];
-
-	unsigned char keybuf[16];
+	const char ramdiskKey[] = "188458A6D15034DFE386F23B61D43774";
 	unsigned char iv[AES_BLOCK_SIZE];
-	int encrypted;
-	off_t data_begin, data_current, data_end, data_len;
+	size_t data_current, data_len;
 
 	if(offset != 0x0) { return; }
 
-	printf("Reading 8900 header with length %d at address 0x%08x\n", sizeof(header8900), value);
+	printf("Reading 8900 header with length %zu at address 0x%08" HWADDR_PRIx "\n",
+	       sizeof(header8900), value);
 
     AddressSpace *nsas = (AddressSpace *)opaque;
     header8900 *header = malloc(sizeof(header8900));
     address_space_rw(nsas, value, MEMTXATTRS_UNSPECIFIED, (uint8_t *)header, sizeof(header8900), 0);
 
-	if( (header->magic[0] != 0x38) && // 8
-	    (header->magic[1] != 0x39) && // 9
-	    (header->magic[2] != 0x30) && // 0
-	    (header->magic[3] != 0x30))  // 0
+	if (memcmp(header->magic, "8900", sizeof(header->magic)) != 0)
 	{
 		printf("Bad 8900 magic\n");
+		free(header);
 		return;
 	}
 
-	if(header->encrypted == 0x03) { encrypted = 1; }
-	else if( header->encrypted = 0x04 ) { encrypted = 0; }
-
-	data_begin = sizeof(header8900);
 	data_len = header->sizeOfData;
+	if (header->encrypted != 0x03 && header->encrypted != 0x04) {
+		printf("Unsupported 8900 encryption marker 0x%02x\n",
+		       header->encrypted);
+		free(header);
+		return;
+	}
+	if (header->encrypted == 0x04) {
+		/* The payload is already plaintext. The previous assignment-in-condition
+		 * mutated this marker and then decrypted it anyway. */
+		free(header);
+		return;
+	}
+	if (data_len % AES_BLOCK_SIZE != 0) {
+		printf("Invalid 8900 encrypted length %zu\n", data_len);
+		free(header);
+		return;
+	}
 
-	printf("Will decrypt 8900 image at address 0x%08x (len: %d bytes)\n", value, data_len);
+	printf("Will decrypt 8900 image at address 0x%08" HWADDR_PRIx
+	       " (len: %zu bytes)\n", value, data_len);
 
 	// read the data into a buffer
 	uint8_t *inbuf = (uint8_t *)malloc(data_len);
@@ -101,6 +109,7 @@ static void s5l8900_8900_engine_write(void *opaque, hwaddr offset, uint64_t valu
 	free(header);
 	free(inbuf);
 	free(outbuf);
+	free(intbuf);
 }
 
 static const MemoryRegionOps engine_8900_ops = {

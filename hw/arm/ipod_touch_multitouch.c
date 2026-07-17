@@ -156,6 +156,8 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
     else if(s->cur_cmd == 0) {
         // we're currently not in a command - start a new command
         s->cur_cmd = value;
+        free(s->out_buffer);
+        free(s->in_buffer);
         s->out_buffer = malloc(0x100);
         s->out_buffer[0] = value; // the response header
         s->buf_ind = 0;
@@ -350,7 +352,7 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
 }
 
 static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, float y, uint16_t radius1, uint16_t radius2, uint16_t radius3, uint16_t contactDensity) {
-    MTFrame *frame = calloc(sizeof(MTFrame), sizeof(uint8_t *));
+    MTFrame *frame = calloc(1, sizeof(*frame));
 
     uint16_t data_len = sizeof(MTFrameHeader) + sizeof(FingerData) + 2;
 
