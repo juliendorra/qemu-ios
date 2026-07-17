@@ -2457,8 +2457,8 @@ to postpone the first measured display-speed pass.
 |---|---|---|---|
 | 1 | Correct CLCD interrupt cadence/acknowledgement, then raise 10 Hz to the hardware's 59.977 Hz (**direct constant change rejected**) | Removes the artificial UI cap without creating an interrupt storm | Scrolling/animation can present up to 60 frames/s; no `unexpected CLCD interrupt`, kernel panic, accelerated guest timers, or input regression |
 | 2 | Redraw only on dirty framebuffer/display state (**implemented; cold boot and retained-wake smoke test pass**) | A blind high-rate full redraw would waste the same host core needed by TCG | Idle display avoids full-frame conversion; changed regions appear on the next presentation tick; no stale frames |
-| 3 | Use the real `arm1176` CPU model as the default performance baseline (**cold boot passes; benchmark pending**) | `-cpu max` overrides the board default with a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
-| 4 | Produce a release build and remove hot-path diagnostics (**quiet launcher documented; build-mode work pending**) | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
+| 3 | Use the real `arm1176` CPU model as the default performance baseline (**implemented; cold boot and release benchmark pass; `max` A/B still pending**) | `-cpu max` overrides the board default with a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
+| 4 | Produce a release build and remove hot-path diagnostics (**implemented and measured**) | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
 | 5 | Stop executing the terminal `b .` after OOCSHDWN | The sleeping CPU currently burns one host core even though real AP power is off | Near-zero QEMU CPU use while asleep; P/H still initiates the retained AP reset and type-4 handoff; RAM CRC stays stable |
 | 6 | Profile an awake workload and fix the largest emulated-device polling loops | Overall slowness cannot be attributed safely without sampling a representative boot/UI trace | Record boot-to-SpringBoard time, app-launch latency, scrolling frame rate, vCPU samples, and top MMIO addresses before each change; improve one identified hotspot at a time |
 | 7 | Evaluate a newer QEMU/TCG base and safe translation settings | This is higher-risk and should follow local hot-path fixes so behavior changes remain attributable | Same firmware and acceptance suite, with repeatable speedup and no boot, NAND, touch, display, or resume regression |
@@ -2503,6 +2503,37 @@ one:
 The immediate safe checkpoint is therefore dirty-only redraw at the existing
 guest IRQ cadence. The next display-speed step is correcting CLCD interrupt
 semantics, not forcing another rate value.
+
+### Release-build benchmark (2026-07-17)
+
+The development and release binaries were built from revision `81d477c5d4`.
+The existing development configuration is `-O2` with debug information, no
+LTO, and assertions enabled. The release configuration is `-O3`, LTO enabled,
+debug information disabled, and assertions still enabled. QEMU 6.2 explicitly
+rejects compiling this tree with `NDEBUG`, so disabling assertions is not a
+valid optimization without first auditing and changing that upstream design
+constraint. Binary size fell from 15 MB to 13 MB.
+
+The test alternated debug and release boots. Each run used the machine's
+ARM1176 default, `-display none`, serial output captured to a file, and a fresh
+APFS copy-on-write clone of the same 521 MB NAND tree. Clone time was excluded.
+The process was stopped when the serial log reached SpringBoard's
+`Configuring SpringBoard for N45AP` line. This isolates boot and emulated-device
+execution from SDL presentation; it does not measure visible frame rate.
+
+| Milestone | Debug runs (s) | Release runs (s) | Debug mean / median | Release mean / median | Mean / median improvement |
+|---|---:|---:|---:|---:|---:|
+| Darwin kernel banner | 4.219, 7.005, 5.924 | 4.228, 5.932, 5.011 | 5.716 / 5.924 | 5.057 / 5.011 | 11.5% / 15.4% |
+| Multitouch firmware downloaded | 5.601, 8.983, 8.101 | 5.572, 7.521, 6.403 | 7.562 / 8.101 | 6.499 / 6.403 | 14.1% / 21.0% |
+| SpringBoard configured | 10.090, 16.778, 16.194 | 11.481, 15.620, 11.623 | 14.354 / 16.194 | 12.908 / 11.623 | 10.1% / 28.2% |
+
+The release build is faster overall, but three trials are not enough to claim
+that the best 28.2% median figure will hold for every launch. Pairwise
+SpringBoard results ranged from release being 13.8% slower to being 28.2%
+faster, showing meaningful host/filesystem scheduling noise. The conservative
+result is approximately **10-15% lower mean boot time at the early milestones**,
+with a larger possible gain later in boot. Future comparisons should retain
+at least three alternating runs and report both mean, median, and raw values.
 
 The same build also cold-booted through SpringBoard with the machine's default
 ARM1176 model after removing the launcher's explicit `-cpu max`. This validates

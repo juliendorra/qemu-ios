@@ -64,6 +64,50 @@ make -j$(sysctl -n hw.ncpu)
 
 The binary is at `build/arm-softmmu/qemu-system-arm`.
 
+### Optimized release build
+
+Keep the development build above and configure an independent release tree so
+the two binaries can be compared from the same source revision:
+
+```bash
+mkdir -p build-release && cd build-release
+
+../configure \
+    --enable-sdl \
+    --disable-cocoa \
+    --target-list=arm-softmmu \
+    --disable-capstone \
+    --disable-pie \
+    --disable-slirp \
+    --disable-debug-info \
+    --enable-lto \
+    --extra-cflags="-I/opt/homebrew/opt/openssl@3/include" \
+    --extra-ldflags="-L/opt/homebrew/opt/openssl@3/lib -lcrypto" \
+    --with-git-submodules=validate
+
+/usr/bin/python3 -B ../meson/meson.py configure \
+    -Doptimization=3 \
+    -Db_ndebug=false \
+    .
+
+ninja qemu-system-arm
+```
+
+This produces an `-O3`, LTO-enabled binary without debug information at
+`build-release/qemu-system-arm`. Assertions intentionally remain enabled:
+this QEMU 6.2 tree rejects `NDEBUG` in `include/qemu/osdep.h`, so setting
+`b_ndebug=true` is not a supported release configuration here.
+
+On the 2026-07-17 M2 benchmark at revision `81d477c5d4`, the release binary
+was 13 MB versus 15 MB for the development binary. Three alternating boots
+used the same ARM1176 model, quiet serial capture, no display backend, and a
+fresh copy-on-write clone of the same NAND for every run. Median time to
+SpringBoard improved from 16.194 s to 11.623 s (28.2%); mean time improved
+from 14.354 s to 12.908 s (10.1%). The run-to-run spread was large, so use the
+mean as the conservative expectation and repeat the benchmark when comparing
+machines or further compiler changes. This boot test excludes SDL rendering;
+frame-presentation performance must be measured separately.
+
 ### Prepare firmware
 
 ```bash
