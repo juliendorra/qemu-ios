@@ -3182,3 +3182,102 @@ re-enabled Z2, loaded built-in calibration, and downloaded the 49,128-byte
 firmware without a panic or data abort. This closes the bounded allocation
 cleanup item. The next work is measurement of sleep-entry stalls, touch report
 cadence, and timer/clock ratios before changing guest-visible timing.
+
+## Phase 18: Model the Merlot panel sleep boundary (2026-07-17)
+
+The remaining status-bar flash during sleep was not caused by a slow PMU
+power-off or by the retained-reset code. It was a missing state transition in
+the SPI LCD-panel peripheral.
+
+### Measurement path and traps
+
+A macOS sample taken during the slow transition showed the main QEMU thread
+almost entirely blocked in `select`, while the TCG vCPU spent nearly every
+sample in one guest timer-reading loop. This rules out SDL redraw and host
+main-thread saturation as the direct cause. It also does not prove that the
+S5L8900 timer runs at the wrong rate: git history traced the counter's `/ 2`
+to upstream commit `0b62d22a3c` (`Fixed kernel timer`), whose explicit purpose
+was to expose the kernel's half-clock timer. Removing it would make all guest
+time run twice as fast and was rejected.
+
+Three timing attempts produced useful harness corrections:
+
+1. A fixed 25-second button press landed during boot and was queued as a
+   shutdown-transition wake. It did not measure normal Power sleep.
+2. SpringBoard's serial `Activated` message preceded the visible OS CLCD
+   buffer by up to ten seconds on the page-file NAND. Serial readiness is not
+   display readiness.
+3. HMP's default synthetic key press lasted only about 11 ms. With an explicit
+   200 ms hold, the guest followed the same prompt Power path seen with a
+   physical SDL key.
+
+The final harness waited until CLCD had scanned a bright OS framebuffer for
+two seconds, held Power for 200 ms, sampled the active framebuffer through
+QMP, and timestamped guest driver and PMU messages. The main content became
+black after 1.013 seconds, but status-bar pixels remained in the active RAM
+buffer until terminal shutdown. `OOCSHDWN` arrived 21.272 seconds after the
+button. That long tail is guest-owned driver shutdown, not the time the
+physical display should remain visible.
+
+An opt-in, temporary trace of SPI1 then captured the decisive sequence:
+
+```text
++0.000 s  Power press
++0.417 s  Merlot register writes
++0.510 s  SPI command 0x10
++21.272 s OOCSHDWN
+```
+
+`0x10` is the MIPI DCS **Sleep In** command. The historical panel stub
+recognized only the ID/status reads `0x95` and `0xDA`-`0xDC`; it silently
+discarded Sleep In. QEMU therefore kept scanning RAM for another twenty
+seconds even though the guest had already told the physical panel to stop.
+That is the exact cause of the leaked status bar.
+
+### Implemented behavior
+
+SPI1 now retains its Merlot peripheral instance, and the board connects that
+peripheral to the CLCD display state. When the guest sends an unambiguous
+command-byte `0x10`, the panel becomes non-visible and invalidates the host
+surface immediately. This does not suspend QEMU, alter the framebuffer, skip
+driver shutdown, accelerate guest time, or trigger the AP reset. The PMU still
+owns the later `OOCSHDWN` power loss.
+
+Wake continues to use the existing retained lifecycle. iBoot itself sent
+another `0x10` while quiescing the display, `System Wake` followed, and only
+the retained kernel's OS CLCD setup made the panel visible again. A full
+manual cycle measured:
+
+| Milestone | Host time relative to Power |
+|---|---:|
+| Merlot Sleep In / completely black output | 0.596 s |
+| PMU `OOCSHDWN` | 21.065 s |
+| Home wake requested (one second later) | 22.104 s |
+| Retained `System Wake` | 33.659 s |
+| Kernel OS scanout visible | 34.338 s |
+| Z2 49,128-byte firmware reload complete | 34.442 s |
+
+An untouched timer-sleep run used the identical boundary: Merlot Sleep In at
+73.370 seconds, then OOCSHDWN 20.500 seconds later. Thus manual and timed
+sleep now go fully black at the guest's panel command while retaining their
+shared, guest-owned PMU shutdown path.
+
+The temporary byte-by-byte panel trace was removed after identifying the
+command. The normal build keeps only one state-change message, avoiding a new
+high-volume diagnostic path.
+
+### Next performance work
+
+This result narrows the remaining performance plan:
+
+1. Do not optimize away the roughly twenty-second post-panel shutdown tail;
+   it is no longer visible and is part of the OS power sequence.
+2. Measure and then raise the hard-coded 10 Hz multitouch motion cadence,
+   correcting the Y-delta calculation in the same isolated change.
+3. Replace synchronous per-page NAND filesystem access with a packed,
+   read-only base plus a small writable overlay. Cold-boot tests varied from
+   roughly twelve seconds to more than a minute depending on page-directory
+   state, making NAND the strongest remaining whole-machine latency source.
+4. Revisit timer and clock ratios only with guest-time acceptance tests. The
+   existing half-clock counter has upstream rationale and must not be used as
+   a global speed knob.

@@ -1,8 +1,20 @@
 #include "hw/arm/ipod_touch_lcd_panel.h"
+#include "hw/arm/ipod_touch_lcd.h"
 
 static uint32_t ipod_touch_lcd_panel_transfer(SSIPeripheral *dev, uint32_t value)
 {
     IPodTouchLCDPanelState *s = IPOD_TOUCH_LCD_PANEL(dev);
+
+    /* MIPI DCS 0x10 is Sleep In. The guest sends it from
+     * AppleMerlotLCD::_lcdEnable(false), well before the PMU finally removes
+     * application-processor power. RAM may still contain status-bar pixels,
+     * but a sleeping physical panel no longer scans them out. */
+    if (!s->cur_cmd && value == 0x10 && s->lcd) {
+        s->lcd->panel_off = true;
+        s->lcd->invalidate = 1;
+        fprintf(stderr, "[LCD] Merlot panel entered sleep\n");
+        return 0;
+    }
 
     if(!s->cur_cmd && (value == 0x95 || value == 0xDA || value == 0xDB || value == 0xDC)) {
         // this is a command -> set it

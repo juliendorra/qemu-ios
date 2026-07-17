@@ -12,6 +12,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchLCDPanelState, IPOD_TOUCH_LCD_PANEL)
 typedef struct IPodTouchLCDPanelState {
     SSIPeripheral ssidev;
     uint32_t cur_cmd;
+    struct IPodTouchLCDState *lcd;
 } IPodTouchLCDPanelState;
 
 #endif

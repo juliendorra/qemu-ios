@@ -280,8 +280,12 @@ static void s5l8900_spi_realize(DeviceState *dev, struct Error **errp)
         case 0:
             break;
         case 1:
-            ssi_create_peripheral(s->spi, TYPE_IPOD_TOUCH_LCD_PANEL);
+        {
+            DeviceState *dev = ssi_create_peripheral(s->spi,
+                                                     TYPE_IPOD_TOUCH_LCD_PANEL);
+            s->panel = IPOD_TOUCH_LCD_PANEL(dev);
             break;
+        }
         case 2:
         {
             DeviceState *dev = ssi_create_peripheral(s->spi, TYPE_IPOD_TOUCH_MULTITOUCH);
