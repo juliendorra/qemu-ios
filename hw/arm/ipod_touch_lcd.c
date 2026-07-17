@@ -69,6 +69,7 @@ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
 static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
+    uint32_t old_framebuffer_base = s->w1_framebuffer_base;
     //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, (uint32_t)val, addr);
 
     switch(addr) {
@@ -119,6 +120,9 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             break;
         case 0x60:
             s->w1_framebuffer_base = val;
+            if (s->w1_framebuffer_base != old_framebuffer_base) {
+                s->invalidate = 1;
+            }
             break;
         case 0x64:
             s->w1_display_resolution_info = val;
@@ -225,10 +229,13 @@ static void lcd_refresh(void *opaque)
         return;
 
     if (lcd->panel_off) {
-        memset(surface_data(surface), 0,
-               surface_stride(surface) * surface_height(surface));
-        dpy_gfx_update(lcd->con, 0, 0,
-                       surface_width(surface), surface_height(surface));
+        if (lcd->invalidate) {
+            memset(surface_data(surface), 0,
+                   surface_stride(surface) * surface_height(surface));
+            dpy_gfx_update(lcd->con, 0, 0,
+                           surface_width(surface), surface_height(surface));
+            lcd->invalidate = 0;
+        }
         return;
     }
 
@@ -239,8 +246,6 @@ static void lcd_refresh(void *opaque)
     first = last = 0;
     width = 320;
     height = 480;
-    lcd->invalidate = 1;
-
     src_width =  4 * width;
     linesize = surface_stride(surface);
 
@@ -471,6 +476,7 @@ static void s5l8900_lcd_realize(DeviceState *dev, Error **errp)
     s->snapshot_visible_frames = 0;
     s->retained_scanout_base = 0;
     s->retained_scanout_valid = false;
+    s->invalidate = 1;
 
     // add mouse handler
     qemu_add_mouse_event_handler(ipod_touch_lcd_mouse_event, s, 1, "iPod Touch Touchscreen");

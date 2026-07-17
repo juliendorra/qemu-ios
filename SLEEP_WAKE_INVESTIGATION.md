@@ -2384,14 +2384,56 @@ plugin state, rather than PMU, IRQ routing, SPI transport, or frame checksum.
 Foreground-app survival is not yet accepted, and performance work remains
 blocked on that result.
 
+## Phase 13: Manual Wake Retest and Display-Sequencing Follow-up
+
+A manual retest of the packaged `6d0f0241fc` build materially changes the
+acceptance boundary from Phase 12. Slide to unlock works nearly every time
+after the resumed lock screen has had enough host time to become responsive.
+Post-wake touch is therefore no longer considered the active blocker. It stays
+on the later reliability checklist because the long delay can still produce
+false negatives and the kernel/user queue boundary has not yet been observed
+end to end.
+
+The retest exposed three display/power-sequencing issues to investigate after
+the first performance pass:
+
+1. Manual Power sleep can leave a status-bar-only frame visible for several
+   host seconds before the panel becomes uniformly black. Sleeping directly
+   from the lock screen goes black immediately. The leading hypothesis is a
+   real guest fade/compositor interval stretched by slow emulation, not the old
+   post-`OOCSHDWN` scanout leak; a timestamped trace must prove whether the bar
+   disappears before or only after the PMU shutdown write.
+2. Power or Home wake displays iBoot's empty-battery artwork for a noticeable
+   interval. The PCF50633 model currently synthesizes only a small subset of
+   charger and ADC status, including conditional USB presence during retained
+   wake. Trace every battery/charger register read and the selected iBoot
+   framebuffer to determine whether iBoot deliberately chooses the artwork or
+   a stale scanout buffer merely exposes it.
+3. Wake can briefly show SpringBoard before the lock screen. Trace CLCD base,
+   render, panel-power, and retained-scanout restoration at every transition.
+   Restore scanout only at the hardware-equivalent type-4/LCD-enable boundary
+   once the correct foreground-versus-lock-screen ownership is known.
+
+Timed sleep often appears to return to slide to unlock immediately, while the
+slider itself remains slow to become active. This observation needs serial and
+PMU timestamps after the speed pass to distinguish lock-only behavior, a
+queued wake, and a complete `OOCSHDWN`/type-4 cycle.
+
+Display-sequencing acceptance is: no empty-battery artwork on a valid retained
+wake, no stale SpringBoard flash, uniform black after `OOCSHDWN`, and the first
+visible lock-screen frame accepting touch without an unexplained delay.
+
 ## Performance Optimization Plan
 
 The two visible performance problems have different causes and should be
 measured separately:
 
 - Display refresh is explicitly capped at **10 Hz** by
-  `LCD_REFRESH_RATE_FREQUENCY` in `include/hw/arm/ipod_touch_lcd.h`. This is an
-  emulator setting, not an M2 hardware limit.
+  `LCD_REFRESH_RATE_FREQUENCY` in `include/hw/arm/ipod_touch_lcd.h`. The same
+  timer currently raises the guest CLCD interrupt, so it is not a
+  presentation-only setting and cannot safely be raised until the incomplete
+  interrupt/acknowledgement model is understood. This is still an emulator
+  limitation, not an M2 hardware limit.
 - CPU/device speed is dominated by single-vCPU TCG translation and emulated
   device polling. The current development build also enables assertions,
   diagnostic logging, and a debug-oriented configuration. One emulated CPU
@@ -2402,17 +2444,19 @@ Optimization must not hide correctness bugs. Every stage below keeps manual
 and timed sleep on the same guest-owned OOCSHDWN/type-4 path and reruns the
 sleep/wake acceptance checks.
 
-**Prerequisite zero:** do not begin priorities 1-2 until manual and timed wake
-both remain awake after real guest input, foreground scanout survives, touch
-works immediately, and repeated cycles are crash-free. A successful
-`pmu wake events: buttons` trace is necessary but not sufficient.
+**Prerequisite-zero update:** the packaged build now passes manual slide to
+unlock nearly every time once its very slow resumed UI becomes responsive.
+That is sufficient to begin priorities 1-2 because performance is itself
+obscuring wake validation. Repeat-cycle reliability, foreground ownership,
+and the Phase 13 display artifacts remain regression gates rather than reasons
+to postpone the first measured display-speed pass.
 
 ### Recommended order
 
 | Priority | Change | Why this order | Measurement / acceptance |
 |---|---|---|---|
-| 1 | Raise the LCD presentation timer from 10 Hz to 60 Hz | Removes the known artificial UI cap immediately and is independent of CPU emulation | Scrolling/animation can present up to 60 frames/s; no accelerated guest timers or input regressions |
-| 2 | Redraw only on dirty framebuffer/palette/display state | A blind 60 Hz full redraw would waste the same host core needed by TCG | Idle display consumes negligible CPU; changed regions appear on the next presentation tick; no stale frames |
+| 1 | Correct CLCD interrupt cadence/acknowledgement, then raise 10 Hz to the hardware's 59.977 Hz (**direct constant change rejected**) | Removes the artificial UI cap without creating an interrupt storm | Scrolling/animation can present up to 60 frames/s; no `unexpected CLCD interrupt`, kernel panic, accelerated guest timers, or input regression |
+| 2 | Redraw only on dirty framebuffer/display state (**implemented; cold boot and retained-wake smoke test pass**) | A blind high-rate full redraw would waste the same host core needed by TCG | Idle display avoids full-frame conversion; changed regions appear on the next presentation tick; no stale frames |
 | 3 | Use the real `arm1176` CPU model as the default performance baseline | `-cpu max` may expose a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
 | 4 | Produce a release build and remove hot-path diagnostics | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
 | 5 | Stop executing the terminal `b .` after OOCSHDWN | The sleeping CPU currently burns one host core even though real AP power is off | Near-zero QEMU CPU use while asleep; P/H still initiates the retained AP reset and type-4 handoff; RAM CRC stays stable |
@@ -2433,6 +2477,32 @@ each result:
 6. Manual and timed sleep results: black panel, stable retained-RAM checksum,
    type-4 `System Wake`, foreground application survival, and immediately
    working touch.
+
+### First optimization experiment: CLCD rate versus dirty presentation
+
+The first A/B test separated two behaviors that the original plan treated as
+one:
+
+- iBoot reports the physical panel target as `fps set to: 59.977`, confirming
+  that 10 Hz is not hardware-accurate.
+- Directly changing `LCD_REFRESH_RATE_FREQUENCY` from 10 to 60 also changes the
+  guest interrupt cadence. The first clean-NAND 60 Hz boot panicked at caller
+  `0xc012d73f` during early driver configuration. This single result is
+  provisional rather than a fully reproduced root cause, but it blocks
+  shipping the direct constant change.
+- The guest prints `unexpected CLCD interrupt: 00000001` even at 10 Hz. The
+  next rate experiment must trace render writes, IRQ raise/lower/acknowledge,
+  and the guest handler before attempting 60 Hz again.
+- Removing the unconditional `lcd->invalidate = 1` makes QEMU use RAM dirty
+  tracking instead of converting and presenting all 320x480 pixels on every
+  display callback. A 10 Hz build with this change booted through SpringBoard,
+  produced a correct complete framebuffer, reached timed `OOCSHDWN`, resumed
+  through the retained LPDDR/type-4 path, logged `System Wake`, and reloaded
+  the multitouch firmware without a kernel or host crash.
+
+The immediate safe checkpoint is therefore dirty-only redraw at the existing
+guest IRQ cadence. The next display-speed step is correcting CLCD interrupt
+semantics, not forcing another rate value.
 
 The current recommendation is therefore to keep the M2 as the development
 baseline. It should be capable of a much better result than the current build;
