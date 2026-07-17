@@ -115,11 +115,13 @@ frame-presentation performance must be measured separately.
 ### Experimental QEMU 11 forward-port build
 
 The isolated `codex/qemu-11-port` branch is based on upstream QEMU 11.0.2.
-Revision `efd9ab8b54` is the engine installed in
+Revision `f734de901e` is the engine installed in
 `/Applications/iPod Touch.app`. Its cold GUI/input, manual and timed
 guest-driven sleep, retained wake, repeated Z2 reload, and post-wake drag
-matrix passed on 2026-07-17. The complete investigation is in
-`QEMU_11_PORT.md`.
+matrix passed on 2026-07-17. The 2026-07-18 follow-up also restores the old
+fork's non-capturing SDL behavior for the iPod's absolute touchscreen, so the
+macOS cursor remains visible and free over the display. The complete
+investigation is in `QEMU_11_PORT.md`.
 
 Configure it in a separate worktree and build directory:
 

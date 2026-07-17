@@ -14,7 +14,8 @@ power-lifecycle checks below passed on 2026-07-17.
 - Initial machine/API port: `697306b42c`.
 - NAND DMA request fix: `78a43a0d56`.
 - SPI2 transmit DMA request fix: `efd9ab8b54`.
-- Installed application: QEMU 11.0.2 at clean port revision `efd9ab8b54`,
+- SDL absolute-pointer capture fix: `f734de901e`.
+- Installed application: QEMU 11.0.2 at clean port revision `f734de901e`,
   promoted only after cold input, manual sleep/wake, timed sleep/wake, and two
   consecutive retained-wake cycles passed against the packaged binary.
 
@@ -202,6 +203,26 @@ two consecutive manual sleep/wake/Z2-reload/drag cycles.
 The automated log scanner's literal `panic` result is a known false positive
 from the guest text `Panic Fail Count: 0`; the runs contained no kernel panic,
 data abort, assertion failure, or QEMU crash.
+
+## Milestone 3: preserve the visible host cursor
+
+The first promoted QEMU 11 app automatically captured and hid the macOS cursor
+when it entered the iPod display. This made normal mouse-driven touch input
+appear unusable even though QMP-injected absolute input still worked.
+
+This was another omitted compatibility change rather than a multitouch-device
+failure. The QEMU 6 iPod fork had deliberately disabled SDL's automatic grab
+at the absolute-input mode change, on window entry, and when the pointer moved
+inside the display. Starting from upstream QEMU 11 silently restored all three
+calls during the forward-port.
+
+Revision `f734de901e` restores the old behavior for absolute pointing devices:
+touch coordinates continue to be forwarded without confining or hiding the
+host pointer. Relative mouse devices retain QEMU's normal click-to-grab path.
+The full cold-touch/manual-sleep/Home-wake/post-wake-drag regression passed.
+A real macOS UI automation click against both the development binary and the
+exact installed binary left the window title unchanged instead of adding
+QEMU's grab-release shortcut, confirming that capture did not engage.
 
 ## Promotion matrix
 
