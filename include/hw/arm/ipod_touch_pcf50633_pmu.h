@@ -40,6 +40,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
 #define PMU_INT2_EXTON1R 0x04   // N45 board-level wake-button latch
 
 #define PMU_MBCS1 0x4B
+#define PMU_MBCS1_USBPRES 0x01
+#define PMU_MBCS1_USBOK 0x02
 #define PMU_ADCC1 0x54
 #define PMU_ADCS1 0x55
 #define PMU_ADCS2 0x56
@@ -133,8 +135,8 @@ void pcf50633_set_onkey(Pcf50633State *s, bool pressed);
 // all use this; ONKEY signaling remains separate.
 bool pcf50633_resume_from_sleep(Pcf50633State *s);
 
-/* Record the retained-memory checksum immediately before an AP reset. */
-void ipod_touch_record_retained_crc(void);
+/* Mark the next reset as a retained wake; optionally checksum retained RAM. */
+void ipod_touch_prepare_retained_wake(void);
 
 // Re-evaluate PMU nIRQ output. Call after SYSIC clears GPIO_INTSTAT for
 // the PMU's GPIO group — if the PMU still has pending interrupts, it will

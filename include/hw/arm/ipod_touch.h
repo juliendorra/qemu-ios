@@ -171,6 +171,7 @@ typedef struct {
 	ARMCPU *cpu;
 	QEMUTimer *wake_assist_timer;
 	int wake_assist_remaining;   // number of IRQ-enable pulses left
+	bool retained_wake_pending;
 	uint32_t retained_crc_before_reset;
 	bool retained_crc_valid;
 	char bootrom_path[1024];
@@ -178,6 +179,6 @@ typedef struct {
 	char nand_path[1024];
 } IPodTouchMachineState;
 
-void ipod_touch_record_retained_crc(void);
+void ipod_touch_prepare_retained_wake(void);
 
 #endif

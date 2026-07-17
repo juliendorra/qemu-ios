@@ -37,16 +37,25 @@ static uint32_t ipod_touch_retained_crc(void)
     return crc;
 }
 
-void ipod_touch_record_retained_crc(void)
+void ipod_touch_prepare_retained_wake(void)
 {
     if (!g_ipod_touch_nms) {
         return;
     }
-    g_ipod_touch_nms->retained_crc_before_reset =
-        ipod_touch_retained_crc();
-    g_ipod_touch_nms->retained_crc_valid = true;
-    fprintf(stderr, "[WAKE] Retained LPDDR CRC32C before AP reset: 0x%08x\n",
-            g_ipod_touch_nms->retained_crc_before_reset);
+
+    g_ipod_touch_nms->retained_wake_pending = true;
+
+    /* A full 128 MiB physical-memory CRC is useful validation, but doing it
+     * twice in every wake path adds seconds of host latency. Keep it as an
+     * explicit regression-test mode instead of changing normal timing. */
+    if (g_getenv("IPOD_TOUCH_VALIDATE_RETAINED_RAM")) {
+        g_ipod_touch_nms->retained_crc_before_reset =
+            ipod_touch_retained_crc();
+        g_ipod_touch_nms->retained_crc_valid = true;
+        fprintf(stderr,
+                "[WAKE] Retained LPDDR CRC32C before AP reset: 0x%08x\n",
+                g_ipod_touch_nms->retained_crc_before_reset);
+    }
 }
 
 static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
@@ -126,7 +135,7 @@ static void ipod_touch_install_8900_ops(void)
 static void ipod_touch_cpu_reset(void *opaque)
 {
     IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE((MachineState *)opaque);
-    bool retained_wake = nms->retained_crc_valid;
+    bool retained_wake = nms->retained_wake_pending;
     ARMCPU *cpu = nms->cpu;
     CPUState *cs = CPU(cpu);
     uint8_t *iboot_data = NULL;
@@ -149,6 +158,7 @@ static void ipod_touch_cpu_reset(void *opaque)
                 "stable" : "CHANGED");
         nms->retained_crc_valid = false;
     }
+    nms->retained_wake_pending = false;
 
     /*
      * A real OOCSHDWN wake reloads iBoot after the application processor has
@@ -191,13 +201,16 @@ static void ipod_touch_cpu_reset(void *opaque)
         mt->wake_unwind_active = 0;
     }
     if (nms->lcd_state) {
-        nms->lcd_state->panel_off = false;
+        /* On a retained wake, OOCSHDWN left the physical panel rail off.
+         * iBoot reports displayEnabled=0 and must not expose its temporary
+         * battery/logo scanout. The resumed kernel turns scanout back on when
+         * it reprograms the OS framebuffer. */
+        nms->lcd_state->panel_off = retained_wake;
+        nms->lcd_state->retained_resume = retained_wake;
         nms->lcd_state->invalidate = 1;
         if (!retained_wake) {
             nms->lcd_state->fb_snapshot_valid = false;
             nms->lcd_state->snapshot_visible_frames = 0;
-            nms->lcd_state->retained_scanout_base = 0;
-            nms->lcd_state->retained_scanout_valid = false;
         }
     }
     nms->wake_assist_remaining = 0;
@@ -620,7 +633,7 @@ static void ipod_touch_key_event(void *opaque, int keycode)
             }
             fprintf(stderr, "[WAKE] %s requested retained-RAM SoC reboot\n",
                     keycode == 25 ? "Power" : "Home");
-            ipod_touch_record_retained_crc();
+            ipod_touch_prepare_retained_wake();
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             return;
         }

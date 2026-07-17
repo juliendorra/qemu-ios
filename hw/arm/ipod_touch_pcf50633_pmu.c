@@ -298,9 +298,6 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
                 * wake cause for the kernel's resume decoder. */
                 s->int2 |= s->retained_int2_wake;
                 s->retained_int2_reexposed = true;
-                if (s->lcd) {
-                    ipod_touch_lcd_resume_scanout(s->lcd);
-                }
             }
             break;
         case PMU_INT1:
@@ -374,7 +371,7 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
                 s->retained_int2_reexposed = false;
                 fprintf(stderr, "[WAKE] Completing queued retained-RAM "
                         "SoC reboot after OOCSHDWN\n");
-                ipod_touch_record_retained_crc();
+                ipod_touch_prepare_retained_wake();
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             }
 
@@ -454,9 +451,11 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
             break;
         case PMU_MBCS1:
             /* iBoot's warm path requires a valid power-on source while it
-             * verifies the retained image. Model USB presence for that brief
-             * boot phase; normal battery operation remains unchanged. */
-            res = (s->regs[PMU_RESUME_STATUS] & PMU_RESUME_WAKE) ? 1 : 0;
+             * verifies the retained image. USBPRES without USBOK describes
+             * an invalid/weak source and selects the low-battery UI. Report
+             * a coherent present-and-valid USB source during that phase. */
+            res = (s->regs[PMU_RESUME_STATUS] & PMU_RESUME_WAKE) ?
+                PMU_MBCS1_USBPRES | PMU_MBCS1_USBOK : 0;
             break;
         case PMU_ADCS1:
             /* 10-bit BATSNS result: 648 / 1023 * 6 V = 3.80 V. */
