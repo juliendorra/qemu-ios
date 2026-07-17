@@ -2483,6 +2483,190 @@ device demo:
    is required. Acceptance: the guest discovers the interface, obtains an
    address, resolves DNS, and loads a page in Safari through the host connection.
 
+## Wi-Fi Feasibility and Implementation Path
+
+### Verdict
+
+Functional Wi-Fi is feasible, but it is a substantial device-emulation task.
+The target is not cycle-accurate radio-frequency simulation. It is a behavioral
+model that presents the SDIO/full-MAC device expected by iPod OS, synthesizes
+scan and association results, and exchanges ordinary Ethernet frames with a
+QEMU host network backend.
+
+There is strong precedent, but no drop-in implementation has been identified:
+
+- The archived [iDroid S5L8900 kernel](https://github.com/iDroid-Project/iDroid-kernel)
+  is a direct hardware-reference project for this Apple generation.
+- Linux's maintained
+  [Marvell Libertas SDIO driver](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/marvell/libertas/if_sdio.c)
+  implements the SD8686-family enumeration, helper/main firmware download,
+  interrupt, command, event, and packet flows. Its
+  [host protocol definitions](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/marvell/libertas/host.h)
+  describe commands such as hardware-spec query, scan, authenticate, associate,
+  key material, power save, and the Tx/Rx packet descriptors.
+- QEMU explicitly separates a guest-visible device frontend from a host
+  backend. Its [network model](https://www.qemu.org/docs/master/system/devices/net.html)
+  already supports user-mode NAT and host network backends, and this source
+  tree's `mv88w8618_eth` device demonstrates the required `NICConf`, receive
+  callback, and `qemu_send_packet()` plumbing.
+
+The Linux driver is a protocol oracle, not guaranteed proof of Apple's exact
+driver behavior. The N45AP firmware contains `arm-io/sdio`, `wifiaddr`, AirPort,
+and Marvell strings, but the precise card revision, CIS identity, Apple firmware
+revision, and vendor extensions must be established from the running guest.
+The largest uncertainty is therefore the Apple driver/firmware contract, not
+QEMU's ability to carry IP packets.
+
+### Why a host bridge alone cannot work
+
+A QEMU network backend receives and sends Ethernet frames. iPod OS first needs
+to discover a real-looking SDIO card, load or recognize its firmware, scan for
+an access point, authenticate, associate, configure encryption, and receive
+link events. None of those operations reach a backend with the current
+`ipodtouch.sdio` stub.
+
+The host Mac's Wi-Fi adapter also cannot simply be exposed as the guest's radio.
+For a deterministic demo, QEMU should present a synthetic access point (for
+example `iPod Emulator Network`) and translate its post-association traffic to
+Ethernet. The backend can then use NAT or a host bridge. Thus the frontend makes
+iPod OS believe it has joined Wi-Fi; the backend decides where the resulting
+packets go.
+
+### Recommended implementation stages
+
+#### 0. Identify the exact guest contract
+
+Add opt-in, rate-limited tracing around the existing SDIO MMIO block and boot
+with Wi-Fi both disabled and enabled in Settings. Record register offsets,
+command arguments, response polling, transfer sizes, GPIO/interrupt routing,
+DMA addresses, power GPIOs, and reset behavior. Correlate the trace with the
+kernel's AirPort/SDIO strings and disassemble only the exercised routines.
+
+This stage should answer before implementation:
+
+- Which S5L8900 interrupt and DMA channels serve SDIO?
+- Does the Apple driver use programmed I/O, DMA, or both?
+- Which CMD5/CMD3/CMD7/CMD52/CMD53 sequence and CIS IDs does it require?
+- Is Marvell helper/main firmware uploaded by the guest, already running, or
+  embedded in the kernel image?
+- Which firmware command IDs and packet headers differ from Linux Libertas?
+
+Do not guess these values globally. Capture them behind an opt-in trace and
+remove hot-path logging from release builds once the protocol is known.
+
+#### 1. Complete the S5L8900 SDIO host controller
+
+Replace the current eight-register readiness stub with the minimum host
+controller behavior observed in stage 0:
+
+- command launch, completion, response types, timeout, and error status;
+- block size/count, data FIFO and/or guest-memory DMA;
+- interrupt status, mask, acknowledgement, and the correct SYSIC/VIC route;
+- clock, bus width, card-select, and reset/power state; and
+- AP-reset and sleep-domain behavior consistent with the retained-wake model.
+
+Keep the host controller separate from the card. This prevents Apple-specific
+MMIO behavior and Marvell card behavior from becoming one untestable state
+machine.
+
+#### 2. Enumerate a Marvell-compatible SDIO card
+
+Implement the card-side state needed by the guest:
+
+- I/O OCR and ready response (`CMD5`), RCA/select state (`CMD3`/`CMD7`);
+- direct and extended I/O (`CMD52`/`CMD53`);
+- CCCR, function-basic registers, CIS tuples, function enable/ready bits;
+- function-one block size and card interrupt assertion; and
+- stable vendor/device/revision values taken from the guest trace.
+
+The first milestone is not Internet access: it is AirPort attaching without a
+timeout and the Wi-Fi control appearing enabled in Settings.
+
+#### 3. Model firmware boot and the full-MAC mailbox
+
+Prefer a behavioral firmware model over emulating the proprietary Marvell
+embedded processor. Accept and validate the guest's helper/main download
+sequence if it uploads firmware, transition to firmware-ready state, and then
+implement only commands the Apple driver actually issues. Use Linux Libertas
+for structure and ordering, but make the guest trace authoritative.
+
+Likely initial commands include hardware specification/MAC address, radio
+control, channel/rate setup, scan, authenticate, associate, key material,
+RSSI, multicast filter, power save, and deauthenticate. Responses must preserve
+sequence numbers and generate the same command-complete/link events and SDIO
+interrupt timing expected by the guest.
+
+User-supplied Apple/Marvell firmware may be inspected or accepted at runtime,
+but it must not be added to this repository or bundled without redistribution
+rights. Executing its internal CPU is unnecessary unless the behavioral command
+surface proves too large or fundamentally incompatible.
+
+#### 4. Add a deterministic virtual access point
+
+Return one configurable synthetic BSS from scan first. Implement an open
+network before security, then add only the WEP/WPA command path observed from
+the target iPod OS version. Association establishes a link between the emulated
+full-MAC device and QEMU's Ethernet backend; actual RF modulation, beacon timing,
+and host Wi-Fi password extraction are out of scope.
+
+Transmit path:
+
+`guest Ethernet payload -> Apple/Marvell Tx wrapper -> SDIO -> QEMU NIC queue`
+
+Receive path:
+
+`QEMU NIC queue -> Marvell Rx wrapper/event -> SDIO function interrupt -> guest`
+
+#### 5. Connect the host backend
+
+Use user-mode NAT as the first backend because it is portable and does not need
+privileged host network configuration. Rebuild with libslirp enabled, add a NIC
+property/netdev link to the iPod machine, and expose an opt-in launcher setting.
+QEMU's user backend supplies DHCP and DNS, but the guest still runs its own
+normal DHCP client over the emulated Wi-Fi link.
+
+The current QEMU 6.2-derived tree has no `vmnet` backend. Upstream QEMU documents
+`vmnet-shared` and `vmnet-bridged` as available
+[since QEMU 7.1](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html).
+True macOS bridging therefore requires either a carefully isolated vmnet
+backport, a later-QEMU migration, or a separately installed TAP-style backend.
+Do that only after NAT works; it changes host integration, not SDIO correctness.
+
+#### 6. Integrate power management and regressions
+
+Wi-Fi adds another device to the power lifecycle that caused the sleep bug.
+Model radio power-off, SDIO interrupt quiescence, volatile firmware/card state,
+AP-domain reset, and the guest's resume/reload sequence. Manual and timed sleep
+must remain identical, and a disconnected backend must never block the vCPU or
+delay OOCSHDWN.
+
+### Milestones and acceptance
+
+| Milestone | Observable acceptance |
+|---|---|
+| A. Host controller | No unknown SDIO MMIO; commands complete; IRQs acknowledge without storms |
+| B. Card enumeration | Native AirPort driver attaches and Settings can power Wi-Fi on/off |
+| C. Firmware mailbox | MAC address query succeeds; no firmware-download or command timeout |
+| D. Scan | Synthetic SSID appears repeatedly with stable signal/channel metadata |
+| E. Association | Guest shows the Wi-Fi icon and remains associated |
+| F. Network transport | Guest receives DHCP, resolves DNS, and reaches a host-local HTTP test page |
+| G. Internet demo | Safari loads compatible HTTP content; legacy TLS/certificate limitations are reported separately from networking |
+| H. Power lifecycle | Wi-Fi works after cold boot and retained wake; sleep latency and RAM-retention checks do not regress |
+
+### Main risks and explicit non-goals
+
+- **Apple protocol divergence:** vendor commands or packet layouts may differ
+  from upstream Libertas. Mitigation: trace the guest and implement incrementally.
+- **Firmware/legal constraints:** binary firmware may be proprietary. Keep it
+  user-supplied and avoid depending on redistribution.
+- **Old web compatibility:** successful IP networking does not make 2007 Safari
+  understand modern TLS, certificates, JavaScript, or websites. Test a simple
+  host-local HTTP page first.
+- **Bridge complexity:** macOS bridging is a later backend choice, not a shortcut
+  to card emulation.
+- **Non-goals:** RF/baseband accuracy, host SSID passthrough, monitor mode, and
+  executing the Marvell firmware CPU are not required for the iPod OS demo.
+
 ## Performance Optimization Plan
 
 The original two visible performance problems had different causes and must
