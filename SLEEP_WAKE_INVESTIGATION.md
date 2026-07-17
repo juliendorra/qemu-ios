@@ -2928,3 +2928,97 @@ Telephony does not need to be fully emulated for a UI/demo target; a controlled
 "no service" baseband stub is a reasonable first milestone. The largest
 current blocker to an exact first-stage boot remains the matching LLB/artifact
 set, not the retained-kernel mechanism.
+
+## Phase 16: Remove wake-only display artifacts and diagnostic latency (2026-07-17)
+
+Manual testing of the optimized release exposed a repeatable retained-wake
+sequence: an empty-battery screen, a very brief old SpringBoard frame, and
+finally the correct slide-to-unlock screen. Sleep entry could also take ten or
+more host seconds. These were not three renderings of one guest state; they
+came from three different layers of the emulation.
+
+### Root causes
+
+1. During type-4 wake, the PMU returned `MBCS1=0x01`. PCF50633 bit zero means
+   `USBPRES`, while bit one means `USBOK`. Reporting present without OK told
+   iBoot that a USB source existed but was not valid. The serial trace
+   confirmed `power supply type usb host`, battery-artwork resource loading,
+   and a 3800 mV ADC result.
+2. At iBoot's `RESUME_STATUS=0x40` handoff, QEMU explicitly called
+   `ipod_touch_lcd_resume_scanout()`. That helper replaced iBoot's CLCD base
+   with the brightest pre-sleep OS triple buffer and immediately powered the
+   panel on. The brief SpringBoard image was therefore an emulator-created
+   stale frame, not SpringBoard resuming and changing its mind.
+3. The wake key synchronously computed CRC32C over all 128 MiB of LPDDR, then
+   the reset callback computed the same full CRC again. A macOS sample caught
+   `ipod_touch_cpu_reset()` in that scan. This validation code was on every
+   normal wake and materially extended wake latency.
+4. Supporting the stale-frame helper required scanning two OS framebuffers on
+   a coarse brightness grid every 60 Hz display refresh. Those repeated
+   `cpu_physical_memory_read()` calls competed with the single TCG vCPU and
+   slowed guest-driven display fade and driver shutdown.
+
+The PCF50633 bit interpretation is corroborated by the historical Linux
+driver definitions: `USBPRES=0x01` and `USBOK=0x02`. The emulator now reports
+the coherent combination during iBoot's retained verification phase rather
+than synthesizing an invalid source.
+
+### Implemented power/display behavior
+
+- OOCSHDWN still leaves the PMU-owned LCD panel rail off.
+- The retained AP reset reloads volatile boot memory but no longer turns that
+  panel rail on. iBoot's own log says `displayEnabled: 0`, so its temporary
+  `0x0fe00000` scanout remains correctly invisible.
+- QEMU no longer chooses or restores an old OS framebuffer. The panel becomes
+  visible only after the retained kernel programs one of its OS CLCD bases
+  (`0x0f400000` or `0x0f496000`). The buffer contents and lock-screen decision
+  therefore remain guest-owned.
+- A dedicated `retained_wake_pending` flag now carries reset semantics. The
+  full 128 MiB before/after CRC is available only when launching with
+  `IPOD_TOUCH_VALIDATE_RETAINED_RAM=1`; it is deliberately not part of normal
+  wake timing.
+- The continuous brightest-buffer scan was removed. The short startup
+  visibility check used to gate premature touch input remains separate.
+
+This is closer to the physical lifecycle than the prior workaround: the panel
+rail stays off across the bootloader phase and the retained kernel, not QEMU,
+selects the first visible OS framebuffer. It does not yet model the Merlot
+panel command stream in enough detail to derive rail state from the exact SPI
+sleep-out/display-on command, so recognizing the resumed kernel's CLCD base is
+still a device-level approximation.
+
+### Validation and measured effect
+
+A release build booted from the existing disposable NAND and exercised both
+manual and timed OOCSHDWN. Manual Power reached terminal OOCSHDWN within the
+next five-second observation interval, versus the earlier roughly fifteen
+seconds. Home requested the AP reset immediately without a checksum pause.
+iBoot consumed the type-4 token, the retained kernel logged `System Wake`,
+the Z2 firmware reloaded, and CLCD returned through an OS base.
+
+Two screen captures bracketed the second, timed-sleep wake:
+
+1. immediately after Home: completely black;
+2. after the retained kernel CLCD write: the complete slide-to-unlock screen.
+
+No battery artwork or old SpringBoard framebuffer was visible in either
+phase. The guest subsequently returned to timed OOCSHDWN through the same PMU
+path. Manual touchscreen dragging still requires validation in the packaged
+SDL app because HMP only exposes relative mouse motion, but no touch protocol
+or readiness gating was changed in this phase.
+
+### Paths rejected or retained only for diagnostics
+
+- Restoring the brightest retained framebuffer was removed, not retimed. It
+  caused the SpringBoard flash and overrode the guest's buffer ownership.
+- Copying a saved screenshot into all triple buffers remains a historical
+  abandoned approach; it is not used by the current AP-reset/type-4 path.
+- Turning the panel on at AP reset would merely reveal iBoot's temporary
+  battery/logo scanout again and contradict `displayEnabled: 0`.
+- Removing the retained-RAM checksum entirely would lose a useful regression
+  tool. Making it explicit keeps the strong validation while keeping normal
+  wake latency honest.
+- Returning `MBCS1=0` was not chosen because earlier type-4 experiments found
+  that iBoot needs a valid power-on source while checking the retained image.
+  The present-and-OK state corrects the inconsistent model without changing
+  that proven boot precondition.
