@@ -2455,7 +2455,7 @@ to postpone the first measured display-speed pass.
 
 | Priority | Change | Why this order | Measurement / acceptance |
 |---|---|---|---|
-| 1 | Correct CLCD interrupt cadence/acknowledgement, then raise 10 Hz to the hardware's 59.977 Hz (**interrupt semantics corrected and cold-booted at 10 Hz; 60 Hz retest pending**) | Removes the artificial UI cap without creating an interrupt storm | Scrolling/animation can present up to 60 frames/s; no `unexpected CLCD interrupt`, kernel panic, accelerated guest timers, or input regression |
+| 1 | Correct CLCD interrupt cadence/acknowledgement, then raise 10 Hz to the hardware's 59.977 Hz (**implemented at 60 Hz; boot/display/retained-wake pass, manual touch regression pending**) | Removes the artificial UI cap without creating an interrupt storm | Scrolling/animation can present up to 60 frames/s; no `unexpected CLCD interrupt`, kernel panic, accelerated guest timers, or input regression |
 | 2 | Redraw only on dirty framebuffer/display state (**implemented; cold boot and retained-wake smoke test pass**) | A blind high-rate full redraw would waste the same host core needed by TCG | Idle display avoids full-frame conversion; changed regions appear on the next presentation tick; no stale frames |
 | 3 | Use the real `arm1176` CPU model as the default performance baseline (**implemented; cold boot and release benchmark pass; `max` A/B still pending**) | `-cpu max` overrides the board default with a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
 | 4 | Produce a release build and remove hot-path diagnostics (**implemented and measured**) | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
@@ -2567,6 +2567,58 @@ then retest 60 Hz independently.
   confirms the `0x38900000` controller layout and 59.977 Hz timing setup but
   does not implement the iPod OS CLCD interrupt handler or name `0x14/0x18`;
   it was useful corroboration, not the basis for inventing register semantics.
+
+### 60 Hz validation after the interrupt fix (2026-07-17)
+
+Changing `LCD_REFRESH_RATE_FREQUENCY` from 10 to 60 was retried as its own
+step after committing the interrupt model. Unlike the earlier direct-rate
+experiment, a fresh-NAND boot passed the former early-driver panic location,
+loaded the multitouch firmware, and configured SpringBoard. The serial log
+contained neither `unexpected CLCD interrupt` nor a kernel panic. A visible
+SDL run showed the complete SpringBoard framebuffer rather than a black or
+partially scanned-out frame.
+
+The same SDL process then exercised retained sleep/wake at 60 Hz:
+
+1. A monitor-injected Power key entered `System Sleep` and reached
+   `OOCSHDWN=0x02`.
+2. Because QEMU `sendkey p` injects press and release as one short pulse, the
+   release was queued during the sleep transition and caused an immediate
+   retained wake. This is an input-injection artifact already distinct from a
+   physical/manual held button, not a reason to change the power model.
+3. The guest subsequently entered timed sleep and remained at terminal
+   OOCSHDWN with the panel completely black.
+4. An injected Home key started the retained AP reboot. LPDDR CRC32C was
+   identical before and at reset, iBoot consumed the type-4 token, the guest
+   logged `System Wake`, Z2 firmware reloaded, and the lock screen became
+   visible.
+
+The core 60 Hz gate therefore passes: boot, scanout, interrupt masking,
+terminal sleep, retained memory, Home wake, and resumed display are intact.
+
+**Still pending:** automated slide-to-unlock was not accepted as evidence.
+The resumed lock-screen pixels become visible before the slow retained
+HID/SpringBoard consumer is necessarily ready. The test drag produced no
+emulated absolute-touch callback, and the device then started its next timed
+sleep: input is deliberately blocked for several seconds during that sleep
+transition while the display fades. The attempted drag therefore landed in an
+invalid timing window and says nothing conclusive about touch at 60 Hz.
+Additionally, QEMU HMP `mouse_move` only queues relative axes and cannot drive
+this absolute touchscreen. Manual drag testing in the packaged release build,
+after waiting for resumed input to become active but before the next sleep
+transition, remains required before declaring the complete input regression
+gate closed.
+
+**Paths not taken:**
+
+- Do not weaken the CLCD mask/status model merely to make 60 Hz boot; the
+  corrected model already passes at the target cadence.
+- Do not treat the monitor Power pulse's immediate wake as a timed-sleep
+  failure; stable timed OOCSHDWN was tested separately in the same process.
+- Do not add a relative-to-absolute coordinate workaround or change sleep
+  input blocking for test automation. QMP absolute input with a readiness
+  signal, or a correctly timed manual SDL drag, is the proper follow-up;
+  production input and power semantics should not be changed for the harness.
 
 ### Release-build benchmark (2026-07-17)
 
