@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_aes.h"
+#include "qemu/log.h"
 
 static uint64_t s5l8900_aes_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -27,22 +28,28 @@ static void s5l8900_aes_write(void *opaque, hwaddr offset, uint64_t value, unsig
 
     switch(offset) {
         case AES_GO:
-            inbuf = (uint8_t *)malloc(aesop->insize);
-            cpu_physical_memory_read((aesop->inaddr - 0x80000000), inbuf, aesop->insize);
-
             switch(aesop->keytype) {
-                    case AESGID:    
-                        fprintf(stderr, "%s: No support for GID key\n", __func__);
-                        return;         
+                    case AESGID:
+                        qemu_log_mask(LOG_UNIMP,
+                                      "iPod AES: GID key is not implemented\n");
+                        return;
                     case AESUID:
                         AES_set_decrypt_key(key_uid, sizeof(key_uid) * 8, &aesop->decryptKey);
                         break;
                     case AESCustom:
                         AES_set_decrypt_key((uint8_t *)aesop->custkey, 0x20 * 8, &aesop->decryptKey);
                         break;
+                    default:
+                        qemu_log_mask(LOG_GUEST_ERROR,
+                                      "iPod AES: invalid key type %u\n",
+                                      aesop->keytype);
+                        return;
             }
 
-            buf = (uint8_t *) malloc(aesop->insize);
+            inbuf = (uint8_t *)malloc(aesop->insize);
+            buf = (uint8_t *)malloc(aesop->insize);
+            cpu_physical_memory_read((aesop->inaddr - 0x80000000), inbuf,
+                                     aesop->insize);
 
             AES_cbc_encrypt(inbuf, buf, aesop->insize, &aesop->decryptKey, (uint8_t *)aesop->ivec, aesop->operation);
 

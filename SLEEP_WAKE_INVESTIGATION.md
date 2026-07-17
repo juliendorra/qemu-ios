@@ -3149,3 +3149,36 @@ The NAND backend was also left intact: attempting an additional disposable
 page-directory copy exhausted available filesystem resources, reinforcing the
 packed-base/overlay priority, but storage semantics must be redesigned in a
 separate commit rather than mixed into wake cleanup.
+
+### Second cleanup tranche: ADM and AES ownership
+
+Git blame traced the ADM allocations to the original 2022 NAND bring-up
+(`7ebda9567e`, `19014a5ea2`, `55b2ddb796`, `d9380bddc9`, and
+`0b241ee0b6`). They were temporary transfer buffers, not required persistent
+device state. Every ADM startup or NAND command leaked several allocations;
+multi-page reads additionally leaked one 12-byte buffer per page and copied
+eleven uninitialized bytes from each buffer into guest completion records.
+
+The ADM path now uses bounded stack scalars and arrays, named native/big-endian
+read helpers, and one initialized completion record. It retains the byte order
+established by the working driver path, bounds guest page counts against the
+512-entry NAND queues, and removes all per-command host allocations. This does
+not change the page-per-file NAND backend or its persistence semantics.
+
+The AES GID-not-implemented path previously allocated its full input buffer and
+returned without freeing it. Key type validation now occurs before allocation,
+including rejection of unknown key selectors. Supported UID/custom operations
+retain their existing buffer lifecycle and crypto behavior. Migrating from the
+deprecated low-level OpenSSL AES API remains separate modernization work.
+
+An optimized release build completed with only the known OpenSSL 3 deprecation
+warnings. One headless run exercised two retained cycles:
+
+1. timed sleep followed by Power wake; and
+2. manual Power sleep followed by Home wake.
+
+Both cycles logged `System Wake`, restored the retained kernel's CLCD scanout,
+re-enabled Z2, loaded built-in calibration, and downloaded the 49,128-byte
+firmware without a panic or data abort. This closes the bounded allocation
+cleanup item. The next work is measurement of sleep-entry stalls, touch report
+cadence, and timer/clock ratios before changing guest-visible timing.
