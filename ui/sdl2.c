@@ -284,25 +284,12 @@ static void sdl_grab_end(struct sdl2_console *scon)
     sdl_update_caption(scon);
 }
 
-static void absolute_mouse_grab(struct sdl2_console *scon)
-{
-    int mouse_x, mouse_y;
-    int scr_w, scr_h;
-    SDL_GetMouseState(&mouse_x, &mouse_y);
-    SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
-    if (mouse_x > 0 && mouse_x < scr_w - 1 &&
-        mouse_y > 0 && mouse_y < scr_h - 1) {
-        sdl_grab_start(scon);
-    }
-}
-
 static void sdl_mouse_mode_change(Notifier *notify, void *data)
 {
     if (qemu_input_is_absolute(sdl2_console[0].dcl.con)) {
         if (!absolute_enabled) {
             absolute_enabled = 1;
             SDL_SetRelativeMouseMode(SDL_FALSE);
-            absolute_mouse_grab(&sdl2_console[0]);
         }
     } else if (absolute_enabled) {
         if (!gui_fullscreen) {
@@ -514,11 +501,6 @@ static void handle_mousemotion(SDL_Event *ev)
                 ev->motion.x == max_x || ev->motion.y == max_y)) {
             sdl_grab_end(scon);
         }
-        if (!gui_grab &&
-            (ev->motion.x > 0 && ev->motion.x < max_x &&
-             ev->motion.y > 0 && ev->motion.y < max_y)) {
-            sdl_grab_start(scon);
-        }
     }
     surf_w = surface_width(scon->surface);
     surf_h = surface_height(scon->surface);
@@ -616,9 +598,6 @@ static void handle_windowevent(SDL_Event *ev)
     case SDL_WINDOWEVENT_FOCUS_GAINED:
         /* fall through */
     case SDL_WINDOWEVENT_ENTER:
-        if (!gui_grab && (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
-            absolute_mouse_grab(scon);
-        }
         /* If a new console window opened using a hotkey receives the
          * focus, SDL sends another KEYDOWN event to the new window,
          * closing the console window immediately after.
