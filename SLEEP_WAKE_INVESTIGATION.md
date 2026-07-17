@@ -3428,3 +3428,64 @@ convert early post-wake HID traffic into activity assertions. The next
 performance work should profile awake MMIO/polling hot spots rather than using
 timer ratios as a global speed control; the next sleep investigation should
 trace that retained inactivity deadline and the first acknowledged Z2 frame.
+
+## Phase 22: Gate retained input on the real Z2 reload boundary (2026-07-17)
+
+The apparent immediate re-sleep initially suggested that SpringBoard retained
+an expired inactivity deadline or failed to turn consumed touch frames into a
+power assertion. That interpretation was based on a run contaminated by manual
+interaction. A second attempt also produced no evidence because its harness
+watched guest serial while the required `[LCD]` marker was on QEMU's stderr;
+it never sent Power and eventually observed an ordinary timed sleep. Neither
+run is used as acceptance evidence.
+
+A corrected marker-driven harness combined host and guest logs and waited for
+each hardware boundary before acting. On the unmodified readiness behavior it
+recorded:
+
+- cold input ready at 10.140 seconds;
+- OOCSHDWN at 30.807 seconds;
+- retained `System Wake` at 42.326 seconds;
+- Z2's 49,128-byte firmware reload at 43.118 seconds; and
+- guest consumption of touch start/end at 44.331/44.357 seconds.
+
+The guest stayed awake for the following 25 seconds. This disproved the claim
+that a correctly timed, consumed touch inherently fails to reset inactivity.
+The trace did reveal a real emulator error: `input_ready` survived the
+application-processor reset, so QEMU accepted and queued host touches during
+iBoot and before the reset Z2 controller or retained driver could consume
+them. Input arriving after OOCSHDWN similarly accumulated in a powered-off
+controller queue. Host enqueue logs from those intervals were therefore false
+evidence of guest HID activity.
+
+The readiness boundary now follows emulated hardware state:
+
+1. Merlot's guest-issued MIPI DCS Sleep In immediately closes host touch input.
+2. Every SoC reset clears display input readiness and Z2 firmware-loaded state.
+3. The large HBPP firmware transaction arms readiness, and the following small
+   calibration transaction completes it. Requiring the sequence prevents an
+   intermediate large-packet boundary from opening input prematurely.
+4. Retained input opens only when the kernel has reclaimed one of its known OS
+   scanout buffers, the panel is powered, and the Z2 firmware is loaded.
+5. Cold boot keeps the existing stable-visible-frame gate.
+
+The first implementation treated completion of the large transaction alone as
+ready. A validation run showed that marker before the guest's firmware message;
+the harness waited in the opposite order, missed the marker, and allowed the
+guest to sleep before injecting touch. That exposed a genuinely premature
+boundary rather than just a harness ordering problem, so the large-then-small
+sequence above replaced it.
+
+In the final release regression, `System Wake` occurred at 87.627 seconds, the
+firmware log at 88.469, and retained input became ready at 88.988. A controlled
+60 Hz drag was accepted at 89.949 and the device remained awake for 25 seconds.
+The unusually slow absolute cold boot in that run reflected host load; the
+wake-relative sequence remained about 2.3 seconds and no guest clock changed.
+An earlier paired no-touch control also remained awake for 25 seconds,
+confirming that the contaminated immediate re-sleep must not be “fixed” by
+altering guest timers or injecting a synthetic activity assertion.
+
+Manual packaged testing remains important for a human beginning to drag during
+the wake animation. Movement events should be ignored while the controller is
+off and begin naturally once scanout and firmware are both ready; no frame is
+fabricated and no guest power-management deadline is modified.

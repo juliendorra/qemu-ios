@@ -60,6 +60,7 @@ typedef struct IPodTouchLCDState
 
     bool input_ready;          // stable OS scanout has enabled touch input
     int input_ready_frames;
+    bool retained_input_wait;  // wait for OS scanout and Z2 firmware reload
     bool panel_off;            // PMU-powered LCD panel state
     bool retained_resume;      // keep iBoot scanout dark until kernel CLCD setup
 } IPodTouchLCDState;

@@ -11,6 +11,8 @@ static uint32_t ipod_touch_lcd_panel_transfer(SSIPeripheral *dev, uint32_t value
      * but a sleeping physical panel no longer scans them out. */
     if (!s->cur_cmd && value == 0x10 && s->lcd) {
         s->lcd->panel_off = true;
+        s->lcd->input_ready = false;
+        s->lcd->input_ready_frames = 0;
         s->lcd->invalidate = 1;
         fprintf(stderr, "[LCD] Merlot panel entered sleep\n");
         return 0;

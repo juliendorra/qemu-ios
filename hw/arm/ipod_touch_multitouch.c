@@ -328,6 +328,16 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
     //printf("<MULTITOUCH> Got value: 0x%02x, returning 0x%02x (index: %d, buffer length: %d)\n", value, ret_val, s->buf_ind, s->buf_size);
 
     if(s->buf_ind == s->buf_size) {
+        /* The driver sends the large firmware HBPP transaction followed by a
+         * small calibration transaction. The reset Z2 is ready only after
+         * that complete sequence. */
+        if (s->cur_cmd == MT_CMD_HBPP_DATA_PACKET) {
+            if (s->buf_size > 0x1000) {
+                s->firmware_transfer_seen = true;
+            } else if (s->firmware_transfer_seen) {
+                s->firmware_loaded = true;
+            }
+        }
         //printf("Finished command 0x%02x\n", s->cur_cmd);
 
         if(s->cur_cmd == 0x1E) {
@@ -586,6 +596,8 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
     s->buf_ind = 0;
     s->in_buffer_ind = 0;
     s->frame_data_pending = false;
+    s->firmware_transfer_seen = false;
+    s->firmware_loaded = false;
     memset(s->hbpp_atn_ack_response, 0,
            sizeof(s->hbpp_atn_ack_response));
     s->frame_counter = 0;

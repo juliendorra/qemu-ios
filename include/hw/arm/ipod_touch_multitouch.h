@@ -150,6 +150,8 @@ typedef struct IPodTouchMultitouchState {
     uint32_t buf_ind;
     uint32_t in_buffer_ind;
     bool frame_data_pending;
+    bool firmware_transfer_seen;
+    bool firmware_loaded;
     uint8_t hbpp_atn_ack_response[2];
     MTFrame *next_frame;
     MTFrame *deferred_frame;

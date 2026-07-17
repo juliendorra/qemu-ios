@@ -198,11 +198,10 @@ static void ipod_touch_cpu_reset(void *opaque)
          * it reprograms the OS framebuffer. */
         nms->lcd_state->panel_off = retained_wake;
         nms->lcd_state->retained_resume = retained_wake;
+        nms->lcd_state->retained_input_wait = retained_wake;
         nms->lcd_state->invalidate = 1;
-        if (!retained_wake) {
-            nms->lcd_state->input_ready = false;
-            nms->lcd_state->input_ready_frames = 0;
-        }
+        nms->lcd_state->input_ready = false;
+        nms->lcd_state->input_ready_frames = 0;
     }
     cpu_reset(cs);
 

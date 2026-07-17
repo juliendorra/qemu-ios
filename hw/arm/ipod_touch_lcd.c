@@ -275,6 +275,21 @@ static void lcd_refresh(void *opaque)
         };
         int best_visible_count = 0;
 
+        if (lcd->retained_input_wait && lcd->mt->firmware_loaded &&
+            !lcd->panel_off &&
+            (lcd->w1_framebuffer_base == 0x0f400000 ||
+             lcd->w1_framebuffer_base == 0x0f496000)) {
+            lcd->input_ready = true;
+            lcd->retained_input_wait = false;
+            fprintf(stderr,
+                    "[LCD] Retained touch input ready after Z2 reload\n");
+            return;
+        }
+
+        if (lcd->retained_input_wait) {
+            return;
+        }
+
         for (int b = 0; b < ARRAY_SIZE(known_bases); b++) {
             uint32_t base = known_bases[b];
             int visible_count = lcd_visible_sample_count(base);
@@ -388,6 +403,7 @@ static void s5l8900_lcd_realize(DeviceState *dev, Error **errp)
 
     s->input_ready = false;
     s->input_ready_frames = 0;
+    s->retained_input_wait = false;
     s->retained_resume = false;
     s->invalidate = 1;
 
