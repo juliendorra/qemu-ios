@@ -2423,17 +2423,76 @@ Display-sequencing acceptance is: no empty-battery artwork on a valid retained
 wake, no stale SpringBoard flash, uniform black after `OOCSHDWN`, and the first
 visible lock-screen frame accepting touch without an unexplained delay.
 
+### Optimized release manual validation (2026-07-17)
+
+Manual testing of the installed release build at `3797660aff` confirms that
+the corrected CLCD interrupt model, 60 Hz cadence, dirty-only redraw, ARM1176
+default, quiet launcher, and O3/LTO build produce a visibly much more responsive
+device. This closes the subjective responsiveness gate for the first display
+optimization pass. It does **not** close the sleep/wake work.
+
+The same build still reproduces the following retained-wake sequence:
+
+1. iBoot's empty-battery image is visible for a noticeable interval;
+2. a SpringBoard frame flashes briefly; and
+3. the slide-to-unlock screen finally replaces it.
+
+Treat this exact ordering as one unresolved display/power-sequencing symptom,
+not three independent UI bugs. The empty-battery frame may be an iBoot decision
+caused by incomplete PCF50633 charger/ADC state, while the SpringBoard flash may
+be a retained or newly selected CLCD buffer; neither explanation is proven yet.
+Trace PMU reads, framebuffer writes, CLCD base selection, and panel enable on a
+single timestamped wake before changing either model.
+
+Sleep and wake are also still far too slow. Sleep entry can take ten host
+seconds or more before the panel becomes black, and the resumed lock screen can
+remain visible but unresponsive for a long interval. Measure these boundaries
+separately:
+
+- Power event to the guest's first shutdown/fade action;
+- shutdown start to `OOCSHDWN=0x02` and panel black;
+- wake event to iBoot's type-4 decision and `System Wake`;
+- `System Wake` to Z2 firmware/input readiness; and
+- first complete lock-screen frame to the first accepted touch.
+
+The leading hypothesis is that normal guest shutdown, iBoot, and resumed-driver
+work are being stretched by slow emulation. A host-side early blank, skipped
+fade, or delayed synthetic input would hide the latency without fixing it and
+must not be used as the solution.
+
+### Platform integration backlog
+
+These tasks are separate from sleep/wake accuracy but are required for a useful
+device demo:
+
+1. **Synchronize guest time with the host.** The PCF50633 RTC read path already
+   synthesizes BCD fields from `localtime()`, yet the displayed time does not
+   match the host. Trace `RTCSC` through `RTCYR` during cold boot and retained
+   wake, then distinguish an RTC-value bug from guest timezone configuration,
+   cached wall-clock state, or incomplete RTC write/alarm behavior. Acceptance:
+   host and guest date/time agree after cold boot and retained wake without a
+   manual correction, while monotonic guest timers remain unaffected.
+2. **Provide host-backed Wi-Fi networking.** The current S5L8900 SDIO device is
+   only a register stub and is not connected to a QEMU network backend; the
+   documented development and release configurations also disable libslirp.
+   A generic emulated Ethernet NIC will not help unless this iPod OS build has
+   its driver. Implement enough of the expected SDIO Wi-Fi function and firmware
+   protocol to satisfy the native guest driver, then connect packet transport to
+   a QEMU net backend. Start with user-mode/NAT networking for a portable proof,
+   followed by an optional macOS `vmnet`/TAP bridge when LAN-level host bridging
+   is required. Acceptance: the guest discovers the interface, obtains an
+   address, resolves DNS, and loads a page in Safari through the host connection.
+
 ## Performance Optimization Plan
 
-The two visible performance problems have different causes and should be
-measured separately:
+The original two visible performance problems had different causes and must
+continue to be measured separately:
 
-- Display refresh is explicitly capped at **10 Hz** by
-  `LCD_REFRESH_RATE_FREQUENCY` in `include/hw/arm/ipod_touch_lcd.h`. The same
-  timer currently raises the guest CLCD interrupt, so it is not a
-  presentation-only setting and cannot safely be raised until the incomplete
-  interrupt/acknowledgement model is understood. This is still an emulator
-  limitation, not an M2 hardware limit.
+- Display refresh was explicitly capped at **10 Hz** by
+  `LCD_REFRESH_RATE_FREQUENCY` in `include/hw/arm/ipod_touch_lcd.h`. The CLCD
+  interrupt mask/status model has now been corrected and the cadence raised to
+  60 Hz; manual release testing confirms a large visible responsiveness gain.
+  This was an emulator limitation, not an M2 hardware limit.
 - CPU/device speed is dominated by single-vCPU TCG translation and emulated
   device polling. The current development build also enables assertions,
   diagnostic logging, and a debug-oriented configuration. One emulated CPU
