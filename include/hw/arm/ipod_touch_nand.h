@@ -60,6 +60,11 @@ typedef struct ITNandState {
     bool is_writing;
     QemuMutex lock;
     char *nand_path;
+    bool pack_checked;
+    GMappedFile *pack_file;
+    const uint8_t *pack_entries;
+    const uint8_t *pack_data;
+    uint32_t pack_entry_count;
 } ITNandState;
 
 void nand_set_buffered_page(ITNandState *s, uint32_t page);

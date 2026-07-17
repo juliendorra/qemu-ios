@@ -121,6 +121,20 @@ unzip nand_n45ap.zip        # creates a nand/ directory with bank0–bank7
 cd ../..
 ```
 
+For substantially faster and more repeatable cold boots, build the optional
+read-only base pack after extracting the NAND:
+
+```bash
+python3 -B scripts/pack-ipod-nand.py build/ipod_files/nand
+```
+
+This creates `build/ipod_files/nand/nand.pack` without modifying the source
+pages. The emulator uses the pack when present and falls back to the legacy
+page files when it is absent. Do not merge or promote historical
+`*_new.page` files into the base: they are incomplete write captures, not a
+replayable NAND overlay. Writable persistence requires a complete data,
+spare, program, and erase model and remains planned work.
+
 ### Run
 
 From the `build/` directory:

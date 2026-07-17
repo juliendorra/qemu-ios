@@ -71,6 +71,16 @@ source compatibility: the packed immutable base plus copy-on-write overlay
 below is also the intended clean semantic boundary for a future native
 backend.
 
+The native implementation now has the first half of that boundary: an optional
+indexed, read-only `nand.pack` maps canonical base pages without per-page file
+opens, while retaining the legacy directory fallback. A three-pair M2 cold-boot
+benchmark reduced median time to SpringBoard from 9.292 to 5.687 seconds. The
+writable half is intentionally not implemented yet. Testing proved that the
+old `*_new.page` files are incomplete program captures: giving them read
+precedence makes iBoot see an HFS signature of zero and enter recovery. Browser
+and native overlays must therefore share a newly specified program/erase and
+spare-metadata contract rather than importing those files.
+
 - Approximately 133,000 individual `.page` files are used.
 - Each page contains 2,048 data bytes and 64 spare bytes.
 - The unpacked tree consumes roughly 521 MiB because of per-file allocation.

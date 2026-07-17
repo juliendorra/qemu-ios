@@ -3350,3 +3350,81 @@ Cupertino timezone displayed 6:50 AM, exactly UTC minus seven hours. Under the
 old local-time feed it would have displayed 8:50 AM. A Paris-configured guest
 should correspondingly display 15:50 rather than 17:50; final confirmation is
 left to the installed app because timezone preferences live in its NAND.
+
+## Phase 21: Pack the immutable NAND base (2026-07-17)
+
+The remaining cold-boot storage path opened and closed one file for every NAND
+page cache miss. The installed image contains 132,894 base pages spread over
+eight directories. On APFS they occupy approximately 523 MiB despite holding
+about 268 MiB of page and spare payload. Metadata lookup, `stat`, `fopen`, and
+`fclose` therefore competed with ARM translation on QEMU's main thread and made
+otherwise identical boots unusually variable.
+
+The native backend now optionally recognizes `nand.pack`. Its small sorted
+index maps `(page, bank)` to an immutable 2,112-byte page record, and QEMU maps
+the pack read-only. A binary search plus two memory copies replaces the
+per-page filesystem operation. If the pack is absent or does not contain a
+requested page, the original directory backend remains available. The
+converter writes a temporary file, flushes it, and atomically installs the
+finished pack; it never changes or deletes the source page tree.
+
+### Rejected shortcut: treating `_new.page` as a valid overlay
+
+The page tree also contained 953 `_new.page` files. Git history shows that the
+2022 backend added them as outputs from the main-data write path, but no read
+path or complete copy-on-write contract was ever added. A tempting first fix
+was to read `_new.page` before the matching base page and write replacements
+atomically. This compiled, but a disposable-clone boot initialized the NAND and
+FTL before failing to mount root: iBoot read an HFS signature of `0x0000` and
+entered recovery.
+
+That result is not evidence of corrupt source NAND. The files capture only the
+currently buffered 2,048-byte program payload plus whatever 64-byte spare data
+happened to have been loaded. The model does not persist a complete NAND
+program/erase transaction, updated spare/FTL metadata, or block lifecycle.
+Consequently the historical files do not form a self-consistent image across
+relaunch. Overlay precedence was reverted before packaging. The current pack
+deliberately includes only canonical `N.page` files and preserves the existing
+runtime behavior of `_new.page` as incomplete diagnostic output.
+
+A real writable overlay remains feasible, but it must begin by modeling the
+guest's data and spare transfers, program/erase commands, bad-block rules, and
+read-after-program behavior. Only then can a journal or copy-on-write pack be
+replayed safely. Simply renaming the existing captures is an explicitly closed
+path.
+
+### Controlled cold-boot benchmark
+
+Three alternating pairs used the same optimized release binary and APFS clones
+of one disposable NAND. Each process stopped at serial's `Configuring
+SpringBoard for N45AP` marker.
+
+| Backend | SpringBoard trials (s) | Mean (s) | Median (s) |
+|---|---:|---:|---:|
+| Legacy page files | 9.292, 8.307, 9.915 | 9.171 | 9.292 |
+| Read-only pack | 5.628, 5.687, 5.891 | 5.735 | 5.687 |
+
+The packed median is 38.8% faster and its range is 0.263 seconds rather than
+1.608 seconds. All six boots reached the Darwin kernel, loaded the 49,128-byte
+Z2 firmware, and configured SpringBoard. This isolates a genuine host I/O
+improvement; it does not change guest clocks, CPU frequency, LCD cadence, or
+the sleep/wake state machine.
+
+The signed packaged app then passed the storage-sensitive retained path:
+
+1. the packed base cold-booted and configured SpringBoard;
+2. Power drove Merlot panel sleep and the guest's normal OOCSHDWN;
+3. Home initiated the retained-RAM reset and the kernel logged `System Wake`;
+4. the CLCD scanout and 49,128-byte Z2 firmware returned; and
+5. post-wake taps plus a 60 Hz drag reached the multitouch model with correct
+   press and release coordinates and no panic, data abort, or process crash.
+
+The retained guest nevertheless reused its prior inactivity deadline and soon
+entered timed sleep again, even while host touch events were reaching the
+emulated controller. This predates the pack and reproduces with the identical
+guest-owned panel/PMU path. It remains a separate power-management/input-
+consumer issue: transport delivery is proven, but SpringBoard does not always
+convert early post-wake HID traffic into activity assertions. The next
+performance work should profile awake MMIO/polling hot spots rather than using
+timer ratios as a global speed control; the next sleep investigation should
+trace that retained inactivity deadline and the first acknowledged Z2 frame.

@@ -1,4 +1,10 @@
 #include "hw/arm/ipod_touch_nand.h"
+#include "qemu/bswap.h"
+
+#define NAND_PACK_FILENAME "nand.pack"
+#define NAND_PACK_MAGIC "IPODNAND"
+#define NAND_PACK_VERSION 1
+#define NAND_PACK_HEADER_SIZE 20
 
 static int get_bank(ITNandState *s) {
     uint32_t bank_bitmap = (s->fmctrl0 >> 1) & 0xFF;
@@ -20,6 +26,101 @@ static void set_bank(ITNandState *s, uint32_t activate_bank) {
     }
 }
 
+static void nand_open_pack(ITNandState *s)
+{
+    char filename[PATH_MAX];
+    const uint8_t *contents;
+    uint32_t version;
+    uint32_t page_size;
+    uint32_t entry_count;
+    uint64_t expected_size;
+    gsize length;
+    GError *error = NULL;
+
+    if (s->pack_checked) {
+        return;
+    }
+    s->pack_checked = true;
+    g_snprintf(filename, sizeof(filename), "%s/%s", s->nand_path,
+               NAND_PACK_FILENAME);
+    s->pack_file = g_mapped_file_new(filename, false, &error);
+    if (s->pack_file == NULL) {
+        if (error == NULL) {
+            hw_error("Unable to map NAND pack %s", filename);
+        }
+        if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+            hw_error("Unable to map NAND pack %s: %s", filename,
+                     error->message);
+        }
+        g_clear_error(&error);
+        return;
+    }
+
+    contents = (const uint8_t *)g_mapped_file_get_contents(s->pack_file);
+    length = g_mapped_file_get_length(s->pack_file);
+    if (length < NAND_PACK_HEADER_SIZE ||
+        memcmp(contents, NAND_PACK_MAGIC, 8) != 0) {
+        hw_error("Invalid NAND pack header in %s", filename);
+    }
+    version = ldl_le_p(contents + 8);
+    page_size = ldl_le_p(contents + 12);
+    entry_count = ldl_le_p(contents + 16);
+    expected_size = NAND_PACK_HEADER_SIZE + (uint64_t)entry_count * 4 +
+                    (uint64_t)entry_count *
+                    (NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE);
+    if (version != NAND_PACK_VERSION ||
+        page_size != NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE ||
+        expected_size != length) {
+        hw_error("Unsupported or truncated NAND pack %s", filename);
+    }
+
+    s->pack_entry_count = entry_count;
+    s->pack_entries = contents + NAND_PACK_HEADER_SIZE;
+    s->pack_data = s->pack_entries + (uint64_t)entry_count * 4;
+    for (uint32_t index = 1; index < entry_count; index++) {
+        if (ldl_le_p(s->pack_entries + (index - 1) * 4) >=
+            ldl_le_p(s->pack_entries + index * 4)) {
+            hw_error("Unsorted or duplicate NAND pack index in %s", filename);
+        }
+    }
+}
+
+static bool nand_read_packed_page(ITNandState *s, uint32_t bank,
+                                  uint32_t page)
+{
+    uint32_t vpn = page * NAND_NUM_BANKS + bank;
+    uint32_t low = 0;
+    uint32_t high;
+
+    nand_open_pack(s);
+    high = s->pack_entry_count;
+    while (low < high) {
+        uint32_t middle = low + (high - low) / 2;
+        uint32_t candidate = ldl_le_p(s->pack_entries + middle * 4);
+
+        if (candidate < vpn) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low == s->pack_entry_count ||
+        ldl_le_p(s->pack_entries + low * 4) != vpn) {
+        return false;
+    }
+
+    memcpy(s->page_buffer,
+           s->pack_data + (uint64_t)low *
+           (NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE),
+           NAND_BYTES_PER_PAGE);
+    memcpy(s->page_spare_buffer,
+           s->pack_data + (uint64_t)low *
+           (NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE) +
+           NAND_BYTES_PER_PAGE,
+           NAND_BYTES_PER_SPARE);
+    return true;
+}
+
 void nand_set_buffered_page(ITNandState *s, uint32_t page) {
     uint32_t bank = get_bank(s);
     if(bank == -1) {
@@ -28,11 +129,13 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
 
     if(bank != s->buffered_bank || page != s->buffered_page) {
         // refresh the buffered page
-        uint32_t vpn = page * 8 + bank;
         char filename[200];
         sprintf(filename, "%s/bank%d/%d.page", s->nand_path, bank, page);
         struct stat st = {0};
-        if (stat(filename, &st) == -1) {
+        if (nand_read_packed_page(s, bank, page)) {
+            /* The immutable base pack replaces the per-page open/read path. */
+        }
+        else if (stat(filename, &st) == -1) {
             // page storage does not exist - initialize an empty buffer
             memset(s->page_buffer, 0, NAND_BYTES_PER_PAGE);
             memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
@@ -163,8 +266,7 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 s->is_writing = false;
 
                 // flush the page buffer to the disk
-                uint32_t vpn = s->buffered_page * 8 + s->buffered_bank;
-                //printf("Flushing page %d, bank %d, vpn %d\n", s->buffered_page, s->buffered_bank, vpn);
+                //printf("Flushing page %d, bank %d\n", s->buffered_page, s->buffered_bank);
                 qemu_mutex_lock(&s->lock);
                 qemu_mutex_unlock(&s->lock);
                 {
@@ -208,6 +310,17 @@ static void itnand_init(Object *obj)
     qemu_mutex_init(&s->lock);
 }
 
+static void itnand_finalize(Object *obj)
+{
+    ITNandState *s = ITNAND(obj);
+
+    if (s->pack_file != NULL) {
+        g_mapped_file_unref(s->pack_file);
+    }
+    free(s->page_spare_buffer);
+    free(s->page_buffer);
+}
+
 static void itnand_reset(DeviceState *d)
 {
     ITNandState *s = (ITNandState *) d;
@@ -235,6 +348,7 @@ static const TypeInfo itnand_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(ITNandState),
     .instance_init = itnand_init,
+    .instance_finalize = itnand_finalize,
     .class_init    = itnand_class_init,
 };
 
