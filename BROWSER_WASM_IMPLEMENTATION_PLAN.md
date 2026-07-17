@@ -62,6 +62,15 @@ The existing machine is a good browser target:
 
 The present NAND representation is the main browser-specific obstacle:
 
+Before sharing this backend with a browser port, the native cleanup audit in
+`SLEEP_WAKE_INVESTIGATION.md` Phase 17 must be resolved or explicitly carried
+forward. In particular, the current synchronous page-per-file reads and
+`*_new.page` writes are both a native performance issue and an incomplete
+persistence contract. Browser work must not preserve that behavior merely for
+source compatibility: the packed immutable base plus copy-on-write overlay
+below is also the intended clean semantic boundary for a future native
+backend.
+
 - Approximately 133,000 individual `.page` files are used.
 - Each page contains 2,048 data bytes and 64 spare bytes.
 - The unpacked tree consumes roughly 521 MiB because of per-file allocation.

@@ -3022,3 +3022,130 @@ or readiness gating was changed in this phase.
   that iBoot needs a valid power-on source while checking the retained image.
   The present-and-OK state corrects the inconsistent model without changing
   that proven boot precondition.
+
+## Phase 17: Whole-machine workaround retirement and cleanup plan (2026-07-17)
+
+The sleep investigation accumulated code that was useful evidence at the time
+but is no longer on the retained-reset path. This matters outside sleep too:
+forced interrupt delivery, guest-memory patching, periodic framebuffer reads,
+and leaked command buffers can distort timing and make unrelated device models
+look slower or less reliable than they are.
+
+Git archaeology gives the following ownership and rationale. The purpose of
+this table is to make deletion reviewable rather than treating old experiments
+as unexplained dead code.
+
+| Code family | Introduced by / original rationale | Current status | Retirement gate |
+|---|---|---|---|
+| Sleep-function patch at `0x0805a6cc` plus delayed VIC/timer cleanup | `bbe67d01de` (`Fix reliable display sleep and input wake`): make the terminal `B .` return, forcibly reopen IRQ/FIQ delivery, restart the tick timer, and restore a framebuffer | Superseded by `d1f48701c0` and `01f12e434a`, which model AP power loss and start iBoot's retained type-4 path; returning from the kernel sleep function is now specifically incorrect | Remove together with its timer and PMU state, then prove OOCSHDWN still leads to retained reset rather than stack unwind |
+| Forty wake-assist IRQ/FIQ pulses and guest PMU sub-IRQ descriptor writes at `0xe0248aa0` | `bbe67d01de`: break the IRQ-masked-idle deadlock created by returning from sleep without a hardware power cycle | No longer called by the normal terminal or transition wake paths; it can corrupt guest critical sections if accidentally re-entered | Remove and verify manual/timed wake, scheduler progress, and touch without modifying CPSR or guest kernel memory |
+| SYSIC deferred PMU clear/reinject timers and `int2_shadow` | `bbe67d01de`: clear a stuck level IRQ, then synthesize ONKEY later so the old resumed kernel workqueue could run | The activating helper has no current caller. `3f558b79f9` and `738bae5cb8` instead retain the real PMU event byte across AP reset and re-expose it to the retained kernel | Remove as one family; retain `retained_int2_wake` and validate the ApplePCF50635 event seen after type-4 handoff |
+| Full framebuffer snapshot copied into all three scanout buffers | `bbe67d01de`: make the screen visible after the incorrect stack-unwind resume; `d1f48701c0` later stopped using it for retained reset but kept the snapshot as a touch-readiness gate | Restoring it is obsolete and caused stale-image ownership problems. The remaining 600 KiB copy is serving only as an indirect “first useful frame seen” flag | Replace with a small explicit input-readiness state; do not write guest framebuffers from QEMU |
+| Dead multitouch wake flags (`display_sleep_requested`, `alternate_wake_via_power`, `swallow_wake_touch`, `wake_unwind_active`) | `bbe67d01de`/`d1f48701c0`: coordinate host blanking, synthetic Home-as-ONKEY, and the old stack unwind | Never armed by the current retained-reset path | Remove after confirming Power/Home release suppression remains intact |
+| Disabled multi-page kernel/stack/LCD debug dump in the button handler | `bbe67d01de`: document the reverse-engineering state at the terminal sleep loop | The findings belong in this document; thousands of disabled source lines are not a maintainable diagnostic interface | Delete; recreate future targeted probes behind small named opt-in diagnostics if needed |
+
+The later commits did not make the earlier work pointless. The false-positive
+wake implementations established several facts used by the current design:
+OOCSHDWN is terminal, IRQ injection cannot wake a powered-off AP, the PMU event
+must survive reset, volatile iBoot state must not survive, and framebuffer
+visibility is not evidence that touchscreen state resumed correctly. The
+cleanup removes the experimental mechanism while retaining those conclusions.
+
+### Cleanup order
+
+1. Remove the superseded sleep trampoline, CPSR forcing, wake-assist timer,
+   SYSIC reinjection timers, and disabled debug dump as one behaviorally dead
+   family.
+2. Replace the framebuffer snapshot with an explicit lightweight input-ready
+   gate, preserving the cold-boot delay without copying or restoring pixels.
+3. Remove unreachable wake-era state fields and audit every remaining host
+   write to guest CPU registers or RAM.
+4. Fix low-risk, whole-machine correctness issues already exposed by the
+   audit: multitouch command-buffer ownership, the oversized `MTFrame`
+   allocation, ADM transfer allocations, AES error-path ownership, and the
+   8900 image decoder's assignment-in-condition/magic-check defects.
+5. Establish measurements before behavior-changing optimization: touch report
+   cadence, timer/clock ratios, NAND page-file I/O, and main-thread stalls.
+6. Only then change the 10 Hz touch movement cadence, timer model, or NAND
+   representation. Each can affect guest timeouts or persistent data and needs
+   its own measured commit and rollback point.
+
+### Whole-machine audit register
+
+Not every shortcut is removable debugging code. The SDIO register stub, USB
+FIFO gaps, GPIO skeleton, accelerometer identity stub, unconditional NAND ECC
+success, minimal LCD-panel identity, TV-out/MBX magic values, direct iBoot/LLB
+loading, and hard-coded image keys are deliberate incomplete device models.
+They should be replaced by implemented hardware semantics, not simply deleted.
+
+The highest-value non-sleep cleanup targets found so far are:
+
+- multitouch movement frames are emitted at a hard-coded 10 Hz, independently
+  of the now-60 Hz CLCD presentation cadence;
+- normal multitouch commands replace heap buffers without consistently freeing
+  the previous command, and `MTFrame` is overallocated by pointer size;
+- ADM allocates temporary scalar/page buffers for every NAND transfer without
+  freeing them;
+- the 8900 decoder validates magic bytes with `&&` instead of rejecting any
+  mismatch and assigns `0x04` in an encryption test instead of comparing it;
+- the NAND backend performs synchronous per-page filesystem I/O and writes
+  `_new.page` files without a complete overlay/readback contract;
+- timer frequencies, minimum counts, and latch values contain functional
+  constants that can change perceived device speed and sleep duration.
+
+The first four are bounded cleanup work. NAND and timer changes are separate
+design projects because they can alter storage or guest-visible time. This
+register is the baseline for documenting paths taken and deliberately untaken
+as cleanup proceeds.
+
+### First cleanup tranche and validation
+
+The first tranche removed the complete superseded stack-unwind family:
+
+- the guest sleep-function instruction patch and its delayed VIC/timer repair;
+- forty forced CPSR IRQ/FIQ pulses and direct writes into the guest PMU
+  sub-interrupt descriptor;
+- SYSIC PMU clear/reinject timers and the synthetic `int2_shadow` path;
+- the disabled kernel/page-table/stack/framebuffer dump in the key handler;
+- dead wake-unwind multitouch flags; and
+- the framebuffer snapshot/restore buffer.
+
+The former snapshot's only live consumer was an early-touch guard. It is now a
+small `input_ready` state that becomes true after a useful OS framebuffer has
+remained visible for two seconds. It samples only until ready and never copies
+or writes guest framebuffer memory. The retained path keeps this already-proven
+driver readiness across AP reset, matching the behavior before cleanup.
+
+The same tranche corrected two independent ownership/correctness findings:
+normal multitouch commands now release the previous command buffers before
+allocating replacements, `MTFrame` allocates its actual object size, and the
+8900 decoder now rejects any bad magic byte, compares rather than assigns the
+encryption marker, leaves plaintext payloads alone, validates AES block length,
+and frees every temporary buffer. These changes removed all of the decoder's
+non-deprecation compiler warnings.
+
+An optimized release build completed successfully. A headless native run then
+validated cold boot, manual Power sleep, and Home wake:
+
+1. iPod OS disabled LCD, multitouch, USB, SDIO, and other drivers and wrote
+   `OOCSHDWN=0x02`;
+2. QEMU left the application processor at terminal power loss;
+3. Home requested the retained-RAM SoC reset;
+4. iBoot consumed the type-4 state and handed off to retained memory;
+5. the kernel logged `System Wake`;
+6. the retained kernel enabled CLCD at `0x0f496000`; and
+7. Z2 re-enabled, downloaded calibration, and reloaded 49,128 bytes of
+   firmware.
+
+No deleted mechanism was needed for this sequence. VIC priority reset remains
+because it is part of the modeled volatile AP interrupt-controller domain, and
+the retained PMU event byte remains because the always-on PMU must preserve the
+wake cause across reset.
+
+Two paths were deliberately not changed in this tranche. Sleep entry was still
+slow in the headless run, so timer/clock ratios and blocking device shutdown
+remain measurement targets rather than being papered over with a host shortcut.
+The NAND backend was also left intact: attempting an additional disposable
+page-directory copy exhausted available filesystem resources, reinforcing the
+packed-base/overlay priority, but storage semantics must be redesigned in a
+separate commit rather than mixed into wake cleanup.
