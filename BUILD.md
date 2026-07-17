@@ -85,7 +85,6 @@ From the `build/` directory:
 ./arm-softmmu/qemu-system-arm \
     -M iPod-Touch,bootrom=ipod_files/bootrom_s5l8900,iboot=ipod_files/iboot_204_n45ap.bin,nand=ipod_files/nand \
     -serial mon:stdio \
-    -cpu max \
     -m 1G \
     -d unimp \
     -pflash ipod_files/nor_n45ap.bin
@@ -207,14 +206,17 @@ FRAMEWORKS="$DIR/Frameworks"
 
 export DYLD_LIBRARY_PATH="$FRAMEWORKS"
 
+QEMU_DIAGNOSTICS=(-serial null)
+if [[ "${IPOD_TOUCH_DEBUG:-0}" == "1" ]]; then
+    QEMU_DIAGNOSTICS=(-serial mon:stdio -d unimp)
+fi
+
 exec "$DIR/MacOS/qemu-system-arm" \
     -M "iPod-Touch,bootrom=$RESOURCES/ipod_files/bootrom_s5l8900,iboot=$RESOURCES/ipod_files/iboot_204_n45ap.bin,nand=$RESOURCES/ipod_files/nand" \
-    -serial mon:stdio \
-    -cpu max \
     -m 1G \
-    -d unimp \
     -pflash "$RESOURCES/ipod_files/nor_n45ap.bin" \
     -L "$RESOURCES/pc-bios" \
+    "${QEMU_DIAGNOSTICS[@]}" \
     "$@"
 LAUNCHER
 chmod +x "$APP/Contents/MacOS/iPod Touch"
@@ -272,6 +274,14 @@ Double-click `iPod Touch.app` in Finder, or from the terminal:
 
 ```bash
 open "iPod Touch.app"
+```
+
+The packaged launcher uses the machine's ARM1176 default and suppresses the
+very verbose guest serial and unimplemented-device logs. For an investigation,
+launch it from Terminal with diagnostics restored:
+
+```bash
+IPOD_TOUCH_DEBUG=1 "iPod Touch.app/Contents/MacOS/iPod Touch"
 ```
 
 > **Note:** If the app is stored inside `~/Documents/` or `~/Desktop/`, macOS

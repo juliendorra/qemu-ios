@@ -2457,8 +2457,8 @@ to postpone the first measured display-speed pass.
 |---|---|---|---|
 | 1 | Correct CLCD interrupt cadence/acknowledgement, then raise 10 Hz to the hardware's 59.977 Hz (**direct constant change rejected**) | Removes the artificial UI cap without creating an interrupt storm | Scrolling/animation can present up to 60 frames/s; no `unexpected CLCD interrupt`, kernel panic, accelerated guest timers, or input regression |
 | 2 | Redraw only on dirty framebuffer/display state (**implemented; cold boot and retained-wake smoke test pass**) | A blind high-rate full redraw would waste the same host core needed by TCG | Idle display avoids full-frame conversion; changed regions appear on the next presentation tick; no stale frames |
-| 3 | Use the real `arm1176` CPU model as the default performance baseline | `-cpu max` may expose a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
-| 4 | Produce a release build and remove hot-path diagnostics | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
+| 3 | Use the real `arm1176` CPU model as the default performance baseline (**cold boot passes; benchmark pending**) | `-cpu max` overrides the board default with a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
+| 4 | Produce a release build and remove hot-path diagnostics (**quiet launcher documented; build-mode work pending**) | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
 | 5 | Stop executing the terminal `b .` after OOCSHDWN | The sleeping CPU currently burns one host core even though real AP power is off | Near-zero QEMU CPU use while asleep; P/H still initiates the retained AP reset and type-4 handoff; RAM CRC stays stable |
 | 6 | Profile an awake workload and fix the largest emulated-device polling loops | Overall slowness cannot be attributed safely without sampling a representative boot/UI trace | Record boot-to-SpringBoard time, app-launch latency, scrolling frame rate, vCPU samples, and top MMIO addresses before each change; improve one identified hotspot at a time |
 | 7 | Evaluate a newer QEMU/TCG base and safe translation settings | This is higher-risk and should follow local hot-path fixes so behavior changes remain attributable | Same firmware and acceptance suite, with repeatable speedup and no boot, NAND, touch, display, or resume regression |
@@ -2503,6 +2503,13 @@ one:
 The immediate safe checkpoint is therefore dirty-only redraw at the existing
 guest IRQ cadence. The next display-speed step is correcting CLCD interrupt
 semantics, not forcing another rate value.
+
+The same build also cold-booted through SpringBoard with the machine's default
+ARM1176 model after removing the launcher's explicit `-cpu max`. This validates
+the accurate CPU as a functional baseline but does not yet prove it faster;
+matched host-time benchmarks remain required. The normal packaged launcher
+can safely omit `-d unimp` and route serial output to `null`, with the old
+verbose behavior retained behind `IPOD_TOUCH_DEBUG=1`.
 
 The current recommendation is therefore to keep the M2 as the development
 baseline. It should be capable of a much better result than the current build;
