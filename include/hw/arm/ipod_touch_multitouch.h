@@ -158,12 +158,8 @@ typedef struct IPodTouchMultitouchState {
     CPUState *cpu;
     Pcf50633State *pmu;
     IPodTouchLCDState *lcd;  // for display wake control
-    bool display_sleep_requested;
-    bool alternate_wake_via_power;
-    bool swallow_wake_touch;
     bool suppress_power_release;
     bool suppress_home_release;
-    int wake_unwind_active;  // set during stack-unwind wake to skip ONKEY
     float touch_x;
     float touch_y;
     float prev_touch_x;
@@ -175,7 +171,5 @@ void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s);
 void ipod_touch_multitouch_on_release(IPodTouchMultitouchState *s);
 
 /* Keep IRQ/FIQ delivery open while the guest leaves its masked idle path. */
-void ipod_touch_start_wake_assist(void);
-void ipod_touch_prepare_pmu_wake(IPodTouchMultitouchState *s);
 
 #endif

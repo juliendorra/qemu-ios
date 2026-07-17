@@ -169,8 +169,6 @@ typedef struct {
 	uint32_t kbootargs_pa;
 	uint32_t uart_mmio_pa;
 	ARMCPU *cpu;
-	QEMUTimer *wake_assist_timer;
-	int wake_assist_remaining;   // number of IRQ-enable pulses left
 	bool retained_wake_pending;
 	uint32_t retained_crc_before_reset;
 	bool retained_crc_valid;

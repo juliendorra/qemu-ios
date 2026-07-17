@@ -99,41 +99,25 @@ typedef struct Pcf50633State {
 	uint8_t int3m;
 	uint8_t int4m;
 	uint8_t int5m;
-	// Shadow register: holds INT2 value saved during wake so the kernel's
-	// deferred workqueue can read ONKEY even after INT2 has been cleared
-	// to de-assert nIRQ (breaking the CPSID IF chicken-and-egg).
-	uint8_t int2_shadow;
-	// General-purpose register file (captures all writes for debugging)
-	uint8_t regs[256];
-	// Post-sleep VIC cleanup timer (finding #66: clear stale priority stack)
-	QEMUTimer *post_sleep_timer;
-	// VIC references for post-sleep cleanup (finding #66)
-	void *vic0;  // PL192State*, forward-declared as void* to avoid header deps
-	void *vic1;
-	// Timer reference for post-sleep restart (finding #71)
-	void *timer;  // IPodTouchTimerState*, forward-declared as void*
-	// LCD reference for framebuffer restore after sleep/wake (finding #92)
-	void *lcd;   // IPodTouchLCDState*, forward-declared as void*
+    // General-purpose register file (captures all writes for debugging)
+    uint8_t regs[256];
+    // VIC references for resetting the retained-wake interrupt domain.
+    void *vic0;  // PL192State*, forward-declared as void* to avoid header deps
+    void *vic1;
+    // LCD reference for the PMU-owned panel rail.
+    void *lcd;   // IPodTouchLCDState*, forward-declared as void*
 	// Interrupt output connected to SYSIC GPIO
 	IPodTouchSYSICState *sysic;
-	// Approach #43: deferred sleep patch — true after OOCSHDWN fires
-	bool oocshdwn_fired;
+    // True after the guest requests application-processor power loss.
+    bool oocshdwn_fired;
 	// A Power/Home press received during the final display-off transition.
 	// Complete OOCSHDWN first, then perform the retained-RAM SoC reboot.
 	bool wake_reset_pending;
-	// True while the guest sleep-loop trampoline is installed. The cleanup
-	// callback restores the original instructions for the next sleep cycle.
-	bool sleep_func_patched;
 } Pcf50633State;
 
 // Set ONKEY state: call when power button is pressed/released.
 // pressed=true sets ONKEYF (falling edge), pressed=false sets ONKEYR (rising).
 void pcf50633_set_onkey(Pcf50633State *s, bool pressed);
-
-// Resume the guest from its emulated deep-sleep loop. Returns true when the
-// temporary wake trampoline was installed. Power, Home, and touch input can
-// all use this; ONKEY signaling remains separate.
-bool pcf50633_resume_from_sleep(Pcf50633State *s);
 
 /* Mark the next reset as a retained wake; optionally checksum retained RAM. */
 void ipod_touch_prepare_retained_wake(void);

@@ -512,10 +512,6 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
            sizeof(s->hbpp_atn_ack_response));
     s->frame_counter = 0;
     s->touch_down = false;
-    s->display_sleep_requested = false;
-    s->alternate_wake_via_power = false;
-    s->swallow_wake_touch = false;
-    s->wake_unwind_active = 0;
     s->touch_x = 0;
     s->touch_y = 0;
     s->prev_touch_x = 0;

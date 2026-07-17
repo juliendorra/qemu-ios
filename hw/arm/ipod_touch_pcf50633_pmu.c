@@ -1,168 +1,8 @@
 #include "hw/arm/ipod_touch_pcf50633_pmu.h"
 #include "hw/arm/ipod_touch_sysic.h"
-#include "hw/arm/ipod_touch_timer.h"
 #include "hw/arm/ipod_touch_lcd.h"
 #include "hw/intc/pl192.h"
-#include "exec/cpu-common.h"    // cpu_physical_memory_read/write
-#include "hw/core/cpu.h"        // current_cpu
-#include "target/arm/cpu.h"     // ARM_CPU, CPUARMState, cpsr_read
-#include "exec/exec-all.h"     // tb_flush
 #include "sysemu/runstate.h"
-
-// Delay after OOCSHDWN write before cleaning up VIC state.
-// The patched sleep function returns immediately; this delay ensures
-// the kernel has had time to execute it and enter the resume path.
-#define POST_SLEEP_VIC_CLEANUP_NS  500000000LL  // 500ms
-
-#define SLEEP_FUNC_DSB_PA   0x0805a6cc
-#define SLEEP_FUNC_LOOP_PA  0x0805a6d0
-#define SLEEP_FUNC_NEXT_PA  0x0805a6d4
-
-// Finding #66: After the patched sleep function returns, the VIC may
-// have a stale in-service interrupt (VECTADDR was read/acked by a GPIO
-// handler but PM suspend prevented the EOI write).  This blocks all
-// same/lower priority IRQ delivery.
-//
-// This timer callback directly resets VIC0/VIC1 priority stacks and
-// re-pulses any pending SYSIC GPIO IRQs.
-static void pmu_post_sleep_vic_cleanup(void *opaque)
-{
-    Pcf50633State *s = (Pcf50633State *)opaque;
-
-    // Directly reset VIC priority stacks via public API
-    if (s->vic0) {
-        pl192_reset_priority((PL192State *)s->vic0);
-    }
-    if (s->vic1) {
-        pl192_reset_priority((PL192State *)s->vic1);
-    }
-    fprintf(stderr, "[PMU] Post-sleep VIC cleanup: reset priority stacks\n");
-
-    // Re-pulse any pending SYSIC GPIO IRQs so the VIC delivers them
-    if (s->sysic) {
-        for (int grp = 0; grp < GPIO_NUMINTGROUPS; grp++) {
-            if (s->sysic->gpio_int_status[grp]) {
-                qemu_irq_lower(s->sysic->gpio_irqs[grp]);
-                qemu_irq_raise(s->sysic->gpio_irqs[grp]);
-                fprintf(stderr, "[PMU] Re-pulsed GPIO IRQ group %d "
-                        "(INTSTAT=0x%08x)\n", grp,
-                        s->sysic->gpio_int_status[grp]);
-            }
-        }
-    }
-
-    // Approach #37: Force-enable IRQs by clearing CPSR I bit.
-    // After sleep function returns, the kernel PM code keeps I=1
-    // (IRQ disabled). Without IRQs, VIC cannot deliver interrupts
-    // and processes remain frozen. Use first_cpu (timer callbacks
-    // have current_cpu=NULL).
-    {
-        CPUState *cpu = first_cpu;
-        if (cpu) {
-            CPUARMState *env = &ARM_CPU(cpu)->env;
-            uint32_t cpsr = cpsr_read(env);
-            fprintf(stderr, "[PMU] Post-sleep: CPSR=0x%08x "
-                    "(I=%d F=%d mode=0x%02x) PC=0x%08x\n",
-                    cpsr, (cpsr >> 7) & 1, (cpsr >> 6) & 1,
-                    cpsr & 0x1f, env->regs[15]);
-            if (cpsr & CPSR_I) {
-                uint32_t new_cpsr = cpsr & ~(CPSR_I | CPSR_F);
-                cpsr_write(env, new_cpsr, CPSR_I | CPSR_F,
-                           CPSRWriteByInstr);
-                fprintf(stderr, "[PMU] Post-sleep: FORCE-ENABLED IRQ+FIQ "
-                        "(CPSR 0x%08x → 0x%08x)\n", cpsr, new_cpsr);
-            }
-        }
-    }
-
-    // Findings #71-73: PM suspend stops the timer. The abort-suspend
-    // path (R0 != 0) doesn't restart it, and the kernel's FIQ handler
-    // clears the timer IRQ but refuses to reprogram the next tick
-    // (PM state check fails).  Force-restart unconditionally.
-    if (s->timer) {
-        IPodTouchTimerState *t = (IPodTouchTimerState *)s->timer;
-        uint32_t count = t->bcreload ? t->bcreload : 100000;
-        t->bcount1 = count;
-        t->bcreload = count;
-        t->base_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        // Use START without MANUALUPDATE — auto-recurring mode.
-        // The kernel's FIQ handler clears IRQLATCH but doesn't reprogram
-        // (finding #73), so MANUALUPDATE would stop after one tick.
-        // Auto-recurring keeps the timer alive until kernel takes over.
-        t->status = TIMER_STATE_START;
-        t->freq_out = 1000000000 / 100;  // 10 MHz
-        t->tick_interval = muldiv64(
-            (t->bcount1 < 1000) ? 1000 : t->bcount1,
-            NANOSECONDS_PER_SECOND, t->freq_out);
-        t->next_planned_tick = t->tick_interval;
-        qemu_irq_lower(t->irq);  // Ensure clean edge
-        timer_mod(t->st_timer,
-                  t->base_time + t->tick_interval);
-        fprintf(stderr, "[PMU] Post-sleep: force-restarted timer "
-                "(bcount1=%u, interval=%llu ns, status was 0x%x)\n",
-                count, (unsigned long long)t->tick_interval, t->status);
-    }
-
-    // Finding #92: Restore framebuffer snapshot after wake.
-    // The kernel switches to a blank framebuffer as the last step of the
-    // "screen off" animation before sleep. After our patched wake-up
-    // (sleep function returns R0=0), the PM resume path doesn't trigger
-    // the display-on sequence. The LCD controller continues reading from
-    // the blank buffer, showing a black screen.
-    //
-    // Fix: Write the pre-sleep framebuffer snapshot to the current
-    // w1_framebuffer_base. The LCD code captures this snapshot
-    // continuously whenever non-black content is visible.
-    if (s->lcd) {
-        IPodTouchLCDState *lcd = (IPodTouchLCDState *)s->lcd;
-        if (lcd->fb_snapshot && lcd->fb_snapshot_valid) {
-            // Write to ALL 3 known framebuffer addresses so the display
-            // shows content regardless of which buffer the LCD points to.
-            static const uint32_t fb_addrs[] = {
-                0x0fe00000, 0x0f400000, 0x0f496000
-            };
-            for (int i = 0; i < 3; i++) {
-                cpu_physical_memory_write(fb_addrs[i],
-                                          lcd->fb_snapshot,
-                                          FB_WIDTH * FB_HEIGHT * FB_BPP);
-            }
-            fprintf(stderr, "[PMU] Post-sleep: restored framebuffer "
-                    "snapshot to all 3 buffers (%dx%d, %d bytes)\n",
-                    FB_WIDTH, FB_HEIGHT,
-                    FB_WIDTH * FB_HEIGHT * FB_BPP);
-        } else {
-            fprintf(stderr, "[PMU] Post-sleep: no valid framebuffer "
-                    "snapshot to restore (lcd=%p, snapshot=%p, valid=%d)\n",
-                    lcd, lcd ? lcd->fb_snapshot : NULL,
-                    lcd ? lcd->fb_snapshot_valid : 0);
-        }
-    }
-
-    // The wake trampoline temporarily replaces the sleep function's DSB/B .
-    // sequence and the first instruction of the following function. Restore
-    // all three once the resume path is safely past them. Leaving the patch in
-    // place corrupts the adjacent function and makes later sleep cycles return
-    // immediately instead of waiting for another power-button event.
-    if (s->sleep_func_patched) {
-        static const uint32_t original_dsb = 0xee073f9a;
-        static const uint32_t original_loop = 0xeafffffe;
-        static const uint32_t original_next = 0xe92d4090;
-        CPUState *cpu = first_cpu;
-
-        cpu_physical_memory_write(SLEEP_FUNC_DSB_PA,
-                                  &original_dsb, sizeof(original_dsb));
-        cpu_physical_memory_write(SLEEP_FUNC_LOOP_PA,
-                                  &original_loop, sizeof(original_loop));
-        cpu_physical_memory_write(SLEEP_FUNC_NEXT_PA,
-                                  &original_next, sizeof(original_next));
-        if (cpu) {
-            tb_flush(cpu);
-        }
-        s->sleep_func_patched = false;
-        s->oocshdwn_fired = false;
-        fprintf(stderr, "[PMU] Restored sleep function for the next cycle\n");
-    }
-}
 
 // Check if any interrupt is pending and update the nIRQ line.
 // nIRQ is active-low and level-triggered: stays asserted as long as
@@ -196,51 +36,6 @@ void pcf50633_update_irq(Pcf50633State *s)
             fprintf(stderr, "[PMU] nIRQ de-assert\n");
         }
     }
-}
-
-bool pcf50633_resume_from_sleep(Pcf50633State *s)
-{
-    // Approach #43: Deferred sleep patch — apply when input arrives and
-    // the CPU is stuck in the sleep loop (B . at PA 0x0805a6d0).
-    CPUState *cpu = first_cpu;
-    uint32_t orig_loop;
-    uint32_t cpsie_if = 0xf10800c0;   // CPSIE IF
-    uint32_t mov_r0_0 = 0xe3a00000;   // MOV R0, #0
-    uint32_t pop_ret  = 0xe8bd8090;    // POP {R4,R7,PC}
-
-    if (!s->oocshdwn_fired || !cpu) {
-        return false;
-    }
-
-    CPUARMState *env = &ARM_CPU(cpu)->env;
-    uint32_t pc = env->regs[15];
-
-    if (pc != 0xc005a6d0 && pc != 0x0005a6d0) {
-        return false;
-    }
-
-    cpu_physical_memory_read(SLEEP_FUNC_LOOP_PA, &orig_loop, 4);
-    if (orig_loop != 0xeafffffe) {
-        return false;
-    }
-
-    // Patch: DSB → CPSIE IF, B . → MOV R0,#0, next → POP.
-    cpu_physical_memory_write(SLEEP_FUNC_DSB_PA, &cpsie_if, 4);
-    cpu_physical_memory_write(SLEEP_FUNC_LOOP_PA, &mov_r0_0, 4);
-    cpu_physical_memory_write(SLEEP_FUNC_NEXT_PA, &pop_ret, 4);
-    s->sleep_func_patched = true;
-    env->regs[15] = 0xc005a6cc;
-    tb_flush(cpu);
-    fprintf(stderr, "[PMU] Installed sleep-resume trampoline; "
-            "PC set to 0xc005a6cc\n");
-
-    if (s->post_sleep_timer) {
-        timer_mod(s->post_sleep_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
-                  + POST_SLEEP_VIC_CLEANUP_NS);
-    }
-
-    return true;
 }
 
 void pcf50633_set_onkey(Pcf50633State *s, bool pressed)
@@ -399,9 +194,8 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
             pcf50633_update_irq(s);  // may de-assert nIRQ
             break;
         case PMU_INT2:
-            res = s->int2 | s->int2_shadow;
+            res = s->int2;
             s->int2 = 0;
-            s->int2_shadow = 0;
             if (s->retained_int2_reexposed &&
                 (res & s->retained_int2_wake)) {
                 /* iBoot and the retained-resume prologue have both touched
@@ -528,8 +322,6 @@ static void pcf50633_init(Object *obj)
     s->int4m = 0xFF;
     s->int5m = 0xFF;
     s->regs[PMU_OOCSTAT] = PMU_OOCSTAT_ONKEY;
-    s->post_sleep_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-        pmu_post_sleep_vic_cleanup, s);
 }
 
 static void pcf50633_class_init(ObjectClass *klass, void *data)

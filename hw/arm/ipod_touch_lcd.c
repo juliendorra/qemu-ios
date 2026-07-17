@@ -264,16 +264,15 @@ static void lcd_refresh(void *opaque)
     }
     lcd->invalidate = 0;
 
-    // Save a framebuffer snapshot once the home screen has remained visible
-    // for two seconds. Capturing the first non-black frame locks in the
-    // SpringBoard boot overlay (Apple logo with dimmed icons), while updating
-    // forever lets the auto-lock fade overwrite a good image.
-    if (lcd->fb_snapshot && !lcd->fb_snapshot_valid) {
+    /* Do not accept touch during the early boot overlays. A useful OS frame
+     * must remain visible for two seconds before input becomes ready. This is
+     * deliberately a boolean readiness gate: QEMU never copies or restores
+     * guest-owned framebuffer contents. */
+    if (!lcd->input_ready) {
         static const uint32_t known_bases[] = {
             /* 0x0fe00000 belongs to iBoot and is overwritten on every wake. */
             0x0f400000, 0x0f496000
         };
-        uint32_t visible_base = 0;
         int best_visible_count = 0;
 
         for (int b = 0; b < ARRAY_SIZE(known_bases); b++) {
@@ -282,24 +281,21 @@ static void lcd_refresh(void *opaque)
 
             if (visible_count > best_visible_count) {
                 best_visible_count = visible_count;
-                visible_base = base;
             }
         }
 
         if (best_visible_count >= 4) {
-            lcd->snapshot_visible_frames++;
+            lcd->input_ready_frames++;
         } else {
-            lcd->snapshot_visible_frames = 0;
+            lcd->input_ready_frames = 0;
         }
 
-        if (lcd->snapshot_visible_frames >=
+        if (lcd->input_ready_frames >=
             2 * LCD_REFRESH_RATE_FREQUENCY) {
-            cpu_physical_memory_read(visible_base, lcd->fb_snapshot, FB_SIZE);
-            lcd->fb_snapshot_valid = true;
-            fprintf(stderr, "[LCD] Captured stable framebuffer snapshot "
-                    "(base=0x%08x, %d/6 visible after %d frames — locked)\n",
-                    visible_base, best_visible_count,
-                    lcd->snapshot_visible_frames);
+            lcd->input_ready = true;
+            fprintf(stderr, "[LCD] Touch input ready "
+                    "(%d/6 visible after %d frames)\n",
+                    best_visible_count, lcd->input_ready_frames);
         }
     }
 }
@@ -346,23 +342,6 @@ bool ipod_touch_lcd_framebuffer_is_dark(IPodTouchLCDState *lcd)
     return true;
 }
 
-void ipod_touch_lcd_restore_snapshot(IPodTouchLCDState *lcd)
-{
-    static const uint32_t known_bases[] = {
-        0x0fe00000, 0x0f400000, 0x0f496000,
-    };
-
-    if (!lcd || !lcd->fb_snapshot_valid) {
-        return;
-    }
-
-    for (int i = 0; i < ARRAY_SIZE(known_bases); i++) {
-        cpu_physical_memory_write(known_bases[i], lcd->fb_snapshot, FB_SIZE);
-    }
-    lcd->invalidate = 1;
-    fprintf(stderr, "[WAKE] Restored stable framebuffer snapshot\n");
-}
-
 static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int buttons_state)
 {
     // convert x and y to fractional numbers
@@ -376,7 +355,7 @@ static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int bu
     lcd->mt->touch_y = fy;
 
     if(buttons_state && !lcd->mt->touch_down) {
-        if (!lcd->fb_snapshot_valid) {
+        if (!lcd->input_ready) {
             fprintf(stderr, "[TOUCH] Ignoring input until display/driver "
                     "startup is stable\n");
             return;
@@ -385,19 +364,7 @@ static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int bu
         fprintf(stderr, "[TOUCH] mouse DOWN at (%.3f, %.3f)\n", fx, fy);
         ipod_touch_multitouch_on_touch(lcd->mt);
     }
-    else if(!buttons_state && lcd->mt->swallow_wake_touch) {
-        if (lcd->mt->alternate_wake_via_power && lcd->mt->pmu) {
-            pcf50633_set_onkey(lcd->mt->pmu, false);
-            lcd->mt->alternate_wake_via_power = false;
-        }
-        lcd->mt->swallow_wake_touch = false;
-        fprintf(stderr, "[TOUCH] wake click released; next click is input\n");
-    }
     else if(!buttons_state && lcd->mt->touch_down) {
-        if (lcd->mt->alternate_wake_via_power && lcd->mt->pmu) {
-            pcf50633_set_onkey(lcd->mt->pmu, false);
-            lcd->mt->alternate_wake_via_power = false;
-        }
         fprintf(stderr, "[TOUCH] mouse UP at (%.3f, %.3f)\n", fx, fy);
         ipod_touch_multitouch_on_release(lcd->mt);
     }
@@ -419,10 +386,8 @@ static void s5l8900_lcd_realize(DeviceState *dev, Error **errp)
     s->con = graphic_console_init(dev, 0, &s5l8900_gfx_ops, s);
     qemu_console_resize(s->con, FB_WIDTH, FB_HEIGHT);
 
-    // Allocate framebuffer snapshot buffer for sleep/wake
-    s->fb_snapshot = g_malloc0(FB_SIZE);
-    s->fb_snapshot_valid = false;
-    s->snapshot_visible_frames = 0;
+    s->input_ready = false;
+    s->input_ready_frames = 0;
     s->retained_resume = false;
     s->invalidate = 1;
 
