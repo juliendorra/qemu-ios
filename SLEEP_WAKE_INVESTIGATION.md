@@ -2455,7 +2455,7 @@ to postpone the first measured display-speed pass.
 
 | Priority | Change | Why this order | Measurement / acceptance |
 |---|---|---|---|
-| 1 | Correct CLCD interrupt cadence/acknowledgement, then raise 10 Hz to the hardware's 59.977 Hz (**direct constant change rejected**) | Removes the artificial UI cap without creating an interrupt storm | Scrolling/animation can present up to 60 frames/s; no `unexpected CLCD interrupt`, kernel panic, accelerated guest timers, or input regression |
+| 1 | Correct CLCD interrupt cadence/acknowledgement, then raise 10 Hz to the hardware's 59.977 Hz (**interrupt semantics corrected and cold-booted at 10 Hz; 60 Hz retest pending**) | Removes the artificial UI cap without creating an interrupt storm | Scrolling/animation can present up to 60 frames/s; no `unexpected CLCD interrupt`, kernel panic, accelerated guest timers, or input regression |
 | 2 | Redraw only on dirty framebuffer/display state (**implemented; cold boot and retained-wake smoke test pass**) | A blind high-rate full redraw would waste the same host core needed by TCG | Idle display avoids full-frame conversion; changed regions appear on the next presentation tick; no stale frames |
 | 3 | Use the real `arm1176` CPU model as the default performance baseline (**implemented; cold boot and release benchmark pass; `max` A/B still pending**) | `-cpu max` overrides the board default with a heavier and less representative execution target; the device used an ARM11-class S5L8900 | Cold boot, launch, scrolling, and sleep/wake pass with `arm1176`; compare guest-time/host-time ratio against `max` |
 | 4 | Produce a release build and remove hot-path diagnostics (**implemented and measured**) | Assertions and `-d unimp`/MMIO/IRQ/frame logging distort timing and add I/O overhead | Build with optimization (target O3/LTO if supported), no `-d unimp` in the normal launcher, and no repetitive hot-path prints; retain an opt-in trace build |
@@ -2503,6 +2503,70 @@ one:
 The immediate safe checkpoint is therefore dirty-only redraw at the existing
 guest IRQ cadence. The next display-speed step is correcting CLCD interrupt
 semantics, not forcing another rate value.
+
+### CLCD protocol trace and corrected interrupt model (2026-07-17)
+
+The next experiment instrumented the low CLCD registers and timer IRQ while
+leaving the rate at 10 Hz. The guest produced this stable sequence once
+`AppleH1CLCD` and its framebuffer user client started:
+
+```text
+W +0x018 <- 0x00000001
+W +0x014 <- 0x00003f01
+tick: IRQ raised
+R +0x018 -> 0x00000001
+R +0x018 -> 0x00000001
+W +0x018 <- 0x00000001
+```
+
+The sequence repeats once per frame. Later the guest disables bit zero:
+
+```text
+W +0x014 <- 0x00003f00
+tick: QEMU still raised IRQ
+R +0x018 -> 0x00000001
+unexpected CLCD interrupt: 00000001
+W +0x018 <- 0x000000ff
+```
+
+This identifies register `0x14` as the interrupt mask/enable register and
+`0x18` as interrupt status with write-one-to-clear behavior. The old model had
+named them `unknown1` and `render`, stored status acknowledgements as a
+persistent render state, and raised on every timer tick whenever that stored
+value was one. It did not consult the mask. The final interrupt after
+`0x3f01 -> 0x3f00` therefore came from QEMU, not the guest, and increasing the
+timer to 60 Hz multiplied the invalid delivery rate.
+
+The corrected 10 Hz model now:
+
+1. latches frame status bit zero on the timer tick;
+2. asserts the IRQ only when a latched status bit is enabled by the mask;
+3. clears selected status bits when the guest writes ones to `0x18`; and
+4. recomputes the level immediately after mask or status changes.
+
+A boot using the corrected model reached the Darwin kernel, downloaded the Z2
+firmware, and configured SpringBoard without an `unexpected CLCD interrupt`
+or kernel panic. This is the first checkpoint; the rate deliberately remains
+10 Hz until a separate 60 Hz boot and sleep/wake regression test passes.
+
+**Path taken:** trace the actual iPod OS register protocol, infer semantics
+from ordering and IRQ response, correct the register model at the old rate,
+then retest 60 Hz independently.
+
+**Paths not taken:**
+
+- The trace-only instrumentation was removed after collecting the sequence;
+  retaining a branch and formatted logging in CLCD MMIO would work against the
+  performance goal.
+- The previous direct `10 -> 60` constant change remains rejected because it
+  changed interrupt frequency before the interrupt protocol was correct.
+- Host-only SDL repainting cannot make the guest render more often when its
+  frame-completion interrupt is still capped, so presentation polling alone
+  is not treated as the fix.
+- [openiBoot's S5L8900 LCD source](https://github.com/iDroid-Project/openiBoot/blob/master/plat-s5l8900/lcd.c)
+  confirms the `0x38900000` controller layout and 59.977 Hz timing setup but
+  does not implement the iPod OS CLCD interrupt handler or name `0x14/0x18`;
+  it was useful corroboration, not the basis for inventing register semantics.
 
 ### Release-build benchmark (2026-07-17)
 

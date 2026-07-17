@@ -17,9 +17,9 @@ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
             return s->lcd_con2;
 
         case 0x14:
-            return s->unknown1;
+            return s->int_mask;
         case 0x18:
-            return s->render;
+            return s->int_status;
 
         case 0x20:
             return s->wnd_con;
@@ -66,6 +66,11 @@ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
     return 0;
 }
 
+static void s5l8900_lcd_update_irq(IPodTouchLCDState *s)
+{
+    qemu_set_irq(s->irq, (s->int_status & s->int_mask) != 0);
+}
+
 static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
@@ -81,11 +86,12 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             break;
 
         case 0x14:
-            s->unknown1 = val;
+            s->int_mask = val;
+            s5l8900_lcd_update_irq(s);
             break;
         case 0x18:
-            s->render = val;
-            qemu_irq_lower(s->irq);
+            s->int_status &= ~val;
+            s5l8900_lcd_update_irq(s);
             break;
 
         case 0x20:
@@ -456,10 +462,8 @@ static void refresh_timer_tick(void *opaque)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
 
-    if (s->render == 0x1)
-        qemu_irq_raise(s->irq);
-    else if (s->render == 0xFF)
-        qemu_irq_lower(s->irq);
+    s->int_status |= 1;
+    s5l8900_lcd_update_irq(s);
 
     timer_mod(s->refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / LCD_REFRESH_RATE_FREQUENCY);
 }
