@@ -15,6 +15,7 @@ arm_ss.add(when: 'CONFIG_IPOD_TOUCH', if_true: [files(
   'ipod_touch_lcd_panel.c',
   'ipod_touch_lis302dl.c',
   'ipod_touch_multitouch.c',
+  'ipod_touch_mv8686.c',
   'ipod_touch_nand.c',
   'ipod_touch_nand_ecc.c',
   'ipod_touch_pcf50633_pmu.c',
