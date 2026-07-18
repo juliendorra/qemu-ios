@@ -5,6 +5,10 @@ Working notes for the Wi-Fi implementation plan in
 Everything here is derived from the running guest (`IPOD_SDIO_TRACE=1`) and
 the N45AP device tree in NOR — not from datasheet guesses.
 
+This file records the **findings**. For the **attempts, dead ends, failed
+disassembly approaches, unresolved mysteries, and tooling difficulties**,
+see `WIFI_SDIO_DEADENDS.md`. Dev harnesses are in `scripts/wifi-dev/`.
+
 ## Device tree facts (NOR `nor_n45ap.bin`, node `sdio`)
 
 - `compatible` = `sdio,s5l8900x`, `device_type` = `sdio`
