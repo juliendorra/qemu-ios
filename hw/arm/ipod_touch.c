@@ -132,6 +132,45 @@ static void ipod_touch_install_8900_ops(void)
                               sizeof(engine_base));
 }
 
+/*
+ * iBoot-204's warm resume runs a mandatory pre-boot charging wait before the
+ * type-4 handoff: its boot task (0x18004c76) enters a charging dispatcher
+ * (0x180099f4) whose loop sleeps in 5-second chunks (pool literal at
+ * 0x18009980) until a charge budget derived from the constant at 0x18021458
+ * (10,000,000 microseconds) elapses. On this emulated device the charge is
+ * fiction — there is no battery — so every Power/Home wake stalled about
+ * 10 seconds inside iBoot before `System Wake`. Shrink both durations in the
+ * freshly reloaded volatile iBoot image (never the file on disk). Each word
+ * is verified first so a different iBoot build passes through unpatched.
+ */
+static void ipod_touch_patch_iboot_charge_wait(void)
+{
+    static const struct {
+        uint32_t addr;
+        uint32_t expected;
+        uint32_t replacement;
+    } patches[] = {
+        /* Charging-loop total budget: 10,000,000 us -> 5,000 us. */
+        { IBOOT_BASE + 0x21458, 10000000, 5000 },
+        /* Charging-loop poll sleep: 5,000,000 us -> 100,000 us. */
+        { IBOOT_BASE + 0x09980, 5000000, 100000 },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(patches); i++) {
+        uint32_t current;
+
+        cpu_physical_memory_read(patches[i].addr, &current, sizeof(current));
+        if (current != patches[i].expected) {
+            fprintf(stderr, "[WAKE] iBoot charge-wait word at 0x%08x is "
+                    "0x%08x (expected 0x%08x); leaving unpatched\n",
+                    patches[i].addr, current, patches[i].expected);
+            continue;
+        }
+        cpu_physical_memory_write(patches[i].addr, &patches[i].replacement,
+                                  sizeof(patches[i].replacement));
+    }
+}
+
 static void ipod_touch_cpu_reset(void *opaque)
 {
     IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE((MachineState *)opaque);
@@ -177,6 +216,7 @@ static void ipod_touch_cpu_reset(void *opaque)
     } else {
         cpu_physical_memory_write(IBOOT_BASE, iboot_data, iboot_size);
         g_free(iboot_data);
+        ipod_touch_patch_iboot_charge_wait();
     }
 
     volatile_boot_ram = g_malloc0(0x30000);
@@ -190,6 +230,17 @@ static void ipod_touch_cpu_reset(void *opaque)
 
         pmu->oocshdwn_fired = false;
         pmu->wake_reset_pending = false;
+
+        /* The PCF50633 nIRQ pin is level-triggered and the always-on PMU is
+         * holding the wake cause pending while the application processor
+         * powers back up, so the pin is already low when iBoot starts. The
+         * SoC reset cleared the emulated GPIO/VIC view of that level; without
+         * re-expressing it, iBoot's wake path never receives the PMU
+         * interrupt and burns its full 10-second wake-event timeout before
+         * reading INT1/INT2 anyway. */
+        if (retained_wake) {
+            pcf50633_update_irq(pmu);
+        }
     }
     if (nms->lcd_state) {
         /* On a retained wake, OOCSHDWN left the physical panel rail off.
@@ -495,6 +546,45 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     }
     if (keycode == 163 && s->suppress_home_release) {
         s->suppress_home_release = false;
+        return;
+    }
+
+    /*
+     * A pre-warmed wake boot is already running (or parked just before the
+     * type-4 handoff). Power/Home only needs to supply the hardware wake
+     * cause and, when parked, restart the machine: the kernel resume then
+     * reads the PMU RTC and the retained wake cause with correct values.
+     */
+    if ((keycode == 25 || keycode == 35) && s->pmu &&
+        s->pmu->prewarm_active) {
+        Pcf50633State *pmu = s->pmu;
+
+        if (keycode == 25) {
+            pmu->regs[PMU_OOCSTAT] &= ~PMU_OOCSTAT_ONKEY;
+            pmu->int2 |= PMU_INT2_ONKEYF | PMU_INT2_EXTON1R;
+            pmu->retained_int2_wake |= PMU_INT2_ONKEYF | PMU_INT2_EXTON1R;
+            s->suppress_power_release = true;
+        } else {
+            pmu->int2 |= PMU_INT2_EXTON1R;
+            pmu->retained_int2_wake |= PMU_INT2_EXTON1R;
+            s->suppress_home_release = true;
+        }
+        pmu->prewarm_wake_requested = true;
+        pcf50633_update_irq(pmu);
+
+        if (pmu->prewarm_parked) {
+            pmu->prewarm_parked = false;
+            pmu->prewarm_active = false;
+            pmu->retained_int2_reexposed = true;
+            fprintf(stderr, "[WAKE] %s completed pre-warmed wake\n",
+                    keycode == 25 ? "Power" : "Home");
+            vm_start();
+        } else {
+            /* The wake boot has not reached its park point yet; the type-4
+             * commit will now pass straight through instead of parking. */
+            fprintf(stderr, "[WAKE] %s requested wake during pre-warm boot\n",
+                    keycode == 25 ? "Power" : "Home");
+        }
         return;
     }
 

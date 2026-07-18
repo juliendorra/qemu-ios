@@ -2,6 +2,7 @@
 #include "hw/arm/ipod_touch_sysic.h"
 #include "hw/arm/ipod_touch_lcd.h"
 #include "hw/intc/pl192.h"
+#include "qemu/main-loop.h"
 #include "system/runstate.h"
 #include "system/rtc.h"
 
@@ -80,8 +81,20 @@ static int int_to_bcd(int value) {
    return res;
 }
 
+static bool pcf50633_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = g_getenv("IPOD_TRACE_PMU") != NULL;
+    }
+    return enabled;
+}
+
 static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
 {
+    if (pcf50633_trace_enabled()) {
+        fprintf(stderr, "[PMUTRACE] write 0x%02x <- 0x%02x\n", reg, val);
+    }
     // Store all writes in register file for debug inspection
     s->regs[reg] = val;
     switch (reg) {
@@ -89,11 +102,24 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
             fprintf(stderr, "[PMU] RESUME_STATUS write <- 0x%02x%s\n",
                     val, (val & PMU_RESUME_ARMED) ? " (armed)" : "");
             if (val == 0x40) {
+                if (s->prewarm_active && !s->prewarm_wake_requested) {
+                    /* Pre-warmed boot reached the type-4 commit with no wake
+                     * button pressed yet. Park the whole machine here; the
+                     * kernel resume (RTC resync, wake-cause read) must not
+                     * run until a real Power/Home press. vm_stop() cannot be
+                     * called from the vCPU thread, so park from a bottom
+                     * half. */
+                    fprintf(stderr, "[WAKE] Pre-warm reached type-4 commit; "
+                            "parking\n");
+                    qemu_bh_schedule(s->prewarm_park_bh);
+                    break;
+                }
                 /* iBoot has consumed the read-clear interrupt status and is
                  * committing its type-4 branch. Re-expose the retained PMU
-                * wake cause for the kernel's resume decoder. */
+                 * wake cause for the kernel's resume decoder. */
                 s->int2 |= s->retained_int2_wake;
                 s->retained_int2_reexposed = true;
+                s->prewarm_active = false;
             }
             break;
         case PMU_INT1:
@@ -167,6 +193,20 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
                 s->retained_int2_reexposed = false;
                 fprintf(stderr, "[WAKE] Completing queued retained-RAM "
                         "SoC reboot after OOCSHDWN\n");
+                ipod_touch_prepare_retained_wake();
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            } else if (val == 0x02) {
+                /* Untouched sleep. Pre-run the retained wake boot now, with
+                 * the panel off and input closed, and park just before the
+                 * type-4 handoff (see PMU_RESUME_STATUS above). A later
+                 * Power/Home press then only pays for the kernel resume. */
+                s->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
+                s->retained_int2_reexposed = false;
+                s->prewarm_active = true;
+                s->prewarm_parked = false;
+                s->prewarm_wake_requested = false;
+                fprintf(stderr, "[WAKE] Pre-warming retained-RAM wake "
+                        "after OOCSHDWN\n");
                 ipod_touch_prepare_retained_wake();
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             }
@@ -301,6 +341,10 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
             res = 0;
     }
 
+    if (pcf50633_trace_enabled()) {
+        fprintf(stderr, "[PMUTRACE] read 0x%02x -> 0x%02x\n", s->cmd, res);
+    }
+
     s->cmd += 1;
     return res;
 }
@@ -319,6 +363,26 @@ static int pcf50633_send(I2CSlave *i2c, uint8_t data)
     return 0;
 }
 
+static void pcf50633_prewarm_park(void *opaque)
+{
+    Pcf50633State *s = opaque;
+
+    if (!s->prewarm_active) {
+        return;
+    }
+    if (s->prewarm_wake_requested) {
+        /* A wake button arrived between the type-4 commit and this timer.
+         * Complete the pass-through that the commit write skipped. */
+        s->int2 |= s->retained_int2_wake;
+        s->retained_int2_reexposed = true;
+        s->prewarm_active = false;
+        return;
+    }
+    s->prewarm_parked = true;
+    vm_stop(RUN_STATE_SUSPENDED);
+    fprintf(stderr, "[WAKE] Pre-warmed wake parked; awaiting Power/Home\n");
+}
+
 static void pcf50633_init(Object *obj)
 {
     Pcf50633State *s = PCF50633(obj);
@@ -328,6 +392,7 @@ static void pcf50633_init(Object *obj)
     s->int4m = 0xFF;
     s->int5m = 0xFF;
     s->regs[PMU_OOCSTAT] = PMU_OOCSTAT_ONKEY;
+    s->prewarm_park_bh = qemu_bh_new(pcf50633_prewarm_park, s);
 }
 
 static void pcf50633_class_init(ObjectClass *klass, const void *data)

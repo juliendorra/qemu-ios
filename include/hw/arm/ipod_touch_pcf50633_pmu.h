@@ -113,6 +113,21 @@ typedef struct Pcf50633State {
 	// A Power/Home press received during the final display-off transition.
 	// Complete OOCSHDWN first, then perform the retained-RAM SoC reboot.
 	bool wake_reset_pending;
+    /* Pre-warmed wake: after an untouched OOCSHDWN the retained-RAM wake
+     * boot runs immediately with the panel off, and the machine parks in
+     * RUN_STATE_SUSPENDED just before iBoot's type-4 handoff. A later
+     * Power/Home press only has to resume the kernel, so the visible wake
+     * latency is the kernel-resume portion alone. The kernel reads the PMU
+     * RTC and the retained wake cause after the park point, so wall-clock
+     * time and the reported wake reason stay correct. */
+    bool prewarm_active;
+    bool prewarm_parked;
+    bool prewarm_wake_requested;
+    /* vm_stop() must run from a bottom half: calling it inside a virtual-
+     * clock timer callback deadlocks (pause_all_vcpus disables the clock
+     * whose timer list is being dispatched while a vCPU waits on the BQL
+     * in an MMIO access). */
+    QEMUBH *prewarm_park_bh;
 } Pcf50633State;
 
 // Set ONKEY state: call when power button is pressed/released.
