@@ -3765,3 +3765,32 @@ seconds after Power still ends awake; an untouched sleep parks and wakes
 in 1.0 second. The two-cycle and timed-sleep regressions pass unchanged.
 The lesson for future acceptance work: always exercise the lock-phase
 press path, not only the post-OOCSHDWN one.
+
+## Acceptance harness
+
+`scripts/ipod-acceptance-test.py` runs the complete user-visible sleep/wake
+matrix — including the manual lock-phase steps that Phase 27 showed the
+older harnesses missed — against the installed application engine with no
+setup: it clones a disposable NAND from the application resources, boots
+one SDL engine, and drives everything over QMP.
+
+```bash
+python3 scripts/ipod-acceptance-test.py            # main matrix, ~2 min
+python3 scripts/ipod-acceptance-test.py --timed    # adds untouched idle sleep
+IPOD_QEMU=/path/to/qemu-system-arm \
+    python3 scripts/ipod-acceptance-test.py        # a development build
+```
+
+Checks, in one boot: cold boot to a lit home screen and a consumed 60 Hz
+drag; Power then Home two seconds later relights the locked device with
+working touch and no reboot or queued wake; Home ~18.5 s after Power (near
+the sleep commit) still ends awake; two untouched sleep → pre-warm park →
+one-second Home wake cycles, each with a post-wake drag; and a panic scan
+with the known `Panic Fail Count`/IOPanicPlatform/sdio-crc false positives
+filtered. `--timed` boots a second engine and lets the guest idle-sleep on
+its own before the parked wake. Exit status is non-zero on any failing
+check, and every serial/stderr log and screendump is kept in a printed
+`/private/tmp/ipod-acceptance-*` directory.
+
+Run this before promoting any engine change; it replaces the ad-hoc
+`/private/tmp` harnesses used during Phases 22–27.

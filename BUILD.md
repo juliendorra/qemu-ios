@@ -407,3 +407,14 @@ IPOD_TOUCH_DEBUG=1 "iPod Touch.app/Contents/MacOS/iPod Touch"
 > **Note:** If the app is stored inside `~/Documents/` or `~/Desktop/`, macOS
 > will show a permission prompt the first time it runs. Moving the app to
 > `/Applications` or another non-protected location avoids this.
+
+## Acceptance testing
+
+Before promoting an engine build into the application bundle, run the
+sleep/wake acceptance matrix (see `SLEEP_WAKE_INVESTIGATION.md` for what it
+covers and why the lock-phase steps exist):
+
+```bash
+python3 scripts/ipod-acceptance-test.py --timed
+IPOD_QEMU=/path/to/build/qemu-system-arm python3 scripts/ipod-acceptance-test.py
+```
