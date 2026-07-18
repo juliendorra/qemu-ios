@@ -3727,3 +3727,41 @@ Measured on the M2 host: parked wake is 1.09–1.13 s from button press to
 retained touch readiness (`System Wake` at 0.36 s); a press immediately
 after sleep entry (pass-through) is 2.4–2.5 s. Validated: manual and timed
 sleep, two consecutive cycles with 60 Hz drags, and a 25-second park.
+
+## Phase 27: Buttons must work during the lock phase (2026-07-18)
+
+Manual testing of the Phase 25/26 engine immediately found what every
+harness had missed: pressing Power and then Home a few seconds later did
+nothing, and the eventual wake still looked slow. The harnesses only ever
+pressed Home after `OOCSHDWN`; a human presses it during the lock phase,
+when the guest is still fully awake for about 20 seconds with the panel
+dark before committing to deep sleep. The dark-framebuffer wake-queue
+heuristic swallowed those presses, so the OS never saw them, and the
+queued reboot fired only when the guest deep-slept on its own much later.
+
+Three defects were fixed, each confirmed against the real SDL build:
+
+1. **Queue gate.** Power/Home are now delivered normally unless the kernel
+   has armed the resume token (`0x76 <- 0x80`), which uniquely marks the
+   sub-second final commit window before OOCSHDWN; iBoot rewrites the
+   register to 0x40 on every wake. `INT1M == 0xB0` was tried first and is
+   not usable — it is also the post-resume runtime mask value, and it
+   swallowed the second cycle's Power press in the two-cycle regression.
+2. **Merlot Sleep Out.** The OS answers a lock-phase press with
+   `AppleMerlotLCD::_lcdEnable: enable: 1`, but the panel model only
+   understood DCS Sleep In (0x10): the guest relit while the host surface
+   stayed black. DCS Sleep Out (0x11) now powers the panel back on, and a
+   panel that slept while interactive reopens touch input immediately;
+   boot overlays keep the two-second visibility gate.
+3. **Racing press.** A press within three seconds of OOCSHDWN becomes an
+   immediate wake instead of a silent pre-warm park.
+
+The parked machine's SDL title now reads `[Sleeping]` instead of the
+default `[Stopped]`, which read like a fault.
+
+Validated in one scripted run against the SDL build: lock-phase Home
+relights the display with instant touch and no reboot; a press 18.5
+seconds after Power still ends awake; an untouched sleep parks and wakes
+in 1.0 second. The two-cycle and timed-sleep regressions pass unchanged.
+The lesson for future acceptance work: always exercise the lock-phase
+press path, not only the post-OOCSHDWN one.
