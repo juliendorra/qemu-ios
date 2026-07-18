@@ -10,11 +10,29 @@ static uint32_t ipod_touch_lcd_panel_transfer(SSIPeripheral *dev, uint32_t value
      * application-processor power. RAM may still contain status-bar pixels,
      * but a sleeping physical panel no longer scans them out. */
     if (!s->cur_cmd && value == 0x10 && s->lcd) {
+        /* If the device was interactive when the panel slept (a lock, not a
+         * boot overlay), a later Sleep Out may reopen input immediately. */
+        s->lcd->relight_input_fast = s->lcd->input_ready;
         s->lcd->panel_off = true;
         s->lcd->input_ready = false;
         s->lcd->input_ready_frames = 0;
         s->lcd->invalidate = 1;
         fprintf(stderr, "[LCD] Merlot panel entered sleep\n");
+        return 0;
+    }
+
+    /* MIPI DCS 0x11 is Sleep Out. During the lock phase the guest stays
+     * fully awake and relights the panel from AppleMerlotLCD::_lcdEnable(1)
+     * when Power/Home is pressed; without this the OS wakes but the host
+     * surface stays black. */
+    if (!s->cur_cmd && value == 0x11 && s->lcd) {
+        s->lcd->panel_off = false;
+        s->lcd->invalidate = 1;
+        if (s->lcd->relight_input_fast) {
+            s->lcd->relight_input_fast = false;
+            s->lcd->input_ready = true;
+        }
+        fprintf(stderr, "[LCD] Merlot panel woke from sleep\n");
         return 0;
     }
 

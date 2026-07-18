@@ -180,7 +180,11 @@ static void sdl_update_caption(struct sdl2_console *scon)
     char icon_title[1024];
     const char *status = "";
 
-    if (!runstate_is_running()) {
+    if (runstate_check(RUN_STATE_SUSPENDED)) {
+        /* The iPod machine parks in RUN_STATE_SUSPENDED while asleep with a
+         * pre-warmed wake ready; "Stopped" reads like a fault. */
+        status = " [Sleeping]";
+    } else if (!runstate_is_running()) {
         status = " [Stopped]";
     } else if (gui_grab) {
         if (alt_grab) {

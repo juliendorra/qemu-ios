@@ -253,6 +253,7 @@ static void ipod_touch_cpu_reset(void *opaque)
         nms->lcd_state->invalidate = 1;
         nms->lcd_state->input_ready = false;
         nms->lcd_state->input_ready_frames = 0;
+        nms->lcd_state->relight_input_fast = false;
     }
     cpu_reset(cs);
 
@@ -632,14 +633,22 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     }
 
     /*
-     * The guest can spend several seconds in its display-off/driver-shutdown
-     * transition before the final OOCSHDWN write. If Power or Home arrives in
-     * that interval, remember the hardware wake request and let shutdown
-     * finish. The PMU will reset the SoC immediately after OOCSHDWN.
+     * After Power locks the device the guest stays fully awake for many
+     * seconds with the panel dark before it commits to deep sleep; buttons
+     * in that window must be delivered normally so the OS relights the
+     * display, exactly like hardware. Only the short final commit window is
+     * different: the kernel arms resume-token bit 7 (0x76 <- 0x80) moments
+     * before OOCSHDWN — and iBoot rewrites the register to 0x40 on every
+     * wake — so an armed token while awake uniquely identifies that window.
+     * A press after that point must be remembered as a hardware wake
+     * request so the PMU can reset the SoC once shutdown completes.
+     * (Earlier gates — a dark framebuffer, or INT1M == 0xB0 — also matched
+     * the ordinary locked or post-resume states and swallowed presses,
+     * which made wake appear to take 15+ seconds.)
      */
-    if ((keycode == 25 || keycode == 35) && s->lcd && s->pmu &&
+    if ((keycode == 25 || keycode == 35) && s->pmu &&
         !s->pmu->oocshdwn_fired &&
-        ipod_touch_lcd_framebuffer_is_dark(s->lcd)) {
+        (s->pmu->regs[PMU_RESUME_STATUS] & PMU_RESUME_ARMED)) {
         s->pmu->wake_reset_pending = true;
         if (keycode == 25) {
             s->pmu->regs[PMU_OOCSTAT] &= ~PMU_OOCSTAT_ONKEY;
@@ -697,6 +706,13 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     }
 
     if(do_irq) {
+        /* Remember the press so a sleep commit racing with it can turn into
+         * an immediate wake instead of a silent pre-warm park. */
+        if ((keycode == 25 || keycode == 35) && s->pmu) {
+            s->pmu->last_button_press_ns =
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+
         // Always raise the GPIO interrupt for all buttons.
         // The VIC / SYSIC handle delivery during normal operation.
         s->sysic->gpio_int_status[gpio_group] |= (1 << gpio_selector);

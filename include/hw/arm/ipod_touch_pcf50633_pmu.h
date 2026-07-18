@@ -123,6 +123,10 @@ typedef struct Pcf50633State {
     bool prewarm_active;
     bool prewarm_parked;
     bool prewarm_wake_requested;
+    /* Virtual-clock stamp of the last normally-delivered Power/Home press.
+     * A press that lands just before OOCSHDWN was meant to wake the device;
+     * the sleep commit turns it into an immediate wake. */
+    int64_t last_button_press_ns;
     /* vm_stop() must run from a bottom half: calling it inside a virtual-
      * clock timer callback deadlocks (pause_all_vcpus disables the clock
      * whose timer list is being dispatched while a vCPU waits on the BQL

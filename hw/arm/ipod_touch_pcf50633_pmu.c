@@ -196,17 +196,33 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
                 ipod_touch_prepare_retained_wake();
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             } else if (val == 0x02) {
-                /* Untouched sleep. Pre-run the retained wake boot now, with
-                 * the panel off and input closed, and park just before the
-                 * type-4 handoff (see PMU_RESUME_STATUS above). A later
-                 * Power/Home press then only pays for the kernel resume. */
+                int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                bool recent_press = s->last_button_press_ns &&
+                    now - s->last_button_press_ns <
+                        3 * NANOSECONDS_PER_SECOND;
+
                 s->regs[PMU_RESUME_STATUS] |= PMU_RESUME_WAKE;
                 s->retained_int2_reexposed = false;
-                s->prewarm_active = true;
-                s->prewarm_parked = false;
-                s->prewarm_wake_requested = false;
-                fprintf(stderr, "[WAKE] Pre-warming retained-RAM wake "
-                        "after OOCSHDWN\n");
+                if (recent_press) {
+                    /* A Power/Home press raced the sleep commit: the user
+                     * wanted the device awake. Wake immediately instead of
+                     * silently pre-warming and parking. */
+                    s->int2 |= PMU_INT2_EXTON1R;
+                    s->retained_int2_wake |= PMU_INT2_EXTON1R;
+                    fprintf(stderr, "[WAKE] Press raced OOCSHDWN; waking "
+                            "immediately\n");
+                } else {
+                    /* Untouched sleep. Pre-run the retained wake boot now,
+                     * with the panel off and input closed, and park just
+                     * before the type-4 handoff (see PMU_RESUME_STATUS
+                     * above). A later Power/Home press then only pays for
+                     * the kernel resume. */
+                    s->prewarm_active = true;
+                    s->prewarm_parked = false;
+                    s->prewarm_wake_requested = false;
+                    fprintf(stderr, "[WAKE] Pre-warming retained-RAM wake "
+                            "after OOCSHDWN\n");
+                }
                 ipod_touch_prepare_retained_wake();
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             }
