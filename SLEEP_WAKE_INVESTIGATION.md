@@ -3627,3 +3627,103 @@ Touch.app` must not be replaced until those checks pass. The next repository
 step is to establish a QEMU 11.0.2-based port branch, import the already
 validated device/API changes as reviewable commits, and perform GUI plus
 sleep/wake validation from that branch.
+
+## Phase 25: The 10-second wake stall is iBoot's charging wait (2026-07-18)
+
+Wake latency was the last slow feature: 11.5 seconds from Power/Home to
+`System Wake` and 12.4 seconds to retained touch readiness on the promoted
+QEMU 11 engine. A marker harness that timestamps every serial and stderr line
+and samples the guest PC over QMP during the wake window localized all of it
+to one place.
+
+### Where the time went
+
+- 93.6% of wake-window PC samples landed in iBoot, alternating between the
+  64-bit free-running timer read (`0x18002bb6`, reading `0x3E200080/84`
+  high-low-high) and the serial console poll task (`0x1800349c`) — the idle
+  signature of a blocked task scheduler, not real work.
+- The serial timeline bracketed the stall precisely: after iBoot's second
+  `power supply type usb host` line (1.2 s) nothing happened until 11.3 s,
+  when iBoot itself read PMU INT1–5 at the standard addresses 0x02–0x06,
+  wrote `0x76 <- 0x80` then `0x76 <- 0x40`, ran `merlot_quiesce()`, and
+  handed off to the retained kernel.
+- MMIO tracing proved the guest touched no PMU, SYSIC, or GPIO register at
+  all during the stall. Nothing the models could assert would end it.
+
+### What iBoot-204 actually does on the warm path
+
+Static analysis of `iboot_204_n45ap.bin` (all addresses in-image):
+
+- The boot task (`0x18004c76`) calls `0x18009734`, which reads resume
+  register 0x76 through a cached GPMEM helper (`0x180095cc`, register
+  `0x67 + 0x0f`) and extracts **bit 5** — the flag this project names
+  `PMU_RESUME_WAKE`. When set, the boot task runs a charging dispatcher
+  (`0x180099f4`) before the type-4 resume.
+- The dispatcher's charging loop (`0x18009878`) sleeps 5,000,000 µs per
+  iteration (`task_sleep`, pool literal at `0x18009980`), reads INT1–5 once
+  per iteration, and exits when an elapsed budget derived from the data word
+  at `0x18021458` (10,000,000 µs) is spent. That is the observed 10.08 s.
+- Bit 7 of register 0x76 only selects the standby type in the
+  `need battery charge, no power source` shutdown routine (`0x180099b8`).
+
+### Disproved alternatives (do not retry)
+
+| Attempt | Result |
+|---|---|
+| Re-assert PMU nIRQ level after the SoC reset | Correct level-triggered modeling, kept, but no effect: iBoot never arms the PMU GPIO interrupt on this path |
+| Report a full 4.20 V battery | Stall unchanged; the budget is a constant, not voltage-sized |
+| Report no USB source (battery wake) | `need battery charge, no power source` → guest OOCSHDWN shutdown, at 3.80 V and at 4.08 V |
+| Clear bit 5 of 0x76 | Charging skipped but the resume gate is lost: iBoot cold-boots the kernel cache and foreground state is gone |
+| Clear bit 7, keep bit 5 | Still shuts down on battery; bit 7 is not the charge trigger |
+
+The warm path hard-requires a valid external source and always spends the
+fixed charge budget. There is no PMU register state that both resumes and
+skips the wait.
+
+### Fix
+
+`ipod_touch_cpu_reset()` already reloads a pristine volatile iBoot image on
+every retained wake. `ipod_touch_patch_iboot_charge_wait()` now verifies and
+rewrites the two charge-timing words in that RAM copy only (never the file):
+the 10,000,000 µs budget at `+0x21458` becomes 5,000 µs and the 5,000,000 µs
+poll sleep at `+0x9980` becomes 100,000 µs. A mismatched word (any other
+iBoot build) is left untouched and logged. An env-gated `IPOD_TRACE_PMU`
+diagnostic that logs every PMU I2C access remains available.
+
+Result: Power/Home to `System Wake` fell from 11.5 s to 1.74 s and retained
+touch readiness from 12.4 s to 2.5 s. Cold boot, manual sleep/wake with
+post-wake drag, timed sleep, and two consecutive cycles all passed with no
+panic or data abort.
+
+## Phase 26: Pre-warmed wake parks before the type-4 handoff (2026-07-18)
+
+Since wake is an application-processor power cycle whose boot work is
+identical whenever the button is pressed, the wake boot now runs at sleep
+entry instead of at wake time.
+
+1. When an untouched `OOCSHDWN=0x02` completes (manual or timed sleep, no
+   queued button), the PMU immediately requests the same retained-RAM SoC
+   reboot a button would, arms resume bit 5, but supplies no wake cause.
+2. iBoot runs its whole wake path with the panel off and input closed.
+3. At the type-4 commit (`0x76 <- 0x40`) with no wake requested, a bottom
+   half parks the machine with `vm_stop(RUN_STATE_SUSPENDED)`. QEMU's input
+   layer still delivers key events in that runstate.
+4. Power or Home then records the true hardware wake cause (OOCSTAT/ONKEY
+   edges, `EXTON1R`, retained INT2 re-expose) and calls `vm_start()`. Only
+   the kernel resume remains: RTC resync and the wake-cause read execute
+   after the real button press, so wall-clock time and the reported wake
+   reason stay correct no matter how long the park lasted.
+5. A press that lands while the pre-warm boot is still running skips the
+   park and completes as a normal full wake; the bottom-half also resolves
+   the race where the press arrives between the commit write and the park.
+
+One hard-won constraint: the park must not be issued from a
+`QEMU_CLOCK_VIRTUAL` timer callback. `vm_stop()` disables the virtual clock
+whose timer list is being dispatched while the vCPU waits on the BQL inside
+an MMIO access — a permanent deadlock, observed and symbolized. A bottom
+half (the same context as the monitor's `stop`) is safe.
+
+Measured on the M2 host: parked wake is 1.09–1.13 s from button press to
+retained touch readiness (`System Wake` at 0.36 s); a press immediately
+after sleep entry (pass-through) is 2.4–2.5 s. Validated: manual and timed
+sleep, two consecutive cycles with 60 Hz drags, and a 25-second park.
