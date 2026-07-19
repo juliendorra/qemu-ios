@@ -20,6 +20,32 @@ machine (see `hw/arm/ipod_touch.c`):
   It is copied to `IPodTouchMachineState.board_id` at machine init so device
   models can branch on it as iPhone bring-up uncovers differences.
 
+## What changed from the iPod profile, and why
+
+The iPhone work has deliberately kept the shared S5L8900 implementation intact
+and added only the board distinctions that real M68AP firmware requires:
+
+| Change | Reason |
+|---|---|
+| `-M iPhone-2G` QOM subclass | Gives M68AP an explicit board identity without duplicating the working S5L8900 machine. |
+| `board_id` on the machine state/class | Allows shared peripherals to select M68AP or N45AP behavior while preserving the iPod path. |
+| S-Gold2 chardev on UART1 | The iPhone has a cellular baseband and routes its vibrator through that interface. |
+| ISL29003 on I2C0 | The iPhone firmware probes this ambient-light sensor. |
+| Zephyr1 multitouch mode and M68AP ATN GPIO | The iPhone controller protocol and interrupt line differ from the iPod's Zephyr2/HBPP setup. |
+| M68AP image extractor | Apple IPSW boot images are 8900-encrypted/IMG2-wrapped, while the machine's direct-iBoot path expects raw ARM code. |
+| iPhone smoke test | Checks board-profile divergence with N45AP firmware; it is a regression test, not proof that an M68AP kernel boots. |
+
+Not every problem found during this work was introduced by the iPhone profile:
+
+- **Real board differences:** SYSIC security epoch, DeviceTree/NOR images,
+  NAND contents, Zephyr1, baseband, sensors, GPIOs, and call audio.
+- **Existing emulator limitations exposed by M68AP:** a hard-coded SYSIC epoch,
+  an inert watchdog, dependence on a prebuilt physical NAND page tree, and
+  incomplete NAND writes/erase/persistence.
+- **Deliberate mixed-artifact failures:** M68AP iBoot rejects N45AP NOR IMG2
+  entries for their security epoch and rejects the N45AP NAND's WMR/production
+  format. These diagnostics do not prove that matched M68AP artifacts fail.
+
 ## Launching
 
 ```bash
@@ -100,6 +126,21 @@ only produces response bytes the driver never reads. A firmware image that
 happens to contain the literal sequence `05 00 00 06` would end the upload
 early; revisit if a real m68ap driver ever hits this.
 
+## Smoke test
+
+`scripts/iphone-smoke-test.py` boots `-M iPhone-2G` with the n45ap images
+and checks the divergence points that are observable without m68ap firmware:
+kernel boot, AppleISL29003 probing the ALS stub, the expected
+`Could not detect HBPP` Zephyr-mode mismatch, no panics, and both machine
+types still listed by `-M help`. Every wait has a timeout and the whole
+script sits under a SIGALRM watchdog, so it can never hang a caller
+(an untimed boot wait once wedged a session for two hours — always wrap
+QEMU boot tests in a hard timeout).
+
+```bash
+IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
+```
+
 ## Verified
 
 - `-M help` lists both machines; `iPod-Touch` still passes the full
@@ -117,12 +158,61 @@ early; revisit if a real m68ap driver ever hits this.
 
 ## Remaining bring-up work
 
-- **Blocked on real m68ap firmware dumps** (iBoot, NOR with syscfg, NAND):
-  none of the iPhone-only models can be exercised for real until then; the
-  Zephyr1 protocol in particular is implemented from the openiboot reference
-  but has never seen the real AppleZephyr driver.
+> **Live status:** see [`IPHONE_2G_BRINGUP_HANDOFF.md`](IPHONE_2G_BRINGUP_HANDOFF.md).
+> The m68ap iBoot (from the 1.1.4 IPSW) decrypts with the GID key already in
+> `hw/arm/ipod_touch_8900_engine.h`. Its early panic is now identified exactly:
+> M68AP iBoot requires SYSIC `POWER_ID` epoch 3, while the emulator returns the
+> N45AP value 2 unconditionally. Overriding that one read reaches the iBoot
+> banner and recovery prompt; the next boot blocker is matched M68AP NAND
+> content, not the initial NOR hypothesis.
+
+- **Firmware obtained** (1.1.4 IPSW, iBoot-204 — same build as n45ap): iBoot,
+  LLB, and device tree all decrypt with the shared S5L8900 GID key. The Zephyr1
+  protocol is still implemented only from the openiboot reference and has never
+  seen the real AppleZephyr driver.
 - **Speaker/receiver audio codec** differences (the baseband owns call audio
   via `at+xdrv=0,...`; the stub just OKs those commands).
 - **Proximity sensor** (distinct from the ALS) if the m68ap kernel probes one.
 - Possible board-ID strap reads in m68ap iBoot (GPIO reads all return 0,
   which conveniently equals the M68AP board ID).
+
+## Path to a full iPhone OS 1 boot
+
+What separates today's state (Darwin kernel boots under `-M iPhone-2G`
+with iPod images) from a real iPhone OS 1.x boot to SpringBoard:
+
+1. **Make SYSIC epoch board-specific.** Return epoch 3 from `POWER_ID` for
+   M68AP and retain epoch 2 for N45AP. With this single value overridden in a
+   debugger, genuine m68ap iBoot-204.3.14 initializes the M68 display, prints
+   its banner, initializes the NAND controller/FTL, and enters recovery.
+2. **Provide matched boot artifacts.** Raw m68ap iBoot extraction is solved,
+   but the remaining artifact pipeline is incomplete:
+   - Preserve the complete decrypted M68AP IMG2 header/container when building
+     a synthetic NOR; reusing the N45AP header retains the wrong security epoch
+     and invalid metadata. A `build-m68ap-nor.py` tool does not exist yet.
+   - Obtain a lawful M68AP NAND dump, or implement a restore constructor that
+     creates bank/page data, spare bytes, VFL/FTL/WMR metadata, kernelcache,
+     and filesystems from an IPSW. `scripts/pack-ipod-nand.py` only packs an
+     already-created page tree; it is not a NAND constructor.
+3. **Multitouch Zephyr1 against the real driver.** The Z1 model follows
+   openiboot, but the real `AppleZephyr` kext has never run against it;
+   the raw-upload verify heuristic (see caveat above) is the likeliest
+   first breakage.
+4. **Baseband bring-up depth.** iPhone OS's CommCenter is far more
+   demanding than the current OK-to-everything stub: SIM status, IMEI,
+   signal-strength unsolicited responses, and the multiplexed audio
+   channel (`at+xdrv=0`). Expect iterative stubbing guided by actual
+   CommCenter traffic in the serial log. SpringBoard itself should
+   tolerate a dead radio (real devices boot with no SIM).
+5. **Proximity sensor** — openiboot models it as part of the ALS path on
+   m68ap; whether iPhone OS 1.x hard-requires it is unknown until the
+   real kernel boots.
+6. **Risks:** iBoot may read board-strap GPIOs we return as 0 (happens to
+   match M68AP); the m68ap device tree may reference S5L8900 peripherals
+   the iPod firmware never touches (unimplemented-register aborts); NOR
+   syscfg validation may reject a synthetic image.
+
+Realistic sequencing: land the board-aware SYSIC epoch, make the extractor
+retain the M68AP IMG2 containers needed for NOR, then choose between a physical
+M68AP NAND dump and implementing a NAND restore constructor. The latter is now
+the largest missing piece between the recovery prompt and a real kernel boot.
