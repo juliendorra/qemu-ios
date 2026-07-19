@@ -4,6 +4,7 @@ wait for SpringBoard + settle time, optionally drive taps, then quit and
 summarize the [sdio] trace lines from stderr."""
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -17,13 +18,37 @@ APP = Path("/Applications/iPod Touch.app/Contents")
 QEMU = Path(os.environ.get("IPOD_QEMU",
             "/private/tmp/qemu-11-port/build-ipod/qemu-system-arm"))
 PORT = int(os.environ.get("IPOD_QMP_PORT", "4491"))
+QMP_SOCKET = os.environ.get("IPOD_QMP_SOCKET")
+QMP_STDIO = os.environ.get("IPOD_QMP_STDIO") == "1"
 SETTLE = float(os.environ.get("SETTLE", "45"))
+TAP_DELAY = float(os.environ.get("TAP_DELAY", "2"))
+TAPS = [tuple(map(int, item.split(",")))
+        for item in os.environ.get("TAPS", "").split(";") if item]
+ACTIONS = json.loads(os.environ.get("ACTIONS_JSON", "[]"))
+INTERACTIVE = os.environ.get("INTERACTIVE") == "1"
 LOGS = Path(os.environ.get("LOGS") or tempfile.mkdtemp(
     prefix="sdio-trace-", dir="/private/tmp"))
 LOGS.mkdir(parents=True, exist_ok=True)
 
 qmp_id = 0
 qmp_buffer = b""
+
+
+class PipeConnection:
+    """Small socket-compatible wrapper for QMP over QEMU stdio."""
+
+    def __init__(self, proc):
+        self.proc = proc
+
+    def sendall(self, data):
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+    def recv(self, size):
+        return os.read(self.proc.stdout.fileno(), size)
+
+    def close(self):
+        pass
 
 
 def command(conn, execute, arguments=None):
@@ -35,9 +60,18 @@ def command(conn, execute, arguments=None):
     conn.sendall((json.dumps(req) + "\n").encode())
     while True:
         while b"\n" not in qmp_buffer:
-            qmp_buffer += conn.recv(65536)
+            chunk = conn.recv(65536)
+            if not chunk:
+                raise RuntimeError("QMP channel closed")
+            qmp_buffer += chunk
         line, qmp_buffer = qmp_buffer.split(b"\n", 1)
-        resp = json.loads(line)
+        if not line.strip():
+            continue
+        try:
+            resp = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"ignoring non-QMP stdout: {line!r}", flush=True)
+            continue
         if resp.get("id") != qmp_id:
             continue
         if "error" in resp:
@@ -56,36 +90,139 @@ def wait_for(path, marker, start=0, timeout=120):
     raise RuntimeError(f"did not observe {marker!r} in {path}")
 
 
+def tap(conn, x, y):
+    """Tap a 320x480 guest-screen coordinate through QMP."""
+    abs_x = round(x * 0x7fff / 319)
+    abs_y = round(y * 0x7fff / 479)
+    command(conn, "input-send-event", {"events": [
+        {"type": "abs", "data": {"axis": "x", "value": abs_x}},
+        {"type": "abs", "data": {"axis": "y", "value": abs_y}},
+        {"type": "btn", "data": {"button": "left", "down": True}},
+    ]})
+    time.sleep(0.1)
+    command(conn, "input-send-event", {"events": [
+        {"type": "btn", "data": {"button": "left", "down": False}},
+    ]})
+
+
+def drag(conn, x1, y1, x2, y2, steps=12):
+    """Drag between two guest-screen coordinates through QMP."""
+    def move(x, y, down=None):
+        events = [
+            {"type": "abs", "data": {"axis": "x",
+                                     "value": round(x * 0x7fff / 319)}},
+            {"type": "abs", "data": {"axis": "y",
+                                     "value": round(y * 0x7fff / 479)}},
+        ]
+        if down is not None:
+            events.append({"type": "btn",
+                           "data": {"button": "left", "down": down}})
+        command(conn, "input-send-event", {"events": events})
+
+    move(x1, y1, True)
+    for step in range(1, steps + 1):
+        move(x1 + (x2 - x1) * step / steps,
+             y1 + (y2 - y1) * step / steps)
+        time.sleep(0.02)
+    command(conn, "input-send-event", {"events": [
+        {"type": "btn", "data": {"button": "left", "down": False}},
+    ]})
+
+
+def press_key(conn, qcode):
+    """Press one of the machine's physical-button key bindings."""
+    for down in (True, False):
+        command(conn, "input-send-event", {"events": [{
+            "type": "key",
+            "data": {"key": {"type": "qcode", "data": qcode},
+                     "down": down},
+        }]})
+        time.sleep(0.1)
+
+
+def screendump(conn, index):
+    command(conn, "human-monitor-command", {"command-line":
+            f"screendump {LOGS}/screen-{index}.ppm"})
+
+
+def perform_action(conn, action, screen_index):
+    if "wait" in action:
+        delay = float(action["wait"])
+        print(f"wait: {delay}s", flush=True)
+        time.sleep(delay)
+        return screen_index
+    if "tap" in action:
+        x, y = action["tap"]
+        print(f"tap: ({x}, {y})", flush=True)
+        tap(conn, x, y)
+    elif "drag" in action:
+        x1, y1, x2, y2 = action["drag"]
+        print(f"drag: ({x1}, {y1}) -> ({x2}, {y2})", flush=True)
+        drag(conn, x1, y1, x2, y2, int(action.get("steps", 12)))
+    elif "key" in action:
+        print(f"key: {action['key']}", flush=True)
+        press_key(conn, action["key"])
+    else:
+        raise ValueError(f"unknown action: {action!r}")
+    screen_index += 1
+    time.sleep(float(action.get("after", TAP_DELAY)))
+    screendump(conn, screen_index)
+    return screen_index
+
+
 def main():
-    temp_nand = Path(tempfile.mkdtemp(prefix="sdio-trace-nand-",
-                                      dir="/private/tmp")) / "nand"
-    subprocess.run(["cp", "-Rc", str(APP / "Resources/ipod_files/nand"),
-                    str(temp_nand)], check=True)
+    persistent_root = os.environ.get("IPOD_TEST_ROOT")
+    temp_root = (Path(persistent_root) if persistent_root else
+                 Path(tempfile.mkdtemp(prefix="sdio-trace-nand-",
+                                       dir="/private/tmp")))
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_nand = temp_root / "nand"
+    temp_pflash = temp_root / "nor_n45ap.bin"
+    if not temp_nand.exists():
+        subprocess.run(["cp", "-Rc", str(APP / "Resources/ipod_files/nand"),
+                        str(temp_nand)], check=True)
+    if not temp_pflash.exists():
+        shutil.copy2(APP / "Resources/ipod_files/nor_n45ap.bin", temp_pflash)
     serial = LOGS / "serial.log"
     stderr_path = LOGS / "stderr.log"
-    env = dict(os.environ, IPOD_SDIO_TRACE="1")
+    env = dict(os.environ,
+               IPOD_SDIO_TRACE=os.environ.get("IPOD_SDIO_TRACE", "1"))
+    qmp_endpoint = ("stdio" if QMP_STDIO else
+                    f"unix:{QMP_SOCKET},server=on,wait=off" if QMP_SOCKET else
+                    f"tcp:127.0.0.1:{PORT},server=on,wait=off")
     stderr_handle = stderr_path.open("wb")
-    proc = subprocess.Popen([
+    qemu_args = [
         str(QEMU),
         "-M", ("iPod-Touch,"
                f"bootrom={APP / 'Resources/ipod_files/bootrom_s5l8900'},"
                f"iboot={APP / 'Resources/ipod_files/iboot_204_n45ap.bin'},"
                f"nand={temp_nand}"),
         "-m", "1G",
-        "-pflash", str(APP / "Resources/ipod_files/nor_n45ap.bin"),
+        "-drive", f"if=pflash,format=raw,file={temp_pflash}",
         "-L", str(APP / "Resources/pc-bios"),
         "-display", "sdl,gl=off",
         "-serial", f"file:{serial}",
         "-monitor", "none",
-        "-qmp", f"tcp:127.0.0.1:{PORT},server=on,wait=off",
-    ], stdout=subprocess.DEVNULL, stderr=stderr_handle, env=env)
+        "-qmp", qmp_endpoint,
+    ]
+    qemu_args += shlex.split(os.environ.get("EXTRA_QEMU_ARGS", ""))
+    proc = subprocess.Popen(qemu_args,
+       stdin=subprocess.PIPE if QMP_STDIO else None,
+       stdout=subprocess.PIPE if QMP_STDIO else subprocess.DEVNULL,
+       stderr=stderr_handle, env=env)
     conn = None
     try:
         for _ in range(500):
             if proc.poll() is not None:
                 raise RuntimeError(f"QEMU exited {proc.returncode}")
             try:
-                conn = socket.create_connection(("127.0.0.1", PORT))
+                if QMP_STDIO:
+                    conn = PipeConnection(proc)
+                elif QMP_SOCKET:
+                    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    conn.connect(QMP_SOCKET)
+                else:
+                    conn = socket.create_connection(("127.0.0.1", PORT))
                 conn.recv(65536)
                 command(conn, "qmp_capabilities")
                 break
@@ -98,8 +235,23 @@ def main():
         print("SpringBoard configured; settling "
               f"{SETTLE}s for driver matching...", flush=True)
         time.sleep(SETTLE)
-        command(conn, "human-monitor-command",
-                {"command-line": f"screendump {LOGS}/home.ppm"})
+        screendump(conn, 0)
+        screen_index = 0
+        for index, (x, y) in enumerate(TAPS, 1):
+            print(f"tap {index}: ({x}, {y})", flush=True)
+            tap(conn, x, y)
+            time.sleep(TAP_DELAY)
+            screendump(conn, index)
+            screen_index = index
+        for action in ACTIONS:
+            screen_index = perform_action(conn, action, screen_index)
+        while INTERACTIVE:
+            print("action JSON (or quit)> ", end="", flush=True)
+            line = sys.stdin.readline()
+            if not line or line.strip() == "quit":
+                break
+            screen_index = perform_action(conn, json.loads(line),
+                                          screen_index)
         time.sleep(0.5)
     finally:
         if conn:
@@ -113,11 +265,12 @@ def main():
         except subprocess.TimeoutExpired:
             proc.kill()
         stderr_handle.close()
-        shutil.rmtree(temp_nand.parent, ignore_errors=True)
+        if not persistent_root:
+            shutil.rmtree(temp_nand.parent, ignore_errors=True)
 
     lines = [l for l in stderr_path.read_text(errors="replace").splitlines()
-             if l.startswith("[sdio]")]
-    print(f"\n{len(lines)} [sdio] trace lines -> {LOGS}/stderr.log")
+             if l.startswith(("[sdio]", "[mv8686]"))]
+    print(f"\n{len(lines)} SDIO/card trace lines -> {LOGS}/stderr.log")
     for l in lines[:200]:
         print(l)
     if len(lines) > 200:

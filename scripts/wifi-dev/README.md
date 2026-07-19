@@ -16,7 +16,11 @@ Apple driver does at the SDIO register level.
 
 Env: `IPOD_QEMU`, `IPOD_QMP_PORT` (use a unique port per concurrent run —
 collisions leave stray QEMUs), `LOGS`, `SETTLE`, `IPOD_MV_WIFI`,
-`IPOD_MV_EEPROM_FILL`.
+`IPOD_MV_EEPROM_FILL`, `TAPS`, and `TAP_DELAY`. For mixed timing and physical
+button input, `ACTIONS_JSON` accepts tap, key, drag, and wait objects, for
+example: `[{"key":"h","after":2},{"drag":[55,432,270,432]}]`.
+With `INTERACTIVE=1`, the harness then accepts one action JSON object per line
+on stdin until `quit`, which is useful for inspecting each generated screen.
 
 ## `dump-ram.py`
 
