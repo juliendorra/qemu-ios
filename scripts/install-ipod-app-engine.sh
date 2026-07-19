@@ -2,27 +2,52 @@
 
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-    echo "usage: $0 QEMU_BINARY [APP_BUNDLE]" >&2
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+    echo "usage: $0 QEMU_BINARY [APP_BUNDLE] [ipod-touch|iphone-2g]" >&2
     exit 2
 fi
 
 QEMU_BINARY="$1"
 APP_BUNDLE="${2:-/Applications/iPod Touch.app}"
+PROFILE="${3:-ipod-touch}"
 CONTENTS="$APP_BUNDLE/Contents"
 TARGET_BINARY="$CONTENTS/MacOS/qemu-system-arm"
 TARGET_FRAMEWORKS="$CONTENTS/Frameworks"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+case "$PROFILE" in
+    ipod-touch|iphone-2g) ;;
+    *)
+        echo "Invalid S5L8900 profile: $PROFILE" >&2
+        exit 2
+        ;;
+esac
 
 if [[ ! -x "$QEMU_BINARY" ]]; then
     echo "QEMU binary is not executable: $QEMU_BINARY" >&2
     exit 1
 fi
 if [[ ! -d "$TARGET_FRAMEWORKS" || ! -f "$CONTENTS/Info.plist" ]]; then
-    echo "Invalid iPod Touch application bundle: $APP_BUNDLE" >&2
+    echo "Invalid S5L8900 application bundle: $APP_BUNDLE" >&2
     exit 1
 fi
+for helper in ipod-app-launcher.sh ipod-http-bridge.py; do
+    if [[ ! -f "$SCRIPT_DIR/$helper" ]]; then
+        echo "Missing installer helper: $SCRIPT_DIR/$helper" >&2
+        exit 1
+    fi
+done
 
-STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ipod-app-engine.XXXXXX")"
+BUNDLE_EXECUTABLE="$(/usr/libexec/PlistBuddy \
+    -c 'Print :CFBundleExecutable' "$CONTENTS/Info.plist")"
+if [[ -z "$BUNDLE_EXECUTABLE" || "$BUNDLE_EXECUTABLE" == */* ||
+        "$BUNDLE_EXECUTABLE" == "qemu-system-arm" ]]; then
+    echo "Invalid CFBundleExecutable for launcher installation: $BUNDLE_EXECUTABLE" >&2
+    exit 1
+fi
+TARGET_LAUNCHER="$CONTENTS/MacOS/$BUNDLE_EXECUTABLE"
+
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/s5l8900-app-engine.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/Frameworks"
 cp -R "$TARGET_FRAMEWORKS/." "$STAGE/Frameworks/"
@@ -86,6 +111,11 @@ codesign --force -s - "$STAGE/qemu-system-arm"
 ditto "$STAGE/Frameworks" "$TARGET_FRAMEWORKS"
 cp "$STAGE/qemu-system-arm" "$TARGET_BINARY"
 chmod 755 "$TARGET_BINARY"
+cp "$SCRIPT_DIR/ipod-http-bridge.py" "$CONTENTS/Resources/ipod-http-bridge.py"
+chmod 644 "$CONTENTS/Resources/ipod-http-bridge.py"
+cp "$SCRIPT_DIR/ipod-app-launcher.sh" "$TARGET_LAUNCHER"
+chmod 755 "$TARGET_LAUNCHER"
+printf '%s\n' "$PROFILE" > "$CONTENTS/Resources/s5l8900-profile"
 codesign --force --deep -s - "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 
