@@ -770,6 +770,8 @@ static void ipod_touch_machine_init(MachineState *machine)
     AddressSpace *nsas;
     ARMCPU *cpu;
 
+    nms->board_id = IPOD_TOUCH_MACHINE_GET_CLASS(machine)->board_id;
+
     ipod_touch_cpu_setup(machine, &sysmem, &cpu, &nsas);
 
     // setup clock
@@ -1065,11 +1067,27 @@ static void ipod_touch_machine_init(MachineState *machine)
 static void ipod_touch_machine_class_init(ObjectClass *obj, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(obj);
-    mc->desc = "iPod Touch";
+    IPodTouchMachineClass *imc = IPOD_TOUCH_MACHINE_CLASS(obj);
+    mc->desc = "iPod Touch 1G (N45AP)";
     mc->init = ipod_touch_machine_init;
     mc->max_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm1176");
     mc->default_nic = TYPE_IPOD_TOUCH_SDIO;
+    imc->board_id = BOARD_ID_N45AP;
+}
+
+/*
+ * The iPhone (2G, M68AP) is the same S5L8900 SoC with the same peripheral
+ * layout; the device-specific behaviour lives in the firmware images passed
+ * on the command line (m68ap iBoot/NOR/NAND). It therefore inherits the
+ * whole iPod Touch machine and only overrides its identity.
+ */
+static void iphone_2g_machine_class_init(ObjectClass *obj, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(obj);
+    IPodTouchMachineClass *imc = IPOD_TOUCH_MACHINE_CLASS(obj);
+    mc->desc = "iPhone 2G (M68AP)";
+    imc->board_id = BOARD_ID_M68AP;
 }
 
 static const TypeInfo ipod_touch_machine_info = {
@@ -1082,9 +1100,16 @@ static const TypeInfo ipod_touch_machine_info = {
     .interfaces    = arm_machine_interfaces,
 };
 
+static const TypeInfo iphone_2g_machine_info = {
+    .name          = TYPE_IPHONE_2G_MACHINE,
+    .parent        = TYPE_IPOD_TOUCH_MACHINE,
+    .class_init    = iphone_2g_machine_class_init,
+};
+
 static void ipod_touch_machine_types(void)
 {
     type_register_static(&ipod_touch_machine_info);
+    type_register_static(&iphone_2g_machine_info);
 }
 
 type_init(ipod_touch_machine_types)

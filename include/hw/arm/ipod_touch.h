@@ -27,10 +27,20 @@
 #include "cpu.h"
 
 #define TYPE_IPOD_TOUCH "iPod-Touch"
+#define TYPE_IPHONE_2G "iPhone-2G"
 
 #define TYPE_IPOD_TOUCH_MACHINE   MACHINE_TYPE_NAME(TYPE_IPOD_TOUCH)
+#define TYPE_IPHONE_2G_MACHINE    MACHINE_TYPE_NAME(TYPE_IPHONE_2G)
 #define IPOD_TOUCH_MACHINE(obj) \
     OBJECT_CHECK(IPodTouchMachineState, (obj), TYPE_IPOD_TOUCH_MACHINE)
+#define IPOD_TOUCH_MACHINE_GET_CLASS(obj) \
+    OBJECT_GET_CLASS(IPodTouchMachineClass, (obj), TYPE_IPOD_TOUCH_MACHINE)
+#define IPOD_TOUCH_MACHINE_CLASS(klass) \
+    OBJECT_CLASS_CHECK(IPodTouchMachineClass, (klass), TYPE_IPOD_TOUCH_MACHINE)
+
+/* Apple board IDs reported by the board straps / IMG2 header checks */
+#define BOARD_ID_M68AP 0  /* iPhone (2G) */
+#define BOARD_ID_N45AP 2  /* iPod Touch 1G */
 
 // VIC
 #define S5L8900_VIC_N	  2
@@ -126,6 +136,7 @@ const int S5L8900_GPIO_IRQS[7] = { S5L8900_GPIO_G0_IRQ, S5L8900_GPIO_G1_IRQ, S5L
 
 typedef struct {
     MachineClass parent;
+    uint32_t board_id; /* BOARD_ID_M68AP or BOARD_ID_N45AP */
 } IPodTouchMachineClass;
 
 typedef struct s5l8900_usb_phys_s
@@ -176,6 +187,7 @@ typedef struct {
 	char bootrom_path[1024];
 	char iboot_path[1024];
 	char nand_path[1024];
+	uint32_t board_id;
 } IPodTouchMachineState;
 
 void ipod_touch_prepare_retained_wake(void);
