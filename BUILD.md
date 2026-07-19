@@ -164,8 +164,26 @@ paths before deployment, signs the app, and verifies the final signature:
 ```bash
 scripts/install-ipod-app-engine.sh \
     /private/tmp/qemu-11-port/build-ipod/qemu-system-arm \
-    "/Applications/iPod Touch.app"
+    "/Applications/iPod Touch.app" \
+    ipod-touch
 ```
+
+The installer and launcher are shared by both S5L8900 board profiles. The
+historical script filenames remain for compatibility. An eventual iPhone
+bundle selects its board and default artifact directory with:
+
+```bash
+scripts/install-ipod-app-engine.sh \
+    /path/to/qemu-system-arm \
+    "/Applications/iPhone 2G.app" \
+    iphone-2g
+```
+
+The selected profile is stored in `Contents/Resources/s5l8900-profile`.
+`ipod-touch` uses `iPod-Touch` plus `Resources/ipod_files`; `iphone-2g` uses
+`iPhone-2G` plus `Resources/iphone_files`. The launcher also accepts
+`S5L8900_PROFILE`, `S5L8900_FIRMWARE_DIR`, `S5L8900_BOOTROM`,
+`S5L8900_IBOOT`, `S5L8900_NOR`, and `S5L8900_NAND` overrides.
 
 Do not include `build-ipod/` in commits. It is a local build product and, on
 the port branch, is intentionally left untracked.
@@ -318,29 +336,19 @@ done
 ### 6. Create the launcher script
 
 ```bash
-cat > "$APP/Contents/MacOS/iPod Touch" << 'LAUNCHER'
-#!/bin/bash
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-RESOURCES="$DIR/Resources"
-FRAMEWORKS="$DIR/Frameworks"
-
-export DYLD_LIBRARY_PATH="$FRAMEWORKS"
-
-QEMU_DIAGNOSTICS=(-serial null)
-if [[ "${IPOD_TOUCH_DEBUG:-0}" == "1" ]]; then
-    QEMU_DIAGNOSTICS=(-serial mon:stdio -d unimp)
-fi
-
-exec "$DIR/MacOS/qemu-system-arm" \
-    -M "iPod-Touch,bootrom=$RESOURCES/ipod_files/bootrom_s5l8900,iboot=$RESOURCES/ipod_files/iboot_204_n45ap.bin,nand=$RESOURCES/ipod_files/nand" \
-    -m 1G \
-    -pflash "$RESOURCES/ipod_files/nor_n45ap.bin" \
-    -L "$RESOURCES/pc-bios" \
-    "${QEMU_DIAGNOSTICS[@]}" \
-    "$@"
-LAUNCHER
+cp scripts/ipod-app-launcher.sh "$APP/Contents/MacOS/iPod Touch"
 chmod +x "$APP/Contents/MacOS/iPod Touch"
+printf '%s\n' ipod-touch > "$APP/Contents/Resources/s5l8900-profile"
+cp scripts/ipod-http-bridge.py "$APP/Contents/Resources/"
 ```
+
+The launcher starts a loopback-only HTTP compatibility service that can fetch
+modern HTTPS pages and rewrite their links for old Safari. This service is
+common to both board profiles, but it does **not** itself provide guest
+networking: the SDIO Wi-Fi model still needs a working network-backend path
+before either guest can reach the host bridge. Disable the service with
+`S5L8900_HTTP_BRIDGE=0` or change its host port with
+`S5L8900_HTTP_BRIDGE_PORT`.
 
 ### 7. Create Info.plist
 
@@ -401,8 +409,10 @@ very verbose guest serial and unimplemented-device logs. For an investigation,
 launch it from Terminal with diagnostics restored:
 
 ```bash
-IPOD_TOUCH_DEBUG=1 "iPod Touch.app/Contents/MacOS/iPod Touch"
+S5L8900_DEBUG=1 "iPod Touch.app/Contents/MacOS/iPod Touch"
 ```
+
+`IPOD_TOUCH_DEBUG=1` remains accepted as a compatibility alias.
 
 > **Note:** If the app is stored inside `~/Documents/` or `~/Desktop/`, macOS
 > will show a permission prompt the first time it runs. Moving the app to
