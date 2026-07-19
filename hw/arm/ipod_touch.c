@@ -18,6 +18,7 @@
 #include "hw/dma/pl080.h"
 #include "chardev/char.h"
 #include "ui/input.h"
+#include "hw/arm/ipod_touch_baseband.h"
 #include <openssl/aes.h>
 
 // Global pointer to machine state for wake assist timer access from key handler
@@ -853,7 +854,13 @@ static void ipod_touch_machine_init(MachineState *machine)
         abort();
     }
 
-    dev = exynos4210_uart_create(UART1_MEM_BASE, 256, 1, serial_hd(1), nms->irq[0][25]);
+    // The iPhone's S-Gold2 baseband hangs off UART1; give it an AT-command
+    // stub there so radio (and vibrator) bring-up sees "OK" instead of silence.
+    Chardev *uart1_chr = serial_hd(1);
+    if (nms->board_id == BOARD_ID_M68AP) {
+        uart1_chr = qemu_chardev_new("sgold2-baseband", TYPE_CHARDEV_SGOLD2, NULL, NULL, &error_fatal);
+    }
+    dev = exynos4210_uart_create(UART1_MEM_BASE, 256, 1, uart1_chr, nms->irq[0][25]);
     if (!dev) {
         printf("Failed to create uart1 device!\n");
         abort();
@@ -893,6 +900,8 @@ static void ipod_touch_machine_init(MachineState *machine)
     spi2_state->mt->sysic = sysic_state;
     spi2_state->mt->gpio_state = gpio_state;
     spi2_state->mt->cpu = CPU(cpu);
+    // the iPhone's touch controller runs the Zephyr1 firmware/protocol
+    spi2_state->mt->zephyr1 = (nms->board_id == BOARD_ID_M68AP);
     nms->spi2_state = spi2_state;
 
     ipod_touch_memory_setup(machine, sysmem, nsas);
@@ -992,6 +1001,11 @@ static void ipod_touch_machine_init(MachineState *machine)
 
     // init the accelerometer
     I2CSlave *accelerometer = i2c_slave_create_simple(i2c_state->bus, "lis302dl", 0x1D);
+
+    if (nms->board_id == BOARD_ID_M68AP) {
+        // the iPhone's ISL29003 ambient light sensor (8-bit address 0x92)
+        i2c_slave_create_simple(i2c_state->bus, "isl29003", 0x49);
+    }
 
     dev = qdev_new("ipodtouch.i2c");
     i2c_state = IPOD_TOUCH_I2C(dev);
