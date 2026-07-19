@@ -65,25 +65,30 @@
 #define CMD_802_11_PS_MODE          0x0021
 #define CMD_802_11_DEAUTHENTICATE   0x0024
 #define CMD_MAC_CONTROL             0x0028
+#define CMD_802_11_DEEP_SLEEP       0x003e
 #define CMD_802_11_MAC_ADDRESS      0x004d
 #define CMD_802_11_ASSOCIATE        0x0050
 #define CMD_RET(c)                  (0x8000 | (c))
+/* Unlike normal replies, the Libertas firmware reports an association
+ * response using the legacy 0x8012 command ID. */
+#define CMD_RET_802_11_ASSOCIATE    0x8012
 
 /* Firmware events (libertas/host.h MACREG_INT_CODE_*) */
 #define MV_EVENT_LINK_SENSED        4
 #define MV_EVENT_DEAUTHENTICATED    8
+#define MV_EVENT_DEEP_SLEEP_AWAKE   16
 
 #define MV8686_SSID     "iPod Emulator Network"
 #define MV8686_CHANNEL  6
 
 static const uint8_t mv8686_bssid[6] = { 0x02, 0x1a, 0x11, 0xe0, 0x86, 0x86 };
 
-static bool mv8686_wifi_experimental(void)
+static bool mv8686_wifi_enabled(void)
 {
     static int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("IPOD_MV_WIFI");
-        enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+        enabled = (!env || !env[0] || strcmp(env, "0") != 0) ? 1 : 0;
     }
     return enabled;
 }
@@ -153,7 +158,7 @@ static const uint8_t mv8686_cis1[] = {
 
 static void mv8686_update_int(MV8686State *c)
 {
-    uint8_t status = H_INT_DNLD;   /* tx path always ready */
+    uint8_t status = c->dnld_pending ? H_INT_DNLD : 0;
 
     if (c->rx_head) {
         status |= H_INT_UPLD;
@@ -169,7 +174,8 @@ static void mv8686_update_int(MV8686State *c)
 
     if (c->set_card_irq) {
         /* interrupt the host while an upload is pending */
-        c->set_card_irq(c->irq_opaque, !!(c->rx_head));
+        c->set_card_irq(c->irq_opaque,
+                        c->rx_head != NULL || c->dnld_pending);
     }
 }
 
@@ -201,9 +207,10 @@ static void mv8686_queue_packet(MV8686State *c, uint16_t type,
 
 static void mv8686_queue_event(MV8686State *c, uint32_t code)
 {
-    /* SDIO event packets carry a little-endian cause word; the host
-     * extracts the code from bits 10:3 (SBI_EVENT_CAUSE_SHIFT). */
-    uint32_t cause = code << 3;
+    /* 8686 SDIO event packets carry the event ID directly in the low byte
+     * of a little-endian cause word.  The three-bit shift belongs to the
+     * older 8385 register-based event path, not this mailbox protocol. */
+    uint32_t cause = code;
     uint8_t payload[4];
 
     payload[0] = cause & 0xff;
@@ -211,6 +218,16 @@ static void mv8686_queue_event(MV8686State *c, uint32_t code)
     payload[2] = (cause >> 16) & 0xff;
     payload[3] = (cause >> 24) & 0xff;
     mv8686_queue_packet(c, MVMS_EVENT, payload, sizeof(payload));
+}
+
+static void mv8686_wake_timer(void *opaque)
+{
+    MV8686State *c = opaque;
+
+    if (c->deep_sleep) {
+        c->deep_sleep = false;
+        mv8686_queue_event(c, MV_EVENT_DEEP_SLEEP_AWAKE);
+    }
 }
 
 /* --- firmware command handling ------------------------------------- */
@@ -233,7 +250,8 @@ static void mv8686_cmd_response(MV8686State *c, uint16_t cmd, uint16_t seq,
         total = sizeof(resp);
         body_len = total - 8;
     }
-    put_le16(resp + 0, CMD_RET(cmd));
+    put_le16(resp + 0, cmd == CMD_802_11_ASSOCIATE ?
+             CMD_RET_802_11_ASSOCIATE : CMD_RET(cmd));
     put_le16(resp + 2, total);
     put_le16(resp + 4, seq);
     put_le16(resp + 6, 0);          /* result: success */
@@ -323,12 +341,26 @@ static void mv8686_handle_cmd(MV8686State *c, const uint8_t *pkt, size_t len)
         c->associated = true;
         mv8686_cmd_response(c, cmd, seq, resp, sizeof(resp));
         mv8686_queue_event(c, MV_EVENT_LINK_SENSED);
+        if (c->deferred_frame_len) {
+            size_t deferred_len = c->deferred_frame_len;
+
+            c->deferred_frame_len = 0;
+            mv8686_receive_frame(c, c->deferred_frame, deferred_len);
+        }
         break;
     }
     case CMD_802_11_DEAUTHENTICATE:
         c->associated = false;
         mv8686_cmd_response(c, cmd, seq, body, body_len);
         mv8686_queue_event(c, MV_EVENT_DEAUTHENTICATED);
+        break;
+    case CMD_802_11_DEEP_SLEEP:
+        /* This command is deliberately fire-and-forget.  Marvell's
+         * firmware specification says that the card enters deep sleep
+         * immediately and sends no command response.  Apple keeps the
+         * command on a special completion path; returning a conventional
+         * 0x803e response leaves it there until the watchdog resets Wi-Fi. */
+        c->deep_sleep = true;
         break;
     case CMD_802_11_MAC_ADDRESS: {
         uint8_t resp[8];
@@ -394,9 +426,25 @@ void mv8686_receive_frame(MV8686State *c, const uint8_t *frame, size_t len)
     /* struct rxpd (20 bytes) + frame */
     uint8_t pkt[MV8686_MAX_PKT - 4];
 
-    if (!c->associated || len + 20 > sizeof(pkt)) {
+    mv_trace_hex("rx frame", frame, len);
+
+    if (len + 20 > sizeof(pkt)) {
         return;
     }
+
+    /* Slirp may synchronously return the first DHCP reply while the guest's
+     * ASSOCIATE command is still queued behind its optimistic DHCP request.
+     * Preserve that reply, but expose it only after the association response
+     * and link event so the old network stack does not discard it. */
+    if (!c->associated) {
+        if (!c->deferred_frame_len) {
+            memcpy(c->deferred_frame, frame, len);
+            c->deferred_frame_len = len;
+            mv_trace("deferred pre-association frame (%zu bytes)", len);
+        }
+        return;
+    }
+
     memset(pkt, 0, 20);
     pkt[2] = 40;                     /* snr */
     put_le16(pkt + 4, len);          /* pkt_len */
@@ -411,28 +459,50 @@ void mv8686_receive_frame(MV8686State *c, const uint8_t *frame, size_t len)
 static void mv8686_stage_eeprom(MV8686State *c, const uint8_t *req,
                                 uint32_t req_len)
 {
-    /* The 16-byte request encodes the EEPROM window the driver wants.
-     * Its exact layout is still being characterized from the guest; for
-     * now stage an image carrying the card MAC and mark the response
-     * ready so the host proceeds to the read. The fill byte is
-     * selectable while the calibration format is being reverse
-     * engineered. */
-    const char *fillenv = getenv("IPOD_MV_EEPROM_FILL");
-    uint8_t fill = fillenv ? (uint8_t)strtoul(fillenv, NULL, 0) : 0x00;
-    memset(c->eeprom, fill, sizeof(c->eeprom));
-    memcpy(c->eeprom, c->mac, 6);
+    uint8_t *p = c->eeprom;
+
+    /* AppleMRVL868x::parseEEPROM() expects a big-endian record stream:
+     *
+     *   de ad 00 04 be ef ca fe       image header
+     *   [be16 key][be16 words][data]  records, words includes the header
+     *
+     * Key 1 becomes the "tx-calibration" device-tree property and key 2
+     * becomes "local-mac-address".  The start path rejects calibration
+     * whose first 128 bytes are all 0x00 or all 0xff, so use a stable,
+     * non-uniform behavioral-model payload.  The real RF calibration is
+     * neither consumed by QEMU nor needed by the modeled firmware.
+     *
+     * The helper reports EEPROM response length through scratch 0x34/35;
+     * it is a signed 16-bit chunk length, not the 0xFEDC firmware-ready
+     * marker.  Apple reads exactly 0x800 bytes before parsing. */
+    memset(c->eeprom, 0xff, sizeof(c->eeprom));
+    *p++ = 0xde; *p++ = 0xad;
+    *p++ = 0x00; *p++ = 0x04;
+    *p++ = 0xbe; *p++ = 0xef;
+    *p++ = 0xca; *p++ = 0xfe;
+
+    /* Key 1: 128-byte Wi-Fi calibration; (4 + 128) / 2 = 66 words. */
+    *p++ = 0x00; *p++ = 0x01;
+    *p++ = 0x00; *p++ = 0x42;
+    for (unsigned i = 0; i < 128; i++) {
+        *p++ = i;
+    }
+
+    /* Key 2: six-byte Wi-Fi MAC; (4 + 6) / 2 = 5 words. */
+    *p++ = 0x00; *p++ = 0x02;
+    *p++ = 0x00; *p++ = 0x05;
+    memcpy(p, c->mac, sizeof(c->mac));
     c->eeprom_len = sizeof(c->eeprom);
 
     c->dl_state = MV8686_EEPROM_READ;
     /* no further host writes expected before the read */
     c->fn1[FN1_RD_BASE] = 0;
     c->fn1[FN1_RD_BASE + 1] = 0;
-    /* signal the staged response length through RX_LEN/RX_UNIT and keep
-     * the firmware-ready magic in scratch */
+    /* Signal the staged response length through both register pairs. */
     c->fn1[FN1_RX_LEN] = c->eeprom_len & 0xff;
     c->fn1[FN1_RX_UNIT] = (c->eeprom_len >> 8) & 0xff;
-    c->fn1[FN1_SCRATCH] = MV_FIRMWARE_OK & 0xff;
-    c->fn1[FN1_SCRATCH + 1] = MV_FIRMWARE_OK >> 8;
+    c->fn1[FN1_SCRATCH] = c->eeprom_len & 0xff;
+    c->fn1[FN1_SCRATCH + 1] = (c->eeprom_len >> 8) & 0xff;
     (void)req; (void)req_len;
 }
 
@@ -450,19 +520,9 @@ bool mv8686_io_rw_extended(MV8686State *c, bool write, uint8_t fn,
             uint32_t chunk = len >= 4 ?
                 (buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24)) : 0;
             if (chunk == 0) {
-                /* Bootstrapper booted. AppleMRVL868x::readEEPROM now waits
-                 * for RD_BASE to equal its request size (16); it reads
-                 * that size, then writes the EEPROM request there.
-                 *
-                 * Advancing readEEPROM requires a valid Apple calibration
-                 * EEPROM image, whose format is not yet known. Feeding a
-                 * synthetic image makes the driver parse garbage and panic
-                 * the kernel during boot. Until the format is reverse
-                 * engineered, default to letting readEEPROM time out
-                 * gracefully (driver logs "no calibration" and gives up,
-                 * the system still boots). The full bring-up is opt-in via
-                 * IPOD_MV_WIFI=1 for continued development. */
-                if (mv8686_wifi_experimental()) {
+                /* Bootstrapper booted. AppleMRVL868x::readEEPROM waits for
+                 * RD_BASE to equal its fixed 16-byte request size. */
+                if (mv8686_wifi_enabled()) {
                     c->dl_state = MV8686_EEPROM_CMD;
                     c->fn1[FN1_RD_BASE] = MV8686_EEPROM_CMD_LEN;
                     c->fn1[FN1_RD_BASE + 1] = 0;
@@ -476,7 +536,7 @@ bool mv8686_io_rw_extended(MV8686State *c, bool write, uint8_t fn,
                     c->fn1[FN1_RD_BASE] = 0x00;
                     c->fn1[FN1_RD_BASE + 1] = 0x08;
                     mv_trace("helper booted (%u bytes); Wi-Fi bring-up "
-                             "disabled (set IPOD_MV_WIFI=1 to enable)",
+                             "disabled by IPOD_MV_WIFI=0",
                              c->helper_bytes);
                 }
             } else {
@@ -532,6 +592,11 @@ bool mv8686_io_rw_extended(MV8686State *c, bool write, uint8_t fn,
                 mv_trace("tx packet with unhandled type %u", type);
                 break;
             }
+            /* The card consumed the host buffer.  This is a distinct
+             * interrupt cause from a command response and matters for
+             * fire-and-forget commands such as DEEP_SLEEP. */
+            c->dnld_pending = true;
+            mv8686_update_int(c);
         } else {
             MV8686Packet *p = c->rx_head;
             if (!p) {
@@ -576,6 +641,13 @@ static uint8_t mv8686_fn0_read(MV8686State *c, uint32_t reg)
             /* every enabled function is instantly ready */
             return c->cccr[CCCR_IOE];
         }
+        if (reg == CCCR_INT_PEND) {
+            /* Bit n reports an interrupt pending from function n.  The
+             * S5L8900 controller raises its card-interrupt IRQ first, then
+             * AppleMRVL868x reads this register to decide whether it should
+             * inspect function 1's H_INT_STATUS. */
+            return (c->rx_head || c->dnld_pending) ? (1 << 1) : 0;
+        }
         return c->cccr[reg];
     }
     if (reg >= 0x100 && reg < 0x200) {
@@ -604,7 +676,12 @@ static void mv8686_fn0_write(MV8686State *c, uint32_t reg, uint8_t data)
         c->cccr[reg] = data;
         break;
     case CCCR_IO_ABORT:
-        c->io_reset = (data & 0x08) != 0;
+        if (data & 0x08) {
+            /* RES resets function 1.  Apple uses this to recover the chip;
+             * leaving the mailbox live makes the following helper image
+             * look like a stream of malformed runtime packets. */
+            mv8686_reset(c);
+        }
         break;
     default:
         if (reg >= 0x100 && reg < 0x200) {
@@ -619,6 +696,8 @@ static void mv8686_fn0_write(MV8686State *c, uint32_t reg, uint8_t data)
 
 static uint8_t mv8686_fn1_read(MV8686State *c, uint32_t reg)
 {
+    uint8_t value;
+
     if (reg >= sizeof(c->fn1)) {
         return 0;
     }
@@ -630,7 +709,15 @@ static uint8_t mv8686_fn1_read(MV8686State *c, uint32_t reg)
         mv_trace("firmware boot handshake complete (main %u bytes)",
                  c->main_bytes);
     }
-    return c->fn1[reg];
+    value = c->fn1[reg];
+    if (reg == FN1_H_INT_STATUS) {
+        /* Apple reads the cause register once per card interrupt.  The
+         * download-ready edge is consumed by that read; upload remains
+         * asserted until its packet is drained from the mailbox. */
+        c->dnld_pending = false;
+        mv8686_update_int(c);
+    }
+    return value;
 }
 
 static void mv8686_fn1_write(MV8686State *c, uint32_t reg, uint8_t data)
@@ -639,6 +726,18 @@ static void mv8686_fn1_write(MV8686State *c, uint32_t reg, uint8_t data)
         return;
     }
     switch (reg) {
+    case FN1_CONFIG:
+        c->fn1[reg] = data;
+        if (c->deep_sleep && (data & 0x02) && /* HOST_POWER_UP */
+            !timer_pending(c->wake_timer)) {
+            /* Real firmware needs time to wake.  More importantly, do not
+             * raise DS_AWAKE from inside the guest's CMD52 write: Apple sets
+             * its wake-wait state after that write returns. */
+            timer_mod(c->wake_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NANOSECONDS_PER_SECOND);
+        }
+        break;
     case FN1_H_INT_STATUS:
         /* write-to-clear from the host; recompute from queue state */
         mv8686_update_int(c);
@@ -704,6 +803,11 @@ uint32_t mv8686_exec_cmd(MV8686State *c, uint8_t cmd_idx, uint32_t arg)
 void mv8686_reset(MV8686State *c)
 {
     MV8686Packet *p = c->rx_head;
+    uint8_t mac[sizeof(c->mac)];
+    bool have_mac;
+
+    memcpy(mac, c->mac, sizeof(mac));
+    have_mac = memcmp(mac, (uint8_t[sizeof(mac)]) { 0 }, sizeof(mac)) != 0;
 
     while (p) {
         MV8686Packet *next = p->next;
@@ -715,12 +819,20 @@ void mv8686_reset(MV8686State *c)
     void *irq_opaque = c->irq_opaque;
     void (*send_frame)(void *, const uint8_t *, size_t) = c->send_frame;
     void *net_opaque = c->net_opaque;
+    QEMUTimer *wake_timer = c->wake_timer;
 
     memset(c, 0, sizeof(*c));
     c->set_card_irq = set_card_irq;
     c->irq_opaque = irq_opaque;
     c->send_frame = send_frame;
     c->net_opaque = net_opaque;
+    c->wake_timer = wake_timer;
+    if (!c->wake_timer) {
+        c->wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     mv8686_wake_timer, c);
+    } else {
+        timer_del(c->wake_timer);
+    }
 
     c->cccr[CCCR_REVISION] = 0x11;   /* CCCR 1.1 / SDIO 1.1 */
     c->cccr[CCCR_SD_SPEC] = 0x00;
@@ -745,7 +857,27 @@ void mv8686_reset(MV8686State *c)
     c->fn1[FN1_FW_STATUS] = MV_FIRMWARE_OK & 0xff;
     c->fn1[FN1_FW_STATUS + 1] = MV_FIRMWARE_OK >> 8;
 
-    /* locally administered MAC, stable across boots */
-    c->mac[0] = 0x02; c->mac[1] = 0x1a; c->mac[2] = 0x11;
-    c->mac[3] = 0xe0; c->mac[4] = 0x00; c->mac[5] = 0x01;
+    if (have_mac) {
+        memcpy(c->mac, mac, sizeof(c->mac));
+    } else {
+        /* locally administered MAC, stable across boots */
+        c->mac[0] = 0x02; c->mac[1] = 0x1a; c->mac[2] = 0x11;
+        c->mac[3] = 0xe0; c->mac[4] = 0x00; c->mac[5] = 0x01;
+    }
+}
+
+void mv8686_cleanup(MV8686State *c)
+{
+    MV8686Packet *p = c->rx_head;
+
+    while (p) {
+        MV8686Packet *next = p->next;
+        g_free(p);
+        p = next;
+    }
+    c->rx_head = c->rx_tail = NULL;
+    if (c->wake_timer) {
+        timer_free(c->wake_timer);
+        c->wake_timer = NULL;
+    }
 }

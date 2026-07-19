@@ -837,8 +837,10 @@ static void ipod_touch_machine_init(MachineState *machine)
 
     // init SDIO
     dev = qdev_new("ipodtouch.sdio");
+    qemu_configure_nic_device(dev, true, "mv8686");
     IPodTouchSDIOState *sdio_state = IPOD_TOUCH_SDIO(dev);
     nms->sdio_state = sdio_state;
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
     memory_region_add_subregion(sysmem, SDIO_MEM_BASE, &sdio_state->iomem);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8900_get_irq(nms, S5L8900_SDIO_IRQ));
@@ -1067,6 +1069,7 @@ static void ipod_touch_machine_class_init(ObjectClass *obj, const void *data)
     mc->init = ipod_touch_machine_init;
     mc->max_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm1176");
+    mc->default_nic = TYPE_IPOD_TOUCH_SDIO;
 }
 
 static const TypeInfo ipod_touch_machine_info = {

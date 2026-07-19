@@ -7,6 +7,31 @@
  * flood the host log. Not compiled out: the check is one cached branch. */
 #define SDIO_TRACE_LINE_LIMIT 60000
 
+static ssize_t ipod_touch_sdio_receive(NetClientState *nc,
+                                       const uint8_t *buf, size_t size)
+{
+    IPodTouchSDIOState *s = qemu_get_nic_opaque(nc);
+
+    mv8686_receive_frame(&s->card, buf, size);
+    return size;
+}
+
+static NetClientInfo ipod_touch_sdio_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = ipod_touch_sdio_receive,
+};
+
+static void ipod_touch_sdio_send_frame(void *opaque, const uint8_t *buf,
+                                       size_t size)
+{
+    IPodTouchSDIOState *s = opaque;
+
+    if (s->nic) {
+        qemu_send_packet(qemu_get_queue(s->nic), buf, size);
+    }
+}
+
 static bool sdio_trace_enabled(void)
 {
     static int enabled = -1;
@@ -263,6 +288,7 @@ static void ipod_touch_sdio_reset(DeviceState *dev)
            offsetof(IPodTouchSDIOState, card) -
            offsetof(IPodTouchSDIOState, ctrl));
     mv8686_reset(&s->card);
+    memcpy(s->card.mac, s->conf.macaddr.a, sizeof(s->card.mac));
 }
 
 static void ipod_touch_sdio_init(Object *obj)
@@ -275,12 +301,45 @@ static void ipod_touch_sdio_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     s->card.set_card_irq = sdio_card_irq;
     s->card.irq_opaque = s;
+    s->card.send_frame = ipod_touch_sdio_send_frame;
+    s->card.net_opaque = s;
     mv8686_reset(&s->card);
 }
+
+static void ipod_touch_sdio_realize(DeviceState *dev, Error **errp)
+{
+    IPodTouchSDIOState *s = IPOD_TOUCH_SDIO(dev);
+
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    memcpy(s->card.mac, s->conf.macaddr.a, sizeof(s->card.mac));
+    s->nic = qemu_new_nic(&ipod_touch_sdio_net_info, &s->conf,
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+}
+
+static void ipod_touch_sdio_unrealize(DeviceState *dev)
+{
+    IPodTouchSDIOState *s = IPOD_TOUCH_SDIO(dev);
+
+    if (s->nic) {
+        qemu_del_nic(s->nic);
+        s->nic = NULL;
+    }
+    mv8686_cleanup(&s->card);
+}
+
+static const Property ipod_touch_sdio_properties[] = {
+    DEFINE_NIC_PROPERTIES(IPodTouchSDIOState, conf),
+};
 
 static void ipod_touch_sdio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = ipod_touch_sdio_realize;
+    dc->unrealize = ipod_touch_sdio_unrealize;
+    device_class_set_props(dc, ipod_touch_sdio_properties);
     device_class_set_legacy_reset(dc, ipod_touch_sdio_reset);
 }
 

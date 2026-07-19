@@ -5,6 +5,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/core/sysbus.h"
+#include "net/net.h"
 #include "hw/arm/ipod_touch_mv8686.h"
 
 #define TYPE_IPOD_TOUCH_SDIO                "ipodtouch.sdio"
@@ -67,6 +68,8 @@ typedef struct IPodTouchSDIOState
     uint32_t unknown_regs[0x1000 / 4];
 
     MV8686State card;
+    NICConf conf;
+    NICState *nic;
 } IPodTouchSDIOState;
 
 #endif

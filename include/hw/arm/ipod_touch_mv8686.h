@@ -2,6 +2,7 @@
 #define IPOD_TOUCH_MV8686_H
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 
 /* Behavioral model of the Marvell 88W8686-family SDIO Wi-Fi card found in
  * the N45AP. The card side is deliberately separate from the S5L8900 host
@@ -39,6 +40,7 @@ typedef enum {
 
 /* the driver's EEPROM read request is a fixed 16 bytes */
 #define MV8686_EEPROM_CMD_LEN   16
+#define MV8686_EEPROM_LEN       2048
 
 typedef struct MV8686State {
     /* fn0: CCCR (0x00-0xFF) and FBR1 (0x100-0x1FF) register files */
@@ -53,13 +55,21 @@ typedef struct MV8686State {
     uint16_t cmd_seq;             /* last guest command sequence number */
     bool radio_on;
     bool associated;
+    bool deep_sleep;
+    bool dnld_pending;
+    QEMUTimer *wake_timer;
+
+    /* A backend such as slirp can synchronously answer the guest's first
+     * DHCP request before its ASSOCIATE command reaches the mailbox. */
+    uint8_t deferred_frame[MV8686_MAX_PKT - 24];
+    size_t deferred_frame_len;
 
     MV8686DlState dl_state;
     uint32_t helper_bytes;
     uint32_t main_bytes;
 
     /* EEPROM image staged for the readEEPROM handshake */
-    uint8_t eeprom[8192];
+    uint8_t eeprom[MV8686_EEPROM_LEN];
     uint32_t eeprom_len;
 
     /* queue of card-to-host packets (cmd responses, events, rx data) */
@@ -76,6 +86,7 @@ typedef struct MV8686State {
 } MV8686State;
 
 void mv8686_reset(MV8686State *c);
+void mv8686_cleanup(MV8686State *c);
 
 /* Execute an SD/SDIO command without data. Returns the 32-bit response
  * word for RESP0 (raw response bits 39:8, as the S5L8900 exposes it). */
