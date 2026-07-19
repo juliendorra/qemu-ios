@@ -102,49 +102,48 @@ libertas:
   CMD53 from the I/O port.
 
 The model now walks this: helper-end → RD_BASE=16 → accept the 16-byte
-request → stage an EEPROM image (MAC + zeros) and RX_LEN → serve the read
-→ RD_BASE=0x800 to begin the main-firmware download.
+request → return a valid 2048-byte Apple EEPROM record stream → begin the
+main-firmware download → expose the runtime mailbox.
 
 ### The 16-byte EEPROM request (captured)
 
-With `IPOD_MV_WIFI=1`, `readEEPROM` sends this 16-byte CMD53 write once
-RD_BASE reads 16:
+`readEEPROM` sends this 16-byte CMD53 write once RD_BASE reads 16:
 
 ```
 14 00 00 00  00 00 00 02  00 00 00 00  00 00 00 00
 ```
 
-It then reads the EEPROM payload back over CMD53 and parses it.
+It then reads exactly 0x800 bytes. The accepted payload is a big-endian
+record stream:
 
-### Open unknown — the EEPROM payload format (external dependency)
+```
+de ad 00 04 be ef ca fe       image header
+[be16 key][be16 words][data]  records; words includes the 4-byte record header
+```
 
-The EEPROM **payload format** that makes the driver accept calibration
-data and a MAC is not known, and feeding a synthetic image makes the
-driver parse garbage and **panic the kernel during boot**
-(`kernel abort type 4 ... far=0x0000010c` immediately after
-`Reading EEPROM data`). Confirmed there is no open-source reference:
-Linux libertas (`if_sdio.c`) and iphonelinux (`openiboot/wlan.c`) both
-load helper + main firmware with **no** EEPROM step — the read is
-Apple-specific to `AppleMRVL868x`.
+Key 1 becomes the `tx-calibration` property and key 2 becomes
+`local-mac-address`. The behavioral model supplies a stable, non-uniform
+128-byte calibration record and the QEMU NIC MAC. Scratch 0x34/0x35 must
+contain the signed response length (`0x0800`) during this exchange; using
+the later firmware-ready marker (`0xFEDC`) here was the cause of the earlier
+7904-byte read and kernel panic.
 
-Getting the format requires one of:
-- A real N45AP Wi-Fi EEPROM/calibration dump, or
-- Offline disassembly of `AppleMRVL868x::readEEPROM` with a tool that
-  resolves ARM PC-relative (ADR) string references. The in-RAM
-  kernelcache is C++-symbol-stripped and uses PIC string refs, so a
-  literal-pool pointer search does not locate the function; a proper
-  Ghidra/IDA load of the extracted kernelcache is needed.
+### Runtime mailbox and networking details
 
-### Safe default and opt-in
+- Event packets carry the raw event ID. Shifting the ID left by three is an
+  88W8385 register-path convention and makes Apple miss `DEEP_SLEEP_AWAKE`.
+- `CMD_802_11_DEEP_SLEEP` is fire-and-forget. HOST_POWER_UP schedules the
+  awake event one virtual second later; repeated polls must not postpone it.
+- `CMD_802_11_ASSOCIATE` has the protocol's exceptional reply ID `0x8012`,
+  not the otherwise natural `0x8050`.
+- Apple sends its first DHCP Discover just before ASSOCIATE reaches the
+  mailbox. SLIRP can synchronously return the Offer, so the model defers that
+  backend frame until after the association response and link event.
+- The machine exposes the card as a QEMU NIC and uses the default user-mode
+  SLIRP backend. Build QEMU with `-Dslirp=enabled` (or `--enable-slirp`).
 
-Because a synthetic EEPROM panics the kernel, the default build lets
-`readEEPROM` time out gracefully (the driver logs "no calibration",
-gives up, and the system still boots to SpringBoard with Wi-Fi absent —
-no boot/sleep regression). The experimental bring-up (EEPROM handshake,
-main-firmware download, mailbox, scan/associate, tx/rx) is opt-in behind
-`IPOD_MV_WIFI=1` for continued development, per the plan's requirement
-that Wi-Fi be an opt-in setting that never blocks the vCPU or regresses
-the sleep path.
+Wi-Fi is enabled by default. `IPOD_MV_WIFI=0` remains as a bring-up escape
+hatch; `IPOD_SDIO_TRACE=1` enables the verbose controller/card trace.
 
 ## Status against the plan's milestone ladder
 
@@ -153,9 +152,9 @@ the sleep path.
 | A. Host controller | **Done** — no unknown SDIO MMIO; CMD52/CMD53 complete; IRQ on VIC 0x2A, no storms |
 | B. Card enumeration | **Done** — `AppleMRVL868x` attaches; CCCR/FBR/CIS accepted; fn1 enabled |
 | (helper) | **Done** — 2432-byte bootstrapper downloaded byte-exact |
-| C. Firmware mailbox | **Blocked** at Apple `readEEPROM`; MAC query needs the EEPROM payload format |
-| D. Scan | Modeled (deterministic open BSS) but not reachable until C |
-| E. Association | Modeled but not reachable until C |
-| F. Network transport | Card tx/rx implemented; NAT backend (libslirp) installed, netdev wiring pending |
-| G. Internet demo (Safari) | **Not reached** — gated on C and F |
-| H. Power lifecycle | Default build does not regress boot/sleep (Wi-Fi opt-in) |
+| C. Firmware mailbox | **Done** — Apple EEPROM accepted, firmware loaded, command/event/data paths active |
+| D. Scan | **Done** — deterministic open `iPod Emulator Network` appears in Settings |
+| E. Association | **Done** — Apple accepts the 0x8012 response and link-sensed event |
+| F. Network transport | **Done** — QEMU NIC + SLIRP, DHCP gives the guest 10.0.2.15, ARP and bidirectional Ethernet verified |
+| G. Safari demo | **Done** — Safari rendered `http://10.0.2.2:8080/` from a host HTTP server |
+| H. Power lifecycle | **Done for tested path** — deep-sleep/wake loops no longer trigger the Apple command watchdog |

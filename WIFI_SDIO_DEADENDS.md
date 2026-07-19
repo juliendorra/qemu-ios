@@ -53,7 +53,7 @@ Conclusion: RD_BASE is the card's *download-request size*; readEEPROM
 waits for it to equal its own 16-byte request size. Early "flag in the
 high bits" hypotheses were wrong; it is a plain size match.
 
-## 5. Kernelcache disassembly to recover the EEPROM format (all dead ends)
+## 5. Kernelcache byte-search approaches (dead ends)
 
 Goal: read `AppleMRVL868x::readEEPROM` to learn the EEPROM/calibration
 payload layout. Dumped 128 MB of guest RAM via QMP `pmemsave`
@@ -75,10 +75,9 @@ payload layout. Dumped 128 MB of guest RAM via QMP `pmemsave`
 
 Root cause: the kext references its strings via **PC-relative `ADR`**
 (position-independent code), so there is no absolute pointer to grep for.
-Locating the function needs a proper Ghidra/IDA load of the extracted
-kernelcache (ARM PIC analysis), which is out of scope for an in-session
-byte search. `scripts/wifi-dev/find_readeeprom.py` captures approaches
-1–2 for reference.
+Locating the function needed ARM-aware analysis rather than another byte
+search. `scripts/wifi-dev/find_readeeprom.py` captures approaches 1–2 for
+reference; these attempts were not evidence that the format was unknowable.
 
 ## 6. EEPROM content experiments (dead ends)
 
@@ -98,22 +97,39 @@ byte search. `scripts/wifi-dev/find_readeeprom.py` captures approaches
   packet types — all used in the model — but has **no EEPROM-read step**.
 - **iphonelinux** `openiboot/wlan.c` (same 8686 hardware): also loads
   helper + main firmware with **no EEPROM step**.
-- Therefore `readEEPROM` is specific to Apple's `AppleMRVL868x`, and no
-  open-source reference exists for its payload format.
+- Therefore `readEEPROM` is specific to Apple's `AppleMRVL868x`; the format
+  ultimately had to be recovered from the Apple driver.
 
-## 8. Unresolved mysteries (open questions)
+## 8. Resolution and later protocol traps
 
-- **Where does the 7904-byte read length come from?** After the 16-byte
-  request, the driver issues a `CMD53 read len=7904` (0x1EE0). This is
-  not `RX_LEN` (we set 8192), not the request length, and not obviously
-  derived from the scratch value (0xFEDC). Origin unknown.
-- **The 16-byte request bytes** `14 00 00 00 00 00 00 02 …`: the field
-  layout (opcode/offset/length) is not decoded.
-- **The main-firmware command set** Apple's 123020-byte image expects was
-  never reached (blocked at EEPROM), so whether the modeled Libertas
-  command set matches Apple's is unverified.
+ARM-aware analysis recovered the parser's format: an eight-byte
+`de ad 00 04 be ef ca fe` header followed by big-endian
+`[key][word count][data]` records. Key 1 is calibration and key 2 is the
+MAC address. The earlier 7904-byte read was also explained: scratch 0x34/35
+is the signed EEPROM response length at that stage, so leaving the later
+`0xFEDC` firmware-ready marker there was a state-machine bug.
 
-## 9. Tooling / process difficulties
+Three more plausible-looking implementations were wrong and are worth
+calling out:
+
+- SDIO event IDs are raw in the 8686 mailbox; shifting by three is from the
+  older 8385 register event path and breaks the deep-sleep awake event.
+- ASSOCIATE response command ID is the legacy exception `0x8012`, not
+  `0x8050`; the latter makes Apple time out the otherwise successful join.
+- SLIRP returns the first DHCP Offer synchronously while Apple's ASSOCIATE
+  command is still queued. Delivering it immediately loses the Offer in the
+  old network stack; it must be released after the association/link packets.
+
+## 9. Previously unresolved questions
+
+- The 7904-byte read was the signed interpretation of stale scratch value
+  `0xFEDC`; the correct response length is `0x0800`.
+- The full field-level meaning of the fixed 16-byte request remains
+  unneeded; the exact request and response contract are captured.
+- Apple's firmware mailbox was exercised through scan, authenticate,
+  associate, deep sleep/wake, Ethernet TX/RX, DHCP, ARP, TCP, and HTTP.
+
+## 10. Tooling / process difficulties
 
 - **Stray QEMU processes**: parallel boots on fixed QMP ports collided;
   one run left a QEMU holding port 4494 and produced empty logs. Needed a
@@ -127,13 +143,10 @@ byte search. `scripts/wifi-dev/find_readeeprom.py` captures approaches
   mailbox → EEPROM RE → gating) survives only in this document and
   `WIFI_SDIO_NOTES.md`, not as separate commits.
 
-## 10. What would unblock progress
+## 11. Outcome
 
-1. Obtain a **real N45AP Wi-Fi EEPROM/calibration dump** (from hardware or
-   a known-good image), or
-2. **Ghidra/IDA disassembly** of `AppleMRVL868x::readEEPROM` from the
-   extracted kernelcache to decode the request format and the calibration
-   payload structure.
-
-Only after the card survives `readEEPROM` can milestones C–G (firmware
-mailbox → scan → associate → NAT → Safari) actually be exercised.
+The blocker was resolved without a hardware EEPROM dump. The launched dev
+build now associates, obtains `10.0.2.15` from SLIRP, and loads a host-served
+HTTP page in Safari. Modern HTTPS remains an application-layer limitation of
+the 2007 browser; an HTTP reverse proxy on the host is the practical bridge
+to contemporary TLS sites.
