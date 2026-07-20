@@ -31,12 +31,26 @@ if [[ ! -d "$TARGET_FRAMEWORKS" || ! -f "$CONTENTS/Info.plist" ]]; then
     echo "Invalid S5L8900 application bundle: $APP_BUNDLE" >&2
     exit 1
 fi
-for helper in ipod-app-launcher.sh ipod-http-bridge.py; do
+for helper in ipod-app-launcher.sh ipod-http-bridge.py ipod-https-proxy.py \
+        ipod_tls_common.py ipod-nand-restore-dns.py ipod-nand-trust-ca.py \
+        pack-ipod-nand.py; do
     if [[ ! -f "$SCRIPT_DIR/$helper" ]]; then
         echo "Missing installer helper: $SCRIPT_DIR/$helper" >&2
         exit 1
     fi
 done
+
+case "$PROFILE" in
+    ipod-touch) FIRMWARE_SUBDIR="ipod_files" ;;
+    iphone-2g) FIRMWARE_SUBDIR="iphone_files" ;;
+esac
+SOURCE_NAND="$CONTENTS/Resources/$FIRMWARE_SUBDIR/nand"
+NAND_INPUT="${S5L8900_INSTALL_NAND_SOURCE:-$SOURCE_NAND}"
+if [[ ! -d "$NAND_INPUT" ]]; then
+    echo "Firmware NAND not found: $NAND_INPUT" >&2
+    exit 1
+fi
+HTTPS_STATE_DIR="${S5L8900_HTTPS_STATE_DIR:-$HOME/Library/Application Support/S5L8900 HTTPS Bridge/$PROFILE}"
 
 BUNDLE_EXECUTABLE="$(/usr/libexec/PlistBuddy \
     -c 'Print :CFBundleExecutable' "$CONTENTS/Info.plist")"
@@ -108,11 +122,30 @@ for dylib in "$STAGE/Frameworks/"*.dylib; do
 done
 codesign --force -s - "$STAGE/qemu-system-arm"
 
+# Patch only a staged NAND.  The installed bundle is updated below after CA
+# generation, DNS restoration, trust injection, fsck, and packing all succeed.
+ditto "$NAND_INPUT" "$STAGE/nand"
+CA_PEM="$(python3 "$SCRIPT_DIR/ipod_tls_common.py" --state "$HTTPS_STATE_DIR")"
+CA_DER="$HTTPS_STATE_DIR/bridge-ca.der"
+if [[ ! -f "$CA_PEM" || ! -f "$CA_DER" ]]; then
+    echo "HTTPS bridge CA generation failed" >&2
+    exit 1
+fi
+python3 "$SCRIPT_DIR/ipod-nand-restore-dns.py" --nand "$STAGE/nand"
+python3 "$SCRIPT_DIR/ipod-nand-trust-ca.py" \
+    --nand "$STAGE/nand" --ca-cert "$CA_DER"
+python3 "$SCRIPT_DIR/pack-ipod-nand.py" "$STAGE/nand"
+
 ditto "$STAGE/Frameworks" "$TARGET_FRAMEWORKS"
 cp "$STAGE/qemu-system-arm" "$TARGET_BINARY"
 chmod 755 "$TARGET_BINARY"
 cp "$SCRIPT_DIR/ipod-http-bridge.py" "$CONTENTS/Resources/ipod-http-bridge.py"
 chmod 644 "$CONTENTS/Resources/ipod-http-bridge.py"
+cp "$SCRIPT_DIR/ipod-https-proxy.py" "$CONTENTS/Resources/ipod-https-proxy.py"
+cp "$SCRIPT_DIR/ipod_tls_common.py" "$CONTENTS/Resources/ipod_tls_common.py"
+chmod 644 "$CONTENTS/Resources/ipod-https-proxy.py" \
+    "$CONTENTS/Resources/ipod_tls_common.py"
+ditto "$STAGE/nand" "$SOURCE_NAND"
 cp "$SCRIPT_DIR/ipod-app-launcher.sh" "$TARGET_LAUNCHER"
 chmod 755 "$TARGET_LAUNCHER"
 printf '%s\n' "$PROFILE" > "$CONTENTS/Resources/s5l8900-profile"

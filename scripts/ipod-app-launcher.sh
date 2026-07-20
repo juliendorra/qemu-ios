@@ -69,6 +69,7 @@ if [[ ! -d "$NAND" ]]; then
 fi
 
 BRIDGE_PID=""
+HTTPS_PID=""
 BRIDGE_PORT="${S5L8900_HTTP_BRIDGE_PORT:-18080}"
 if [[ "${S5L8900_HTTP_BRIDGE:-1}" != "0" ]] &&
         command -v python3 >/dev/null 2>&1 &&
@@ -78,10 +79,47 @@ if [[ "${S5L8900_HTTP_BRIDGE:-1}" != "0" ]] &&
     BRIDGE_PID=$!
 fi
 
+HTTPS_PORT="${S5L8900_HTTPS_PROXY_PORT:-18443}"
+HTTPS_CONTROL_PORT="${S5L8900_HTTPS_PROXY_CONTROL_PORT:-18442}"
+HTTPS_STATE_DIR="${S5L8900_HTTPS_STATE_DIR:-$HOME/Library/Application Support/S5L8900 HTTPS Bridge/$PROFILE}"
+HTTPS_PROOF_LOG="${S5L8900_HTTPS_PROOF_LOG:-$HTTPS_STATE_DIR/https-proof.jsonl}"
+if [[ "${S5L8900_HTTPS_BRIDGE:-1}" != "0" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "HTTPS bridge requires python3" >&2
+        exit 1
+    fi
+    for helper in ipod-https-proxy.py ipod_tls_common.py; do
+        if [[ ! -f "$RESOURCES/$helper" ]]; then
+            echo "HTTPS bridge helper missing: $RESOURCES/$helper" >&2
+            exit 1
+        fi
+    done
+    mkdir -p "$HTTPS_STATE_DIR"
+    chmod 700 "$HTTPS_STATE_DIR"
+    echo "Starting local HTTPS compatibility bridge; TLS metadata only is logged." >&2
+    echo "Do not enter credentials into sites you do not intend to intercept." >&2
+    python3 "$RESOURCES/ipod-https-proxy.py" \
+        --port "$HTTPS_PORT" --control-port "$HTTPS_CONTROL_PORT" \
+        --state "$HTTPS_STATE_DIR" --proof-log "$HTTPS_PROOF_LOG" &
+    HTTPS_PID=$!
+    sleep 1
+    if ! kill -0 "$HTTPS_PID" 2>/dev/null; then
+        wait "$HTTPS_PID" || true
+        echo "HTTPS bridge failed to start (ports may already be in use)" >&2
+        exit 1
+    fi
+    export IPOD_HTTPS_PROXY_PORT="$HTTPS_PORT"
+    export IPOD_HTTPS_PROXY_CONTROL_PORT="$HTTPS_CONTROL_PORT"
+fi
+
 cleanup() {
     if [[ -n "$BRIDGE_PID" ]]; then
         kill "$BRIDGE_PID" 2>/dev/null || true
         wait "$BRIDGE_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$HTTPS_PID" ]]; then
+        kill "$HTTPS_PID" 2>/dev/null || true
+        wait "$HTTPS_PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM

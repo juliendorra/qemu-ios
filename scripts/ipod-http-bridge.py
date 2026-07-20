@@ -4,10 +4,14 @@
 import argparse
 import html
 import ipaddress
+import json
 import re
 import socket
 import ssl
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 from urllib.request import (
@@ -54,13 +58,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     device_name = "S5L8900 device"
     bridge_port = 18080
+    event_log = None
+    event_log_lock = threading.Lock()
+    redirect_url = "https://example.com/"
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        self.record_event("http-request", path=parsed.path,
+                          host=self.headers.get("Host", ""))
         if parsed.scheme in ("http", "https") and parsed.netloc:
             self.fetch(self.path, rewrite=False)
         elif parsed.path == "/":
             self.home()
+        elif parsed.path == "/redirect":
+            self.redirect()
         elif parsed.path == "/proxy.pac":
             self.proxy_pac()
         elif parsed.path == "/fetch":
@@ -68,6 +79,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.fetch(target, rewrite=True)
         else:
             self.send_error(404)
+
+    def record_event(self, event, **fields):
+        if self.event_log is None:
+            return
+        record = {"event": event, "time_unix": time.time(), **fields}
+        line = json.dumps(record, sort_keys=True) + "\n"
+        with self.event_log_lock:
+            with self.event_log.open("a", encoding="utf-8") as stream:
+                stream.write(line)
+
+    def redirect(self):
+        body = b""
+        self.send_response(302)
+        self.send_header("Location", self.redirect_url)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.record_event("http-redirect", path="/redirect",
+                          location=self.redirect_url)
 
     def do_CONNECT(self):
         body = (b"HTTPS proxying is not enabled yet. The guest must trust "
@@ -100,6 +130,7 @@ guest network transport is required to reach this service.</p>
 <ul>
 <li><a href="/fetch?url=http%3A%2F%2Fexample.com%2F">Example over HTTP</a></li>
 <li><a href="/fetch?url=https%3A%2F%2Fjuliendorra.com%2F">juliendorra.com over HTTPS</a></li>
+<li><a href="/redirect">Transparent HTTP to HTTPS redirect test</a></li>
 <li><a href="/proxy.pac">Automatic proxy configuration</a></li>
 </ul></body></html>""".encode("utf-8")
         self.reply(200, "text/html; charset=utf-8", body)
@@ -184,9 +215,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--device-name", default="S5L8900 device")
+    parser.add_argument("--event-log", type=Path,
+                        help="append metadata-only JSONL request events")
+    parser.add_argument("--redirect-url", default="https://example.com/")
     args = parser.parse_args()
     BridgeHandler.device_name = args.device_name
     BridgeHandler.bridge_port = args.port
+    BridgeHandler.event_log = args.event_log
+    BridgeHandler.redirect_url = args.redirect_url
+    if args.event_log:
+        args.event_log.parent.mkdir(parents=True, exist_ok=True)
     server = BridgeServer(("127.0.0.1", args.port), BridgeHandler)
     try:
         server.serve_forever()
