@@ -53,41 +53,75 @@ class PublicRedirectHandler(HTTPRedirectHandler):
 class BridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     device_name = "S5L8900 device"
+    bridge_port = 18080
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/":
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            self.fetch(self.path, rewrite=False)
+        elif parsed.path == "/":
             self.home()
+        elif parsed.path == "/proxy.pac":
+            self.proxy_pac()
         elif parsed.path == "/fetch":
             target = parse_qs(parsed.query).get("url", [""])[0]
-            self.fetch(target)
+            self.fetch(target, rewrite=True)
         else:
             self.send_error(404)
+
+    def do_CONNECT(self):
+        body = (b"HTTPS proxying is not enabled yet. The guest must trust "
+                b"the bridge CA before TLS can be terminated safely.\n")
+        self.reply(501, "text/plain; charset=utf-8", body)
 
     def home(self):
         device_name = html.escape(self.device_name)
         body = f"""<!doctype html>
-<html><head><title>S5L8900 web bridge</title></head>
+<html><head><title>S5L8900 web bridge</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0,
+maximum-scale=1.0, user-scalable=no">
+<style>
+body {{ margin: 0; padding: 14px; font: 16px Helvetica, Arial, sans-serif;
+       color: #222; background: #fff; }}
+h1 {{ margin: 0 0 12px; font-size: 24px; }}
+p {{ margin: 0 0 14px; line-height: 1.35; }}
+input.url {{ display: block; box-sizing: border-box; width: 100%;
+             margin-bottom: 8px; padding: 9px; font-size: 16px; }}
+input.open {{ padding: 8px 18px; font-size: 16px; }}
+li {{ margin: 10px 0; }}
+</style></head>
 <body><h1>S5L8900 web bridge</h1>
 <p>This host-side compatibility service lets old Safari on {device_name}
 request modern HTTPS pages using the Mac's DNS and certificates. A separate
 guest network transport is required to reach this service.</p>
 <form action="/fetch" method="get">
-<p><input name="url" value="https://example.com/" size="36">
-<input type="submit" value="Open"></p></form>
+<p><input class="url" name="url" value="https://example.com/">
+<input class="open" type="submit" value="Open"></p></form>
 <ul>
 <li><a href="/fetch?url=http%3A%2F%2Fexample.com%2F">Example over HTTP</a></li>
 <li><a href="/fetch?url=https%3A%2F%2Fjuliendorra.com%2F">juliendorra.com over HTTPS</a></li>
+<li><a href="/proxy.pac">Automatic proxy configuration</a></li>
 </ul></body></html>""".encode("utf-8")
         self.reply(200, "text/html; charset=utf-8", body)
 
-    def fetch(self, target):
+    def proxy_pac(self):
+        body = ("function FindProxyForURL(url, host) {\n"
+                f'    return "PROXY 10.0.2.2:{self.bridge_port}";\n'
+                "}\n").encode("ascii")
+        self.reply(200, "application/x-ns-proxy-autoconfig", body)
+
+    def fetch(self, target, rewrite):
         try:
             public_target(target)
-            request = Request(target, headers={
+            headers = {
                 "User-Agent": "S5L8900-HTTP-Bridge/1.0",
                 "Accept-Encoding": "identity",
-            })
+            }
+            for name in ("Accept", "Accept-Language", "Cookie", "Referer",
+                         "User-Agent"):
+                if self.headers.get(name):
+                    headers[name] = self.headers[name]
+            request = Request(target, headers=headers)
             opener = build_opener(
                 PublicRedirectHandler(),
                 HTTPSHandler(context=ssl.create_default_context()),
@@ -106,7 +140,7 @@ guest network transport is required to reach this service.</p>
                        b"<h1>Bridge error</h1><p>" + message + b"</p>")
             return
 
-        if content_type in ("text/html", "application/xhtml+xml"):
+        if rewrite and content_type in ("text/html", "application/xhtml+xml"):
             body = self.rewrite_html(body, final_url, charset)
             content_type = "text/html; charset=utf-8"
         self.reply(200, content_type, body)
@@ -148,10 +182,11 @@ class BridgeServer(ThreadingHTTPServer):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--device-name", default="S5L8900 device")
     args = parser.parse_args()
     BridgeHandler.device_name = args.device_name
+    BridgeHandler.bridge_port = args.port
     server = BridgeServer(("127.0.0.1", args.port), BridgeHandler)
     try:
         server.serve_forever()

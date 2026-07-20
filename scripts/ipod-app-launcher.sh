@@ -69,7 +69,7 @@ if [[ ! -d "$NAND" ]]; then
 fi
 
 BRIDGE_PID=""
-BRIDGE_PORT="${S5L8900_HTTP_BRIDGE_PORT:-8080}"
+BRIDGE_PORT="${S5L8900_HTTP_BRIDGE_PORT:-18080}"
 if [[ "${S5L8900_HTTP_BRIDGE:-1}" != "0" ]] &&
         command -v python3 >/dev/null 2>&1 &&
         [[ -f "$RESOURCES/ipod-http-bridge.py" ]]; then
