@@ -18,6 +18,7 @@
 #include "hw/dma/pl080.h"
 #include "chardev/char.h"
 #include "ui/input.h"
+#include "hw/arm/ipod_touch_baseband.h"
 #include <openssl/aes.h>
 
 // Global pointer to machine state for wake assist timer access from key handler
@@ -770,6 +771,8 @@ static void ipod_touch_machine_init(MachineState *machine)
     AddressSpace *nsas;
     ARMCPU *cpu;
 
+    nms->board_id = IPOD_TOUCH_MACHINE_GET_CLASS(machine)->board_id;
+
     ipod_touch_cpu_setup(machine, &sysmem, &cpu, &nsas);
 
     // setup clock
@@ -851,7 +854,13 @@ static void ipod_touch_machine_init(MachineState *machine)
         abort();
     }
 
-    dev = exynos4210_uart_create(UART1_MEM_BASE, 256, 1, serial_hd(1), nms->irq[0][25]);
+    // The iPhone's S-Gold2 baseband hangs off UART1; give it an AT-command
+    // stub there so radio (and vibrator) bring-up sees "OK" instead of silence.
+    Chardev *uart1_chr = serial_hd(1);
+    if (nms->board_id == BOARD_ID_M68AP) {
+        uart1_chr = qemu_chardev_new("sgold2-baseband", TYPE_CHARDEV_SGOLD2, NULL, NULL, &error_fatal);
+    }
+    dev = exynos4210_uart_create(UART1_MEM_BASE, 256, 1, uart1_chr, nms->irq[0][25]);
     if (!dev) {
         printf("Failed to create uart1 device!\n");
         abort();
@@ -891,6 +900,8 @@ static void ipod_touch_machine_init(MachineState *machine)
     spi2_state->mt->sysic = sysic_state;
     spi2_state->mt->gpio_state = gpio_state;
     spi2_state->mt->cpu = CPU(cpu);
+    // the iPhone's touch controller runs the Zephyr1 firmware/protocol
+    spi2_state->mt->zephyr1 = (nms->board_id == BOARD_ID_M68AP);
     nms->spi2_state = spi2_state;
 
     ipod_touch_memory_setup(machine, sysmem, nsas);
@@ -991,6 +1002,11 @@ static void ipod_touch_machine_init(MachineState *machine)
     // init the accelerometer
     I2CSlave *accelerometer = i2c_slave_create_simple(i2c_state->bus, "lis302dl", 0x1D);
 
+    if (nms->board_id == BOARD_ID_M68AP) {
+        // the iPhone's ISL29003 ambient light sensor (8-bit address 0x92)
+        i2c_slave_create_simple(i2c_state->bus, "isl29003", 0x49);
+    }
+
     dev = qdev_new("ipodtouch.i2c");
     i2c_state = IPOD_TOUCH_I2C(dev);
     nms->i2c1_state = i2c_state;
@@ -1065,11 +1081,27 @@ static void ipod_touch_machine_init(MachineState *machine)
 static void ipod_touch_machine_class_init(ObjectClass *obj, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(obj);
-    mc->desc = "iPod Touch";
+    IPodTouchMachineClass *imc = IPOD_TOUCH_MACHINE_CLASS(obj);
+    mc->desc = "iPod Touch 1G (N45AP)";
     mc->init = ipod_touch_machine_init;
     mc->max_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm1176");
     mc->default_nic = TYPE_IPOD_TOUCH_SDIO;
+    imc->board_id = BOARD_ID_N45AP;
+}
+
+/*
+ * The iPhone (2G, M68AP) is the same S5L8900 SoC with the same peripheral
+ * layout; the device-specific behaviour lives in the firmware images passed
+ * on the command line (m68ap iBoot/NOR/NAND). It therefore inherits the
+ * whole iPod Touch machine and only overrides its identity.
+ */
+static void iphone_2g_machine_class_init(ObjectClass *obj, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(obj);
+    IPodTouchMachineClass *imc = IPOD_TOUCH_MACHINE_CLASS(obj);
+    mc->desc = "iPhone 2G (M68AP)";
+    imc->board_id = BOARD_ID_M68AP;
 }
 
 static const TypeInfo ipod_touch_machine_info = {
@@ -1082,9 +1114,16 @@ static const TypeInfo ipod_touch_machine_info = {
     .interfaces    = arm_machine_interfaces,
 };
 
+static const TypeInfo iphone_2g_machine_info = {
+    .name          = TYPE_IPHONE_2G_MACHINE,
+    .parent        = TYPE_IPOD_TOUCH_MACHINE,
+    .class_init    = iphone_2g_machine_class_init,
+};
+
 static void ipod_touch_machine_types(void)
 {
     type_register_static(&ipod_touch_machine_info);
+    type_register_static(&iphone_2g_machine_info);
 }
 
 type_init(ipod_touch_machine_types)

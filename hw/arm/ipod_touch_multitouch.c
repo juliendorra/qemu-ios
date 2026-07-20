@@ -132,9 +132,306 @@ static void prepare_short_control_response(IPodTouchMultitouchState *s, uint8_t 
     s->out_buffer[15] = (checksum >> 8) & 0xFF;
 }
 
+static uint32_t z1_report_length(uint8_t report_id)
+{
+    switch(report_id) {
+        case MT_REPORT_UNKNOWN1:            return MT_REPORT_UNKNOWN1_SIZE;
+        case MT_REPORT_FAMILY_ID:           return MT_REPORT_FAMILY_ID_SIZE;
+        case MT_REPORT_SENSOR_INFO:         return MT_REPORT_SENSOR_INFO_SIZE;
+        case MT_REPORT_SENSOR_REGION_DESC:  return MT_REPORT_SENSOR_REGION_DESC_SIZE;
+        case MT_REPORT_SENSOR_REGION_PARAM: return MT_REPORT_SENSOR_REGION_PARAM_SIZE;
+        case MT_REPORT_SENSOR_DIMENSIONS:   return MT_REPORT_SENSOR_DIMENSIONS_SIZE;
+        default:                            return 0;
+    }
+}
+
+// 0x8F: reply 0xAA .. .. .. (err<<4|len_hi) len_lo ck_hi ck_lo
+static void z1_prepare_report_info_response(IPodTouchMultitouchState *s, uint8_t report_id)
+{
+    uint32_t len = z1_report_length(report_id);
+    uint8_t err = 0;
+
+    if(len == 0) {
+        err = 1;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "iPhone multitouch: unsupported Z1 report-info ID 0x%02x\n",
+                      report_id);
+    }
+
+    s->out_buffer[4] = (err << 4) | ((len >> 8) & 0xF);
+    s->out_buffer[5] = len & 0xFF;
+
+    uint16_t checksum = (report_id + s->out_buffer[4] + s->out_buffer[5]) & 0xFFFF;
+    s->out_buffer[6] = (checksum >> 8) & 0xFF;
+    s->out_buffer[7] = checksum & 0xFF;
+}
+
+// 0x82: reply 0xAA .. .. .. <data> ck_hi ck_lo (checksum covers the id + data)
+static void z1_prepare_report_response(IPodTouchMultitouchState *s, uint8_t report_id)
+{
+    uint32_t len = z1_report_length(report_id);
+
+    s->buf_size = len + 6;
+    memset(s->out_buffer + 1, 0, s->buf_size - 1);
+
+    uint8_t *data = &s->out_buffer[4];
+    switch(report_id) {
+        case MT_REPORT_FAMILY_ID:
+            data[0] = MT_FAMILY_ID;
+            break;
+        case MT_REPORT_SENSOR_INFO:
+            data[0] = MT_ENDIANNESS;
+            data[1] = MT_SENSOR_ROWS;
+            data[2] = MT_SENSOR_COLUMNS;
+            data[3] = (MT_BCD_VERSION >> 8) & 0xFF;
+            data[4] = MT_BCD_VERSION & 0xFF;
+            break;
+        case MT_REPORT_SENSOR_REGION_DESC:
+            data[0] = MT_SENSOR_REGION_DESC;
+            break;
+        case MT_REPORT_SENSOR_REGION_PARAM:
+            data[0] = MT_SENSOR_REGION_PARAM;
+            break;
+        case MT_REPORT_SENSOR_DIMENSIONS: {
+            uint32_t *dims = (uint32_t *)data;
+            dims[0] = MT_SENSOR_SURFACE_WIDTH;
+            dims[1] = MT_SENSOR_SURFACE_HEIGHT;
+            break;
+        }
+        default:
+            // the driver only asks for reports it enumerated via 0x8F
+            break;
+    }
+
+    uint16_t checksum = report_id;
+    for(int i = 0; i < len; i++) {
+        checksum += data[i];
+    }
+    checksum &= 0xFFFF;
+    s->out_buffer[len + 4] = (checksum >> 8) & 0xFF;
+    s->out_buffer[len + 5] = checksum & 0xFF;
+}
+
+static const uint8_t z1_verify_pattern[4] = { 0x05, 0x00, 0x00, 0x06 };
+
+/*
+ * The Z1 main firmware is clocked out raw, with no command framing, and the
+ * SPI model carries no chip-select boundaries. The upload is tx-only (the
+ * driver ignores responses until the separate verify transaction), so we
+ * absorb bytes into a running checksum and tentatively answer the verify
+ * pattern whenever the byte stream matches it: a false partial match only
+ * wastes response bytes the driver never looks at.
+ */
+static uint32_t z1_raw_upload_transfer(IPodTouchMultitouchState *s, uint8_t value)
+{
+    uint8_t ret = 0;
+
+    if(value == z1_verify_pattern[s->z1_verify_matched]) {
+        if(s->z1_verify_matched == 0) {
+            uint16_t checksum = s->z1_raw_sum & 0xFFFF;
+            s->z1_verify_resp[0] = 0xD0;
+            s->z1_verify_resp[1] = 0x00;
+            s->z1_verify_resp[2] = (checksum >> 8) & 0xFF;
+            s->z1_verify_resp[3] = checksum & 0xFF;
+        }
+        ret = s->z1_verify_resp[s->z1_verify_matched];
+        s->z1_verify_matched++;
+        if(s->z1_verify_matched == 4) {
+            // a full verify transaction ends the raw upload stream
+            s->z1_upload_cksum = s->z1_raw_sum & 0xFFFF;
+            s->z1_raw_upload = false;
+            s->z1_verify_matched = 0;
+            s->firmware_loaded = true;
+        }
+        return ret;
+    }
+
+    // the partial match was firmware data after all - fold it into the sum
+    for(int i = 0; i < s->z1_verify_matched; i++) {
+        s->z1_raw_sum += z1_verify_pattern[i];
+    }
+    s->z1_verify_matched = 0;
+
+    if(value == z1_verify_pattern[0]) {
+        uint16_t checksum = s->z1_raw_sum & 0xFFFF;
+        s->z1_verify_resp[0] = 0xD0;
+        s->z1_verify_resp[1] = 0x00;
+        s->z1_verify_resp[2] = (checksum >> 8) & 0xFF;
+        s->z1_verify_resp[3] = checksum & 0xFF;
+        ret = s->z1_verify_resp[0];
+        s->z1_verify_matched = 1;
+    }
+    else {
+        s->z1_raw_sum += value;
+    }
+
+    return ret;
+}
+
+static uint32_t z1_transfer(IPodTouchMultitouchState *s, uint32_t value)
+{
+    if(s->z1_raw_upload) {
+        return z1_raw_upload_transfer(s, (uint8_t)value);
+    }
+
+    if(s->cur_cmd == 0 && value == 0) {
+        // clock padding while idle
+        return 0;
+    }
+
+    if(s->cur_cmd == 0) {
+        // start a new command
+        s->cur_cmd = value;
+        free(s->out_buffer);
+        free(s->in_buffer);
+        s->out_buffer = malloc(MT_Z1_MAX_PACKET_SIZE + 0x10);
+        s->in_buffer = malloc(MT_Z1_MAX_PACKET_SIZE + 0x10);
+        memset(s->out_buffer, 0, MT_Z1_MAX_PACKET_SIZE + 0x10);
+        s->buf_ind = 0;
+        s->in_buffer_ind = 0;
+
+        switch(value) {
+            case MT_Z1_CMD_BL_PACKET:
+                // blank packet until the address byte proves otherwise
+                s->buf_size = 4;
+                break;
+            case MT_Z1_CMD_BL_VERIFY:
+            {
+                s->buf_size = 4;
+                uint16_t checksum = s->z1_upload_cksum & 0xFFFF;
+                s->out_buffer[0] = 0xD0;
+                s->out_buffer[1] = 0x00;
+                s->out_buffer[2] = (checksum >> 8) & 0xFF;
+                s->out_buffer[3] = checksum & 0xFF;
+                break;
+            }
+            case MT_Z1_CMD_BL_EXECUTE:
+                s->buf_size = 4;
+                break;
+            case MT_Z1_CMD_IFACE_VERSION:
+                s->buf_size = 4;
+                s->out_buffer[0] = MT_Z1_REPLY_OK;
+                s->out_buffer[1] = MT_INTERFACE_VERSION;
+                s->out_buffer[2] = (MT_Z1_MAX_PACKET_SIZE >> 8) & 0xFF;
+                s->out_buffer[3] = MT_Z1_MAX_PACKET_SIZE & 0xFF;
+                break;
+            case MT_Z1_CMD_REPORT_INFO:
+                s->buf_size = 8;
+                s->out_buffer[0] = MT_Z1_REPLY_OK;
+                // the rest is filled in once the report ID arrives
+                break;
+            case MT_Z1_CMD_GET_REPORT:
+                // provisional; corrected to len+6 once the report ID arrives
+                s->buf_size = MT_Z1_MAX_PACKET_SIZE;
+                s->out_buffer[0] = MT_Z1_REPLY_OK;
+                break;
+            case MT_Z1_CMD_FRAME_NOP1:
+            case MT_Z1_CMD_FRAME_NOP2:
+            {
+                s->buf_size = 8;
+                s->out_buffer[0] = MT_Z1_REPLY_OK;
+                uint16_t frame_len = 0;
+                if(s->next_frame) {
+                    frame_len = sizeof(MTFrameHeader) + sizeof(FingerData) + 2;
+                }
+                s->out_buffer[4] = (frame_len >> 8) & 0xFF;
+                s->out_buffer[5] = frame_len & 0xFF;
+                uint16_t checksum = (s->out_buffer[4] + s->out_buffer[5]) & 0xFFFF;
+                s->out_buffer[6] = (checksum >> 8) & 0xFF;
+                s->out_buffer[7] = checksum & 0xFF;
+                break;
+            }
+            case MT_Z1_CMD_FRAME_READ:
+            {
+                if(s->next_frame) {
+                    uint16_t payload_len = sizeof(MTFrameHeader) + sizeof(FingerData);
+                    s->buf_size = payload_len + 3;
+                    s->out_buffer[0] = MT_Z1_REPLY_OK;
+                    memcpy(s->out_buffer + 1, &s->next_frame->frame_packet.header,
+                           sizeof(MTFrameHeader));
+                    memcpy(s->out_buffer + 1 + sizeof(MTFrameHeader),
+                           &s->next_frame->finger_data, sizeof(FingerData));
+                    uint16_t checksum = 0;
+                    for(int i = 0; i < payload_len; i++) {
+                        checksum += s->out_buffer[1 + i];
+                    }
+                    s->out_buffer[payload_len + 1] = (checksum >> 8) & 0xFF;
+                    s->out_buffer[payload_len + 2] = checksum & 0xFF;
+                }
+                else {
+                    // frame read raced a consumed frame: give an empty, valid reply
+                    s->buf_size = 4;
+                    s->out_buffer[0] = MT_Z1_REPLY_OK;
+                }
+                break;
+            }
+            default:
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "iPhone multitouch: ignoring unknown Z1 command 0x%02x\n",
+                              (uint8_t)value);
+                s->buf_size = 1;
+                break;
+        }
+    }
+
+    s->in_buffer[s->in_buffer_ind] = value;
+    s->in_buffer_ind++;
+
+    if(s->cur_cmd == MT_Z1_CMD_BL_PACKET && s->in_buffer_ind == 2) {
+        // a real data packet carries the (nonzero) target address high byte
+        if(s->in_buffer[1] != 0) {
+            s->buf_size = MT_Z1_BL_PACKET_SIZE;
+        }
+    }
+    else if(s->cur_cmd == MT_Z1_CMD_REPORT_INFO && s->in_buffer_ind == 2) {
+        z1_prepare_report_info_response(s, s->in_buffer[1]);
+    }
+    else if(s->cur_cmd == MT_Z1_CMD_GET_REPORT && s->in_buffer_ind == 2) {
+        z1_prepare_report_response(s, s->in_buffer[1]);
+    }
+
+    uint8_t ret_val = s->out_buffer[s->buf_ind];
+    s->buf_ind++;
+
+    if(s->buf_ind == s->buf_size) {
+        if(s->cur_cmd == MT_Z1_CMD_BL_PACKET) {
+            if(s->buf_size == MT_Z1_BL_PACKET_SIZE) {
+                // checksum covers the header and payload, not the trailing
+                // checksum bytes; the zero padding contributes nothing
+                uint32_t checksum = 0;
+                for(int i = 0; i < MT_Z1_BL_PACKET_SIZE - 2; i++) {
+                    checksum += s->in_buffer[i];
+                }
+                s->z1_upload_cksum = checksum & 0xFFFF;
+                s->firmware_transfer_seen = true;
+            }
+            else {
+                // a blank packet announces the raw main-firmware stream
+                s->z1_raw_upload = true;
+                s->z1_raw_sum = 0;
+                s->z1_verify_matched = 0;
+            }
+        }
+        else if(s->cur_cmd == MT_Z1_CMD_FRAME_READ && s->next_frame &&
+                s->buf_size > 4) {
+            ipod_touch_multitouch_consume_frame(s);
+        }
+
+        // we're done with the command
+        s->cur_cmd = 0;
+        s->buf_size = 0;
+    }
+
+    return ret_val;
+}
+
 static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t value)
 {
     IPodTouchMultitouchState *s = IPOD_TOUCH_MULTITOUCH(dev);
+
+    if(s->zephyr1) {
+        return z1_transfer(s, value);
+    }
 
     //printf("<MULTITOUCH> Got value: 0x%02x\n", value);
 
@@ -445,12 +742,15 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
 }
 
 static void ipod_touch_multitouch_inform_frame_ready(IPodTouchMultitouchState *s) {
-    s->sysic->gpio_int_status[4] |= (1 << 27);
+    int grp = s->zephyr1 ? MT_ATN_INT_GROUP_Z1 : MT_ATN_INT_GROUP_Z2;
+    int bit = s->zephyr1 ? MT_ATN_INT_BIT_Z1 : MT_ATN_INT_BIT_Z2;
+
+    s->sysic->gpio_int_status[grp] |= (1 << bit);
     /* The AP reset can leave QEMU's qemu_irq level high even after the VIC
      * raw bit was reset. Generate the physical ATN edge explicitly so a
      * retained-kernel wake cannot lose the first post-reset frame. */
-    qemu_irq_lower(s->sysic->gpio_irqs[4]);
-    qemu_irq_raise(s->sysic->gpio_irqs[4]);
+    qemu_irq_lower(s->sysic->gpio_irqs[grp]);
+    qemu_irq_raise(s->sysic->gpio_irqs[grp]);
 }
 
 static void ipod_touch_multitouch_queue_frame(IPodTouchMultitouchState *s,
@@ -609,9 +909,16 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
     s->prev_touch_y = 0;
     s->last_frame_timestamp = 0;
 
+    s->z1_upload_cksum = 0;
+    s->z1_raw_upload = false;
+    s->z1_raw_sum = 0;
+    s->z1_verify_matched = 0;
+
     if (s->sysic) {
-        s->sysic->gpio_int_status[4] &= ~(1 << 27);
-        qemu_irq_lower(s->sysic->gpio_irqs[4]);
+        int grp = s->zephyr1 ? MT_ATN_INT_GROUP_Z1 : MT_ATN_INT_GROUP_Z2;
+        int bit = s->zephyr1 ? MT_ATN_INT_BIT_Z1 : MT_ATN_INT_BIT_Z2;
+        s->sysic->gpio_int_status[grp] &= ~(1 << bit);
+        qemu_irq_lower(s->sysic->gpio_irqs[grp]);
     }
 }
 

@@ -70,6 +70,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
 #define MT_MOTION_REPORT_HZ 60
 #define MT_FULL_END_DELAY_NS (NANOSECONDS_PER_SECOND / 10)
 
+/*
+ * Zephyr1 (iPhone 2G) protocol, per openiboot multitouch-z1.c. Unlike the
+ * Zephyr2's HBPP/E1-EB command set, the Z1 bootloader takes 0x400-byte 0xC2
+ * data packets, a 05 00 00 06 checksum-verify, and a 0xC4 execute; the
+ * running firmware answers 0xAA-framed request/response transactions.
+ */
+#define MT_Z1_CMD_BL_PACKET     0xC2 // bootloader data packet (or 4-byte blank packet)
+#define MT_Z1_CMD_BL_VERIFY     0x05 // checksum verify, replied with 0xD0 00 ck ck
+#define MT_Z1_CMD_BL_EXECUTE    0xC4
+#define MT_Z1_CMD_IFACE_VERSION 0xD0
+#define MT_Z1_CMD_REPORT_INFO   0x8F
+#define MT_Z1_CMD_GET_REPORT    0x82
+#define MT_Z1_CMD_FRAME_NOP1    0x64 // frame-length poll (driver alternates the two)
+#define MT_Z1_CMD_FRAME_NOP2    0x65
+#define MT_Z1_CMD_FRAME_READ    0x68
+#define MT_Z1_REPLY_OK          0xAA
+#define MT_Z1_BL_PACKET_SIZE    0x400
+#define MT_Z1_MAX_PACKET_SIZE   0x400
+
+// ATN interrupt: GPIO 0xa3 on the iPhone (group 5, bit 3), 0x9b on the iPod (group 4, bit 27)
+#define MT_ATN_INT_GROUP_Z1 5
+#define MT_ATN_INT_BIT_Z1   3
+#define MT_ATN_INT_GROUP_Z2 4
+#define MT_ATN_INT_BIT_Z2   27
+
 typedef struct MTFrameLengthPacket
 {
     uint8_t cmd;
@@ -169,6 +194,14 @@ typedef struct IPodTouchMultitouchState {
     float prev_touch_x;
     float prev_touch_y;
     uint64_t last_frame_timestamp;
+
+    // Zephyr1 (iPhone 2G) protocol state
+    bool zephyr1;
+    uint32_t z1_upload_cksum;   // checksum of the last bootloader upload
+    bool z1_raw_upload;         // inside the raw main-firmware upload stream
+    uint32_t z1_raw_sum;
+    uint8_t z1_verify_matched;  // bytes matched of the 05 00 00 06 verify pattern
+    uint8_t z1_verify_resp[4];
 } IPodTouchMultitouchState;
 
 void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s);
