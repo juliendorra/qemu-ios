@@ -157,4 +157,5 @@ hatch; `IPOD_SDIO_TRACE=1` enables the verbose controller/card trace.
 | E. Association | **Done** — Apple accepts the 0x8012 response and link-sensed event |
 | F. Network transport | **Done** — QEMU NIC + SLIRP, DHCP gives the guest 10.0.2.15, ARP and bidirectional Ethernet verified |
 | G. Safari demo | **Done** — Safari rendered `http://10.0.2.2:8080/` from a host HTTP server |
-| H. Power lifecycle | **Done for tested path** — deep-sleep/wake loops no longer trigger the Apple command watchdog |
+| H. Power lifecycle | **Done** — deep-sleep/wake loops no longer trigger the Apple command watchdog; when one does fire (idle-lock churn), the card model now survives the driver's hand-of-god power cycle and warm-reloads its firmware |
+| I. DNS / hostnames | **Done** — the distributed NAND was missing the mDNSResponder launchd job; `scripts/ipod-nand-restore-dns.py` restores it and Safari resolves hostnames directly (see `DNS_RESOLVER_NOTES.md`) |
