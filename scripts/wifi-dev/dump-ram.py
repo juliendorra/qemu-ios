@@ -8,6 +8,18 @@ from pathlib import Path
 APP = Path("/Applications/iPod Touch.app/Contents")
 QEMU = Path(os.environ.get("IPOD_QEMU",
             "/private/tmp/qemu-11-port/build-ipod/qemu-system-arm"))
+
+# Board profile (see the launcher / sdio-trace-boot.py): default iPod-Touch.
+PROFILE = os.environ.get("S5L8900_PROFILE", "ipod-touch")
+_PROFILES = {
+    "ipod-touch": ("ipod_files", "iPod-Touch", "iboot_204_n45ap.bin", "nor_n45ap.bin"),
+    "iphone-2g":  ("iphone_files", "iPhone-2G", "iboot_204_m68ap.bin", "nor_m68ap.bin"),
+}
+if PROFILE not in _PROFILES:
+    raise SystemExit(f"Unsupported S5L8900_PROFILE: {PROFILE}")
+FW_SUBDIR, MACHINE, IBOOT, NOR = _PROFILES[PROFILE]
+FW = APP / "Resources" / FW_SUBDIR
+
 PORT = int(os.environ.get("IPOD_QMP_PORT", "4492"))
 OUT = Path(os.environ.get("DUMP", "/private/tmp/ram-dump.bin"))
 BASE = 0x08000000
@@ -38,14 +50,14 @@ def wait_for(path, marker, timeout=180):
 
 def main():
     nand = Path(tempfile.mkdtemp(prefix="ramdump-nand-", dir="/private/tmp"))/"nand"
-    subprocess.run(["cp","-Rc",str(APP/"Resources/ipod_files/nand"),str(nand)],check=True)
+    subprocess.run(["cp","-Rc",str(FW/"nand"),str(nand)],check=True)
     serial = OUT.with_suffix(".serial.log")
     proc = subprocess.Popen([
-        str(QEMU),"-M",("iPod-Touch,"
-          f"bootrom={APP/'Resources/ipod_files/bootrom_s5l8900'},"
-          f"iboot={APP/'Resources/ipod_files/iboot_204_n45ap.bin'},"
+        str(QEMU),"-M",(f"{MACHINE},"
+          f"bootrom={FW/'bootrom_s5l8900'},"
+          f"iboot={FW/IBOOT},"
           f"nand={nand}"),
-        "-m","1G","-pflash",str(APP/"Resources/ipod_files/nor_n45ap.bin"),
+        "-m","1G","-pflash",str(FW/NOR),
         "-L",str(APP/"Resources/pc-bios"),"-display","sdl,gl=off",
         "-serial",f"file:{serial}","-monitor","none",
         "-qmp",f"tcp:127.0.0.1:{PORT},server=on,wait=off",

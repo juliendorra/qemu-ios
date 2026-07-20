@@ -17,6 +17,20 @@ from pathlib import Path
 APP = Path("/Applications/iPod Touch.app/Contents")
 QEMU = Path(os.environ.get("IPOD_QEMU",
             "/private/tmp/qemu-11-port/build-ipod/qemu-system-arm"))
+
+# Board profile: default iPod-Touch (N45AP). Set S5L8900_PROFILE=iphone-2g to
+# target the iPhone-2G (M68AP) firmware tree instead. Mirrors the launcher.
+PROFILE = os.environ.get("S5L8900_PROFILE", "ipod-touch")
+if PROFILE == "ipod-touch":
+    FW_SUBDIR, MACHINE, IBOOT, NOR = ("ipod_files", "iPod-Touch",
+                                      "iboot_204_n45ap.bin", "nor_n45ap.bin")
+elif PROFILE == "iphone-2g":
+    FW_SUBDIR, MACHINE, IBOOT, NOR = ("iphone_files", "iPhone-2G",
+                                      "iboot_204_m68ap.bin", "nor_m68ap.bin")
+else:
+    sys.exit(f"Unsupported S5L8900_PROFILE: {PROFILE} "
+             "(expected ipod-touch or iphone-2g)")
+FW = APP / "Resources" / FW_SUBDIR
 PORT = int(os.environ.get("IPOD_QMP_PORT", "4491"))
 QMP_SOCKET = os.environ.get("IPOD_QMP_SOCKET")
 QMP_STDIO = os.environ.get("IPOD_QMP_STDIO") == "1"
@@ -177,12 +191,12 @@ def main():
                                        dir="/private/tmp")))
     temp_root.mkdir(parents=True, exist_ok=True)
     temp_nand = temp_root / "nand"
-    temp_pflash = temp_root / "nor_n45ap.bin"
+    temp_pflash = temp_root / NOR
     if not temp_nand.exists():
-        subprocess.run(["cp", "-Rc", str(APP / "Resources/ipod_files/nand"),
+        subprocess.run(["cp", "-Rc", str(FW / "nand"),
                         str(temp_nand)], check=True)
     if not temp_pflash.exists():
-        shutil.copy2(APP / "Resources/ipod_files/nor_n45ap.bin", temp_pflash)
+        shutil.copy2(FW / NOR, temp_pflash)
     serial = LOGS / "serial.log"
     stderr_path = LOGS / "stderr.log"
     env = dict(os.environ,
@@ -193,9 +207,9 @@ def main():
     stderr_handle = stderr_path.open("wb")
     qemu_args = [
         str(QEMU),
-        "-M", ("iPod-Touch,"
-               f"bootrom={APP / 'Resources/ipod_files/bootrom_s5l8900'},"
-               f"iboot={APP / 'Resources/ipod_files/iboot_204_n45ap.bin'},"
+        "-M", (f"{MACHINE},"
+               f"bootrom={FW / 'bootrom_s5l8900'},"
+               f"iboot={FW / IBOOT},"
                f"nand={temp_nand}"),
         "-m", "1G",
         "-drive", f"if=pflash,format=raw,file={temp_pflash}",
