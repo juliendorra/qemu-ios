@@ -39,12 +39,17 @@ Not every problem found during this work was introduced by the iPhone profile:
 
 - **Real board differences:** SYSIC security epoch, DeviceTree/NOR images,
   NAND contents, Zephyr1, baseband, sensors, GPIOs, and call audio.
-- **Existing emulator limitations exposed by M68AP:** a hard-coded SYSIC epoch,
-  an inert watchdog, dependence on a prebuilt physical NAND page tree, and
+- **Existing emulator limitations exposed by M68AP, now fixed:** the SYSIC
+  security epoch is board-aware (`POWER_ID` reports N45AP=2 / M68AP=3, with an
+  `epoch=` machine-option override), and the watchdog has real reset semantics
+  on M68AP so an early panic reboots instead of spinning at `0x18001e3c`.
+- **Still open:** dependence on a prebuilt physical NAND page tree, and
   incomplete NAND writes/erase/persistence.
 - **Deliberate mixed-artifact failures:** M68AP iBoot rejects N45AP NOR IMG2
   entries for their security epoch and rejects the N45AP NAND's WMR/production
-  format. These diagnostics do not prove that matched M68AP artifacts fail.
+  format. A synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) now clears
+  the NOR rejection entirely (0 epoch mismatches); the NAND rejection remains
+  the sole boot blocker and needs a matched M68AP NAND.
 
 ## Launching
 
@@ -62,8 +67,8 @@ Required m68ap firmware files (not in this repo):
 |---|---|
 | bootrom | Same `bootrom_s5l8900` dump as the iPod Touch — the bootrom is per-SoC, not per-device |
 | iBoot | `iboot_204_m68ap.bin` from iPhone OS 1.1.x/2.x for iPhone1,1 |
-| NOR | `nor_m68ap.bin` dump (contains syscfg/IMG2 with the m68ap board config) |
-| NAND | NAND dump from an iPhone1,1 |
+| NOR | `nor_m68ap.bin` — build it with `scripts/build-m68ap-nor.py` from the extracted M68AP IMG2 containers plus a real N45AP NOR (for SysCfg); accepted by m68ap iBoot with 0 epoch mismatches |
+| NAND | NAND dump from an iPhone1,1 (the one artifact with no synthesis path yet — see IPHONE_2G_BRINGUP_HANDOFF.md) |
 
 ## iPhone-only hardware modeled (M68AP only, iPod path untouched)
 
@@ -160,11 +165,13 @@ IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
 
 > **Live status:** see [`IPHONE_2G_BRINGUP_HANDOFF.md`](IPHONE_2G_BRINGUP_HANDOFF.md).
 > The m68ap iBoot (from the 1.1.4 IPSW) decrypts with the GID key already in
-> `hw/arm/ipod_touch_8900_engine.h`. Its early panic is now identified exactly:
-> M68AP iBoot requires SYSIC `POWER_ID` epoch 3, while the emulator returns the
-> N45AP value 2 unconditionally. Overriding that one read reaches the iBoot
-> banner and recovery prompt; the next boot blocker is matched M68AP NAND
-> content, not the initial NOR hypothesis.
+> `hw/arm/ipod_touch_8900_engine.h`. The board-aware SYSIC epoch fix and the
+> M68AP watchdog are now **landed in code** (no debugger override needed), and a
+> synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) is accepted by m68ap
+> iBoot with **0** security-epoch rejections. With real m68ap iBoot + that NOR,
+> boot reaches the NAND stage and fails only there ("no signature or no
+> production format"). The **single remaining boot blocker is a matched M68AP
+> NAND** — every other early-boot artifact is solved.
 
 - **Firmware obtained** (1.1.4 IPSW, iBoot-204 — same build as n45ap): iBoot,
   LLB, and device tree all decrypt with the shared S5L8900 GID key. The Zephyr1
@@ -181,19 +188,21 @@ IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
 What separates today's state (Darwin kernel boots under `-M iPhone-2G`
 with iPod images) from a real iPhone OS 1.x boot to SpringBoard:
 
-1. **Make SYSIC epoch board-specific.** Return epoch 3 from `POWER_ID` for
-   M68AP and retain epoch 2 for N45AP. With this single value overridden in a
-   debugger, genuine m68ap iBoot-204.3.14 initializes the M68 display, prints
-   its banner, initializes the NAND controller/FTL, and enters recovery.
-2. **Provide matched boot artifacts.** Raw m68ap iBoot extraction is solved,
-   but the remaining artifact pipeline is incomplete:
-   - Preserve the complete decrypted M68AP IMG2 header/container when building
-     a synthetic NOR; reusing the N45AP header retains the wrong security epoch
-     and invalid metadata. A `build-m68ap-nor.py` tool does not exist yet.
-   - Obtain a lawful M68AP NAND dump, or implement a restore constructor that
-     creates bank/page data, spare bytes, VFL/FTL/WMR metadata, kernelcache,
-     and filesystems from an IPSW. `scripts/pack-ipod-nand.py` only packs an
-     already-created page tree; it is not a NAND constructor.
+1. **Make SYSIC epoch board-specific.** ✅ **Done.** `POWER_ID` reports epoch 3
+   for M68AP and 2 for N45AP (`IPodTouchSYSICState.power_epoch`), overridable
+   with the `epoch=` machine option. Genuine m68ap iBoot-204.3.14 now
+   initializes the M68 display, prints its banner, and reaches the NAND/FTL
+   stage automatically — no debugger override.
+2. **Provide matched boot artifacts.**
+   - NOR: ✅ **Done.** `scripts/extract-m68ap-images.py` retains the full
+     decrypted M68AP IMG2 containers (epoch 3) and `scripts/build-m68ap-nor.py`
+     assembles `nor_m68ap.bin` from them over a real N45AP NOR's SysCfg. m68ap
+     iBoot accepts it with 0 epoch mismatches.
+   - NAND: ⛔ **Open — the one hard blocker.** Obtain a lawful M68AP NAND dump,
+     or implement a restore constructor that creates bank/page data, spare
+     bytes, VFL/FTL/WMR metadata, kernelcache, and filesystems from an IPSW.
+     `scripts/pack-ipod-nand.py` only packs an already-created page tree; it is
+     not a NAND constructor. See the handoff doc for the two lawful routes.
 3. **Multitouch Zephyr1 against the real driver.** The Z1 model follows
    openiboot, but the real `AppleZephyr` kext has never run against it;
    the raw-upload verify heuristic (see caveat above) is the likeliest
