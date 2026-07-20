@@ -4,6 +4,11 @@ Throwaway-but-useful tooling from the SDIO Wi-Fi bring-up. See
 `../../WIFI_SDIO_NOTES.md` (findings) and `../../WIFI_SDIO_DEADENDS.md`
 (attempts and dead ends).
 
+The repository-wide rule is scripted testing first; see
+`../../TESTING_WORKFLOW.md`. Interactive actions below are for discovering a
+state or coordinate and should be folded into a repeatable harness before the
+same sequence is run again.
+
 All scripts assume the installed app engine at
 `/Applications/iPod Touch.app`, or set `IPOD_QEMU` to a dev build.
 
