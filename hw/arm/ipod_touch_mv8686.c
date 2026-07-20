@@ -522,7 +522,17 @@ bool mv8686_io_rw_extended(MV8686State *c, bool write, uint8_t fn,
             if (chunk == 0) {
                 /* Bootstrapper booted. AppleMRVL868x::readEEPROM waits for
                  * RD_BASE to equal its fixed 16-byte request size. */
-                if (mv8686_wifi_enabled()) {
+                if (mv8686_wifi_enabled() && c->eeprom_delivered) {
+                    /* Recovery reload: Apple only reads the EEPROM on its
+                     * first cold probe.  loadMainProgram() polls RD_BASE for
+                     * the 0x800 download request size right after the helper
+                     * boots. */
+                    c->dl_state = MV8686_DL_MAIN;
+                    c->fn1[FN1_RD_BASE] = 0x00;
+                    c->fn1[FN1_RD_BASE + 1] = 0x08;
+                    mv_trace("helper booted (%u bytes); warm reload skips "
+                             "EEPROM stage", c->helper_bytes);
+                } else if (mv8686_wifi_enabled()) {
                     c->dl_state = MV8686_EEPROM_CMD;
                     c->fn1[FN1_RD_BASE] = MV8686_EEPROM_CMD_LEN;
                     c->fn1[FN1_RD_BASE + 1] = 0;
@@ -564,6 +574,7 @@ bool mv8686_io_rw_extended(MV8686State *c, bool write, uint8_t fn,
             memset(buf, 0, len);
             memcpy(buf, c->eeprom, n);
             mv_trace("eeprom read: delivered %u of %u bytes", n, len);
+            c->eeprom_delivered = true;
             /* EEPROM done; move on to the main firmware download */
             c->dl_state = MV8686_DL_MAIN;
             c->fn1[FN1_RD_BASE] = 0x00;
@@ -784,6 +795,14 @@ uint32_t mv8686_exec_cmd(MV8686State *c, uint8_t cmd_idx, uint32_t arg)
 {
     switch (cmd_idx) {
     case 5:
+        /* The inquiry CMD5 (arg 0) only occurs while (re-)enumerating the
+         * card.  AppleMRVL868x's recovery path (invokeTheHandOfGod) power
+         * cycles the chip and re-enumerates without touching IO_ABORT, so
+         * treat the probe as the power-on edge and return the card to its
+         * awaiting-bootstrapper state. */
+        if (arg == 0) {
+            mv8686_reset(c);
+        }
         /* R4: C=1, one I/O function, no memory, OCR */
         return (1u << 31) | (1u << 28) | MV8686_OCR;
     case 3:
@@ -820,6 +839,7 @@ void mv8686_reset(MV8686State *c)
     void (*send_frame)(void *, const uint8_t *, size_t) = c->send_frame;
     void *net_opaque = c->net_opaque;
     QEMUTimer *wake_timer = c->wake_timer;
+    bool eeprom_delivered = c->eeprom_delivered;
 
     memset(c, 0, sizeof(*c));
     c->set_card_irq = set_card_irq;
@@ -827,6 +847,7 @@ void mv8686_reset(MV8686State *c)
     c->send_frame = send_frame;
     c->net_opaque = net_opaque;
     c->wake_timer = wake_timer;
+    c->eeprom_delivered = eeprom_delivered;
     if (!c->wake_timer) {
         c->wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                      mv8686_wake_timer, c);

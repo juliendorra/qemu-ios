@@ -71,6 +71,11 @@ typedef struct MV8686State {
     /* EEPROM image staged for the readEEPROM handshake */
     uint8_t eeprom[MV8686_EEPROM_LEN];
     uint32_t eeprom_len;
+    /* True once the guest has completed readEEPROM.  Survives warm resets:
+     * AppleMRVL868x only performs the EEPROM exchange on its first cold
+     * probe; a recovery reload (invokeTheHandOfGod) goes from the helper
+     * image straight to the main firmware download. */
+    bool eeprom_delivered;
 
     /* queue of card-to-host packets (cmd responses, events, rx data) */
     MV8686Packet *rx_head, *rx_tail;
