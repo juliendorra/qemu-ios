@@ -99,23 +99,23 @@ power-cycle resets".
   1-minute Auto-Lock the deep-sleep watchdog can still fire (see above) —
   it now recovers cleanly.
 
-## The honest HTTPS boundary
+## HTTPS boundary and transparent bridge
 
-- **Plain HTTP by hostname: works** (the fix above).
-- **HTTP→HTTPS redirects and explicit `https://` URLs: fail in the guest.**
-  Safari shows "could not establish a secure connection" (verified with
-  `x.com`). The 2007 TLS stack cannot complete a modern handshake
-  (protocol versions, cipher suites, and certificate chains have all moved
-  on). Controlling the emulated access point does **not** defeat guest TLS
-  certificate validation — nor should it.
-- The host bridge (`scripts/ipod-http-bridge.py`, port 18080) is the
-  supported path for HTTPS content: guest speaks HTTP to `10.0.2.2:18080`,
-  the Mac fetches over modern TLS with its own certificate verification
-  intact. `/fetch` rewrites; absolute-URI forward-proxy GET works for
-  clients that can be pointed at a proxy; `/proxy.pac` is served for
-  manual configuration. `CONNECT` deliberately returns 501: transparent
-  HTTPS MITM would require a guest-trusted CA, which is not implemented,
-  and host-side TLS verification is never weakened.
+- **Plain HTTP by hostname and numeric address works** (the DNS fix above).
+- **Direct HTTPS, redirects, and HTTPS subresources work through the
+  transparent compatibility bridge.** The bundle installer generates a
+  private per-install CA outside the app, injects only its public certificate
+  into a staged iPhone OS trust store, and then packs/installs that NAND.
+- QEMU observes DNS A/CNAME results and transparently redirects guest TCP
+  destination port 443 to a local-only legacy TLS listener. The guest still
+  performs normal certificate validation against its patched trust store.
+  The proxy creates a separate upstream connection with Python's default
+  `CERT_REQUIRED` and hostname checking; verification is never disabled.
+- The old HTTP bridge remains available on port 18080. Its `CONNECT` method
+  deliberately remains 501 because direct HTTPS uses the transparent QEMU
+  path, not guest proxy settings.
+- See `HTTPS_BRIDGE.md` for trust-store format, validity dates, safety model,
+  integration, tests, and current limitations.
 - iPhone OS 1 requested DHCP option 252 (WPAD) and received it in
   Offer/Ack during earlier experiments, but Safari never fetched the PAC;
   those DHCP experiments were reverted and should not be retried without
@@ -127,6 +127,5 @@ Now that DNS works, ordinary `http://` browsing goes direct through slirp.
 A possible next step is transparently steering guest TCP port 80 through
 the host bridge inside the emulator's network path (preserving Host
 headers and destination semantics) so modern-web conveniences (retries,
-redirects to HTTP-capable mirrors) apply without any guest settings. This
-must not touch port 443: Safari validates certificates, and silently
-intercepting TLS is neither feasible without a trusted CA nor acceptable.
+redirects to HTTP-capable mirrors) apply without any guest settings. Port 80
+interception remains separate from the implemented port 443 bridge.
