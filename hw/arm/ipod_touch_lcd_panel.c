@@ -26,6 +26,18 @@ static uint32_t ipod_touch_lcd_panel_transfer(SSIPeripheral *dev, uint32_t value
      * when Power/Home is pressed; without this the OS wakes but the host
      * surface stays black. */
     if (!s->cur_cmd && value == 0x11 && s->lcd) {
+        /* During a retained-RAM wake, iBoot's pre-boot charging dispatcher
+         * relights the Merlot panel to scan out its temporary battery/logo
+         * image at 0x0fe00000, before the resumed kernel owns the display.
+         * Honouring that Sleep Out would surface the low-battery image on a
+         * device that is merely asleep. Keep the panel dark until the kernel
+         * reclaims scanout by programming the OS framebuffer base, which is
+         * where retained_resume is cleared (see the 0x60 case in
+         * ipod_touch_lcd.c). The lighter lock-phase relight runs with
+         * retained_resume == false and is unaffected. */
+        if (s->lcd->retained_resume) {
+            return 0;
+        }
         s->lcd->panel_off = false;
         s->lcd->invalidate = 1;
         if (s->lcd->relight_input_fast) {
