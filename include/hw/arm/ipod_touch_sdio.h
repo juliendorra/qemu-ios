@@ -42,6 +42,34 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchSDIOState, IPOD_TOUCH_SDIO)
 #define SDIO_DSTA_READY        (1 << 0)
 #define SDIO_DSTA_CMD_COMPLETE (1 << 4)
 
+#define IPOD_HTTPS_FLOW_COUNT 64
+#define IPOD_HTTPS_HOST_COUNT 64
+#define IPOD_HTTPS_ALIAS_COUNT 64
+#define IPOD_HTTPS_HOSTNAME_MAX 255
+
+typedef struct IPodHTTPSFlow {
+    uint8_t guest_ip[4];
+    uint8_t original_ip[4];
+    uint16_t guest_port;
+    uint16_t proxy_port;
+    uint64_t last_used;
+    bool valid;
+} IPodHTTPSFlow;
+
+typedef struct IPodHTTPSHost {
+    uint8_t original_ip[4];
+    char hostname[IPOD_HTTPS_HOSTNAME_MAX + 1];
+    uint64_t last_used;
+    bool valid;
+} IPodHTTPSHost;
+
+typedef struct IPodHTTPSAlias {
+    char target[IPOD_HTTPS_HOSTNAME_MAX + 1];
+    char alias[IPOD_HTTPS_HOSTNAME_MAX + 1];
+    uint64_t last_used;
+    bool valid;
+} IPodHTTPSAlias;
+
 typedef struct IPodTouchSDIOState
 {
     SysBusDevice parent_obj;
@@ -66,6 +94,14 @@ typedef struct IPodTouchSDIOState
     uint32_t numblk;
     /* raw storage for offsets without modeled behavior yet */
     uint32_t unknown_regs[0x1000 / 4];
+
+    /* Transparent guest :443 -> host legacy-TLS bridge NAT state. */
+    IPodHTTPSFlow https_flows[IPOD_HTTPS_FLOW_COUNT];
+    IPodHTTPSHost https_hosts[IPOD_HTTPS_HOST_COUNT];
+    IPodHTTPSAlias https_aliases[IPOD_HTTPS_ALIAS_COUNT];
+    uint64_t https_flow_clock;
+    uint64_t https_host_clock;
+    uint64_t https_alias_clock;
 
     MV8686State card;
     NICConf conf;
