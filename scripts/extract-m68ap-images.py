@@ -49,6 +49,21 @@ IMAGES = {
     "DeviceTree.m68ap.img2":    ("DeviceTree.m68ap.bin", True),
 }
 
+# Images whose full decrypted IMG2 container (0x400 header + payload) must be
+# retained for a synthetic NOR image store. These keep the authentic M68AP
+# security epoch in the header, which the M68AP iBoot checks. Emitted as
+# <type>.img2c into <out>/nor-containers/ for scripts/build-m68ap-nor.py.
+# The order here is the order used in the N45AP NOR image store.
+NOR_CONTAINERS = [
+    "DeviceTree.m68ap.img2",
+    "batterycharging.img2",
+    "applelogo.img2",
+    "needservice.img2",
+    "batterylow0.img2",
+    "batterylow1.img2",
+    "recoverymode.img2",
+]
+
 
 def decrypt_8900(data):
     if data[:4] != b"8900":
@@ -83,6 +98,32 @@ def main(src_dir, out_dir):
         out_path = os.path.join(out_dir, out_name)
         open(out_path, "wb").write(dec)
         print(f"{src} -> {out_path} ({len(dec)} bytes, {len(dec):#x})")
+
+    # Retain full IMG2 containers for NOR construction.
+    container_dir = os.path.join(out_dir, "nor-containers")
+    os.makedirs(container_dir, exist_ok=True)
+    for src in NOR_CONTAINERS:
+        src_path = os.path.join(src_dir, src)
+        if not os.path.exists(src_path):
+            print(f"skip container {src}: not found")
+            continue
+        dec = decrypt_8900(open(src_path, "rb").read())
+        if dec[:4] != b"2gmI":
+            raise ValueError(f"{src}: decrypted payload is not IMG2")
+        img_type = dec[4:8][::-1].decode("ascii", "replace")
+        # data length is stored at header offset 0x10; keep header + that many
+        # bytes (trailing bytes past the payload are padding/garbage).
+        data_len = struct.unpack("<I", dec[0x10:0x14])[0]
+        container = dec[:IMG2_HEADER_LEN + data_len]
+        # Name by SOURCE stem, not the IMG2 4CC: two store images differ only
+        # by case ('batl' vs 'batL'), which collides on case-insensitive
+        # filesystems (macOS default). The stem is unambiguous.
+        stem = os.path.splitext(src)[0].replace(".RELEASE", "")
+        out_path = os.path.join(container_dir, f"{stem}.img2c")
+        open(out_path, "wb").write(container)
+        epoch = struct.unpack("<H", dec[0xa:0xc])[0]
+        print(f"{src} -> {out_path} (type={img_type} epoch={epoch} "
+              f"{len(container):#x} bytes)")
 
 
 if __name__ == "__main__":

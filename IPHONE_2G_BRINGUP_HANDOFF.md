@@ -56,6 +56,66 @@ n45ap-on-M68AP boot broke *by design* (n45ap iBoot requires epoch 2). Do not
 "fix" this by reverting the board default — the `epoch=` override exists for
 exactly this synthetic combination.
 
+## Session log — 2026-07-21 (real m68ap iBoot boots; NOR solved; NAND is the wall)
+
+Booted the **real extracted m68ap iBoot** (`iboot_204_m68ap.bin`) on the
+merged binary. With the epoch fix landed, no debugger override is needed:
+iBoot reaches its banner (`BUILD_TAG: iBoot-204.3.14`), FTL, and NAND probe
+automatically.
+
+**Synthetic NOR — SOLVED.** With the N45AP NOR, iBoot logged 7×
+`Ignoring image with mismatching security epoch` (the N45AP images are epoch
+2; this iBoot wants 3). Fix:
+- `scripts/extract-m68ap-images.py` now also emits the full decrypted IMG2
+  *containers* (0x400 header + payload, epoch 3 intact) into
+  `<out>/nor-containers/`, named by source stem.
+- `scripts/build-m68ap-nor.py` rewrites the NOR image store (0x10400..) with
+  those containers in N45AP order (dtre, batC, logo, nsrv, batl, batL, recm),
+  0x40-aligned, preserving the N45AP SysCfg at 0xFC000.
+- Result: booting m68ap iBoot with `nor_m68ap.bin` logs **0** epoch
+  mismatches (was 7). All M68AP NOR images accepted, DeviceTree included.
+
+**IMG2 epoch field pinned down**: header offset **+0xa** is `uint16
+security_epoch` (N45AP=2, M68AP=3). Confirmed by diffing the two DeviceTree
+headers. This is the same value the SYSIC `power_epoch` fix reports.
+
+**Gotcha (recorded)**: the two NOR battery images use IMG2 4CCs that differ
+only by case — `batl` (batterylow0) vs `batL` (batterylow1). Keying container
+files by 4CC collides on a case-insensitive filesystem (macOS default: batL
+silently overwrote batl, so both came out 0xedd2). The extractor now keys
+container files by source stem instead.
+
+**Remaining wall — the NAND.** With the m68ap iBoot **and** the synthetic
+m68ap NOR, the boot now fails at exactly one place — the N45AP NAND:
+```
+[FTL:MSG] FTL_Init            [OK]
+[WMR:ERR] read only version (1, 0)
+[WMR:ERR] no signature or no production format
+NAND failed initialisation
+... root filesystem mount failed ... Entering recovery mode
+```
+The Whimory low level initializes (FIL/BUF/VFL/FTL all `[OK]`) because it is
+the same SoC/controller, but the higher WMR layer rejects the N45AP NAND's
+signature/production format. So the ordered blocker list is now down to one
+artifact:
+
+### The NAND, precisely
+- The shipped iPod NAND (`.../ipod_files/nand/bankN/*.page`) is a **real
+  device dump** — pages named by physical page number, carrying the original
+  spare/VFL/FTL/WMR metadata and production signature. It was NOT synthesized;
+  `pack-ipod-nand.py` only compacts an existing page tree.
+- No lawful **iPhone 2G** NAND dump is obtainable from an IPSW (an IPSW ships
+  a DMG root filesystem + boot images, never the on-NAND Whimory metadata).
+- Two lawful routes to an M68AP NAND, both large:
+  1. A physical iPhone 2G NAND dump supplied by the user (shortest path).
+  2. Run the authentic **restore** (iBSS→iBEC→restore ramdisk over emulated
+     DFU/USB) so the device software formats the NAND and `asr`-writes the
+     root fs, producing valid WMR metadata as a side effect. This needs the
+     S5L8900 USB/DFU device modeled well enough to run the ramdisk — not yet
+     present.
+- Reverse-engineering the WMR production signature to bless the N45AP-format
+  NAND is a third route but is the same unsolved metadata problem noted before.
+
 ---
 
 ## What is proven (advances)
