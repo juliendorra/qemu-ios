@@ -13,13 +13,48 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 
 ## Current state (one line)
 
-The old blocker ("no m68ap firmware") is gone: the firmware is obtained and
-**decrypts with the GID key already in the emulator**. The exact early panic is
-now proven to be `miu_init: Epoch Mismatch`: M68AP iBoot expects SYSIC epoch 3,
-while the emulator returns the N45AP value 2. Overriding that one read reaches
-the genuine iBoot banner and recovery prompt with the existing N45AP NOR/NAND.
-The next code change is a board-aware SYSIC `POWER_ID`; the next artifact
-blocker is a matched M68AP NAND or a real NAND-construction pipeline.
+The iPhone-2G machine is merged onto the Wi-Fi/HTTPS line (one QEMU 11 binary
+registers both machines with the full MV8686/DNS/HTTPS stack), the SYSIC epoch
+and watchdog fixes from "Next plan" step 1 are landed and verified in code, and
+the remaining blockers are artifacts: extract the m68ap images from a
+user-supplied IPSW, build a synthetic `nor_m68ap.bin`, and (the hard one)
+construct an M68AP NAND.
+
+## Session log — 2026-07-21 (merge onto wifi line + step-1 fixes landed)
+
+Work done on branch `ipod_touch_1g` (the wifi/HTTPS line), merging in
+`iphone_2g`:
+
+1. **Merge**: `iphone_2g` (machine type, baseband/ALS/Zephyr1 stubs, m68ap
+   tooling) merged into the branch carrying MV8686 Wi-Fi + DNS + HTTP/HTTPS
+   bridge work. Zero file overlap between the two lines — clean merge. One
+   QEMU 11.0.2 binary (`build-ipod11/qemu-system-arm`) now registers both
+   `iPod-Touch` and `iPhone-2G`, sharing the whole networking stack.
+2. **Board-aware SYSIC epoch (landed)**: `POWER_ID` bits [31:24] now come from
+   `IPodTouchSYSICState.power_epoch`, set at machine init: N45AP=2, M68AP=3.
+   A new machine option `epoch=` overrides it (see 4).
+3. **Watchdog reset semantics (landed, M68AP only)**: `WATCHDOG_MEM_BASE`
+   is a real MMIO region on M68AP; writing 0x100000 requests a guest reset.
+   N45AP keeps the historical inert-RAM backing (shipped working config).
+   *Evidence*: booting n45ap iBoot on `-M iPhone-2G` (default epoch 3) now
+   produces a clean panic→reset loop — 1223 QMP RESET events in 20 s — where
+   it previously hung silently at `0x18001e3c` forever.
+4. **`epoch=` machine option**: `-M iPhone-2G,epoch=2` boots cross-board
+   firmware (n45ap images on the M68AP board). `scripts/iphone-smoke-test.py`
+   uses it; without it the epoch/watchdog behavior of (3) is the expected
+   result, which is itself the regression check for these fixes.
+5. **Regressions run**:
+   - `-M iPod-Touch` with the merged binary boots to SpringBoard
+     (iBoot-204 → Darwin → FTL → AppleMRVL Wi-Fi → mDNSResponder →
+     SpringBoard). N45AP unaffected.
+   - `scripts/iphone-smoke-test.py` (now with `epoch=2`): all checks pass —
+     both machines listed, Darwin boots, AppleISL29003 probes, Zephyr1-mode
+     mismatch as expected, no panics.
+
+**Dead-end recorded**: after the epoch fix, the smoke test's original
+n45ap-on-M68AP boot broke *by design* (n45ap iBoot requires epoch 2). Do not
+"fix" this by reverting the board default — the `epoch=` override exists for
+exactly this synthetic combination.
 
 ---
 

@@ -188,6 +188,7 @@ typedef struct {
 	char iboot_path[1024];
 	char nand_path[1024];
 	uint32_t board_id;
+	uint32_t sysic_epoch_override; /* 0 = use the board default */
 } IPodTouchMachineState;
 
 void ipod_touch_prepare_retained_wake(void);

@@ -43,6 +43,10 @@ typedef struct IPodTouchSYSICState {
     MemoryRegion iomem;
     qemu_irq gpio_irqs[GPIO_NUMINTGROUPS];
     uint32_t power_state;
+    /* Security/power epoch reported in POWER_ID bits [31:24]. N45AP (iPod
+     * Touch 1G) iBoot expects 2; M68AP (iPhone 2G) iBoot's miu_init() panics
+     * with "Epoch Mismatch" unless it reads 3. Set per-board at machine init. */
+    uint32_t power_epoch;
     Pcf50633State *pmu;
 
     // GPIO

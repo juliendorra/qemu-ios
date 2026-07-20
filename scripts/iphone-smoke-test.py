@@ -3,7 +3,9 @@
 
 Boots the `iPhone-2G` machine with the n45ap (iPod Touch 1G) firmware
 images -- no real m68ap dumps exist in this repo -- and verifies the
-board-id divergence points behave as documented in IPHONE_2G.md:
+board-id divergence points behave as documented in IPHONE_2G.md.
+It passes `epoch=2` because the board's default SYSIC epoch is now the
+real M68AP value (3), which n45ap iBoot rejects in miu_init:
 
   1. The full Darwin kernel boots (not just iBoot) with no panic.
   2. AppleISL29003 matches and starts against the ALS stub.
@@ -127,8 +129,12 @@ stderr = LOGS / "iphone-stderr.log"
 stderr_handle = stderr.open("wb")
 process = subprocess.Popen([
     str(QEMU),
+    # epoch=2: the iPhone-2G board now reports the real M68AP SYSIC epoch (3)
+    # by default, which makes n45ap iBoot panic in miu_init and reset-loop via
+    # the (now functional) watchdog. Overriding the epoch keeps this synthetic
+    # n45ap-firmware-on-M68AP boot alive for the divergence checks below.
     "-M", (
-        "iPhone-2G,"
+        "iPhone-2G,epoch=2,"
         f"bootrom={APP / 'Resources/ipod_files/bootrom_s5l8900'},"
         f"iboot={APP / 'Resources/ipod_files/iboot_204_n45ap.bin'},"
         f"nand={nand}"

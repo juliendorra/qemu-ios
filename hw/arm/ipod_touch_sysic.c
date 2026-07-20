@@ -15,8 +15,10 @@ static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr) {
         case POWER_ID:
-            //return (3 << 24); //for older iboots
-            return (2 << 0x18);
+            /* Board-specific epoch: N45AP=2, M68AP=3 (see power_epoch). A
+             * zero value means the field was never initialised, so fall back
+             * to the historical N45AP default rather than reporting epoch 0. */
+            return ((s->power_epoch ? s->power_epoch : 2) << 0x18);
         case POWER_SETSTATE:
         case POWER_STATE:
             return s->power_state;

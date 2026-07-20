@@ -24,6 +24,36 @@
 // Global pointer to machine state for wake assist timer access from key handler
 IPodTouchMachineState *g_ipod_touch_nms = NULL;
 
+/*
+ * Minimal S5L8900 watchdog. On real hardware iBoot's reboot routine writes the
+ * reset bit here and the SoC resets. The N45AP path historically backs this
+ * region with inert RAM (a working, shipped configuration), so we only install
+ * real reset semantics for M68AP, where iBoot panics early and spins forever
+ * waiting for a reset that never comes. Writing the reset value (0x100000)
+ * requests a guest reset; other writes are ignored so watchdog "pet" traffic
+ * does not reboot the guest.
+ */
+#define WATCHDOG_RESET_VALUE 0x100000
+
+static void ipod_touch_watchdog_write(void *opaque, hwaddr addr, uint64_t val,
+                                      unsigned size)
+{
+    if (val == WATCHDOG_RESET_VALUE) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+static uint64_t ipod_touch_watchdog_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static const MemoryRegionOps ipod_touch_watchdog_ops = {
+    .read = ipod_touch_watchdog_read,
+    .write = ipod_touch_watchdog_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
 static uint32_t ipod_touch_retained_crc(void)
 {
     const size_t chunk_size = 1024 * 1024;
@@ -435,7 +465,17 @@ static void ipod_touch_memory_setup(MachineState *machine, MemoryRegion *sysmem,
     //  }
 
     allocate_ram(sysmem, "edgeic", EDGEIC_MEM_BASE, 0x1000);
-    allocate_ram(sysmem, "watchdog", WATCHDOG_MEM_BASE, align_64k_high(0x1));
+    if (nms->board_id == BOARD_ID_M68AP) {
+        // M68AP iBoot reboots by poking the watchdog then spinning; back it
+        // with real reset semantics so an early panic reboots instead of
+        // hanging forever. N45AP keeps the historical inert-RAM behavior.
+        MemoryRegion *watchdog = g_new(MemoryRegion, 1);
+        memory_region_init_io(watchdog, OBJECT(machine), &ipod_touch_watchdog_ops,
+                              nms, "watchdog", align_64k_high(0x1));
+        memory_region_add_subregion(sysmem, WATCHDOG_MEM_BASE, watchdog);
+    } else {
+        allocate_ram(sysmem, "watchdog", WATCHDOG_MEM_BASE, align_64k_high(0x1));
+    }
 
     allocate_ram(sysmem, "iis0", IIS0_MEM_BASE, align_64k_high(0x1));
     allocate_ram(sysmem, "iis1", IIS1_MEM_BASE, align_64k_high(0x1));
@@ -500,6 +540,18 @@ static void ipod_touch_set_nand_path(Object *obj, const char *value, Error **err
     g_strlcpy(nms->nand_path, value, sizeof(nms->nand_path));
 }
 
+static char *ipod_touch_get_epoch(Object *obj, Error **errp)
+{
+    IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(obj);
+    return g_strdup_printf("%u", nms->sysic_epoch_override);
+}
+
+static void ipod_touch_set_epoch(Object *obj, const char *value, Error **errp)
+{
+    IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(obj);
+    nms->sysic_epoch_override = (uint32_t)g_ascii_strtoull(value, NULL, 0);
+}
+
 static void ipod_touch_instance_init(Object *obj)
 {
 	object_property_add_str(obj, "bootrom", ipod_touch_get_bootrom_path, ipod_touch_set_bootrom_path);
@@ -510,6 +562,11 @@ static void ipod_touch_instance_init(Object *obj)
 
     object_property_add_str(obj, "nand", ipod_touch_get_nand_path, ipod_touch_set_nand_path);
     object_property_set_description(obj, "nand", "Path to the NAND files");
+
+    object_property_add_str(obj, "epoch", ipod_touch_get_epoch, ipod_touch_set_epoch);
+    object_property_set_description(obj, "epoch",
+        "Override the SYSIC POWER_ID security epoch (default: per-board; N45AP=2, M68AP=3). "
+        "Lets cross-board firmware boot, e.g. -M iPhone-2G,epoch=2 with n45ap images.");
 }
 
 static inline qemu_irq s5l8900_get_irq(IPodTouchMachineState *s, int n)
@@ -826,6 +883,10 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("ipodtouch.sysic");
     IPodTouchSYSICState *sysic_state = IPOD_TOUCH_SYSIC(dev);
     nms->sysic = sysic_state;
+    // M68AP iBoot's miu_init() requires POWER_ID epoch 3; N45AP expects 2.
+    // An explicit -M ...,epoch=N wins (used to boot cross-board firmware).
+    sysic_state->power_epoch = nms->sysic_epoch_override ?
+        nms->sysic_epoch_override : ((nms->board_id == BOARD_ID_M68AP) ? 3 : 2);
     memory_region_add_subregion(sysmem, SYSIC_MEM_BASE, &sysic_state->iomem);
     busdev = SYS_BUS_DEVICE(dev);
     for(int grp = 0; grp < GPIO_NUMINTGROUPS; grp++) {
