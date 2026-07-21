@@ -90,17 +90,32 @@ body" hypothesis:
   `dwXorSum`@0x7FC `= ⊕ words[0..509] ^ 0xAABBCCDD` (510 LE u32 over bytes
   0x000–0x7F7; const at `0x1801580c`).
 
-**Therefore the next step is NOT a generator field, it is the emulated NAND
-geometry / FIL buffer.** Compare, byte for byte, the FIL geometry the M68AP
-iBoot derives (struct `[0x18025530]`: +0x08/+0x0a pages-per-block, +0x2c block
-count, CE count) and the context RAM buffer sizing (`malloc(blockcount<<11)` at
-`0x180159d0` → `[0x18025300]`; the 0x800 copy at `0x180162f4` writes
-`[0x18025300]+(bank<<11)`) against the N45AP path. The likely fix is in the
-machine/`ITNand` model or FIL geometry table, not in `build-m68ap-nand.py`.
-Controlled test still owed: **N45AP iBoot on `-M iPhone-2G` with the same tree**
-(the working smoke test uses `epoch=2`; isolate machine/epoch vs iBoot as the
-variable). Key VAs: memcpy `0x18017bac` (fault interior `0x18017cb4`), ctxbuf
-malloc `0x180159d0`, geometry struct `[0x18025530]`, ctxbuf ptr `[0x18025300]`.
+**Runtime diagnosis (2026-07-21, monitor dumps at the fault):** the abort is a
+`memcpy` (`0x18017bac`) invoked with a **garbage length** — at the fault
+`R0=0x180fc9e0` (dst), `R1=0x18100000` (src, reads all-zero), `R2=0xffe6121d`
+(~4 GB). It runs off the end of RAM. The dst `0x180fc9e0` holds a live table
+(`0x27800c12, 0x27900c12, …`, +0x100000 stride — looks like DMA/scatter
+descriptors) being clobbered. The **call chain is `0x18004xxx-0x1800bxxx` via
+libc helpers `0x18018cc0`/`0x18018d20` (from `0x18006120`, a format/log helper
+that also calls `0x180034a8` for a 64-bit value) — NOT the VFL/FTL code**
+(`0x18015xxx-0x18017xxx`). Confirmed ruled out: the iBoot code is byte-identical
+to N45AP (true section delta is **0x704**, not 0x700; the FIL read core matches
+exactly once realigned — my one-off "FIL differs" reading was a misalignment
+artifact). NAND geometry is sane (`[0x18025530]+8` low16 = 0x80 = 128
+pages/block; banks 8; ctxbuf `0x18033150`). FIL page buffers `[0x180254dc]=0x1802ca48`,
+`[0x180254e0]=0x1802d250` — not the bogus src.
+
+Since the code is identical and N45AP iBoot boots on the same `-M iPhone-2G`
+machine (smoke test, `epoch=2`), the divergence is **M68AP-build runtime data or
+environment** (NOR device tree / `epoch=3` / a baked buffer size), not the NAND
+page format — so it is NOT a `build-m68ap-nand.py` fix. **Next step:** find the
+memcpy call site — disassemble `0x18018cc0`/`0x18018d20`/`0x18006120` and trace
+where a length becomes `0xffe6121d` (likely a pointer-subtraction underflow, or
+a `0x38a000xx` FMI-controller register the `ITNand` model returns wrong). Then
+run the controlled isolation: M68AP iBoot with the **n45ap NOR** (device-tree
+variable) and re-check. Key VAs: memcpy `0x18017bac` (fault interior
+`0x18017cb4`), FMI base `0x38a00000`, format helpers `0x18018cc0`/`0x18018d20`,
+geometry struct `[0x18025530]`.
 
 ## Firmware layout & parity (iPod ⇄ iPhone)
 
