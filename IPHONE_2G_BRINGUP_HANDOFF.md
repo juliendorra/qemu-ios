@@ -43,10 +43,11 @@ the live bring-up state.
 >    `WMR_Init` @ `0x180164a0`) until PC branches to `0x18017cb4`. The
 >    `bx`/`blx`/`pop {pc}` **immediately before** that jump — reading a
 >    corrupted value — is the culprit. Identify where that value comes from.
-> 4. If the debugger can't drive the `-icount` stub, add ~5 lines of temporary
->    instrumentation to QEMU's `arm_cpu_do_interrupt` (target/arm) to log the
->    pre-abort PC/LR/mode on the first prefetch abort, then `ninja -C
->    build-ipod11` and re-run.
+> 4. **Preferred over any debugger:** use the repo's proven debug loop
+>    (`AGENTS.md` § "Debugging the guest") — add ~5 lines of instrumentation to
+>    QEMU's `arm_cpu_do_interrupt` (target/arm) to log the pre-abort PC/LR/mode
+>    on the first prefetch abort (or a hook that fires when PC is set to
+>    `0x18017cb4`), then `ninja -C build-ipod11` and re-run under `-icount`.
 > 5. Cross-check by booting M68AP iBoot with the **n45ap NOR** (isolates the
 >    device-tree variable).
 >
