@@ -528,6 +528,18 @@ static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
         trace_exynos_uart_wo_read(s->channel, exynos4210_uart_regname(offset),
                                   offset);
         break;
+    case UMSTAT:
+        /* No real modem/flow-control peer is attached to any of these UARTs, so
+         * report CTS asserted (bit 0 = Clear To Send). Without this, a
+         * flow-controlled writer spins forever waiting for CTS -- e.g. M68AP
+         * iBoot-204's baseband uart_write on UART1 (0x3cc0401c), which parks the
+         * kernel handoff right after gBootArgs. Always-clear-to-send is the
+         * correct emulation default and does not change N45AP behaviour (the
+         * iPod firmware never polls UMSTAT). */
+        res = s->reg[I_(UMSTAT)] | 0x1;
+        trace_exynos_uart_read(s->channel, offset,
+                               exynos4210_uart_regname(offset), res);
+        return res;
     default:
         trace_exynos_uart_read(s->channel, offset,
                                exynos4210_uart_regname(offset),

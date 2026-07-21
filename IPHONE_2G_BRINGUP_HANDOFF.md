@@ -10,74 +10,68 @@ the live bring-up state.
 
 ## ► NEXT-SESSION PROMPT (start here)
 
-> **Continue the legacy iPhone 2G (M68AP) emulation bring-up. The NAND payload
-> pipeline now works** — the first milestone is reached. With a generated NAND
-> whose HFS+ boot partition carries the kernelcache, iBoot-204.3.14 on
-> `-M iPhone-2G` mounts the filesystem, finds
-> `/System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8900xrb`,
-> **decrypts it (GID key), decompresses it (complzss), passes its adler32 check
-> (`done`), and parses it as a Mach-O.** The boot wall is now several stages
-> deeper: `load_macho_image: failed to load device tree` (see the 2026-07-21
-> "kernelcache loads" session log below).
+> **THE M68AP DARWIN KERNEL NOW BOOTS.** With three fixes landed (below), m68ap
+> iBoot loads the device tree, hands off, and the real iPhone-2G kernelcache
+> runs: `Darwin Kernel Version 9.0.0d1 ... RELEASE_ARM_S5L8900XRB`, the platform
+> expert matches as **M68AP**, and IOKit registers cpu0 / vram@F400000 /
+> arm-io@3C000000 / buttons / dock / charger / FairPlay. (~5400 serial lines.)
 >
-> **The next task: get iBoot's secure-boot policy to accept the unsigned M68AP
-> NOR images (the device-tree in particular).** The device-tree load path is now
-> fully reverse-engineered and MOSTLY cleared — the remaining gate is secure
-> boot, not IMG2 formatting. See the 2026-07-21 "device-tree load fully
-> reverse-engineered" session log below for the complete chain with live-lldb
-> evidence. Summary of where it stands:
+> **The next wall is the kernel's own NAND FTL.** After IOKit comes up, the
+> `AppleNANDFTL` kext's `_FTLRestore` scans the generated NAND, finds no valid
+> free-block pool (`_ScanForFreeBlk(0xF35) failed`, `wDataBlkCnt=0xF20
+> wFreeBlkCnt=0x15`, thousands of `found block (#N) with unidentified spare`),
+> so `FTL_Open failed`, `AppleNANDFTL::start ... failed`, and the kernel prints
+> `Still waiting for root device`. **This is a NAND-generation fidelity task,
+> not a hack:** the kernel FTL is stricter than iBoot's (iBoot's own `FTL_Open`
+> succeeds on this same NAND). Our tree has only metadata + a minimal 16 MB HFS
+> payload; every other block is bare-erased with empty spare, which the kernel
+> FTL rejects. Sub-tasks:
+> 1. Extend `scripts/build-m68ap-nand.py` to populate a proper FTL free-block
+>    pool and per-block spare across all banks so `_FTLRestore` passes — match
+>    the mature it1g/it2g generator's FTL context/free-list, not just the WMR
+>    metadata pages. This is the same class as the earlier BBT/VFL work.
+> 2. Then place the real 1.1.4 root HFS+ (`022-3894-4.dmg`) so `rd=disk0s1`
+>    mounts and boot proceeds to launchd/SpringBoard. Still blocked offline: the
+>    dmg is `encrcdsa`/vfdecrypt-encrypted (GID key does not open it).
 >
-> - `dt_load` (`0x1800d060`) finds the `dtre` descriptor via
->   `image_find_by_type` (CONFIRMED found, r0≠0) and calls `image_load`
->   (`0x18008340`→`0x180088cc`) to copy it to `0x0bf00000`.
-> - `image_load`'s IMG2 validator (`0x18008478`) now PASSES (verified by lldb
->   bisect) thanks to the NOR-builder fix in `scripts/build-m68ap-nor.py`
->   (`promote_loadable`): iBoot normalises each NOR IMG2 header into a RAM copy
->   with flags2 (`+0x1c`) bit 30 CLEARED and bit 24 SET, and validates a CRC32
->   over that normalised header; the builder now emits `+0x1c=0x01000000` and a
->   matching `+0x64` CRC so both enumeration and the load-time validator accept
->   it.
-> - The final gate is **secure boot**: `image_load` (`0x180089b0`) checks flags2
->   bit 1 to pick the signed-hash path vs the unsigned path; our image is
->   unsigned (bit 1 clear, zero hash at `+0x3e0`), so it falls to the decider
->   `0x18005984`, which returns "allowed" only if **bit 4 of the security config
->   word at `0x18022fa0`** is set. It is NOT set, so `image_load` returns −1 and
->   the DT load fails.
+> **Verify with** `scripts/iphone-nand-acceptance.py` (its `kernel` JSON gate is
+> now reachable). **Use `--icount-shift -1` (real time)** so the kernel gets
+> enough wall-clock — the default icount path parks in iBoot's UART loop just
+> before the banner. The boot needs the patched iBoot (see fix 2) and the
+> validator-normalised NOR (fix 1).
 >
-> **So the next frontier is secure-boot policy for NOR images**, not NAND and
-> not IMG2 CRC. Options, in rough order of promise: (a) find where `0x18022fa0`
-> is initialised (a `security_init`/`make_production` early in boot; grep code
-> refs — they cluster at `0x18005958`–`0x18005ba8`) and make the emulator report
-> a development/demoted security state so bit 4 is set, mirroring the board-aware
-> SYSIC epoch fix — this would accept ALL unsigned M68AP images at once;
-> (b) properly sign the NOR images so the bit-1 signed path's hash check
-> (`0x18003284` AES/SHA setup + `0x180183e0` memcmp at image `+0x3e0`/`+0x60`)
-> passes under the emulator's crypto — heavier, needs the exact M68AP image
-> signature scheme; (c) check whether the N45AP boot relies on the same config
-> bit or on genuinely-valid signatures (it uses generator-signed images with a
-> hash at `+0x20`/`+0x3e0`, which the authentic IPSW M68AP images lack). Verify
-> any fix with a live lldb read of `r0` at `0x1800d0a6` (dt_load's post-load
-> value: ≥0 means the DT loaded) — `scripts/`-adjacent probe recipe is in the
-> session log.
+> **The three fixes that got from "failed to load device tree" to a live kernel
+> (all landed this session):**
+> 1. **NOR IMG2 validator** — `build-m68ap-nor.py promote_loadable` normalises
+>    each NOR image's flags2 (`+0x1c`) to bit 24 SET / bit 30 CLEAR and
+>    recomputes the `+0x64` CRC, matching iBoot's RAM-normalised header. Faithful
+>    format fix. (Committed earlier: `e44f44cad6`.)
+> 2. **Secure-boot bypass** — `scripts/patch-m68ap-iboot.py`: one 2-byte Thumb
+>    edit at the unsigned-image decider (VA `0x18005984`, file `0x5990`
+>    `00 20`→`01 20`). This RELEASE iBoot strictly enforces secure boot and our
+>    synthetic images are unsigned; this is the standard "pwnage"-equivalent
+>    every legacy-iOS emulator relies on. Apply to a STAGED iBoot copy; never
+>    commit patched firmware.
+> 3. **UART CTS** — `hw/char/exynos4210_uart.c` UMSTAT now reports CTS asserted
+>    (bit 0). Without it, m68ap iBoot's flow-controlled baseband write on UART1
+>    (`0x3cc0401c`) spins forever right after `gBootArgs`. A genuine UART-model
+>    completeness fix; N45AP never polls UMSTAT so it is unaffected.
 >
-> **Second milestone (kernel banner):** once the DT loads, `load_macho_image`
-> relocates the kernel and jumps; expect `gBootArgs.commandLine = [...]` then
-> `Darwin Kernel Version` (exactly the N45AP sequence). **Third milestone
-> (SpringBoard) is blocked on the real root filesystem** — the kernelcache-only
-> HFS+ has no bootable root, and the genuine root FS (`022-3894-4.dmg`) is
-> `encrcdsa`/vfdecrypt-encrypted with a key not available offline. Track that
-> separately; do not block the kernel-banner milestone on it.
+> When M68AP finally boots through SpringBoard, create `iPhone 2G.app` from the
+> app scaffolding and the board-aware `s5l8900-profile=iphone-2g` launcher.
 >
-> **Reproduce the payload:** build a kernelcache-carrying HFS+ with
-> `scripts/build-m68ap-hfs-payload.sh <kernelcache> out.dmg`, then
-> `scripts/build-m68ap-nand.py --out <dir> --signature m68ap --hfs out.dmg`.
-> **Verify with:** `python3 scripts/iphone-nand-acceptance.py --timeout 90
-> --nand-m68ap <dir>` (runs M68AP + the N45AP regression; JSON gates include
-> `kernel`). Structural checks: `python3 scripts/test-build-m68ap-nand.py`.
+> ---
 >
-> When real M68AP firmware finally boots through SpringBoard, create
-> `iPhone 2G.app` from the existing app scaffolding and board-aware
-> `s5l8900-profile=iphone-2g` launcher.
+> **(Historical, now solved) The device-tree secure-boot gate.** The full path
+> is reverse-engineered in the 2026-07-21 "device-tree load fully
+> reverse-engineered" session log below. Where it stood before the iBoot patch:
+> `dt_load` (`0x1800d060`) found the `dtre` descriptor and called `image_load`
+> (`0x18008340`→`0x180088cc`); the IMG2 validator (`0x18008478`) was cleared by
+> fix 1; the last gate was `image_load` (`0x180089b0`) taking the unsigned path
+> to decider `0x18005984`, which requires security-config `0x18022fa0` bit 4 —
+> never set in this RELEASE build — hence the secure-boot patch (fix 2). A more
+> faithful alternative to fix 2 is to reconstruct Apple's img2 GID signatures so
+> the bit-1 signed path passes; larger and separately licensable.
 
 **The former blocker (solved 2026-07-21, kept for the record):** after
 `FTL_Init [OK]`, iBoot Data-Aborted inside `memmove` (`DFAR=0x18100000`,
@@ -102,12 +96,52 @@ registers both machines). SYSIC epoch, watchdog, M68AP extraction, synthetic
 NOR, NAND signature/production BBT/DEVICEINFOBBT fix, **and now the NAND
 filesystem payload** are all landed and verified. With a kernelcache-carrying
 HFS+ boot partition, m68ap iBoot mounts HFS+, loads/decrypts/decompresses the
-kernelcache and validates it as a Mach-O. The boot wall is now
-`load_macho_image: failed to load device tree` — a **NOR** `dtre` image-load
-failure, now fully reverse-engineered: the IMG2 header validator is cleared (via
-`build-m68ap-nor.py promote_loadable`), and the last remaining gate is iBoot's
-**secure-boot policy** rejecting the unsigned M68AP images (config `0x18022fa0`
-bit 4). N45AP still boots to the Darwin kernel (no regression).
+kernelcache. **The M68AP Darwin kernel now boots** (three fixes: NOR IMG2
+validator normalisation, an iBoot secure-boot bypass patch, and a UART CTS
+fix) — `Darwin Kernel Version ... RELEASE_ARM_S5L8900XRB`, platform expert
+matches M68AP, IOKit registers. The wall is now the kernel's `AppleNANDFTL`
+`_FTLRestore` (no free-block pool in the generated NAND) → `Still waiting for
+root device`. Both machines still reach the Darwin kernel in the acceptance
+batch (no regression from the shared UART change).
+
+## Session log — 2026-07-21 (M68AP DARWIN KERNEL BOOTS; DT + secure boot + UART CTS solved)
+
+Cleared the device-tree wall and everything through the kernel handoff. Three
+fixes, in the order the boot hits them:
+
+1. **NOR IMG2 validator** (`build-m68ap-nor.py promote_loadable`, faithful):
+   normalise each NOR image's flags2 (`+0x1c`) to bit 24 set / bit 30 clear and
+   recompute the `+0x64` CRC to match iBoot's RAM-normalised header. Detail in
+   the DT-reverse-engineering log below.
+2. **Secure-boot bypass** (`scripts/patch-m68ap-iboot.py`, standard "pwnage"
+   equivalent): this RELEASE iBoot-204.3.14 never sets security-config
+   `0x18022fa0` bit 4 (seeded 0x002c0000 at `0x18005a28`), so it strictly
+   rejects unsigned images and refuses to LOAD the (found, validated) `dtre`.
+   One 2-byte Thumb edit at the unsigned-image decider (VA `0x18005984`, file
+   `0x5990`: `movs r0,#0` → `movs r0,#1`) makes it accept unsigned images.
+   Applied to a staged iBoot copy; patched firmware is never committed. With
+   it, iBoot loads the DT and reaches `gBootArgs.commandLine = [...]`.
+3. **UART CTS** (`hw/char/exynos4210_uart.c`, faithful): after `gBootArgs`,
+   m68ap iBoot does a flow-controlled write to the **baseband UART1** and spins
+   in `uart_write` (VA `0x18003c9e`) polling UMSTAT (`0x3cc0401c` = UART1+0x1c)
+   for CTS. The exynos UART model returned UMSTAT=0 (CTS clear) → infinite
+   spin. Report CTS asserted (bit 0) — the correct default for an emulated UART
+   with no modem. N45AP never polls UMSTAT, so it is unaffected.
+
+**Result (real time, `--icount-shift -1`):**
+`Darwin Kernel Version 9.0.0d1: ... xnu-933.0.0.211 RELEASE_ARM_S5L8900XRB`,
+then `config(...): starting on M68AP`, `AppleARMPE::start(M68AP)`, IOKit
+registers `cpu0` / `vram@F400000` / `arm-io@3C000000` / `buttons` / `dock` /
+`charger` / FairPlay. ~5400 serial lines. Acceptance batch: **m68ap PASS
+(deepest=kernel), n45ap PASS (deepest=kernel)** — no regression. Note: run in
+REAL TIME; under `-icount shift=3` the kernel does not get enough wall-clock and
+the run parks in iBoot's UART loop before the banner.
+
+**Next wall (kernel NAND FTL):** `AppleNANDFTL::_FTLRestore` rejects the
+generated NAND (`_ScanForFreeBlk(0xF35) failed`, `wFreeBlkCnt=0x15`, many
+`unidentified spare`) → `FTL_Open failed` → `Still waiting for root device`.
+The kernel FTL is stricter than iBoot's; the generated tree needs a real
+free-block pool + per-block spare (see the NEXT-SESSION prompt).
 
 ## Session log — 2026-07-21 (device-tree load fully reverse-engineered; secure boot is the last gate)
 

@@ -62,15 +62,20 @@ Not every problem found during this work was introduced by the iPhone profile:
   (built with `scripts/build-m68ap-hfs-payload.sh`). m68ap iBoot mounts HFS+,
   loads the kernelcache, decrypts it (GID key), complzss-decompresses it, passes
   its adler32 check, and validates the Mach-O — clearing `Not HFS+`.
-- **Still open (current blocker):** `load_macho_image: failed to load device
-  tree`. Fully reverse-engineered: iBoot loads the DT from the **NOR** `dtre`
-  image (`dt_load=0x1800d060` → `image_find_by_type` → `image_load`). The IMG2
-  header validator is now cleared (`build-m68ap-nor.py promote_loadable` sets
-  flags2 bit 24, clears bit 30, and fixes the header CRC to match iBoot's
-  normalised RAM copy — verified by live lldb). The last gate is **secure
-  boot**: `image_load` rejects the unsigned M68AP images unless security config
-  `0x18022fa0` bit 4 is set. This is a NOR/secure-boot problem, not NAND. Full
-  evidence, addresses, and next-session prompt: `IPHONE_2G_BRINGUP_HANDOFF.md`.
+- **The M68AP Darwin kernel boots.** Three fixes cleared the device-tree wall
+  and the kernel handoff: (1) `build-m68ap-nor.py promote_loadable` normalises
+  the NOR IMG2 flags2/CRC so iBoot's image validator accepts the `dtre` image;
+  (2) `scripts/patch-m68ap-iboot.py` bypasses this RELEASE iBoot's secure-boot
+  enforcement (it never sets the allow-unsigned config bit) — the standard
+  "pwnage"-equivalent, applied to a staged iBoot copy, never committed; (3)
+  `hw/char/exynos4210_uart.c` reports UART CTS asserted so iBoot's baseband
+  UART1 write does not spin before the kernel jump. Result: `Darwin Kernel
+  Version ... RELEASE_ARM_S5L8900XRB`, platform expert matches M68AP, IOKit
+  registers. Run in REAL TIME (`--icount-shift -1`).
+- **Still open (current blocker):** the kernel's `AppleNANDFTL` `_FTLRestore`
+  rejects the generated NAND (no free-block pool) → `Still waiting for root
+  device`. A NAND-generation fidelity task (the kernel FTL is stricter than
+  iBoot's). Full evidence and next-session prompt: `IPHONE_2G_BRINGUP_HANDOFF.md`.
 - **Root filesystem (for SpringBoard): separate, key-blocked.** The genuine
   root FS `022-3894-4.dmg` is `encrcdsa`/vfdecrypt-encrypted (not an 8900
   container), so the GID key does not open it; the kernelcache-only HFS+ reaches
