@@ -113,12 +113,12 @@ fixes, in the order the boot hits them:
    normalise each NOR image's flags2 (`+0x1c`) to bit 24 set / bit 30 clear and
    recompute the `+0x64` CRC to match iBoot's RAM-normalised header. Detail in
    the DT-reverse-engineering log below.
-2. **Secure-boot bypass** (`scripts/patch-m68ap-iboot.py`, standard "pwnage"
-   equivalent): this RELEASE iBoot-204.3.14 never sets security-config
-   `0x18022fa0` bit 4 (seeded 0x002c0000 at `0x18005a28`), so it strictly
-   rejects unsigned images and refuses to LOAD the (found, validated) `dtre`.
-   One 2-byte Thumb edit at the unsigned-image decider (VA `0x18005984`, file
-   `0x5990`: `movs r0,#0` → `movs r0,#1`) makes it accept unsigned images.
+2. **Secure-boot bypass** (`scripts/patch-m68ap-iboot.py`, a SHORTCUT — see the
+   "how N45AP does it" note below): this RELEASE iBoot-204.3.14 never sets
+   security-config `0x18022fa0` bit 4 (seeded 0x002c0000 at `0x18005a28`), so it
+   strictly rejects unsigned images and refuses to LOAD the (found, validated)
+   `dtre`. One 2-byte Thumb edit at the unsigned-image decider (VA `0x18005984`,
+   file `0x5990`: `movs r0,#0` → `movs r0,#1`) makes it accept unsigned images.
    Applied to a staged iBoot copy; patched firmware is never committed. With
    it, iBoot loads the DT and reaches `gBootArgs.commandLine = [...]`.
 3. **UART CTS** (`hw/char/exynos4210_uart.c`, faithful): after `gBootArgs`,
@@ -142,6 +142,28 @@ generated NAND (`_ScanForFreeBlk(0xF35) failed`, `wFreeBlkCnt=0x15`, many
 `unidentified spare`) → `FTL_Open failed` → `Still waiting for root device`.
 The kernel FTL is stricter than iBoot's; the generated tree needs a real
 free-block pool + per-block spare (see the NEXT-SESSION prompt).
+
+**Why N45AP boots UNPATCHED but M68AP needs the patch (proven, not assumed).**
+It is NOT that the iPod's iBoot is more permissive — the two are identical here:
+- N45AP's secure-boot decider is byte-identical (its `movs r0,#0` reject is
+  intact at file `0x5070`; the iPod iBoot is unpatched), and its `security_init`
+  is byte-identical too (seeds `0x18022fa0=0x2c0000`, sets bits 28/29, 20, 5 by
+  hardware, but NEVER bit 4). So N45AP does not allow unsigned images either.
+- The emulator **cryptographically verifies the IMG2 signature.** Proof: flip 32
+  bytes of the N45AP `dtre` signature at IMG2 `+0x3e0` (outside the `+0x64`
+  header CRC) and the iPod fails with the SAME `failed to load device tree`,
+  never reaching Darwin — i.e. break the signature and the iPod hits our wall.
+- Therefore N45AP boots because its NOR images are **genuinely, validly signed**
+  (flags2 bit 1 set, real hash at `+0x20`/`+0x3e0`) by the upstream devos50
+  generator; the emulator checks them and they pass. Our M68AP NOR uses the raw
+  IPSW IMG2s, which are unsigned in our pipeline (zero hash), so they fail the
+  same real check.
+- **So the patch is a genuine shortcut, and the faithful alternative is real:**
+  sign the M68AP NOR images the way the generator signs the N45AP ones, and the
+  iBoot patch becomes unnecessary. That is the honest path to remove the one
+  hack in this bring-up. (Open sub-question: what key/scheme the generator/img2
+  signature uses that the emulator's crypto accepts — the plain AES engine's
+  GID path is a no-op, but AES-UID and the 8900/GID engine are implemented.)
 
 **Dead ends / techniques this session (don't repeat these):**
 - **The "make the emulator report development mode to allow unsigned images"
