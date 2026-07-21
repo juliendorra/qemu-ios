@@ -81,8 +81,18 @@ def test_m68ap_signature_and_bbt() -> None:
           "signature page is otherwise zero")
     bbt = (out / "bank0" / "524160.page").read_bytes()
     check(bbt[:16] == b"DEVICEINFOBBT\x00\x00\x00", "BBT header present")
-    check(all(x == 0xFF for x in bbt[16:PAGE]),
-          "M68AP BBT data region is 0xFF-filled (production, all-good)")
+    # Layout per m68ap iBoot-204.3.14's DEVICEINFOBBT loader (0x18015fa0):
+    # +0x34 u32 BBT byte count, +0x38 bitmap (1 bit/block, 1 = good). A
+    # full-page 0xFF fill corrupts the count (0xFFFFFFFF) and iBoot's
+    # memmove Data Aborts after FTL_Init — the count MUST be the bitmap size.
+    bbt_len = struct.unpack_from("<I", bbt, 0x34)[0]
+    check(bbt_len == 0x200, "BBT count @0x34 == 0x200 (4096 blocks / 8)")
+    check(all(x == 0xFF for x in bbt[0x38:0x38 + 0x200]),
+          "BBT bitmap @0x38 is 0xFF-filled (production, all-good)")
+    check(all(x == 0 for x in bbt[0x10:0x34]),
+          "BBT header padding (0x10..0x34) is zero")
+    check(all(x == 0 for x in bbt[0x238:PAGE]),
+          "BBT tail after bitmap is zero")
 
 
 def test_geometry_and_layout() -> None:

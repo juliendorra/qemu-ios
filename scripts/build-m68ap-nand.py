@@ -164,14 +164,21 @@ def build_bbt_page(production: bool) -> bytes:
     page = bytearray(BYTES_PER_PAGE)
     page[0:16] = b"DEVICEINFOBBT\x00\x00\x00"
     if production:
-        # Production ("all blocks good") fill, as the final N72AP generator does.
-        # M68AP's Whimory2_1 VFL_Init builds its searchable-block bitmap from this
-        # page; the it1g zero-fill leaves every block marked bad, so VFL_Open's
-        # context scan finds nothing and fails at _LoadVFLCxt line 768. Verified:
-        # 0xFF-fill lets VFL_Open discover the context. N45AP iBoot does not need
-        # this (it accepts the zero-fill BBT), so it is an M68AP-specific choice.
-        for i in range(16, BYTES_PER_PAGE):
-            page[i] = 0xFF
+        # Production ("all blocks good") BBT, needed by M68AP's Whimory2_1
+        # VFL_Init (the it1g zero-fill marks every block bad, so VFL_Open's
+        # context scan finds nothing and fails at _LoadVFLCxt line 768).
+        # Page layout decoded from m68ap iBoot-204.3.14's loader at 0x18015fa0:
+        # it memcmp()s the first 0x10 bytes against "DEVICEINFOBBT", then does
+        # memmove(dst, page + 0x38, *(uint32 *)(page + 0x34)) — +0x34 is the
+        # BBT byte count and +0x38 the bitmap (1 bit per block, 1 = good).
+        # An earlier full-page 0xFF fill therefore put 0xFFFFFFFF in the count
+        # and made that memmove read past the iBoot RAM window: the
+        # post-FTL_Init Data Abort (DFAR=0x18100000). Only the bitmap may be
+        # 0xFF; the count must be the real bitmap size and the rest zeros,
+        # matching the N45AP page shape (marker + zeros, count 0).
+        bbt_len = (PAGES_PER_BANK // PAGES_PER_BLOCK) // 8  # 4096 blocks -> 0x200
+        struct.pack_into("<I", page, 0x34, bbt_len)
+        page[0x38:0x38 + bbt_len] = b"\xFF" * bbt_len
     return bytes(page)
 
 
