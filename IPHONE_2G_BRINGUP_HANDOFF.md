@@ -143,6 +143,32 @@ generated NAND (`_ScanForFreeBlk(0xF35) failed`, `wFreeBlkCnt=0x15`, many
 The kernel FTL is stricter than iBoot's; the generated tree needs a real
 free-block pool + per-block spare (see the NEXT-SESSION prompt).
 
+**Dead ends / techniques this session (don't repeat these):**
+- **The "make the emulator report development mode to allow unsigned images"
+  idea is a DEAD END — do not re-chase it.** iBoot DOES read a hardware
+  security register (`security_init` at `0x18005a28` calls `0x180018e4`, which
+  returns bit 4 of CHIPID `0x3e500004` — modeled by `hw/arm/ipod_touch_chipid.c`,
+  offset 0x4 returns `CHIP_REVISION<<24`), so a CHIPID/fuse lever *seemed*
+  plausible (like the SYSIC epoch fix). But tracing it shows the security-config
+  word `0x18022fa0` is seeded to `0x002c0000` and NO code path in this RELEASE
+  build ever sets its bit 4 (the allow-unsigned bit the decider `0x18005984`
+  checks); the CHIPID bit only influences other config bits (bit 5, etc.). There
+  is no hardware lever to accept unsigned images. Hence the iBoot patch (or,
+  faithfully, reconstructing the img2 GID signatures) is required — not a CHIPID
+  tweak.
+- **Locating the UART1 spin:** the boot went silent after `gBootArgs` with no
+  serial error. Sampling the parked CPU via the monitor (`info registers` → R15)
+  gave PC `0x18003c9e`; disassembling around it showed `uart_write`'s TX/CTS
+  poll of `[r4+0x1c]`, and R02 held the polled MMIO address `0x3cc0401c`.
+  Decoding that against `include/hw/arm/ipod_touch.h` (`UART1_MEM_BASE
+  0x3cc04000`) identified UART1+0x1c = UMSTAT. Always sample the parked PC + the
+  MMIO address in registers before assuming a hang; the fix followed directly.
+- **Each image-load fix only advanced the failure one gate** (validator CRC →
+  validator bit-24 → secure-boot decider → post-`gBootArgs` UART), and every
+  `image_load` rejection prints the SAME `failed to load device tree`, so serial
+  alone never localised it — register-level lldb bisection at each gate was the
+  decisive technique (see the DT-reverse-engineering log's lldb recipe).
+
 ## Session log — 2026-07-21 (device-tree load fully reverse-engineered; secure boot is the last gate)
 
 Followed the `load_macho_image: failed to load device tree` wall all the way
