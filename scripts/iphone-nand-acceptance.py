@@ -39,7 +39,10 @@ REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get(
     "IPOD_APP", "/Applications/iPod Touch.app/Contents"))
 DEFAULT_QEMU = REPO / "build-ipod11" / "qemu-system-arm"
-DEFAULT_ART = REPO / "m68ap-artifacts"
+# Firmware lives in the app bundle, in parity dirs: ipod_files/ (N45AP) and
+# iphone_files/ (M68AP). Install the latter with install-iphone-firmware.py.
+IPOD_FILES = APP / "Resources" / "ipod_files"
+IPHONE_FILES = APP / "Resources" / "iphone_files"
 
 # Ordered M68AP phase markers. Each is (key, needle, is_failure).
 M68AP_PHASES = [
@@ -108,13 +111,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--qemu", type=Path, default=DEFAULT_QEMU)
     ap.add_argument("--bootrom", type=Path,
-                    default=APP / "Resources/ipod_files/bootrom_s5l8900")
+                    default=IPHONE_FILES / "bootrom_s5l8900")
     ap.add_argument("--iboot-m68ap", type=Path,
-                    default=DEFAULT_ART / "extracted/iboot_204_m68ap.bin")
+                    default=IPHONE_FILES / "iboot_204_m68ap.bin")
     ap.add_argument("--nor-m68ap", type=Path,
-                    default=DEFAULT_ART / "nor_m68ap.bin")
+                    default=IPHONE_FILES / "nor_m68ap.bin")
     ap.add_argument("--nand-m68ap", type=Path,
-                    default=DEFAULT_ART / "nand-m68ap")
+                    default=IPHONE_FILES / "nand")
     ap.add_argument("--skip-n45ap", action="store_true",
                     help="skip the iPod (N45AP) regression boot")
     ap.add_argument("--timeout", type=int, default=45)
@@ -163,9 +166,9 @@ def main() -> int:
 
     # --- N45AP regression -----------------------------------------------------
     if not args.skip_n45ap:
-        n_iboot = APP / "Resources/ipod_files/iboot_204_n45ap.bin"
-        n_nor = APP / "Resources/ipod_files/nor_n45ap.bin"
-        n_src = APP / "Resources/ipod_files/nand"
+        n_iboot = IPOD_FILES / "iboot_204_n45ap.bin"
+        n_nor = IPOD_FILES / "nor_n45ap.bin"
+        n_src = IPOD_FILES / "nand"
         if not (args.qemu.exists() and n_iboot.exists() and n_src.exists()):
             result["cases"]["n45ap"] = {"status": "SKIP",
                                         "reason": "installed iPod firmware absent"}

@@ -62,16 +62,72 @@ Root-caused and eliminated the `no signature or no production format` blocker:
    word, production BBT fill, VFL spare `[8]=0`/`[9]=0x80`, awInfoBlk@0x7A2,
    geometry) with no Apple payloads in the repo.
 
-**Next failure (precise):** with signature + production BBT, VFL_Open discovers
-the context then takes a **Prefetch Abort** (IFAR `0x18017cb4`, IFSR 0x8
-external-abort-on-fetch) — it branches to a bad code address while interpreting
-the it1g VFL context *body*. Validator facts (VA 0x18016120): a context page is
-accepted purely on its spare (`spare[8]==0 && spare[9]==0x80`), reading the
-first 8 pages of each scanned block; awInfoBlk is read at page offset **0x7A2**
-(the it1g offset, not the it2g ~0x68E). So M68AP wants the it1g VFLCxt *layout*
-with production field *values* set. Deriving the exact required fields
-(version/checksum/counts/wCxtLocation) from the N45AP-vs-M68AP VFL_Open
-instruction diff is the next step.
+**Next failure (precise, re-diagnosed):** with signature + production BBT,
+VFL_Open discovers the context then takes a **Prefetch Abort** (IFAR
+`0x18017cb4`, IFSR 0x8). A full disassembly diff overturned the "production VFL
+body" hypothesis:
+
+- **The entire Whimory VFL/FTL code is byte-identical between the N45AP and
+  M68AP iBoot-204 builds** (M68AP `0x14900-0x18000` vs N45AP shifted −0x700);
+  every difference is relocation noise (BL/BLX offset high bytes, relocated
+  literal-pool pointers, device strings). There is **no new field check, no new
+  constant** in the validator (`0x18016120`), VFL_Open (`0x18016194`), the
+  checksum funcs (`0x18015810`/`0x180157e0`), FTL_Open (`0x18015068`), or
+  WMR_Init (`0x180164a0`). So the two builds require *identical* context bytes,
+  and the it1g body is NOT the problem.
+- `0x18017cb4` is **inside the ARM-mode `memcpy` at `0x18017bac`** (its
+  byte-copy tail), not a code target. Every memcpy in this path is a **fixed**
+  size (8 / 0x800 / 6). A fixed-size memcpy that aborts means a **bad source or
+  destination pointer**, i.e. a NAND-geometry / buffer issue, not a rejected
+  page. The two indirect calls in `_LoadVFLCxt` dispatch through a **statically
+  initialised** vtable (`[0x18025570]` set at `0x18015a54` to
+  `{0x18015864, 0x18015810}`), so "call through garbage" is ruled out.
+- **VFL context layout confirmed (it1g, NOT it2g):** spare `[8]==0` /
+  `[9]==0x80`, `dwCxtAge` at spare `[0..3]`; data `awInfoBlk[4]` at **0x7A2**
+  (literal cited at both iBoots). Optional production trailer (verified present
+  in the checksum code, but N45AP accepts zeros so it is not what blocks us):
+  `dwVersion`@0x7F4, `dwCheckSum`@0x7F8 `= Σ words[0..509] + 0xAABBCCDD`,
+  `dwXorSum`@0x7FC `= ⊕ words[0..509] ^ 0xAABBCCDD` (510 LE u32 over bytes
+  0x000–0x7F7; const at `0x1801580c`).
+
+**Therefore the next step is NOT a generator field, it is the emulated NAND
+geometry / FIL buffer.** Compare, byte for byte, the FIL geometry the M68AP
+iBoot derives (struct `[0x18025530]`: +0x08/+0x0a pages-per-block, +0x2c block
+count, CE count) and the context RAM buffer sizing (`malloc(blockcount<<11)` at
+`0x180159d0` → `[0x18025300]`; the 0x800 copy at `0x180162f4` writes
+`[0x18025300]+(bank<<11)`) against the N45AP path. The likely fix is in the
+machine/`ITNand` model or FIL geometry table, not in `build-m68ap-nand.py`.
+Controlled test still owed: **N45AP iBoot on `-M iPhone-2G` with the same tree**
+(the working smoke test uses `epoch=2`; isolate machine/epoch vs iBoot as the
+variable). Key VAs: memcpy `0x18017bac` (fault interior `0x18017cb4`), ctxbuf
+malloc `0x180159d0`, geometry struct `[0x18025530]`, ctxbuf ptr `[0x18025300]`.
+
+## Firmware layout & parity (iPod ⇄ iPhone)
+
+Firmware lives in the app bundle, one dir per board, same file names:
+
+```
+<App>/Contents/Resources/
+  ipod_files/     bootrom_s5l8900  iboot_204_n45ap.bin  nor_n45ap.bin  nand/
+  iphone_files/   bootrom_s5l8900  iboot_204_m68ap.bin  nor_m68ap.bin  nand/  firmware-provenance.json
+```
+
+This is the layout `scripts/install-ipod-app-engine.sh` already expects (its
+`ipod-touch` profile → `ipod_files`, `iphone-2g` profile → `iphone_files`).
+Populate `iphone_files/` reproducibly from a user-supplied IPSW:
+
+```
+python3 scripts/extract-m68ap-images.py <IPSW>/.../all_flash.m68ap.production OUT
+python3 scripts/build-m68ap-nor.py  --template <n45ap NOR> --containers OUT/nor-containers --out OUT/nor_m68ap.bin
+python3 scripts/build-m68ap-nand.py --out OUT/nand-m68ap --signature m68ap
+python3 scripts/install-iphone-firmware.py --from OUT   # assembles + installs + re-signs
+```
+
+`scripts/iphone-nand-acceptance.py` defaults to these bundle dirs (no paths
+needed), exactly as it uses `ipod_files/` for the N45AP regression. Apple-derived
+firmware is never committed (AGENTS.md); it lives only in the bundle, like the
+N45AP set. Each `iphone_files/` carries a `firmware-provenance.json` (hashes +
+the NAND constructor manifest).
 
 ## Session log — 2026-07-21 (merge onto wifi line + step-1 fixes landed)
 
