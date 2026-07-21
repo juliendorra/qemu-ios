@@ -58,3 +58,26 @@ Always boot staged NAND and NOR copies during diagnosis. CA/DNS patching,
 packing, and guest acceptance happen on those copies. Updating and signing
 `/Applications/iPod Touch.app` is a final step only after the development
 engine suite passes.
+
+### Why the historical self-launching harness was retired
+
+The legacy QEMU 6 line included `scripts/ipod-acceptance-test.py`, a monolithic
+sleep/wake harness that cloned NAND but passed the installed application's NOR
+directly to QEMU as writable `-pflash`. That made the installed firmware copy
+part of a diagnostic run and no longer satisfies this repository's staged
+NAND/NOR policy.
+
+The QEMU 11 workflow deliberately separates responsibilities instead:
+
+1. Launch QEMU with explicit staged NAND and NOR copies.
+2. Connect the reusable QMP harness to that already-running guest.
+3. Run power (`--sleep-wake`), network, HTTP, and HTTPS checks as distinct
+   evidence-producing cases.
+
+This change exists to make firmware provenance and mutation boundaries
+explicit, prevent accidental writes to the installed application's only NOR,
+and avoid coupling every UI regression to one self-launching script. The old
+scenario matrix remains documented in `SLEEP_WAKE_INVESTIGATION.md` as
+historical coverage guidance, but the unsafe executable harness is intentionally
+not carried onto the active branch. Extend the current QMP harness when fuller
+power coverage is required.

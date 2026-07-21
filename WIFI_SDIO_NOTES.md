@@ -1,6 +1,6 @@
 # Wi-Fi / SDIO bring-up notes (stage 0+)
 
-Working notes for the Wi-Fi implementation plan in
+Working notes for the Wi-Fi implementation plan carried forward in
 `SLEEP_WAKE_INVESTIGATION.md` ("Wi-Fi Feasibility and Implementation Path").
 Everything here is derived from the running guest (`IPOD_SDIO_TRACE=1`) and
 the N45AP device tree in NOR — not from datasheet guesses.

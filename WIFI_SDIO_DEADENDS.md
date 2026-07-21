@@ -7,8 +7,8 @@ person does not repeat them. Roughly chronological.
 
 ## 1. Finding the plan
 
-- The plan is **not** in the Padipop app repo. It lives in the separate
-  QEMU emulator repo, `SLEEP_WAKE_INVESTIGATION.md`, section "Wi-Fi
+- The plan is **not** in the Padipop app repo. It lives in this QEMU emulator
+  repo in `SLEEP_WAKE_INVESTIGATION.md`, section "Wi-Fi
   Feasibility and Implementation Path". Searching the Padipop repo for
   "wifi bridge" returns nothing.
 

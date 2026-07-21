@@ -29,8 +29,10 @@ Never mutate the installed app's only firmware copy while diagnosing.
 
 This is the proven loop for chasing a guest-side hang, panic, or bad branch. It
 is deterministic and does not depend on an external debugger. The iPod Touch 1G
-sleep/wake work (`SLEEP_WAKE_INVESTIGATION.md`, on the `ipod_touch_1g` line) is
-the worked example — dozens of findings, all via this loop.
+sleep/wake work in `SLEEP_WAKE_INVESTIGATION.md` is the worked example —
+dozens of findings, all via this loop. The notebook was carried forward from
+`ipod_touch_1g-qemu6-legacy` and spans the work that led into the QEMU 11
+promotion; treat commands and status statements as dated technical provenance.
 
 **The loop:**
 
