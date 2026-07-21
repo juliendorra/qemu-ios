@@ -10,65 +10,45 @@ the live bring-up state.
 
 ## ► NEXT-SESSION PROMPT (start here)
 
-> **Continue the legacy iPhone 2G (M68AP) emulation bring-up. Find the caller
-> that invokes ARM `memmove` at `0x18017bac` with corrupt arguments after
-> `FTL_Init [OK]`, then fix the emulator-side cause so iBoot reaches
-> `VFL_Open [OK]` and `FTL_Open [OK]`.** Use only staged NAND/NOR copies; never
-> mutate the installed firmware. Do not commit Apple-derived artifacts.
+> **Continue the legacy iPhone 2G (M68AP) emulation bring-up. WMR init is
+> fully green** (`VFL_Open [OK]` / `FTL_Open [OK]` — the post-`FTL_Init` Data
+> Abort is root-caused and fixed, see the 2026-07-21 session log below). iBoot
+> now runs all the way to `HFSInitPartition`, prints `Not HFS+ (signature
+> 0x0000)` / `root filesystem mount failed`, and drops into a **live recovery
+> command prompt**. The next task: **give the generated NAND a bootable
+> payload** — GPT/partition pages, the HFS+ root filesystem from a user-supplied
+> 1.1.4 IPSW (`022-3894-4.dmg`, decrypted), and the kernelcache where M68AP
+> iBoot expects it — so `bootx` proceeds to the Darwin kernel. Use only staged
+> NAND/NOR copies; never mutate the installed firmware except via
+> `scripts/install-iphone-firmware.py`. Do not commit Apple-derived artifacts.
 >
-> **Correct current diagnosis:** the primary exception is a **Data Abort**, not
-> a bad indirect branch or an instruction-fetch abort at `0x18017cb4`.
-> `-d int` proves `DFSR=0x8`, `DFAR=0x18100000` while executing the byte-load at
-> `0x18017cb4` inside `memmove`. Its live arguments are
-> `r0=0x180fc9e0`, `r1=0x18100000`, `r2=0xffe6121d`. The abort vector at `0x10`
-> is unmapped under the active MMU, so it then prefetch-aborts; vector `0x0c`
-> also prefetch-aborts forever. The visible prefetch loop is secondary.
+> Follow the proven N45AP layout: the it1g generator places GPT + HFS payload
+> through the FTL's logical-page mapping (see `scripts/build-m68ap-nand.py`
+> `--hfs`, which already implements payload placement but has only been
+> exercised without a payload). Compare against the installed N45AP NAND's
+> partition/filesystem pages for structure. First milestone: iBoot prints an
+> HFS+ signature instead of 0x0000 and finds `/System/Library/Caches/
+> com.apple.kernelcaches/kernelcache` (or the NOR boot path's expected
+> location); second milestone: kernel banner in serial.
 >
-> **Already ruled out:** the NAND signature and production BBT are solved;
-> M68AP/N45AP Whimory code is byte-identical; changing BBT fill length does not
-> change the fault; M68AP iBoot with the N45AP NOR reaches the identical
-> post-`FTL_Init` fault, ruling out the NOR/device-tree contents; and the old
-> "corrupted code pointer" interpretation was caused by inspecting the nested
-> abort state rather than the first exception.
->
-> **Reproduce first:** run
-> `python3 scripts/iphone-nand-acceptance.py --skip-n45ap --timeout 25
-> --logs /private/tmp/iphone-m68ap-next`. The harness stages NAND/NOR, defaults
-> to `-icount shift=3`, writes JSON/serial/stderr, and stops the CPU to save a
-> monitor register/stack snapshot. Add `--interrupt-log` only for a short
-> exception investigation: the repeated vector abort can make `-d int` logs
-> grow very quickly.
->
-> **Next concrete experiment:** temporarily instrument
-> `arm_cpu_do_interrupt()` in `target/arm/helper.c` for the **first
-> `EXCP_DATA_ABORT`**, before mode switching, and log `last_pc`, SVC `LR`/`SP`,
-> CPSR, registers, DFSR and DFAR. Rebuild `build-ipod11`, reproduce under
-> `-icount`, and use the captured pre-exception LR/stack to identify the direct
-> caller of `memmove`. Disassemble that caller from the extracted M68AP iBoot
-> with Capstone and trace how `r2` becomes `0xffe6121d`; compare the equivalent
-> N45AP caller (Whimory section delta is `0x704`). Fold any useful diagnostic
-> into the scripted harness, remove temporary CPU hooks, and verify both the
-> M68AP case and the N45AP regression.
->
-> **Do not repeat:** software breakpoints in read-only iBoot (use hardware
-> breakpoints), single-stepping without `-icount`, the VFL-context-body theory,
-> the bad-indirect-branch theory, the N45AP-NOR isolation boot, or BBT fill-size
-> experiments. Read "Runtime diagnosis — corrected exception chain" and "Dead
-> ends / gotchas" below for the evidence.
+> **Verify with:** `python3 scripts/iphone-nand-acceptance.py --timeout 90`
+> (runs M68AP + the N45AP regression; JSON gates already include `kernel`).
+> Structural checks: `python3 scripts/test-build-m68ap-nand.py`.
 >
 > When real M68AP firmware finally boots through SpringBoard, create
 > `iPhone 2G.app` from the existing app scaffolding and board-aware
 > `s5l8900-profile=iphone-2g` launcher.
 
-**Deterministic repro command:**
-
-```bash
-./build-ipod11/qemu-system-arm -M \
-  "iPhone-2G,bootrom=<iphone_files>/bootrom_s5l8900,iboot=<iphone_files>/iboot_204_m68ap.bin,nand=<staged nand copy>" \
-  -m 1G -pflash <staged nor_m68ap.bin> -L "<pc-bios>" \
-  -icount shift=3 -display none -serial file:serial.log -monitor none
-# -> serial ends at "[FTL:MSG] FTL_Init  [OK]"; PC parks at abort vector 0xc.
-```
+**The former blocker (solved 2026-07-21, kept for the record):** after
+`FTL_Init [OK]`, iBoot Data-Aborted inside `memmove` (`DFAR=0x18100000`,
+count `r2=0xffe6121d`). Root cause: the constructor's full-page 0xFF
+"production BBT" fill corrupted the `DEVICEINFOBBT` page's own length field.
+The loader at `0x18015fa0` does `memcmp(page, "DEVICEINFOBBT", 0x10)` then
+`memmove(dst, page+0x38, *(u32 *)(page+0x34))` — with the page 0xFF-filled
+past the marker, the count was 0xFFFFFFFF and the copy ran off the iBoot RAM
+window. Fix (landed): `build-m68ap-nand.py` writes count `0x200` at +0x34
+(4096 blocks/bank ÷ 8) and 0xFF only across the 0x200-byte bitmap at +0x38,
+zeros elsewhere — the same shape as the N45AP page (whose count is 0).
 
 ## Goal
 
@@ -79,14 +59,54 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 
 The iPhone-2G machine is merged onto the Wi-Fi/HTTPS line (one QEMU 11 binary
 registers both machines with the full MV8686/DNS/HTTPS stack). SYSIC epoch,
-watchdog, M68AP extraction, and synthetic NOR are landed and verified. **The
-`no signature or no production format` blocker is SOLVED**: `scripts/build-m68ap-nand.py`
-emits a NAND whose FIL signature (`0x43303033`) M68AP iBoot accepts, and the
-production BBT lets VFL_Open discover the context. The current failure has moved
-one gate deeper: after `FTL_Init [OK]`, iBoot enters `memmove` with a corrupt
-near-4-GiB count and reads past the iBoot RAM window at `0x18100000`, causing a
-Data Abort. Its caller and the source of the bad count remain to be identified.
-WMR init is not yet fully green (no `VFL_Open [OK]`/`FTL_Open [OK]`).
+watchdog, M68AP extraction, synthetic NOR, NAND signature, production BBT, and
+the DEVICEINFOBBT length fix are all landed and verified: **WMR init is fully
+green** (`FIL/BUF/VFL/FTL_Init`, `VFL_Open`, `FTL_Open` all `[OK]`) and m68ap
+iBoot reaches a live recovery prompt. The sole remaining boot blocker is NAND
+payload content: no GPT/HFS+/kernelcache in the generated tree yet
+(`Not HFS+ (signature 0x0000)` at `HFSInitPartition`).
+
+## Session log — 2026-07-21 (Data Abort SOLVED; full WMR init green)
+
+Executed exactly the planned experiment: applied
+`scripts/iphone-data-abort-hook.patch`, rebuilt, reproduced under `-icount`.
+The first-Data-Abort capture gave `lr=0x1801605f` (Thumb) — the `memmove`
+caller is the loop at **`0x18015fa0`**, and Capstone disassembly decoded it:
+
+- It allocates a page buffer, then scans blocks from the top of the bank
+  downward (bounds from geometry `[0x18025530]`: start `blocksPerBank-1`,
+  span `blocksPerBank/10`), reading the first pages of each block.
+- Each read page is `memcmp`'d against the 16-byte literal at `0x18020710`:
+  **`"DEVICEINFOBBT\0\0\0"`** — this is the stored bad-block-table loader.
+- On match: `memmove(dst, page+0x38, *(u32 *)(page+0x34))` — i.e. **+0x34 is
+  the BBT byte count, +0x38 the bitmap**. A first presence-check pass calls it
+  with `dst=NULL` (no copy); the abort happened on the second, real call.
+- Our generated `bank*/524160.page` was `DEVICEINFOBBT` + 0xFF fill for the
+  whole page, so the count read `0xFFFFFFFF` and the copy walked to
+  `0x18100000` (end of iBoot RAM) → Data Abort. The captured live count
+  `0xffe6121d` is `0xFFFFFFFF` minus the ~1.7 MB already copied. The N45AP
+  page is marker + zeros (count 0 → no-op copy), which is why N45AP never
+  faulted.
+- This also retroactively explains the "BBT fill size doesn't change the
+  fault" dead end: both the 512-byte and full-page 0xFF experiments still
+  0xFF-filled the header area including +0x34.
+
+**Fix (landed):** `build_bbt_page()` in `scripts/build-m68ap-nand.py` now
+writes count `0x200` at +0x34 (4096 blocks/bank ÷ 8) and 0xFFs only the
+0x200-byte bitmap at +0x38 (all blocks good), zeros elsewhere.
+`scripts/test-build-m68ap-nand.py` asserts the new shape.
+
+**Verified:** `iphone-nand-acceptance.py` (clean binary, hook reverted):
+M68AP case PASS with `full_wmr_init: true`, deepest gate `ftl_open`, serial
+shows `VFL_Open [OK]`, `FTL_Open [OK]`, then `HFSInitPartition` →
+`Not HFS+ (signature 0x0000)` → recovery prompt (`]`). N45AP regression in
+the same batch still reaches the Darwin kernel banner. The fixed NAND is
+installed into the app bundle via `install-iphone-firmware.py` (new tree hash
+`da27b620…`), and the bundle-default harness run passes.
+
+**Next frontier:** NAND payload — GPT/partition pages, decrypted HFS+ root
+filesystem, kernelcache placement (`--hfs` path of the constructor, so far
+unexercised), then `bootx` to the kernel banner.
 
 ## Session log — 2026-07-21 (NAND signature SOLVED; constructor + tests landed)
 
@@ -647,8 +667,10 @@ this as a regression invariant.
   time, so single-stepping makes the guest timer fly and moves the fault earlier
   (before `FTL_Init`) — an artifact. Use `-icount shift=3` for a deterministic
   repro that matches the fast path.
-- **BBT fill size is not the cause.** 512-byte (4096-block) vs full-page 0xFF
-  fill produce the identical fault. The production 0xFF fill is still required
+- **BBT fill size is not the cause** — *resolved*: both fill sizes faulted
+  because both 0xFF-filled the DEVICEINFOBBT header including the count field
+  at +0x34. The real layout is count@+0x34 / bitmap@+0x38 (see the 2026-07-21
+  Data Abort session log). The production bitmap fill is still required
   (the it1g zero-fill fails VFL_Open's context scan at line 768).
 - **Do not repeat the “device dump only” conclusion.** The 1G generator and
   current bundled metadata hashes disprove it, while the final 2G port proves

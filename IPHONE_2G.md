@@ -48,17 +48,20 @@ Not every problem found during this work was introduced by the iPhone profile:
   for M68AP, sets the FIL signature `0x43303033` ("300C", vs N45AP "200C") and
   a production BBT. This removes the `[WMR:ERR] no signature or no production
   format` rejection — the milestone the constructor targeted.
-- **Still open (current blocker):** with the generated NAND, iBoot reaches
-  `[FTL:MSG] FTL_Init [OK]` then executes ARM `memmove` with a corrupt
-  near-4-GiB count. Its byte load at `0x18017cb4` reads through the end of the
-  iBoot RAM window (`DFSR=0x8`, `DFAR=0x18100000`), causing a **Data Abort**.
-  The unmapped abort vectors subsequently prefetch-abort, which was previously
-  misdiagnosed as the primary failure. This is not a NAND-format problem; the
-  immediate next step is to capture the caller that supplied the bad length.
-  Reproduce deterministically with `-icount shift=3`; the full evidence,
-  dead ends, reusable diagnostics, and next-session prompt are in
-  `IPHONE_2G_BRINGUP_HANDOFF.md`. NAND write/erase/persistence also remains
-  open.
+- **Post-`FTL_Init` Data Abort: solved.** The corrupt `memmove` count was the
+  constructor's own doing: the full-page 0xFF "production BBT" fill overwrote
+  the `DEVICEINFOBBT` page's length field at +0x34 with `0xFFFFFFFF`. iBoot's
+  BBT loader (`0x18015fa0`) copies `*(u32*)(page+0x34)` bytes from page+0x38,
+  so the copy ran past the iBoot RAM window. Fixed in
+  `scripts/build-m68ap-nand.py` (count `0x200`, bitmap-only 0xFF fill):
+  WMR init is now fully green — `VFL_Open [OK]`, `FTL_Open [OK]`, and iBoot
+  reaches a live recovery prompt.
+- **Still open (current blocker):** the generated NAND has no payload yet —
+  `HFSInitPartition` finds `Not HFS+ (signature 0x0000)` and root mount fails.
+  Next step: place GPT/partition pages, the decrypted 1.1.4 root HFS+ image,
+  and the kernelcache into the generated tree (the constructor's `--hfs` path),
+  then chase the kernel banner. NAND write/erase/persistence also remains
+  open. Full evidence and next-session prompt: `IPHONE_2G_BRINGUP_HANDOFF.md`.
 - **Deliberate mixed-artifact failures:** M68AP iBoot rejects N45AP NOR IMG2
   entries for their security epoch and rejects the N45AP NAND's WMR signature.
   A synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) clears the NOR
@@ -242,12 +245,16 @@ with iPod images) from a real iPhone OS 1.x boot to SpringBoard:
      decrypted M68AP IMG2 containers (epoch 3) and `scripts/build-m68ap-nor.py`
      assembles `nor_m68ap.bin` from them over a real N45AP NOR's SysCfg. m68ap
      iBoot accepts it with 0 epoch mismatches.
-   - NAND: ⛔ **Open — the one hard blocker.** Implement
-     `scripts/build-m68ap-nand.py` as a clean, reproducible constructor from a
-     user-supplied IPSW. Reuse the proven 1G geometry/mapping design and the
-     2G generator's production-format concepts, then determine the exact M68AP
-     WMR signature/version fields from iBoot. `scripts/pack-ipod-nand.py` only
-     packs an already-created page tree and remains the final compaction step.
+   - NAND metadata: ✅ **Done.** `scripts/build-m68ap-nand.py` generates the
+     M68AP page tree (FIL signature `0x43303033`, production BBT with the
+     correct DEVICEINFOBBT count/bitmap layout). WMR init is fully green:
+     `VFL_Open [OK]` / `FTL_Open [OK]`, recovery prompt reachable.
+   - NAND payload: ⛔ **Open — the current blocker.** Place GPT/partition
+     pages, the decrypted 1.1.4 root HFS+ filesystem, and the kernelcache into
+     the generated tree (the constructor's `--hfs` path, so far unexercised)
+     so `HFSInitPartition` finds a real filesystem and `bootx` can load the
+     kernel. `scripts/pack-ipod-nand.py` only packs an already-created page
+     tree and remains the final compaction step.
 3. **Multitouch Zephyr1 against the real driver.** The Z1 model follows
    openiboot, but the real `AppleZephyr` kext has never run against it;
    the raw-upload verify heuristic (see caveat above) is the likeliest
