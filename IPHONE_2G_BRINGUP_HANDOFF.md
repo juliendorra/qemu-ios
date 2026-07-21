@@ -104,6 +104,35 @@ matches M68AP, IOKit registers. The wall is now the kernel's `AppleNANDFTL`
 root device`. Both machines still reach the Darwin kernel in the acceptance
 batch (no regression from the shared UART change).
 
+## STRATEGIC CORRECTION — 2026-07-21 (the NAND approach diverged from the iPod path)
+
+The M68AP NAND has been hand-crafted (copy N45AP's static FTL context + place a
+minimal 16 MB HFS with just the kernelcache). This is NOT how the iPod NAND was
+made and it is a dead-end for SpringBoard. Proven by comparing the two:
+
+- **N45AP kernel does a clean `FTL_Open [OK]`** (its NAND is internally
+  consistent — the FTL context matches the full 272 MB filesystem, ~133 data
+  blocks/bank, built by the upstream devos50 `qemu-ios-generate-nand`).
+- **M68AP kernel `FTL_Open` FAILS → `_FTLRestore` → fails** (`_ScanForFreeBlk`
+  finds only 21 free blocks; `wDataBlkCnt=0xF20`). Our copied context describes
+  blocks up to 334 but our data stops at block 210. The FTL-context page
+  (`bank0/25728.page`) is byte-identical to N45AP's; the inconsistency is that
+  it references a filesystem that isn't there. iBoot's lenient FTL tolerates
+  this (kernelcache loads); the kernel's strict FTL does not.
+
+**Right path (follow the iPod literally, don't hand-craft):**
+1. Get the authoritative base sources ONLINE: the devos50
+   `qemu-ios-generate-nand` generator (it1g/it2g branches) and the **vfdecrypt
+   key** for the iPhone1,1 1.1.4 root DMG `022-3894-4.dmg`.
+2. Decrypt the real root filesystem with that key.
+3. Run/port the generator to emit a CONSISTENT NAND from the real root FS
+   (M68AP signature/BBT), so the context matches the data. Then the kernel
+   `FTL_Open` succeeds and root mounts.
+
+The decrypted root FS (vfdecrypt) is the TRUE gate to SpringBoard; the minimal
+HFS was only ever good for the kernel-banner milestone. Do not keep hand-crafting
+the NAND metadata. See the memory note `use-the-reference-generator-not-a-static-copy`.
+
 ## Session log — 2026-07-21 (faithful signing PROVEN; exposes a timer-consistency bug)
 
 Replaced the secure-boot patch approach on the `dtre` image with real signing,
