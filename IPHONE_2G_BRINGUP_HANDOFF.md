@@ -10,30 +10,48 @@ the live bring-up state.
 
 ## ► NEXT-SESSION PROMPT (start here)
 
-> **Continue the legacy iPhone 2G (M68AP) emulation bring-up. WMR init is
-> fully green** (`VFL_Open [OK]` / `FTL_Open [OK]` — the post-`FTL_Init` Data
-> Abort is root-caused and fixed, see the 2026-07-21 session log below). iBoot
-> now runs all the way to `HFSInitPartition`, prints `Not HFS+ (signature
-> 0x0000)` / `root filesystem mount failed`, and drops into a **live recovery
-> command prompt**. The next task: **give the generated NAND a bootable
-> payload** — GPT/partition pages, the HFS+ root filesystem from a user-supplied
-> 1.1.4 IPSW (`022-3894-4.dmg`, decrypted), and the kernelcache where M68AP
-> iBoot expects it — so `bootx` proceeds to the Darwin kernel. Use only staged
-> NAND/NOR copies; never mutate the installed firmware except via
-> `scripts/install-iphone-firmware.py`. Do not commit Apple-derived artifacts.
+> **Continue the legacy iPhone 2G (M68AP) emulation bring-up. The NAND payload
+> pipeline now works** — the first milestone is reached. With a generated NAND
+> whose HFS+ boot partition carries the kernelcache, iBoot-204.3.14 on
+> `-M iPhone-2G` mounts the filesystem, finds
+> `/System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8900xrb`,
+> **decrypts it (GID key), decompresses it (complzss), passes its adler32 check
+> (`done`), and parses it as a Mach-O.** The boot wall is now several stages
+> deeper: `load_macho_image: failed to load device tree` (see the 2026-07-21
+> "kernelcache loads" session log below).
 >
-> Follow the proven N45AP layout: the it1g generator places GPT + HFS payload
-> through the FTL's logical-page mapping (see `scripts/build-m68ap-nand.py`
-> `--hfs`, which already implements payload placement but has only been
-> exercised without a payload). Compare against the installed N45AP NAND's
-> partition/filesystem pages for structure. First milestone: iBoot prints an
-> HFS+ signature instead of 0x0000 and finds `/System/Library/Caches/
-> com.apple.kernelcaches/kernelcache` (or the NOR boot path's expected
-> location); second milestone: kernel banner in serial.
+> **The next task: fix the device-tree load.** iBoot loads the DT from the
+> **NOR** `dtre` image, not the NAND. The loader is `dt_load` at `0x1800d060`:
+> it calls `image_find_by_type('dtre')` (`0x18008376`), size-checks (≤1 MB),
+> then `image_load` (`0x18008340` → `0x180088cc`) into `0x0bf00000`. It returns
+> `< 0` for our synthetic M68AP NOR `dtre`, so `load_macho_image` (`0x1800d544`)
+> prints "failed to load device tree" and drops to recovery. Determine whether
+> `image_find_by_type` returns NULL (dtre not registered in the boot image
+> list) or `image_load`'s validation (`0x18008478`, comparing a computed value
+> to `[descriptor+0x10]`) rejects our container. Cheapest decisive experiments:
+> (a) blank/mangle the `dtre` in a *copy* of `nor_m68ap.bin` and see if the
+> error changes — if identical, `dtre` is not being loaded from where we think;
+> (b) trace `0x18008478` to learn exactly which field it validates. Do NOT
+> assume the IMG2 header signature is the cause: the N45AP NOR `dtre` (which
+> loads) was reprocessed by the devos50 generator and carries a hash at +0x20 /
+> signature at +0x3e0 that the **authentic** M68AP `dtre` (decrypted from the
+> IPSW) does not — that is a generator-vs-Apple difference, not proof iBoot
+> requires the signature (a real M68AP device boots without it).
 >
-> **Verify with:** `python3 scripts/iphone-nand-acceptance.py --timeout 90`
-> (runs M68AP + the N45AP regression; JSON gates already include `kernel`).
-> Structural checks: `python3 scripts/test-build-m68ap-nand.py`.
+> **Second milestone (kernel banner):** once the DT loads, `load_macho_image`
+> relocates the kernel and jumps; expect `gBootArgs.commandLine = [...]` then
+> `Darwin Kernel Version` (exactly the N45AP sequence). **Third milestone
+> (SpringBoard) is blocked on the real root filesystem** — the kernelcache-only
+> HFS+ has no bootable root, and the genuine root FS (`022-3894-4.dmg`) is
+> `encrcdsa`/vfdecrypt-encrypted with a key not available offline. Track that
+> separately; do not block the kernel-banner milestone on it.
+>
+> **Reproduce the payload:** build a kernelcache-carrying HFS+ with
+> `scripts/build-m68ap-hfs-payload.sh <kernelcache> out.dmg`, then
+> `scripts/build-m68ap-nand.py --out <dir> --signature m68ap --hfs out.dmg`.
+> **Verify with:** `python3 scripts/iphone-nand-acceptance.py --timeout 90
+> --nand-m68ap <dir>` (runs M68AP + the N45AP regression; JSON gates include
+> `kernel`). Structural checks: `python3 scripts/test-build-m68ap-nand.py`.
 >
 > When real M68AP firmware finally boots through SpringBoard, create
 > `iPhone 2G.app` from the existing app scaffolding and board-aware
@@ -58,13 +76,88 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 ## Current state (one line)
 
 The iPhone-2G machine is merged onto the Wi-Fi/HTTPS line (one QEMU 11 binary
-registers both machines with the full MV8686/DNS/HTTPS stack). SYSIC epoch,
-watchdog, M68AP extraction, synthetic NOR, NAND signature, production BBT, and
-the DEVICEINFOBBT length fix are all landed and verified: **WMR init is fully
-green** (`FIL/BUF/VFL/FTL_Init`, `VFL_Open`, `FTL_Open` all `[OK]`) and m68ap
-iBoot reaches a live recovery prompt. The sole remaining boot blocker is NAND
-payload content: no GPT/HFS+/kernelcache in the generated tree yet
-(`Not HFS+ (signature 0x0000)` at `HFSInitPartition`).
+registers both machines). SYSIC epoch, watchdog, M68AP extraction, synthetic
+NOR, NAND signature/production BBT/DEVICEINFOBBT fix, **and now the NAND
+filesystem payload** are all landed and verified. With a kernelcache-carrying
+HFS+ boot partition, m68ap iBoot mounts HFS+, loads/decrypts/decompresses the
+kernelcache and validates it as a Mach-O. The boot wall is now
+`load_macho_image: failed to load device tree` — a **NOR** `dtre` image-load
+failure, not a NAND problem. N45AP still boots to the Darwin kernel (no
+regression).
+
+## Session log — 2026-07-21 (NAND payload works; kernelcache loads; DT is the wall)
+
+Gave the generated NAND a real filesystem payload and cleared the
+`Not HFS+ (signature 0x0000)` wall, advancing the boot through five new stages.
+
+**What was done**
+- `scripts/build-m68ap-hfs-payload.sh` (new): builds a minimal case-sensitive
+  HFS+ (HFSX, matching the N45AP volume's `HX`/version-5 header) via macOS
+  `hdiutil -layout NONE` (filesystem from byte 0, volume header at +0x400),
+  sized to a 2048 multiple. It places the IPSW kernelcache at
+  `/System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8900xrb` — the
+  exact `$boot-path` iBoot's `fsboot` loads (string in iBoot at VA
+  `0x1801a500`). No Apple content committed.
+- `scripts/build-m68ap-nand.py --hfs <that dmg>` places the HFS image through
+  the FTL logical mapping exactly as the N45AP tree does. Verified byte-for-byte
+  that the N45AP installed NAND puts MBR@LBA0 (`sysid 0xEE`, part LBA3, size
+  132854), GPT header@LBA1 (`EFI PART`, 1 entry, entsz 0x80), GPT entry@LBA2
+  (HFS+ type GUID, lba_start 3), and the HFS+ volume header at page+0x400 of
+  LBA3 — the `--hfs` output reproduces this layout.
+
+**Result (verified, `iphone-nand-acceptance.py`, both cases PASS, no
+regression)** — M68AP serial now reads:
+```
+[FTL:MSG] FTL_Open            [OK]
+HFSInitPartition: 0x1802e888
+Loading kernel cache at 0xb000000...data starts at 0xb000180
+done
+load_macho_image: failed to load device tree
+```
+`done` is emitted by the adler32 check inside `load_macho_image`, so the
+kernelcache is decrypted (GID key), complzss-decompressed, integrity-verified,
+and its Mach-O magic is present in RAM. The N45AP regression in the same batch
+still reaches `gBootArgs.commandLine = [...]` and `Darwin Kernel Version`.
+
+**Boot-path RE (iBoot-204.3.14, addresses at VA base `0x18000000`)**
+- `load_macho_image = 0x1800d544`. It: validates the kernelcache IMG2
+  (`Kernelcache image corrupt/too large/not valid`), checks the `complzss`
+  signature (`"comp"`=`0x636f6d70` / `"lzss"`=`0x6c7a7373`), prints
+  `Loading kernel cache at %#x...` + `data starts at %p`, LZSS-decompresses
+  (`0x1800d3a0`), adler32-checks (`0x180075c0`) → `done`, checks Mach-O magic
+  `0xfeedface`, then calls the device-tree loader.
+- **Device-tree loader `dt_load = 0x1800d060`** (called at `0x1800e07a`,
+  dest global `0x18023c20`→`0x0bf00000`, size global `0x18023c24`): calls
+  `image_find_by_type('dtre'=0x64747265)` at `0x18008376`; if NULL → fail; if
+  `[img+4] > 0x100000` → fail; else `image_load` (`0x18008340`→`0x180088cc`).
+  On `< 0` it clears the globals and returns `-1`, so `load_macho_image` prints
+  "failed to load device tree" (`0x1800d676`, returns `-7`) and boot drops to
+  recovery. **This is why the fault is a NOR/`dtre` problem, not NAND.**
+- `image_load` (`0x180088cc`) checks the descriptor magic
+  (`[img+0xc] == 0x22f5ef0e`, or `"Memz"=0x4d656d7a`), then validates via
+  `0x18008478` comparing its result to `[descriptor+0x10]`, then copies the
+  payload through a function pointer at `[obj+0x1c]`. The exact field
+  `0x18008478` validates is the open question for the next session.
+
+**Attempts / dead ends recorded this session**
+- *Static disassembly first was slow.* `load_macho_image` and its callees are
+  compiler-optimized with reordered basic blocks; several disassembly windows
+  landed in literal pools and decoded as garbage. The decisive signal was the
+  **empirical N45AP-vs-M68AP serial comparison** (N45AP loads the DT silently
+  between `done` and `gBootArgs`; M68AP fails there). Reach for the A/B boot
+  before deep RE next time.
+- *IMG2 header signature is NOT confirmed as the cause (do not chase it blind).*
+  The N45AP NOR `dtre` has a populated hash at +0x20 and a 0x20-byte signature
+  at +0x3e0; the authentic M68AP `dtre` (decrypted from the IPSW) has zeros
+  there and its metadata at +0x60. But the N45AP NOR image was reprocessed by
+  the devos50 generator, and a real M68AP device boots without that block, so
+  iBoot-204 cannot strictly require it. Treat the header diff as a lead to
+  verify against `0x18008478`, not a proven root cause.
+- *Root filesystem is a separate, key-blocked track.* `022-3894-4.dmg`
+  (`SystemRestoreImages`→`User`, 123 MB) is `encrcdsa` (vfdecrypt), not an 8900
+  container, so the GID key does not open it and no offline key is available.
+  The kernelcache-only HFS+ is deliberately minimal: it reaches kernel *load*,
+  not a mountable root. Do not block the kernel-banner milestone on the root FS.
 
 ## Session log — 2026-07-21 (Data Abort SOLVED; full WMR init green)
 

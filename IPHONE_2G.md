@@ -56,12 +56,22 @@ Not every problem found during this work was introduced by the iPhone profile:
   `scripts/build-m68ap-nand.py` (count `0x200`, bitmap-only 0xFF fill):
   WMR init is now fully green — `VFL_Open [OK]`, `FTL_Open [OK]`, and iBoot
   reaches a live recovery prompt.
-- **Still open (current blocker):** the generated NAND has no payload yet —
-  `HFSInitPartition` finds `Not HFS+ (signature 0x0000)` and root mount fails.
-  Next step: place GPT/partition pages, the decrypted 1.1.4 root HFS+ image,
-  and the kernelcache into the generated tree (the constructor's `--hfs` path),
-  then chase the kernel banner. NAND write/erase/persistence also remains
-  open. Full evidence and next-session prompt: `IPHONE_2G_BRINGUP_HANDOFF.md`.
+- **NAND payload: works (kernelcache loads).** The constructor's `--hfs` path
+  now carries a case-sensitive HFS+ (HFSX) boot partition holding the
+  kernelcache at `/System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8900xrb`
+  (built with `scripts/build-m68ap-hfs-payload.sh`). m68ap iBoot mounts HFS+,
+  loads the kernelcache, decrypts it (GID key), complzss-decompresses it, passes
+  its adler32 check, and validates the Mach-O — clearing `Not HFS+`.
+- **Still open (current blocker):** `load_macho_image: failed to load device
+  tree`. iBoot loads the device tree from the **NOR** `dtre` image (loader
+  `dt_load=0x1800d060` → `image_find_by_type('dtre')` → `image_load`), which
+  rejects our synthetic M68AP `dtre`. This is a NOR image-load problem, not
+  NAND. Full evidence, addresses, attempts and next-session prompt:
+  `IPHONE_2G_BRINGUP_HANDOFF.md`.
+- **Root filesystem (for SpringBoard): separate, key-blocked.** The genuine
+  root FS `022-3894-4.dmg` is `encrcdsa`/vfdecrypt-encrypted (not an 8900
+  container), so the GID key does not open it; the kernelcache-only HFS+ reaches
+  kernel *load*, not a mountable root.
 - **Deliberate mixed-artifact failures:** M68AP iBoot rejects N45AP NOR IMG2
   entries for their security epoch and rejects the N45AP NAND's WMR signature.
   A synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) clears the NOR
@@ -249,12 +259,15 @@ with iPod images) from a real iPhone OS 1.x boot to SpringBoard:
      M68AP page tree (FIL signature `0x43303033`, production BBT with the
      correct DEVICEINFOBBT count/bitmap layout). WMR init is fully green:
      `VFL_Open [OK]` / `FTL_Open [OK]`, recovery prompt reachable.
-   - NAND payload: ⛔ **Open — the current blocker.** Place GPT/partition
-     pages, the decrypted 1.1.4 root HFS+ filesystem, and the kernelcache into
-     the generated tree (the constructor's `--hfs` path, so far unexercised)
-     so `HFSInitPartition` finds a real filesystem and `bootx` can load the
-     kernel. `scripts/pack-ipod-nand.py` only packs an already-created page
-     tree and remains the final compaction step.
+   - NAND payload: ✅ **Kernelcache loads.** The constructor's `--hfs` path
+     places a case-sensitive HFS+ boot partition (built by
+     `scripts/build-m68ap-hfs-payload.sh`) with the kernelcache at the boot
+     path; `HFSInitPartition` succeeds and iBoot loads/decrypts/decompresses/
+     Mach-O-validates the kernelcache. `scripts/pack-ipod-nand.py` remains the
+     final compaction step. A full bootable root FS still needs the decrypted
+     `022-3894-4.dmg` (vfdecrypt-encrypted; key not available offline).
+   - Device tree: ⛔ **Open — the current blocker.** `load_macho_image` then
+     fails to load the `dtre` NOR image; see `IPHONE_2G_BRINGUP_HANDOFF.md`.
 3. **Multitouch Zephyr1 against the real driver.** The Z1 model follows
    openiboot, but the real `AppleZephyr` kext has never run against it;
    the raw-upload verify heuristic (see caveat above) is the likeliest
