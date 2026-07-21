@@ -27,6 +27,7 @@ import argparse
 import os
 import struct
 import sys
+import zlib
 
 # Image-store region in the 1 MiB NOR: the first container starts here, and the
 # SysCfg block sits well above the last one. These match the observed N45AP
@@ -50,6 +51,50 @@ STORE_ORDER = [
 
 def align_up(value, alignment):
     return (value + alignment - 1) & ~(alignment - 1)
+
+
+# IMG2 header field offsets used by the "loadable" promotion below.
+IMG2_FLAGS2_OFF = 0x1c      # uint32 flags word
+IMG2_FLAGS2_LOADABLE = 0x01000000   # bit 24: image may be loaded/booted
+IMG2_FLAGS2_EXTCKSUM = 0x40000000   # bit 30: extended +0x60/+0x68 sub-checksum
+IMG2_HDR_CRC_OFF = 0x64     # uint32 CRC32 over header bytes [0:0x64]
+
+
+def promote_loadable(container):
+    """Normalise the IMG2 +0x1c flags to the value m68ap iBoot's image_load path
+    requires, and recompute the header CRC.
+
+    m68ap iBoot-204.3.14 builds a *normalised* RAM copy of each NOR IMG2 header
+    at enumeration time and validates THAT copy on load (validator VA
+    0x18008478, reached via image_load 0x180088cc). Two facts, both confirmed by
+    live lldb probing of the dtre load (see IPHONE_2G_BRINGUP_HANDOFF.md):
+
+    - The load path REQUIRES flags2 bit 24 (0x180084aa: `lsls r1, flags2, #7;
+      bpl <reject>`). Enumeration skips this check, so an image with bit 24 clear
+      registers but fails to load, and iBoot prints
+      "load_macho_image: failed to load device tree" for the dtre image.
+    - iBoot's RAM copy CLEARS flags2 bit 30 (the extended +0x60 checksum flag):
+      a NOR +0x1c of 0x41000000 becomes 0x01000000 in RAM. But it COPIES the
+      NOR's +0x64 CRC verbatim. The validator then recomputes CRC32 over the
+      RAM header (with +0x1c = 0x01000000) and compares it to that copied CRC,
+      so the CRC must be computed over the bit-30-CLEARED flags, not the raw
+      IPSW value (0x40000000, bit 30 set).
+
+    So: clear bit 30, set bit 24 (matching the normalised RAM value), then
+    recompute the +0x64 CRC32 over header[0:0x64] (standard zlib CRC, verified
+    against the N45AP NOR). This makes the NOR header self-consistent for
+    enumeration AND identical to iBoot's RAM copy for the load-time validator,
+    and it makes the validator take the no-extended-checksum path.
+    """
+    hdr = bytearray(container[:0x400])
+    flags2 = struct.unpack_from("<I", hdr, IMG2_FLAGS2_OFF)[0]
+    new_flags2 = (flags2 & ~IMG2_FLAGS2_EXTCKSUM) | IMG2_FLAGS2_LOADABLE
+    if new_flags2 == flags2:
+        return container  # already normalised
+    struct.pack_into("<I", hdr, IMG2_FLAGS2_OFF, new_flags2)
+    crc = zlib.crc32(bytes(hdr[:IMG2_HDR_CRC_OFF])) & 0xFFFFFFFF
+    struct.pack_into("<I", hdr, IMG2_HDR_CRC_OFF, crc)
+    return bytes(hdr) + container[0x400:]
 
 
 def main():
@@ -78,6 +123,7 @@ def main():
         container = open(path, "rb").read()
         if container[:4] != b"2gmI":
             sys.exit(f"{path}: not an IMG2 container")
+        container = promote_loadable(container)
         img_type = container[4:8][::-1].decode("ascii", "replace")
         epoch = struct.unpack("<H", container[0xa:0xc])[0]
         end = offset + len(container)

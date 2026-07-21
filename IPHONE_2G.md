@@ -63,11 +63,14 @@ Not every problem found during this work was introduced by the iPhone profile:
   loads the kernelcache, decrypts it (GID key), complzss-decompresses it, passes
   its adler32 check, and validates the Mach-O — clearing `Not HFS+`.
 - **Still open (current blocker):** `load_macho_image: failed to load device
-  tree`. iBoot loads the device tree from the **NOR** `dtre` image (loader
-  `dt_load=0x1800d060` → `image_find_by_type('dtre')` → `image_load`), which
-  rejects our synthetic M68AP `dtre`. This is a NOR image-load problem, not
-  NAND. Full evidence, addresses, attempts and next-session prompt:
-  `IPHONE_2G_BRINGUP_HANDOFF.md`.
+  tree`. Fully reverse-engineered: iBoot loads the DT from the **NOR** `dtre`
+  image (`dt_load=0x1800d060` → `image_find_by_type` → `image_load`). The IMG2
+  header validator is now cleared (`build-m68ap-nor.py promote_loadable` sets
+  flags2 bit 24, clears bit 30, and fixes the header CRC to match iBoot's
+  normalised RAM copy — verified by live lldb). The last gate is **secure
+  boot**: `image_load` rejects the unsigned M68AP images unless security config
+  `0x18022fa0` bit 4 is set. This is a NOR/secure-boot problem, not NAND. Full
+  evidence, addresses, and next-session prompt: `IPHONE_2G_BRINGUP_HANDOFF.md`.
 - **Root filesystem (for SpringBoard): separate, key-blocked.** The genuine
   root FS `022-3894-4.dmg` is `encrcdsa`/vfdecrypt-encrypted (not an 8900
   container), so the GID key does not open it; the kernelcache-only HFS+ reaches

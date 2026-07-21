@@ -20,23 +20,45 @@ the live bring-up state.
 > deeper: `load_macho_image: failed to load device tree` (see the 2026-07-21
 > "kernelcache loads" session log below).
 >
-> **The next task: fix the device-tree load.** iBoot loads the DT from the
-> **NOR** `dtre` image, not the NAND. The loader is `dt_load` at `0x1800d060`:
-> it calls `image_find_by_type('dtre')` (`0x18008376`), size-checks (≤1 MB),
-> then `image_load` (`0x18008340` → `0x180088cc`) into `0x0bf00000`. It returns
-> `< 0` for our synthetic M68AP NOR `dtre`, so `load_macho_image` (`0x1800d544`)
-> prints "failed to load device tree" and drops to recovery. Determine whether
-> `image_find_by_type` returns NULL (dtre not registered in the boot image
-> list) or `image_load`'s validation (`0x18008478`, comparing a computed value
-> to `[descriptor+0x10]`) rejects our container. Cheapest decisive experiments:
-> (a) blank/mangle the `dtre` in a *copy* of `nor_m68ap.bin` and see if the
-> error changes — if identical, `dtre` is not being loaded from where we think;
-> (b) trace `0x18008478` to learn exactly which field it validates. Do NOT
-> assume the IMG2 header signature is the cause: the N45AP NOR `dtre` (which
-> loads) was reprocessed by the devos50 generator and carries a hash at +0x20 /
-> signature at +0x3e0 that the **authentic** M68AP `dtre` (decrypted from the
-> IPSW) does not — that is a generator-vs-Apple difference, not proof iBoot
-> requires the signature (a real M68AP device boots without it).
+> **The next task: get iBoot's secure-boot policy to accept the unsigned M68AP
+> NOR images (the device-tree in particular).** The device-tree load path is now
+> fully reverse-engineered and MOSTLY cleared — the remaining gate is secure
+> boot, not IMG2 formatting. See the 2026-07-21 "device-tree load fully
+> reverse-engineered" session log below for the complete chain with live-lldb
+> evidence. Summary of where it stands:
+>
+> - `dt_load` (`0x1800d060`) finds the `dtre` descriptor via
+>   `image_find_by_type` (CONFIRMED found, r0≠0) and calls `image_load`
+>   (`0x18008340`→`0x180088cc`) to copy it to `0x0bf00000`.
+> - `image_load`'s IMG2 validator (`0x18008478`) now PASSES (verified by lldb
+>   bisect) thanks to the NOR-builder fix in `scripts/build-m68ap-nor.py`
+>   (`promote_loadable`): iBoot normalises each NOR IMG2 header into a RAM copy
+>   with flags2 (`+0x1c`) bit 30 CLEARED and bit 24 SET, and validates a CRC32
+>   over that normalised header; the builder now emits `+0x1c=0x01000000` and a
+>   matching `+0x64` CRC so both enumeration and the load-time validator accept
+>   it.
+> - The final gate is **secure boot**: `image_load` (`0x180089b0`) checks flags2
+>   bit 1 to pick the signed-hash path vs the unsigned path; our image is
+>   unsigned (bit 1 clear, zero hash at `+0x3e0`), so it falls to the decider
+>   `0x18005984`, which returns "allowed" only if **bit 4 of the security config
+>   word at `0x18022fa0`** is set. It is NOT set, so `image_load` returns −1 and
+>   the DT load fails.
+>
+> **So the next frontier is secure-boot policy for NOR images**, not NAND and
+> not IMG2 CRC. Options, in rough order of promise: (a) find where `0x18022fa0`
+> is initialised (a `security_init`/`make_production` early in boot; grep code
+> refs — they cluster at `0x18005958`–`0x18005ba8`) and make the emulator report
+> a development/demoted security state so bit 4 is set, mirroring the board-aware
+> SYSIC epoch fix — this would accept ALL unsigned M68AP images at once;
+> (b) properly sign the NOR images so the bit-1 signed path's hash check
+> (`0x18003284` AES/SHA setup + `0x180183e0` memcmp at image `+0x3e0`/`+0x60`)
+> passes under the emulator's crypto — heavier, needs the exact M68AP image
+> signature scheme; (c) check whether the N45AP boot relies on the same config
+> bit or on genuinely-valid signatures (it uses generator-signed images with a
+> hash at `+0x20`/`+0x3e0`, which the authentic IPSW M68AP images lack). Verify
+> any fix with a live lldb read of `r0` at `0x1800d0a6` (dt_load's post-load
+> value: ≥0 means the DT loaded) — `scripts/`-adjacent probe recipe is in the
+> session log.
 >
 > **Second milestone (kernel banner):** once the DT loads, `load_macho_image`
 > relocates the kernel and jumps; expect `gBootArgs.commandLine = [...]` then
@@ -82,8 +104,72 @@ filesystem payload** are all landed and verified. With a kernelcache-carrying
 HFS+ boot partition, m68ap iBoot mounts HFS+, loads/decrypts/decompresses the
 kernelcache and validates it as a Mach-O. The boot wall is now
 `load_macho_image: failed to load device tree` — a **NOR** `dtre` image-load
-failure, not a NAND problem. N45AP still boots to the Darwin kernel (no
-regression).
+failure, now fully reverse-engineered: the IMG2 header validator is cleared (via
+`build-m68ap-nor.py promote_loadable`), and the last remaining gate is iBoot's
+**secure-boot policy** rejecting the unsigned M68AP images (config `0x18022fa0`
+bit 4). N45AP still boots to the Darwin kernel (no regression).
+
+## Session log — 2026-07-21 (device-tree load fully reverse-engineered; secure boot is the last gate)
+
+Followed the `load_macho_image: failed to load device tree` wall all the way
+down with static disassembly + **live lldb probing** (QEMU `-S -gdb tcp::…`,
+hardware breakpoints; only `lldb` is on this host, it drives QEMU's gdbstub).
+Each probe advanced the failure deeper, converging on a single remaining gate.
+
+**Full device-tree load chain (all VAs, iBoot-204.3.14 @ base 0x18000000):**
+1. `load_macho_image` (`0x1800d544`) loads/validates the kernelcache, then calls
+   `dt_load` (`0x1800d060`) at `0x1800e07a`; on `dt_load < 0` it prints
+   "failed to load device tree" (`0x1800d676`) and returns −7.
+2. `dt_load` (`0x1800d060`): `image_find_by_type('dtre'=0x64747265)`
+   (`0x18008376`→walks the image list at head `0x180211a8`, matching
+   `descriptor[+8]`); size-check `[desc+4] ≤ 0x100000`; `image_load`
+   (`0x18008340`) to dest `0x0bf00000` (globals `0x18023c20`/`0x18023c24`).
+   **lltb probe: find returns 0x1802bd48 (FOUND); image_load returns −1.**
+3. `image_load` (`0x18008340`→worker `0x180088cc`): checks descriptor magic
+   `[desc+0xc]==0x22f5ef0e` (probe: OK), runs the IMG2 validator `0x18008478`,
+   then a secure-boot/copy tail.
+
+**IMG2 validator `0x18008478` (was the first real blocker; now cleared):**
+iBoot builds a *normalised RAM copy* of the NOR IMG2 header (probe: at
+`0x1802b918`) and validates THAT, not the NOR bytes. The validator, on the load
+path (arg r3=0), requires: magic `"Img2"`; `crc32(header[0:0x64]) == [hdr+0x64]`
+(standard zlib CRC, `0x18007780`); flags2 (`+0x1c`) **bit 24 set**
+(`0x180084aa: lsls #7; bpl reject`); epoch (`+0xa`) `== 3`. Two facts nailed by
+lldb: iBoot's RAM copy **clears flags2 bit 30** (NOR `0x41000000` → RAM
+`0x01000000`) but **copies `+0x64` verbatim** from NOR, so the CRC must be
+computed over the bit-30-cleared header. Fix (landed, `build-m68ap-nor.py`
+`promote_loadable`): set `+0x1c = (flags2 & ~0x40000000) | 0x01000000` and
+recompute `+0x64`. After the fix the validator PASSES (probe: reaches
+`0x180084b0` and `0x1800852a`, not the `0x18008596` fail block; RAM `+0x64`
+= `0x5f2a73a2` now matches the recomputed CRC).
+
+**Remaining gate — secure boot (`image_load` tail `0x180089aa`+):** with the
+validator passing, `image_load` then checks flags2 **bit 1** (`0x180089b0:
+lsls #0x1e; bmi`) to choose the signed-hash path vs the unsigned path. Our
+`dtre` is unsigned (bit 1 clear; zero hash at IMG2 `+0x3e0`), so it takes the
+unsigned path to the decider `0x18005984(1)`, which returns "allowed" ONLY if
+**bit 4 (0x10) of the security config word `0x18022fa0`** is set. It is not, so
+`image_load` returns −1. The generator-made N45AP `dtre` that loads carries a
+real hash at `+0x20`/`+0x3e0` (bit 1 set, signed path); the authentic IPSW
+M68AP images do not. **This is a secure-boot-policy problem, not a NAND or IMG2
+formatting one** — see the next-session prompt for the three ways forward.
+
+**lldb probe recipe (reusable):** boot with
+`-S -gdb tcp::PORT -icount shift=3 -serial file:… -monitor none`; then
+`lldb --batch -o "gdb-remote PORT" -o "breakpoint set --hardware --address 0xADDR" -o "process continue" -o "register read …"`.
+Wrap in a host `( sleep 90; pkill -9 lldb qemu-system-arm )` watchdog. Key
+observation points: `0x1800d0a6` (dt_load post-load r0: ≥0 ⇒ DT loaded),
+`0x1800891e` (validator entry; r0 = IMG2 ptr to dump), `0x18008596`
+(validator fail), `0x18008a60`/`0x18008a64` (worker fail exits).
+
+**Dead ends / notes:** (1) Setting only bit 24 (keeping bit 30) made the
+validator fail the CRC check — the RAM-copy normalisation clears bit 30, so the
+CRC must be over the cleared value; must clear bit 30 too. (2) The serial
+message "failed to load device tree" is identical for EVERY `image_load`
+failure mode, so it cannot localise the fault — register-level lldb was required.
+(3) `image_load` runs for multiple NOR images, so breakpoints inside it fire for
+non-`dtre` calls; use `0x1800d0a6` (inside `dt_load`, dtre-only) for a
+dtre-specific verdict.
 
 ## Session log — 2026-07-21 (NAND payload works; kernelcache loads; DT is the wall)
 
