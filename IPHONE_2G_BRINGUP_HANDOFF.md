@@ -10,61 +10,55 @@ the live bring-up state.
 
 ## ► NEXT-SESSION PROMPT (start here)
 
-> **Task: find and fix the M68AP post-`FTL_Init` Prefetch Abort so `-M iPhone-2G`
-> boots past NAND init.** This is a legacy-device (20-year-old iPhone 2G)
-> conservation/emulation project — fair-use research; user-supplied firmware,
-> nothing Apple committed.
+> **Continue the legacy iPhone 2G (M68AP) emulation bring-up. Find the caller
+> that invokes ARM `memmove` at `0x18017bac` with corrupt arguments after
+> `FTL_Init [OK]`, then fix the emulator-side cause so iBoot reaches
+> `VFL_Open [OK]` and `FTL_Open [OK]`.** Use only staged NAND/NOR copies; never
+> mutate the installed firmware. Do not commit Apple-derived artifacts.
 >
-> **State of play (all committed):** the NAND *signature* blocker is solved —
-> `scripts/build-m68ap-nand.py` makes a tree M68AP iBoot accepts (`Apple NAND
-> Driver 0x43303033`, `FIL/BUF/VFL/FTL_Init [OK]`, no more `no signature or no
-> production format`). The remaining blocker is a **Prefetch Abort right after
-> `FTL_Init [OK]`**: a bad indirect branch whose *instruction fetch* of
-> `0x18017cb4` external-aborts (IFSR=0x8). It is **not** a NAND-format bug — the
-> iBoot code is byte-identical to N45AP (which boots on the same machine), so
-> stop looking at `build-m68ap-nand.py` / the page format. It is a
-> corrupted-code-pointer bug, tied to runtime data / the NOR device tree /
-> interrupt timing.
+> **Correct current diagnosis:** the primary exception is a **Data Abort**, not
+> a bad indirect branch or an instruction-fetch abort at `0x18017cb4`.
+> `-d int` proves `DFSR=0x8`, `DFAR=0x18100000` while executing the byte-load at
+> `0x18017cb4` inside `memmove`. Its live arguments are
+> `r0=0x180fc9e0`, `r1=0x18100000`, `r2=0xffe6121d`. The abort vector at `0x10`
+> is unmapped under the active MMU, so it then prefetch-aborts; vector `0x0c`
+> also prefetch-aborts forever. The visible prefetch loop is secondary.
 >
-> **Reproduce deterministically:** boot with `-icount shift=3` (see the exact
-> command below) — reaches `FTL_Init [OK]` then aborts, every time.
+> **Already ruled out:** the NAND signature and production BBT are solved;
+> M68AP/N45AP Whimory code is byte-identical; changing BBT fill length does not
+> change the fault; M68AP iBoot with the N45AP NOR reaches the identical
+> post-`FTL_Init` fault, ruling out the NOR/device-tree contents; and the old
+> "corrupted code pointer" interpretation was caused by inspecting the nested
+> abort state rather than the first exception.
 >
-> **Do this:**
-> 1. Rebuild the firmware artifacts if absent (they are gitignored, never
->    committed): download the IPSW, run `extract-m68ap-images.py`,
->    `build-m68ap-nor.py`, `build-m68ap-nand.py`, then
->    `install-iphone-firmware.py` (all steps in "Firmware layout & parity"
->    below). Or reuse `Resources/iphone_files/` if already installed.
-> 2. Attach a **real** debugger (`lldb` is installed; or install a cross
->    `gdb`) to the `-icount shift=3` repro with **hardware** breakpoints —
->    iBoot at `0x18000000` is read-only, so software breakpoints silently fail
->    there (this cost a whole session; don't repeat it).
-> 3. Single-step from `0x18016508` (just after the `FTL_Init [OK]` print inside
->    `WMR_Init` @ `0x180164a0`) until PC branches to `0x18017cb4`. The
->    `bx`/`blx`/`pop {pc}` **immediately before** that jump — reading a
->    corrupted value — is the culprit. Identify where that value comes from.
-> 4. **Preferred over any debugger:** use the repo's proven debug loop
->    (`AGENTS.md` § "Debugging the guest") — add ~5 lines of instrumentation to
->    QEMU's `arm_cpu_do_interrupt` (target/arm) to log the pre-abort PC/LR/mode
->    on the first prefetch abort (or a hook that fires when PC is set to
->    `0x18017cb4`), then `ninja -C build-ipod11` and re-run under `-icount`.
-> 5. Cross-check by booting M68AP iBoot with the **n45ap NOR** (isolates the
->    device-tree variable).
+> **Reproduce first:** run
+> `python3 scripts/iphone-nand-acceptance.py --skip-n45ap --timeout 25
+> --logs /private/tmp/iphone-m68ap-next`. The harness stages NAND/NOR, defaults
+> to `-icount shift=3`, writes JSON/serial/stderr, and stops the CPU to save a
+> monitor register/stack snapshot. Add `--interrupt-log` only for a short
+> exception investigation: the repeated vector abort can make `-d int` logs
+> grow very quickly.
 >
-> **Don't repeat these dead ends** (see "Dead ends" below): production VFL body
-> theory (code is identical); "garbage-length memcpy" (the fault registers are
-> leftover garbage — execution jumps *into* memmove, doesn't call it); BBT fill
-> size (512-byte vs full-page: same fault); software breakpoints in iBoot ROM;
-> single-stepping without `-icount` (the virtual clock flies and moves the
-> fault — an artifact).
+> **Next concrete experiment:** temporarily instrument
+> `arm_cpu_do_interrupt()` in `target/arm/helper.c` for the **first
+> `EXCP_DATA_ABORT`**, before mode switching, and log `last_pc`, SVC `LR`/`SP`,
+> CPSR, registers, DFSR and DFAR. Rebuild `build-ipod11`, reproduce under
+> `-icount`, and use the captured pre-exception LR/stack to identify the direct
+> caller of `memmove`. Disassemble that caller from the extracted M68AP iBoot
+> with Capstone and trace how `r2` becomes `0xffe6121d`; compare the equivalent
+> N45AP caller (Whimory section delta is `0x704`). Fold any useful diagnostic
+> into the scripted harness, remove temporary CPU hooks, and verify both the
+> M68AP case and the N45AP regression.
 >
-> **When it boots:** build `iPhone 2G.app` — the app scaffolding is ready
-> (`Resources/iphone_files/` + the board-aware `s5l8900-profile=iphone-2g`
-> launcher); duplicate `iPod Touch.app`, flip the profile, rename, re-sign.
+> **Do not repeat:** software breakpoints in read-only iBoot (use hardware
+> breakpoints), single-stepping without `-icount`, the VFL-context-body theory,
+> the bad-indirect-branch theory, the N45AP-NOR isolation boot, or BBT fill-size
+> experiments. Read "Runtime diagnosis — corrected exception chain" and "Dead
+> ends / gotchas" below for the evidence.
 >
-> Update this handoff and commit as you go (repo preference). Read the
-> "Session log — NAND signature SOLVED" and "Runtime diagnosis" sections below
-> for the full evidence and exact addresses.
+> When real M68AP firmware finally boots through SpringBoard, create
+> `iPhone 2G.app` from the existing app scaffolding and board-aware
+> `s5l8900-profile=iphone-2g` launcher.
 
 **Deterministic repro command:**
 
@@ -89,9 +83,10 @@ watchdog, M68AP extraction, and synthetic NOR are landed and verified. **The
 `no signature or no production format` blocker is SOLVED**: `scripts/build-m68ap-nand.py`
 emits a NAND whose FIL signature (`0x43303033`) M68AP iBoot accepts, and the
 production BBT lets VFL_Open discover the context. The current failure has moved
-one gate deeper: VFL_Open prefetch-aborts while interpreting the VFL context
-body (the it1g body layout needs M68AP production field values). WMR init is not
-yet fully green (no `VFL_Open [OK]`/`FTL_Open [OK]`).
+one gate deeper: after `FTL_Init [OK]`, iBoot enters `memmove` with a corrupt
+near-4-GiB count and reads past the iBoot RAM window at `0x18100000`, causing a
+Data Abort. Its caller and the source of the bad count remain to be identified.
+WMR init is not yet fully green (no `VFL_Open [OK]`/`FTL_Open [OK]`).
 
 ## Session log — 2026-07-21 (NAND signature SOLVED; constructor + tests landed)
 
@@ -132,10 +127,10 @@ Root-caused and eliminated the `no signature or no production format` blocker:
    word, production BBT fill, VFL spare `[8]=0`/`[9]=0x80`, awInfoBlk@0x7A2,
    geometry) with no Apple payloads in the repo.
 
-**Next failure (precise, re-diagnosed):** with signature + production BBT,
-VFL_Open discovers the context then takes a **Prefetch Abort** (IFAR
-`0x18017cb4`, IFSR 0x8). A full disassembly diff overturned the "production VFL
-body" hypothesis:
+**Next failure (precise, corrected twice):** with signature + production BBT,
+VFL_Open discovers the context, then iBoot takes a **Data Abort** while
+executing `memmove`. A full disassembly diff first overturned the "production
+VFL body" hypothesis:
 
 - **The entire Whimory VFL/FTL code is byte-identical between the N45AP and
   M68AP iBoot-204 builds** (M68AP `0x14900-0x18000` vs N45AP shifted −0x700);
@@ -145,13 +140,12 @@ body" hypothesis:
   checksum funcs (`0x18015810`/`0x180157e0`), FTL_Open (`0x18015068`), or
   WMR_Init (`0x180164a0`). So the two builds require *identical* context bytes,
   and the it1g body is NOT the problem.
-- `0x18017cb4` is **inside the ARM-mode `memcpy` at `0x18017bac`** (its
-  byte-copy tail), not a code target. Every memcpy in this path is a **fixed**
-  size (8 / 0x800 / 6). A fixed-size memcpy that aborts means a **bad source or
-  destination pointer**, i.e. a NAND-geometry / buffer issue, not a rejected
-  page. The two indirect calls in `_LoadVFLCxt` dispatch through a **statically
-  initialised** vtable (`[0x18025570]` set at `0x18015a54` to
-  `{0x18015864, 0x18015810}`), so "call through garbage" is ruled out.
+- `0x18017cb4` is the ARM `ldrb r3, [r1], #1` byte-copy instruction inside
+  `memmove` at `0x18017bac`. The two indirect calls in `_LoadVFLCxt` dispatch
+  through a **statically initialised** vtable (`[0x18025570]` set at
+  `0x18015a54` to `{0x18015864, 0x18015810}`), so the original VFL callback
+  corruption theory is ruled out. The direct caller of this particular
+  oversized `memmove` is still unknown.
 - **VFL context layout confirmed (it1g, NOT it2g):** spare `[8]==0` /
   `[9]==0x80`, `dwCxtAge` at spare `[0..3]`; data `awInfoBlk[4]` at **0x7A2**
   (literal cited at both iBoots). Optional production trailer (verified present
@@ -160,48 +154,65 @@ body" hypothesis:
   `dwXorSum`@0x7FC `= ⊕ words[0..509] ^ 0xAABBCCDD` (510 LE u32 over bytes
   0x000–0x7F7; const at `0x1801580c`).
 
-**Runtime diagnosis (2026-07-21, corrected after gdbstub + `-icount` work).**
-The earlier "garbage-length memcpy" reading was WRONG. Findings that hold:
+### Runtime diagnosis — corrected exception chain (2026-07-21)
 
-- **It is a Prefetch Abort where the *fetch* of `0x18017cb4` external-aborts**
-  (IFSR=0x8, IFAR=0x18017cb4). `0x18017cb4` is a valid instruction inside the
-  ARM `memmove` at `0x18017bac` (readable via `xp`), yet fetching it faults.
-  The CPU then loops taking the abort (even fetching vector `0xc` re-aborts).
-- **Execution JUMPS into the middle of `memmove`, it does not call it.** A
-  hardware breakpoint at the `memmove` entry `0x18017bac` never fires before the
-  fault; and a huge count with `|dst-src|=0x3620 < count` would route to the
-  backward path `0x18017d0c`, not the forward byte loop at `0x18017cb4`. So
-  `r0=0x180fc9e0/r1=0x18100000/r2=0xffe6121d` are **leftover garbage**, not real
-  memmove args — this is a **bad indirect branch / corrupted code pointer** to
-  `~0x18017cb4`, not a copy with a bad length.
-- **Deterministic repro:** `-icount shift=3` reproduces it exactly (reaches
-  `FTL_Init [OK]`, then aborts) — use this for any future single-stepping so the
-  timer does not distort timing.
-- **Timing-sensitive.** Without `-icount`, gdb single-stepping makes
-  `QEMU_CLOCK_VIRTUAL` fly (it tracks wall time), so the fault moves *earlier*
-  (before `FTL_Init`) — an artifact, not the real path. The real (fast / icount)
-  fault is right after `FTL_Init [OK]`, in the WMR/VFL path (`r4=0x18025530` =
-  geometry struct at the abort).
-- iBoot code is **byte-identical** to N45AP (true section delta **0x704**), which
-  boots on the same `-M iPhone-2G` machine. NAND/ECC/FMI emulation is not
-  board-conditional and behaves correctly (FMCSTAT@0x48 returns ready; the FIL
-  wait `0x18016850` polls `0x38a00048` bit1 and succeeds). BBT fill size is not
-  the cause (512-byte vs full-page fill: identical fault). So this is **not a
-  `build-m68ap-nand.py` fix** — it is a corrupted-code-pointer bug driven by
-  M68AP-build runtime data / the NOR device tree / interrupt timing.
+The previous session first called this a garbage-length copy, then incorrectly
+overturned that result as a bad indirect branch. The decisive evidence is the
+ordered `-d int` exception log, not the final banked register state:
 
-**Tooling notes for next time (learned the hard way):** iBoot at `0x18000000`
-is a read-only region, so gdb **software** breakpoints (`Z0`) silently fail
-there — use **hardware** breakpoints (`Z1`). `-icount` + `-S -gdb` did not boot
-cleanly in a hand-rolled RSP client; try a real cross-`gdb`/`lldb`. **Next
-step:** with `-icount shift=3` + hardware breakpoints, single-step from
-`0x18016508` (post-`FTL_Init` print) to the branch that targets `0x18017cb4`;
-the instruction before the jump (a `bx`/`blx`/`pop {pc}` through a corrupted
-value) is the culprit. Alternatively add temporary QEMU instrumentation in the
-prefetch-abort path (`arm_cpu_do_interrupt`) to log the pre-abort PC/LR. Also
-run the isolation boot: M68AP iBoot + **n45ap NOR** to test the device-tree
-variable. Key VAs: `memmove 0x18017bac` (fault fetch `0x18017cb4`), WMR_Init
-`0x180164a0`, VFL_Open `0x18016194`, geometry `[0x18025530]`.
+```text
+Exception return from AArch32 irq to svc PC 0x18017cb0
+Taking exception 4 [Data Abort] on CPU 0
+...with DFSR 0x8 DFAR 0x18100000
+Taking exception 3 [Prefetch Abort] on CPU 0
+...with IFSR 0x8 IFAR 0x10
+Taking exception 3 [Prefetch Abort] on CPU 0
+...with IFSR 0x8 IFAR 0xc
+```
+
+- **The original exception is a Data Abort.** `0x18017cb4` is the executing
+  instruction (`ldrb r3, [r1], #1`), not IFAR. `DFAR=0x18100000` equals the
+  live source pointer. The active arguments are `r0=0x180fc9e0`,
+  `r1=0x18100000`, `r2=0xffe6121d`; these are real `memmove` state, and the
+  near-4-GiB count has walked the source to the end of the iBoot RAM mapping.
+- **The prefetch aborts are secondary.** A Data Abort sets abort LR to
+  `fault_pc + 8 = 0x18017cbc` and vectors to `0x10`. That vector is unmapped
+  under the active MMU, so its fetch aborts; vector `0x0c` is also unmapped and
+  repeats forever. Sampling only the parked CPU or IFAR after this cascade led
+  to the false "fetch of `0x18017cb4`" conclusion.
+- **Why the entry breakpoint misled us:** the earlier hand-rolled debugger did
+  not observe the `memmove` entry, but the architectural exception LR and the
+  ordered exception trace prove execution reached its byte loop normally.
+  Treat the missed breakpoint as a debugger/tooling failure, not control-flow
+  evidence.
+- **Deterministic repro:** `-icount shift=3` reaches `FTL_Init [OK]` and then
+  the same Data Abort. Host watchdog duration is not itself a guest-time
+  guarantee: an 8-second sample sometimes caught the normal timer helper at
+  `0x180034b8`, while a 20–25-second bound reliably caught the abort.
+- **NOR isolation completed:** M68AP iBoot plus the N45AP NOR reaches the same
+  post-`FTL_Init` boundary and fault. NOR/DeviceTree contents are not the
+  variable. The mixed NOR adds expected epoch/image messages but does not alter
+  the failure.
+- iBoot Whimory code remains byte-identical to N45AP (true section delta
+  **0x704**), NAND/ECC/FMI behavior is shared, and BBT fill-size changes do not
+  affect the fault. This still does not prove every runtime input is correct;
+  it says the next task is to find who supplied `r2=0xffe6121d`, not to redesign
+  the VFL context or NAND signature.
+
+**Reusable tooling added:** `scripts/iphone-nand-acceptance.py` now defaults to
+`-icount shift=3`, stages firmware, saves a stopped monitor register/stack
+snapshot, and has an opt-in `--interrupt-log`. Keep exception runs short because
+the nested vector abort produces millions of repetitive lines. The temporary
+CPU hook was removed from `target/arm/helper.c`; use the ready-to-apply
+`scripts/iphone-data-abort-hook.patch` when the pre-mode-switch SVC LR/SP is
+needed: run `git apply scripts/iphone-data-abort-hook.patch`, rebuild and
+capture one repro, then run `git apply -R scripts/iphone-data-abort-hook.patch`.
+`git apply --check scripts/iphone-data-abort-hook.patch` verifies that the hook
+still matches the current CPU source before changing it.
+
+**Key addresses:** `memmove=0x18017bac`; faulting byte load `0x18017cb4`;
+WMR_Init `0x180164a0`; post-`FTL_Init` print return `0x18016508`; VFL_Open
+`0x18016194`; geometry `[0x18025530]`.
 
 ## Firmware layout & parity (iPod ⇄ iPhone)
 
@@ -621,10 +632,14 @@ this as a regression invariant.
   0x700 — a 4-byte off-by-one made FIL *look* different once; it isn't). N45AP
   iBoot boots on the same `-M iPhone-2G` machine. Don't re-derive a "production
   VFL context body"; the it1g layout is what M68AP reads (awInfoBlk@0x7A2).
-- **It is NOT a "garbage-length memcpy".** The fault registers
-  (`r2=0xffe6121d` etc.) are leftover garbage — a hardware breakpoint at the
-  `memmove` entry `0x18017bac` never fires, so execution *jumps into the middle*
-  (`0x18017cb4`); it doesn't call memmove. Don't chase a bad length.
+- **Do not dismiss the `memmove` arguments as leftovers.** The ordered
+  exception trace proves this is an ordinary Data Abort while the byte-copy
+  loop executes: `r1=0x18100000` is DFAR and `r2=0xffe6121d` is the bad active
+  count. The earlier entry-breakpoint miss was not evidence of an indirect
+  branch. Chase the caller that supplied the count.
+- **Do not call the primary fault a Prefetch Abort.** The first exception is a
+  Data Abort at `0x18017cb4`; the prefetch aborts only occur because the active
+  MMU does not map exception vectors `0x10` and `0x0c`.
 - **gdb SOFTWARE breakpoints don't work in iBoot.** `0x18000000` is a read-only
   region; `Z0` silently fails there. Use HARDWARE breakpoints (`Z1`). This cost
   a full session.

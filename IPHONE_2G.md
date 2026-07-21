@@ -49,19 +49,22 @@ Not every problem found during this work was introduced by the iPhone profile:
   a production BBT. This removes the `[WMR:ERR] no signature or no production
   format` rejection — the milestone the constructor targeted.
 - **Still open (current blocker):** with the generated NAND, iBoot reaches
-  `[FTL:MSG] FTL_Init [OK]` then takes a **Prefetch Abort** in the WMR/VFL path
-  — a bad indirect branch whose instruction fetch of `0x18017cb4` aborts. It is
-  NOT a NAND-format problem (the iBoot code is byte-identical to N45AP, which
-  boots on the same machine); it is a corrupted-code-pointer bug tied to
-  runtime data / the NOR device tree / interrupt timing. Reproduce
-  deterministically with `-icount shift=3`. Full details, dead ends, and the
-  next step are in `IPHONE_2G_BRINGUP_HANDOFF.md`. Also still open: NAND
-  write/erase/persistence.
+  `[FTL:MSG] FTL_Init [OK]` then executes ARM `memmove` with a corrupt
+  near-4-GiB count. Its byte load at `0x18017cb4` reads through the end of the
+  iBoot RAM window (`DFSR=0x8`, `DFAR=0x18100000`), causing a **Data Abort**.
+  The unmapped abort vectors subsequently prefetch-abort, which was previously
+  misdiagnosed as the primary failure. This is not a NAND-format problem; the
+  immediate next step is to capture the caller that supplied the bad length.
+  Reproduce deterministically with `-icount shift=3`; the full evidence,
+  dead ends, reusable diagnostics, and next-session prompt are in
+  `IPHONE_2G_BRINGUP_HANDOFF.md`. NAND write/erase/persistence also remains
+  open.
 - **Deliberate mixed-artifact failures:** M68AP iBoot rejects N45AP NOR IMG2
   entries for their security epoch and rejects the N45AP NAND's WMR signature.
   A synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) clears the NOR
   rejection (0 epoch mismatches) and `scripts/build-m68ap-nand.py` clears the
-  NAND signature rejection; the boot blocker is now the fetch-abort above.
+  NAND signature rejection; the boot blocker is now the post-`FTL_Init` Data
+  Abort above.
 
 ## Launching
 
@@ -209,11 +212,10 @@ IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
 > `hw/arm/ipod_touch_8900_engine.h`. The board-aware SYSIC epoch fix and the
 > M68AP watchdog are now **landed in code** (no debugger override needed), and a
 > synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) is accepted by m68ap
-> iBoot with **0** security-epoch rejections. With real m68ap iBoot + that NOR,
-> boot reaches the NAND stage and fails only there ("no signature or no
-> production format"). The **single remaining boot blocker is a generated
-> M68AP NAND in the production format expected by iBoot** — every other
-> early-boot artifact is solved.
+> iBoot with **0** security-epoch rejections. With real m68ap iBoot + that NOR
+> and the generated M68AP NAND, iBoot reaches `FTL_Init [OK]` before a Data
+> Abort in a `memmove` with a corrupt count. See the handoff for the exact
+> exception chain and continuation procedure.
 
 - **Firmware obtained** (1.1.4 IPSW, iBoot-204 — same build as n45ap): iBoot,
   LLB, and device tree all decrypt with the shared S5L8900 GID key. The Zephyr1
