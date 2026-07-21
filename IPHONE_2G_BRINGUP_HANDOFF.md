@@ -104,6 +104,54 @@ matches M68AP, IOKit registers. The wall is now the kernel's `AppleNANDFTL`
 root device`. Both machines still reach the Darwin kernel in the acceptance
 batch (no regression from the shared UART change).
 
+## Session log — 2026-07-21 (faithful signing PROVEN; exposes a timer-consistency bug)
+
+Replaced the secure-boot patch approach on the `dtre` image with real signing,
+to confirm the honest path works. **It does: an UNPATCHED iBoot accepts the
+signed `dtre`** — it now logs `image 0x…: bdev 0x… type dtre offset 0x10800 len
+0x8be8` (never printed for the unsigned image), i.e. the signature verification
+passes. This validates the whole faithful-signing direction.
+
+**The IMG2 signature scheme (reverse-engineered + verified).** For each NOR
+image, `image_load`'s validator (`0x18008478`) + worker signed-path
+(`0x180089ba`) require FOUR things; the crypto is `SHA1` (hardware engine at
+`0x38000000`, which the port implements) plus an `AES` step (`0x18001790`) keyed
+by the baked-in constant at VA `0x18020200` (`41705d11…`), IV at `0x18020210`:
+1. **flags2 `+0x1c` bit 1 set** (the "signed" bit) — plus bit 24, bit 30 clear.
+   Survives iBoot's RAM normalisation (RAM `+0x1c` reads `0x01000002`).
+2. **`+0x20` payload hash** (0x40 bytes) — the worker memcmps the computed value
+   here (`0x18008a0a`).
+3. **`+0x3e0` header signature** (0x20 bytes) = `AES(SHA1(header[0:0x3e0]))` —
+   the validator memcmps here (`0x180084f8`). Depends on `+0x20`, so compute it
+   LAST.
+4. **`+0x64` CRC32** recomputed (covers `+0x1c` and `+0x20`).
+Method that works (per image): set `+0x1c` (bit1+bit24) and fix CRC; capture the
+worker's expected `+0x20` via lldb at `0x18008a0a`; write `+0x20`, fix CRC;
+capture the validator's expected `+0x3e0` via lldb at `0x180084f8`; write it.
+All fields are outside/independent enough that the captured values stay valid.
+The captured dtre values are in the scratchpad; a clean implementation should
+reproduce the SHA1+AES offline (both keys/engines are available) rather than
+lldb-capture per image.
+
+**Blocker to a fully-unpatched boot (2 remaining tasks):**
+- (a) **Sign all 7 NOR images**, not just `dtre` (same method).
+- (b) **A timer-consistency emulation bug** the signed path exposes. With the
+  signed `dtre`, iBoot processes/logs the image EARLY and, right after
+  `power supply type firewire`, spins in its 64-bit tick read at VA
+  `0x180034bc`: it reads TICKSLOW (`0x3e200080`), TICKSHIGH (`0x3e200084`),
+  re-reads TICKSLOW, and loops (`bne 0x180034b6`) while the two low reads
+  differ. `hw/arm/ipod_touch_timer.c:87-94` **recalculates the counter from
+  host time on EVERY read**, so consecutive TICKSLOW reads never match →
+  infinite spin. On real hardware the counter is slow relative to 4
+  instructions so they match. **Do NOT casually change this timer** — the
+  project's sleep/wake feature depends on it (finding #83); a fix must latch or
+  stabilise the value across a tight read window WITHOUT regressing sleep/wake,
+  and be tested against `scripts/ipod-acceptance-test.py`.
+
+**So: the faithful fix is proven viable but not yet complete.** The iBoot patch
+(`scripts/patch-m68ap-iboot.py`) remains the working default that boots the
+kernel; signing is the honest replacement once (a) and (b) are done.
+
 ## Session log — 2026-07-21 (M68AP DARWIN KERNEL BOOTS; DT + secure boot + UART CTS solved)
 
 Cleared the device-tree wall and everything through the kernel handoff. Three
