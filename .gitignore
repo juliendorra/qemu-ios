@@ -19,6 +19,7 @@ GTAGS
 *.depend_raw
 *.swp
 *.patch
+!scripts/iphone-data-abort-hook.patch
 *.gcov
 /build-ipod/
 

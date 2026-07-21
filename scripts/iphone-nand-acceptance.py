@@ -71,20 +71,33 @@ N45AP_PHASES = [
 
 
 def run_qemu(qemu: Path, machine_arg: str, pflash: Path, serial: Path,
-             stderr: Path, timeout_s: int) -> None:
+             stderr: Path, monitor_log: Path, debug_log: Path, timeout_s: int,
+             icount_shift: int | None, interrupt_log: bool) -> None:
     serial.write_bytes(b"")
-    with stderr.open("wb") as errfh:
-        proc = subprocess.Popen(
-            [str(qemu), "-M", machine_arg, "-m", "1G",
-             "-pflash", str(pflash), "-L", str(APP / "Resources" / "pc-bios"),
-             "-display", "none", "-serial", f"file:{serial}", "-monitor", "none"],
-            stdout=subprocess.DEVNULL, stderr=errfh)
+    cmd = [str(qemu), "-M", machine_arg, "-m", "1G",
+           "-pflash", str(pflash), "-L", str(APP / "Resources" / "pc-bios"),
+           "-display", "none", "-serial", f"file:{serial}",
+           "-monitor", "stdio"]
+    if icount_shift is not None:
+        cmd.extend(["-icount", f"shift={icount_shift}"])
+    if interrupt_log:
+        cmd.extend(["-d", "int", "-D", str(debug_log)])
+    with stderr.open("wb") as errfh, monitor_log.open("wb") as monfh:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=monfh,
+                                stderr=errfh)
     deadline = time.time() + timeout_s
     try:
         while time.time() < deadline and proc.poll() is None:
             time.sleep(0.5)
     finally:
         if proc.poll() is None:
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(b"stop\ninfo registers\nxp/64wx $sp\n")
+                proc.stdin.flush()
+                time.sleep(0.25)
+            except (OSError, BrokenPipeError) as exc:
+                print(f"monitor query failed: {exc}", file=sys.stderr)
             proc.send_signal(signal.SIGKILL)
             proc.wait()
 
@@ -121,6 +134,11 @@ def main() -> int:
     ap.add_argument("--skip-n45ap", action="store_true",
                     help="skip the iPod (N45AP) regression boot")
     ap.add_argument("--timeout", type=int, default=45)
+    ap.add_argument("--icount-shift", type=int, default=3,
+                    help="deterministic QEMU icount shift (default: 3); "
+                         "use a negative value to disable icount")
+    ap.add_argument("--interrupt-log", action="store_true",
+                    help="write QEMU's verbose -d int exception trace")
     ap.add_argument("--logs", type=Path,
                     default=Path(f"/private/tmp/iphone-nand-accept-{int(time.time())}"))
     args = ap.parse_args()
@@ -149,7 +167,11 @@ def main() -> int:
         machine = (f"iPhone-2G,bootrom={args.bootrom},"
                    f"iboot={args.iboot_m68ap},nand={m_nand}")
         run_qemu(args.qemu, machine, m_nor, serial,
-                 args.logs / "m68ap-stderr.log", args.timeout)
+                 args.logs / "m68ap-stderr.log",
+                 args.logs / "m68ap-monitor.log",
+                 args.logs / "m68ap-interrupt.log", args.timeout,
+                 args.icount_shift if args.icount_shift >= 0 else None,
+                 args.interrupt_log)
         scan = scan_phases(serial, M68AP_PHASES, M68AP_MUST_NOT)
         milestone = (scan["reached"]["and_driver_m68ap"] is not None and
                      scan["reached"]["ftl_init"] is not None and
@@ -181,7 +203,11 @@ def main() -> int:
             machine = (f"iPod-Touch,bootrom={args.bootrom},"
                        f"iboot={n_iboot},nand={n_nand}")
             run_qemu(args.qemu, machine, n_nor, serial,
-                     args.logs / "n45ap-stderr.log", args.timeout)
+                     args.logs / "n45ap-stderr.log",
+                     args.logs / "n45ap-monitor.log",
+                     args.logs / "n45ap-interrupt.log", args.timeout,
+                     args.icount_shift if args.icount_shift >= 0 else None,
+                     args.interrupt_log)
             scan = scan_phases(serial, N45AP_PHASES, None)
             ok = (scan["reached"]["and_driver_n45ap"] is not None and
                   scan["reached"]["vfl_open"] is not None)

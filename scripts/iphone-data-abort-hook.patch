@@ -1,0 +1,27 @@
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -9527,4 +9527,23 @@ void arm_cpu_do_interrupt(CPUState *cs)
+     unsigned int new_el = env->exception.target_el;
+     uint64_t last_pc = cs->cc->get_pc(cs);
+ 
++    /* Diagnostic only: capture the original AArch32 state before banking. */
++    static bool m68ap_data_abort_logged;
++
++    if (cs->exception_index == EXCP_DATA_ABORT &&
++        !m68ap_data_abort_logged) {
++        m68ap_data_abort_logged = true;
++        fprintf(stderr,
++                "M68AP data abort: pc=%08" PRIx64 " lr=%08x sp=%08x "
++                "cpsr=%08x thumb=%d dfsr=%08x dfar=%08x\\n",
++                last_pc, env->regs[14], env->regs[13], cpsr_read(env),
++                env->thumb, env->exception.fsr,
++                (uint32_t)env->exception.vaddress);
++        for (int i = 0; i < 13; i++) {
++            fprintf(stderr, " r%-2d=%08x%s", i, env->regs[i],
++                    i % 4 == 3 ? "\\n" : "");
++        }
++        fprintf(stderr, "\\n");
++    }
++
+     assert(!arm_feature(env, ARM_FEATURE_M));
