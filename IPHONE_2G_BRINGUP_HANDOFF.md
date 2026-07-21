@@ -6,6 +6,75 @@ next concrete steps, so the next person (or LLM) can continue without redoing
 the investigation. Read `IPHONE_2G.md` first for the board design; this file is
 the live bring-up state.
 
+---
+
+## ► NEXT-SESSION PROMPT (start here)
+
+> **Task: find and fix the M68AP post-`FTL_Init` Prefetch Abort so `-M iPhone-2G`
+> boots past NAND init.** This is a legacy-device (20-year-old iPhone 2G)
+> conservation/emulation project — fair-use research; user-supplied firmware,
+> nothing Apple committed.
+>
+> **State of play (all committed):** the NAND *signature* blocker is solved —
+> `scripts/build-m68ap-nand.py` makes a tree M68AP iBoot accepts (`Apple NAND
+> Driver 0x43303033`, `FIL/BUF/VFL/FTL_Init [OK]`, no more `no signature or no
+> production format`). The remaining blocker is a **Prefetch Abort right after
+> `FTL_Init [OK]`**: a bad indirect branch whose *instruction fetch* of
+> `0x18017cb4` external-aborts (IFSR=0x8). It is **not** a NAND-format bug — the
+> iBoot code is byte-identical to N45AP (which boots on the same machine), so
+> stop looking at `build-m68ap-nand.py` / the page format. It is a
+> corrupted-code-pointer bug, tied to runtime data / the NOR device tree /
+> interrupt timing.
+>
+> **Reproduce deterministically:** boot with `-icount shift=3` (see the exact
+> command below) — reaches `FTL_Init [OK]` then aborts, every time.
+>
+> **Do this:**
+> 1. Rebuild the firmware artifacts if absent (they are gitignored, never
+>    committed): download the IPSW, run `extract-m68ap-images.py`,
+>    `build-m68ap-nor.py`, `build-m68ap-nand.py`, then
+>    `install-iphone-firmware.py` (all steps in "Firmware layout & parity"
+>    below). Or reuse `Resources/iphone_files/` if already installed.
+> 2. Attach a **real** debugger (`lldb` is installed; or install a cross
+>    `gdb`) to the `-icount shift=3` repro with **hardware** breakpoints —
+>    iBoot at `0x18000000` is read-only, so software breakpoints silently fail
+>    there (this cost a whole session; don't repeat it).
+> 3. Single-step from `0x18016508` (just after the `FTL_Init [OK]` print inside
+>    `WMR_Init` @ `0x180164a0`) until PC branches to `0x18017cb4`. The
+>    `bx`/`blx`/`pop {pc}` **immediately before** that jump — reading a
+>    corrupted value — is the culprit. Identify where that value comes from.
+> 4. If the debugger can't drive the `-icount` stub, add ~5 lines of temporary
+>    instrumentation to QEMU's `arm_cpu_do_interrupt` (target/arm) to log the
+>    pre-abort PC/LR/mode on the first prefetch abort, then `ninja -C
+>    build-ipod11` and re-run.
+> 5. Cross-check by booting M68AP iBoot with the **n45ap NOR** (isolates the
+>    device-tree variable).
+>
+> **Don't repeat these dead ends** (see "Dead ends" below): production VFL body
+> theory (code is identical); "garbage-length memcpy" (the fault registers are
+> leftover garbage — execution jumps *into* memmove, doesn't call it); BBT fill
+> size (512-byte vs full-page: same fault); software breakpoints in iBoot ROM;
+> single-stepping without `-icount` (the virtual clock flies and moves the
+> fault — an artifact).
+>
+> **When it boots:** build `iPhone 2G.app` — the app scaffolding is ready
+> (`Resources/iphone_files/` + the board-aware `s5l8900-profile=iphone-2g`
+> launcher); duplicate `iPod Touch.app`, flip the profile, rename, re-sign.
+>
+> Update this handoff and commit as you go (repo preference). Read the
+> "Session log — NAND signature SOLVED" and "Runtime diagnosis" sections below
+> for the full evidence and exact addresses.
+
+**Deterministic repro command:**
+
+```bash
+./build-ipod11/qemu-system-arm -M \
+  "iPhone-2G,bootrom=<iphone_files>/bootrom_s5l8900,iboot=<iphone_files>/iboot_204_m68ap.bin,nand=<staged nand copy>" \
+  -m 1G -pflash <staged nor_m68ap.bin> -L "<pc-bios>" \
+  -icount shift=3 -display none -serial file:serial.log -monitor none
+# -> serial ends at "[FTL:MSG] FTL_Init  [OK]"; PC parks at abort vector 0xc.
+```
+
 ## Goal
 
 Boot a real iPhone OS 1.x image to SpringBoard on `-M iPhone-2G`, reusing the
@@ -544,8 +613,27 @@ this as a regression invariant.
   security epoch and ignores the N45AP entries. Preserve the decrypted M68AP
   header/container in the extraction pipeline.
 - **`pack-ipod-nand.py` does not create a NAND.** It only compacts an existing
-  `bank0..bank7/*.page` tree. Use the planned M68AP constructor; do not confuse
-  packing with construction.
+  `bank0..bank7/*.page` tree. Use `build-m68ap-nand.py` (now built); do not
+  confuse packing with construction.
+- **The post-`FTL_Init` abort is NOT a NAND-format / VFL-body problem.** The
+  iBoot code is byte-identical to N45AP (true section delta **0x704**, not
+  0x700 — a 4-byte off-by-one made FIL *look* different once; it isn't). N45AP
+  iBoot boots on the same `-M iPhone-2G` machine. Don't re-derive a "production
+  VFL context body"; the it1g layout is what M68AP reads (awInfoBlk@0x7A2).
+- **It is NOT a "garbage-length memcpy".** The fault registers
+  (`r2=0xffe6121d` etc.) are leftover garbage — a hardware breakpoint at the
+  `memmove` entry `0x18017bac` never fires, so execution *jumps into the middle*
+  (`0x18017cb4`); it doesn't call memmove. Don't chase a bad length.
+- **gdb SOFTWARE breakpoints don't work in iBoot.** `0x18000000` is a read-only
+  region; `Z0` silently fails there. Use HARDWARE breakpoints (`Z1`). This cost
+  a full session.
+- **Don't single-step without `-icount`.** `QEMU_CLOCK_VIRTUAL` tracks wall
+  time, so single-stepping makes the guest timer fly and moves the fault earlier
+  (before `FTL_Init`) — an artifact. Use `-icount shift=3` for a deterministic
+  repro that matches the fast path.
+- **BBT fill size is not the cause.** 512-byte (4096-block) vs full-page 0xFF
+  fill produce the identical fault. The production 0xFF fill is still required
+  (the it1g zero-fill fails VFL_Open's context scan at line 768).
 - **Do not repeat the “device dump only” conclusion.** The 1G generator and
   current bundled metadata hashes disprove it, while the final 2G port proves
   a production-format sparse tree can also be generated.

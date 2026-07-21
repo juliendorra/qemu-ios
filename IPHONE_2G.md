@@ -43,13 +43,25 @@ Not every problem found during this work was introduced by the iPhone profile:
   security epoch is board-aware (`POWER_ID` reports N45AP=2 / M68AP=3, with an
   `epoch=` machine-option override), and the watchdog has real reset semantics
   on M68AP so an early panic reboots instead of spinning at `0x18001e3c`.
-- **Still open:** dependence on a prebuilt physical NAND page tree, and
-  incomplete NAND writes/erase/persistence.
+- **NAND constructor: built.** `scripts/build-m68ap-nand.py` generates the
+  M68AP sparse page tree; it reproduces the N45AP metadata byte-for-byte and,
+  for M68AP, sets the FIL signature `0x43303033` ("300C", vs N45AP "200C") and
+  a production BBT. This removes the `[WMR:ERR] no signature or no production
+  format` rejection — the milestone the constructor targeted.
+- **Still open (current blocker):** with the generated NAND, iBoot reaches
+  `[FTL:MSG] FTL_Init [OK]` then takes a **Prefetch Abort** in the WMR/VFL path
+  — a bad indirect branch whose instruction fetch of `0x18017cb4` aborts. It is
+  NOT a NAND-format problem (the iBoot code is byte-identical to N45AP, which
+  boots on the same machine); it is a corrupted-code-pointer bug tied to
+  runtime data / the NOR device tree / interrupt timing. Reproduce
+  deterministically with `-icount shift=3`. Full details, dead ends, and the
+  next step are in `IPHONE_2G_BRINGUP_HANDOFF.md`. Also still open: NAND
+  write/erase/persistence.
 - **Deliberate mixed-artifact failures:** M68AP iBoot rejects N45AP NOR IMG2
-  entries for their security epoch and rejects the N45AP NAND's WMR/production
-  format. A synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) now clears
-  the NOR rejection entirely (0 epoch mismatches); the NAND rejection remains
-  the sole boot blocker and needs a matched M68AP NAND.
+  entries for their security epoch and rejects the N45AP NAND's WMR signature.
+  A synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) clears the NOR
+  rejection (0 epoch mismatches) and `scripts/build-m68ap-nand.py` clears the
+  NAND signature rejection; the boot blocker is now the fetch-abort above.
 
 ## Launching
 
@@ -68,7 +80,36 @@ Required m68ap firmware files (not in this repo):
 | bootrom | Same `bootrom_s5l8900` dump as the iPod Touch — the bootrom is per-SoC, not per-device |
 | iBoot | `iboot_204_m68ap.bin` from iPhone OS 1.1.x/2.x for iPhone1,1 |
 | NOR | `nor_m68ap.bin` — build it with `scripts/build-m68ap-nor.py` from the extracted M68AP IMG2 containers plus a real N45AP NOR (for SysCfg); accepted by m68ap iBoot with 0 epoch mismatches |
-| NAND | NAND dump from an iPhone1,1 (the one artifact with no synthesis path yet — see IPHONE_2G_BRINGUP_HANDOFF.md) |
+| NAND | Generated M68AP sparse page tree from the IPSW root filesystem; the constructor is the next implementation step. A physical iPhone1,1 dump is optional validation input, not a required artifact. |
+
+## Historical NAND provenance and route decision
+
+The original qemu-ios ports establish a simpler route than emulating a full
+restore:
+
+| Port | What the history shows |
+|---|---|
+| iPod Touch 1G (N45AP) | NAND device work started in qemu-ios commit [`c333b6490a`](https://github.com/devos50/qemu-ios/commit/c333b6490a474fe0132332c7f0e383ed30887be7); [`b66eef5008`](https://github.com/devos50/qemu-ios/commit/b66eef50088b78ca272ed7a560ab1fc0c2183871) records NAND read plus kernel boot. Generator commit [`a893e27`](https://github.com/devos50/qemu-ios-generate-nand/commit/a893e27145622a0ebd9d98fbf2d8fc3c8481b7fe) added bank support and HFS placement; the `it1g_nand_filesystem` tag preserves the mature 1G format. It builds an eight-bank, 2048+64-byte sparse page tree with FIL, BBT, VFL and FTL metadata. The upstream author explicitly documents the released NAND as generated from the IPSW root filesystem. |
+| iPod Touch 2G (N72AP) | Commit [`1300c08302`](https://github.com/devos50/qemu-ios/commit/1300c08302e6c5f5d26664ced2a9336e2c5947f9) temporarily bypassed FTL reads while bringing the port up. [`5e9f53bfd8`](https://github.com/devos50/qemu-ios/commit/5e9f53bfd8ab3f2969138672daa3605eb7f406ef) removed that bypass from the boot path, and the final port reads generated 4096+64-byte physical pages. Generator commit [`ec11f38`](https://github.com/devos50/qemu-ios-generate-nand/commit/ec11f38c099cdeb529405356bfd17a02f16acc91) is the final format cleanup; its `ipod_touch_2g` branch adds `NANDDRIVERSIGN`, VFL version/vendor fields, mapping pages, BBT, GPT and HFS data. |
+
+The staged metadata pages from the currently bundled N45AP NAND match the 1G
+generator byte-for-byte: `bank0/0.page`, `bank0/4480.page`, every bank's
+`524160.page`, and the corresponding spare data have the same SHA-256 values
+as freshly generated pages. That is positive generator provenance and directly
+contradicts the previous description of the bundle as an unsynthesized device
+dump. It does not establish the provenance of every later filesystem page, so
+future claims must be backed by a manifest rather than inference.
+
+Primary references:
+
+- [Upstream 1G construction instructions](https://devos50.github.io/blog/2022/ipod-touch-qemu-pt2/#manually-generating-the-nand-image)
+- [`qemu-ios-generate-nand` history and 1G/2G branches](https://github.com/devos50/qemu-ios-generate-nand)
+- [Final iPod Touch 2G running instructions](https://github.com/devos50/qemu-ios/blob/ipod_touch_2g/RUNNING.md)
+
+Decision: implement the same physical-page construction architecture for
+M68AP. Do not make a device dump or S5L8900 DFU/USB restore a first-boot
+dependency. A real restore remains valuable later for write-path fidelity and
+cross-validation.
 
 ## iPhone-only hardware modeled (M68AP only, iPod path untouched)
 
@@ -170,8 +211,9 @@ IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
 > synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) is accepted by m68ap
 > iBoot with **0** security-epoch rejections. With real m68ap iBoot + that NOR,
 > boot reaches the NAND stage and fails only there ("no signature or no
-> production format"). The **single remaining boot blocker is a matched M68AP
-> NAND** — every other early-boot artifact is solved.
+> production format"). The **single remaining boot blocker is a generated
+> M68AP NAND in the production format expected by iBoot** — every other
+> early-boot artifact is solved.
 
 - **Firmware obtained** (1.1.4 IPSW, iBoot-204 — same build as n45ap): iBoot,
   LLB, and device tree all decrypt with the shared S5L8900 GID key. The Zephyr1
@@ -198,11 +240,12 @@ with iPod images) from a real iPhone OS 1.x boot to SpringBoard:
      decrypted M68AP IMG2 containers (epoch 3) and `scripts/build-m68ap-nor.py`
      assembles `nor_m68ap.bin` from them over a real N45AP NOR's SysCfg. m68ap
      iBoot accepts it with 0 epoch mismatches.
-   - NAND: ⛔ **Open — the one hard blocker.** Obtain a lawful M68AP NAND dump,
-     or implement a restore constructor that creates bank/page data, spare
-     bytes, VFL/FTL/WMR metadata, kernelcache, and filesystems from an IPSW.
-     `scripts/pack-ipod-nand.py` only packs an already-created page tree; it is
-     not a NAND constructor. See the handoff doc for the two lawful routes.
+   - NAND: ⛔ **Open — the one hard blocker.** Implement
+     `scripts/build-m68ap-nand.py` as a clean, reproducible constructor from a
+     user-supplied IPSW. Reuse the proven 1G geometry/mapping design and the
+     2G generator's production-format concepts, then determine the exact M68AP
+     WMR signature/version fields from iBoot. `scripts/pack-ipod-nand.py` only
+     packs an already-created page tree and remains the final compaction step.
 3. **Multitouch Zephyr1 against the real driver.** The Z1 model follows
    openiboot, but the real `AppleZephyr` kext has never run against it;
    the raw-upload verify heuristic (see caveat above) is the likeliest
@@ -218,10 +261,10 @@ with iPod images) from a real iPhone OS 1.x boot to SpringBoard:
    real kernel boots.
 6. **Risks:** iBoot may read board-strap GPIOs we return as 0 (happens to
    match M68AP); the m68ap device tree may reference S5L8900 peripherals
-   the iPod firmware never touches (unimplemented-register aborts); NOR
-   syscfg validation may reject a synthetic image.
+   the iPod firmware never touches (unimplemented-register aborts); the exact
+   M68AP WMR production fields may differ from both public iPod formats.
 
-Realistic sequencing: land the board-aware SYSIC epoch, make the extractor
-retain the M68AP IMG2 containers needed for NOR, then choose between a physical
-M68AP NAND dump and implementing a NAND restore constructor. The latter is now
-the largest missing piece between the recovery prompt and a real kernel boot.
+Realistic sequencing: the epoch and NOR work are complete. Next, port the
+historical NAND-construction design, first targeting a WMR-clean iBoot probe,
+then kernel/root mount, then SpringBoard. Only after that should full
+DFU/restore and persistent NAND writes compete for effort.
