@@ -3,8 +3,8 @@
 This is a working log for booting **iPhone OS 1.x** on the `-M iPhone-2G`
 machine. It records the path taken, what is proven, the dead ends, and the
 next concrete steps, so the next person (or LLM) can continue without redoing
-the investigation. Read `IPHONE_2G.md` and `IPHONE_2G_OS_1_FEASIBILITY.md`
-first for the board design; this file is the live bring-up state.
+the investigation. Read `IPHONE_2G.md` first for the board design; this file is
+the live bring-up state.
 
 ## Goal
 
@@ -14,11 +14,64 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 ## Current state (one line)
 
 The iPhone-2G machine is merged onto the Wi-Fi/HTTPS line (one QEMU 11 binary
-registers both machines with the full MV8686/DNS/HTTPS stack), the SYSIC epoch
-and watchdog fixes from "Next plan" step 1 are landed and verified in code, and
-the remaining blockers are artifacts: extract the m68ap images from a
-user-supplied IPSW, build a synthetic `nor_m68ap.bin`, and (the hard one)
-construct an M68AP NAND.
+registers both machines with the full MV8686/DNS/HTTPS stack). SYSIC epoch,
+watchdog, M68AP extraction, and synthetic NOR are landed and verified. **The
+`no signature or no production format` blocker is SOLVED**: `scripts/build-m68ap-nand.py`
+emits a NAND whose FIL signature (`0x43303033`) M68AP iBoot accepts, and the
+production BBT lets VFL_Open discover the context. The current failure has moved
+one gate deeper: VFL_Open prefetch-aborts while interpreting the VFL context
+body (the it1g body layout needs M68AP production field values). WMR init is not
+yet fully green (no `VFL_Open [OK]`/`FTL_Open [OK]`).
+
+## Session log — 2026-07-21 (NAND signature SOLVED; constructor + tests landed)
+
+Root-caused and eliminated the `no signature or no production format` blocker:
+
+1. **The blocker was ONE 4-byte constant.** M68AP iBoot-204.3.14 `WMR_Init`
+   (Thumb @ VA 0x180164a0) reads `bank0/page0` word0 and compares it to the FIL
+   "AND driver" signature **`0x43303033` ("300C")**. N45AP iBoot compares to
+   **`0x43303032` ("200C")** (constants at file 0x165b0 / 0x15eb0; the whole
+   Whimory section is shifted +0x700 between the two builds but the logic is
+   byte-identical). The observed `read only version (1, 0)` meant version=1 (OK)
+   but signature-flag=0. There is NO `NANDDRIVERSIGN` string in this iBoot —
+   M68AP uses the simple FIL-id-at-page-0 scheme like it1g, NOT the N72AP
+   `0x43313131` signature-page scheme.
+2. **`scripts/build-m68ap-nand.py`** (new): faithful Python reimplementation of
+   the it1g Whimory metadata structures (S5L8900 geometry: 8 banks, 2048+64,
+   128 pages/block), parameterised on the signature. Verified it reproduces the
+   installed N45AP metadata **byte-for-byte** (all 37 metadata pages; the three
+   handoff fingerprints match) when run with `--signature n45ap --bbt zero`.
+   With `--signature m68ap` it flips only `bank0/0.page` word0 to `0x43303033`
+   and 0xFF-fills the BBT. Emits a JSON provenance sidecar. HFS payload optional
+   (not needed for WMR init).
+3. **Production BBT is required for M68AP.** With the it1g zero-filled BBT,
+   VFL_Open's context scan (`_LoadVFLCxt`) finds nothing and fails at line 768
+   (`fail bank 0`). The final N72AP generator 0xFF-fills the BBT ("all blocks
+   good"); doing the same lets M68AP's Whimory2_1 VFL_Init build a searchable
+   bitmap and VFL_Open then discovers the context. N45AP iBoot does not need
+   this (accepts zero-fill) — so it is an M68AP-specific production choice.
+4. **Milestone reached, verified by `scripts/iphone-nand-acceptance.py`** (new,
+   board-aware, staged copies, hard Python watchdog timeout, machine-readable
+   JSON, runs the N45AP iPod boot in the same batch): booting `-M iPhone-2G`
+   with the real m68ap iBoot + synthetic m68ap NOR + generated m68ap NAND now
+   prints `Apple NAND Driver (AND) 0x43303033`, `FIL/BUF/VFL/FTL_Init [OK]`, and
+   **no** `no signature or no production format` / `read only version`. The
+   N45AP regression still reaches `Darwin Kernel Version`.
+5. **Structural tests**: `scripts/test-build-m68ap-nand.py` validates the
+   generated metadata by bytes/structure (N45AP fingerprints, M68AP signature
+   word, production BBT fill, VFL spare `[8]=0`/`[9]=0x80`, awInfoBlk@0x7A2,
+   geometry) with no Apple payloads in the repo.
+
+**Next failure (precise):** with signature + production BBT, VFL_Open discovers
+the context then takes a **Prefetch Abort** (IFAR `0x18017cb4`, IFSR 0x8
+external-abort-on-fetch) — it branches to a bad code address while interpreting
+the it1g VFL context *body*. Validator facts (VA 0x18016120): a context page is
+accepted purely on its spare (`spare[8]==0 && spare[9]==0x80`), reading the
+first 8 pages of each scanned block; awInfoBlk is read at page offset **0x7A2**
+(the it1g offset, not the it2g ~0x68E). So M68AP wants the it1g VFLCxt *layout*
+with production field *values* set. Deriving the exact required fields
+(version/checksum/counts/wCxtLocation) from the N45AP-vs-M68AP VFL_Open
+instruction diff is the next step.
 
 ## Session log — 2026-07-21 (merge onto wifi line + step-1 fixes landed)
 
@@ -85,7 +138,7 @@ files by 4CC collides on a case-insensitive filesystem (macOS default: batL
 silently overwrote batl, so both came out 0xedd2). The extractor now keys
 container files by source stem instead.
 
-**Remaining wall — the NAND.** With the m68ap iBoot **and** the synthetic
+**Remaining wall — the NAND format.** With the m68ap iBoot **and** the synthetic
 m68ap NOR, the boot now fails at exactly one place — the N45AP NAND:
 ```
 [FTL:MSG] FTL_Init            [OK]
@@ -97,24 +150,60 @@ NAND failed initialisation
 The Whimory low level initializes (FIL/BUF/VFL/FTL all `[OK]`) because it is
 the same SoC/controller, but the higher WMR layer rejects the N45AP NAND's
 signature/production format. So the ordered blocker list is now down to one
-artifact:
+format-construction task:
 
 ### The NAND, precisely
-- The shipped iPod NAND (`.../ipod_files/nand/bankN/*.page`) is a **real
-  device dump** — pages named by physical page number, carrying the original
-  spare/VFL/FTL/WMR metadata and production signature. It was NOT synthesized;
-  `pack-ipod-nand.py` only compacts an existing page tree.
-- No lawful **iPhone 2G** NAND dump is obtainable from an IPSW (an IPSW ships
-  a DMG root filesystem + boot images, never the on-NAND Whimory metadata).
-- Two lawful routes to an M68AP NAND, both large:
-  1. A physical iPhone 2G NAND dump supplied by the user (shortest path).
-  2. Run the authentic **restore** (iBSS→iBEC→restore ramdisk over emulated
-     DFU/USB) so the device software formats the NAND and `asr`-writes the
-     root fs, producing valid WMR metadata as a side effect. This needs the
-     S5L8900 USB/DFU device modeled well enough to run the ramdisk — not yet
-     present.
-- Reverse-engineering the WMR production signature to bless the N45AP-format
-  NAND is a third route but is the same unsolved metadata problem noted before.
+
+- An IPSW does not contain raw physical NAND pages, but that does **not** mean
+  there is no synthesis path. The original qemu-ios projects construct the
+  physical page tree and metadata around an IPSW-derived HFS image.
+- For N45AP, the public generator emits eight banks of 2048-byte data plus
+  64-byte spare pages. It writes FIL `0x43303032`, identical synthetic BBTs,
+  VFL contexts, FTL context/mapping pages, GPT, and the HFS payload. The
+  upstream author's 2022 instructions explicitly say the released NAND is
+  generated from the IPSW root filesystem.
+- The bundled N45AP artifact has exact generator fingerprints. On a staged
+  copy, the following SHA-256 values match freshly generated metadata pages:
+
+  | Page | SHA-256 |
+  |---|---|
+  | `bank0/0.page` | `c5dacd1ade5322b1c36507be39e873a387414308cb64c2f9dac4eef26740c006` |
+  | `bank0/4480.page` (also bank 1) | `5a0157e626602bea19d797571b245809694a28b4e7e9268b6d08df066c19ee67` |
+  | `bank0..7/524160.page` | `6984b58fc2345586f86ab3d64d098a1ffdb6a214556af4574ee439aa22d9bfb0` |
+
+  Therefore the earlier “real dump / not synthesized” claim was incorrect.
+  This fingerprint does not prove the origin of every mutable filesystem page;
+  keep provenance manifests for future artifacts.
+- For N72AP, qemu-ios commit [`1300c08302`](https://github.com/devos50/qemu-ios/commit/1300c08302e6c5f5d26664ced2a9336e2c5947f9)
+  temporarily patched iBoot/kernel FTL reads to a host block device. Commit
+  [`5e9f53bfd8`](https://github.com/devos50/qemu-ios/commit/5e9f53bfd8ab3f2969138672daa3605eb7f406ef)
+  removed that bypass, and the final port reads generated physical pages. Its generator adds a
+  `NANDDRIVERSIGN` page, WMR/VFL production fields, mapping pages, BBT, GPT,
+  and HFS data. This is the closest precedent for the M68AP rejection.
+- `scripts/pack-ipod-nand.py` still only compacts an existing page tree. The
+  missing repository component is a constructor equivalent to the public iPod
+  generators, specialized for M68AP.
+
+### Route decision
+
+Use the iPod ports' final, proven design: generate an M68AP sparse physical
+page tree from a user-supplied IPSW, then boot it through the existing NAND
+controller model. A physical iPhone1,1 dump is an optional oracle, not a
+dependency. Guest FTL-read patching is diagnostic-only because upstream
+removed that transitional bypass before the final 2G solution.
+
+Modeling S5L8900 DFU/USB far enough to run Apple's real restore is feasible in
+principle, but it is a substantially larger fidelity project: USB EP0/DFU
+state, iBSS/iBEC transfers, recovery protocol, ramdisk boot, host orchestration,
+NAND erase/write/persistence, and `asr` behavior all have to work together. It
+is not required to solve the current metadata blocker and is now a secondary
+track after first boot.
+
+Historical primary sources:
+
+- [1G NAND generation walkthrough](https://devos50.github.io/blog/2022/ipod-touch-qemu-pt2/#manually-generating-the-nand-image)
+- [`qemu-ios-generate-nand`](https://github.com/devos50/qemu-ios-generate-nand), including tags `it1g_nand_filesystem` and `it2g_nand_filesystem`
+- [Final iPod Touch 2G runner](https://github.com/devos50/qemu-ios/blob/ipod_touch_2g/RUNNING.md)
 
 ---
 
@@ -160,8 +249,8 @@ IMG2 wrapper ("Img2" = `2gmI` LE; 4-char type at +4: `tobi`=iBoot, `llbz`=LLB,
 `dtre`=DeviceTree), then the raw payload.
 
 Tooling committed: **`scripts/extract-m68ap-images.py`** (extraction/conversion
-only — no firmware or extra keys committed, per the artifact policy in
-`IPHONE_2G_OS_1_FEASIBILITY.md`). Run:
+only — no firmware committed, per the artifact policy in `AGENTS.md`). It also
+retains complete decrypted IMG2 containers for the NOR builder. Run:
 
 ```bash
 python3 scripts/extract-m68ap-images.py \
@@ -278,43 +367,59 @@ directly. Layout:
   (`nvram`, `common` with `boot-args=…`, etc.).
 
 The N45AP syscfg is accepted after the SYSIC epoch override, so syscfg is not
-the early-boot blocker. The N45AP IMG2 entries are nevertheless logged as
-`Ignoring image with mismatching security epoch`; a real kernel boot therefore
-still needs the M68AP DeviceTree image.
+the early-boot blocker. N45AP IMG2 entries are logged as `Ignoring image with
+mismatching security epoch`; `scripts/build-m68ap-nor.py` now replaces them
+with retained M68AP containers, including the DeviceTree.
 
 Do not reuse the N45AP IMG2 header around an M68AP body. The guest, not QEMU,
 parses the NOR and checks header metadata including its security epoch. The
-extractor currently discards the decrypted 0x400-byte M68AP IMG2 headers, so it
-must be extended to retain complete decrypted containers before a reliable
-synthetic NOR can be built.
+extractor and NOR builder now preserve that complete 0x400-byte header; keep
+this as a regression invariant.
 
 ---
 
 ## Next plan (in order)
 
-1. **Make SYSIC `POWER_ID` board-aware (unblocks iBoot normally).**
-   - Return epoch 3 for `BOARD_ID_M68AP` and retain epoch 2 for N45AP.
-   - Add a regression test that reaches the M68AP iBoot banner without a
-     debugger override and preserves the iPod boot.
-   - Give `WATCHDOG_MEM_BASE` real reset semantics so future panics reboot
-     instead of silently spinning at `0x18001e3c`.
+1. **Freeze the proven baselines.**
+   - Keep the current M68AP iBoot + NOR trace as the negative fixture: it must
+     reach `FTL_Init [OK]` and fail only at WMR production validation.
+   - Add fixture tests for the public N45AP generator metadata and its logical
+     page-to-bank/page mapping. Tests should validate bytes and structure, not
+     require Apple payloads in the repository.
+   - Treat the external generator as a format reference. Its repository has no
+     explicit license in the checked history, so do not copy its source
+     verbatim without resolving that; reimplement the documented structures
+     and behavior with attribution.
 
-2. **Retain complete M68AP IMG2 containers and build a synthetic NOR.**
-   - Extend `scripts/extract-m68ap-images.py` to emit both raw payloads and the
-     decrypted IMG2 container/header needed for NOR construction.
-   - Build `nor_m68ap.bin` with the authentic M68AP `dtre` header/body and
-     correct alignment. The N45AP syscfg can remain for the first experiment
-     because iBoot already accepts it.
-   - The direct-iBoot path does not require LLB in NOR.
+2. **Implement `scripts/build-m68ap-nand.py`.**
+   - Input: a user-supplied iPhone1,1 IPSW or extracted root HFS image plus a
+     provenance manifest. Output: a new sparse `bank0..bank7/*.page` tree;
+     never modify an installed or source NAND.
+   - Start with the working S5L8900/N45AP geometry: eight banks, 2048 data + 64
+     spare bytes, 128 pages per block, sparse erased pages, and the established
+     virtual/logical-to-physical mapping.
+   - Generate FIL, BBT, VFL contexts/copies, FTL context and mapping tables,
+     valid data-page spares, GPT/partition pages, HFS payload placement, and
+     the kernelcache location expected by M68AP iBoot.
+   - Add the production-format ideas proven by the final N72AP generator:
+     signature page, explicit VFL metadata version/vendor format, context ages
+     and production markers. Determine M68AP's exact signature constant,
+     WMR version and field offsets by tracing/disassembling iBoot-204.3.14;
+     do not assume N72AP's `0x43313131` is identical.
+   - Emit JSON containing source hashes, output geometry, populated pages,
+     metadata versions, partition offsets, and constructor revision. Optionally
+     run `scripts/pack-ipod-nand.py` only after the sparse tree validates.
 
-3. **Supply or construct an M68AP NAND (unblocks the kernel).**
-   - A lawful physical NAND dump is the shortest route.
-   - Otherwise implement conversion from the IPSW root filesystem and
-     kernelcache into the physical eight-bank layout, including 2048-byte data,
-     64-byte spare, VFL/FTL/WMR metadata, and production signatures/format.
-   - `scripts/pack-ipod-nand.py` is only a packer for an existing page tree; no
-     constructor equivalent to the claimed "same approach used for the iPod"
-     exists in this repository.
+3. **Add one scripted M68AP NAND acceptance case.**
+   - Extend the existing board-aware boot harness rather than doing manual
+     tap-by-tap testing. Always stage NAND and NOR copies.
+   - Phase gates: iBoot banner; FIL/BUF/VFL/FTL success; no `WMR:ERR`; kernel
+     banner; root mount; launchd; SpringBoard. Emit machine-readable status,
+     serial offsets, and a screenshot on success or failure.
+   - The first milestone is deliberately narrow: replace `no signature or no
+     production format` with a successful WMR init. Then fix partition/
+     kernelcache placement using the next observed failure.
+   - Run the existing iPod acceptance test in the same regression batch.
 
 4. **Firmware-specific bring-up** once iBoot/kernel run: the m68ap paths the
    branch already stubs go live — Zephyr1 multitouch, ISL29003 ALS, S-Gold2
@@ -322,6 +427,10 @@ synthetic NOR can be built.
    gated on `board_id == BOARD_ID_M68AP` in `ipod_touch_machine_init`). Expect
    iterative unimplemented-register fixes from the `-d unimp` log. See the
    "Path to a full iPhone OS 1 boot" section of `IPHONE_2G.md`.
+
+5. **Restore fidelity later, independently.** Once generated NAND boots,
+   improve erase/write/persistence and only then evaluate real DFU/restore as
+   an end-to-end validation path. Do not block first boot on USB restore.
 
 ---
 
@@ -348,17 +457,38 @@ synthetic NOR can be built.
   security epoch and ignores the N45AP entries. Preserve the decrypted M68AP
   header/container in the extraction pipeline.
 - **`pack-ipod-nand.py` does not create a NAND.** It only compacts an existing
-  `bank0..bank7/*.page` tree; producing VFL/FTL/WMR metadata from a DMG remains
-  unsolved.
+  `bank0..bank7/*.page` tree. Use the planned M68AP constructor; do not confuse
+  packing with construction.
+- **Do not repeat the “device dump only” conclusion.** The 1G generator and
+  current bundled metadata hashes disprove it, while the final 2G port proves
+  a production-format sparse tree can also be generated.
+- **Do not revive the 2G FTL bypass as the product path.** It was a temporary
+  bring-up hack removed by `5e9f53bfd8`; physical-page generation is the
+  durable design.
 - **Bound every boot test with a hard timeout** (an untimed boot wait once wedged
   a session for two hours — see the note in `IPHONE_2G.md`).
 
 ## Artifacts
 
 - `scripts/extract-m68ap-images.py` — committed, reproducible decryptor.
+- `scripts/build-m68ap-nor.py` — synthetic M68AP NOR builder.
+- `scripts/build-m68ap-nand.py` — M68AP NAND constructor (signature `0x43303033`,
+  production BBT, it1g Whimory metadata; reproduces N45AP metadata byte-for-byte
+  with `--signature n45ap --bbt zero`). Emits a JSON provenance sidecar.
+- `scripts/test-build-m68ap-nand.py` — structural fixture tests (no Apple
+  payloads): N45AP fingerprints, M68AP signature/BBT, VFL spare, geometry.
+- `scripts/iphone-nand-acceptance.py` — board-aware M68AP NAND boot acceptance
+  (staged copies, hard timeout, JSON phase gates) + N45AP regression in the same
+  batch.
 - `scripts/iphone-smoke-test.py` — N45AP-firmware board-divergence regression;
   it is not a real M68AP kernel test.
-- The IPSW, decrypted images, and the m68ap NAND must be regenerated from a
-  user-supplied IPSW/device dump (not committed, per policy). The extractor
-  reproduces `iboot_204_m68ap.bin` byte-for-byte, but must still retain wrapped
-  IMG2 outputs for NOR construction.
+- The IPSW, decrypted images, generated M68AP NAND, and any physical comparison
+  dump stay uncommitted. The extractor and NOR builder are complete; the next
+  repository artifact is the constructor plus structural/boot tests.
+- Every generated NAND must carry a sidecar provenance manifest with IPSW
+  device/build and hash, extracted HFS/kernelcache hashes, constructor commit,
+  output geometry, and declared guest-file modifications.
+- The upstream projects and long-lived public releases are strong technical
+  precedent. They are not a blanket legal determination; repository policy is
+  to accept user-supplied inputs and not distribute Apple payloads or
+  device-unique data.

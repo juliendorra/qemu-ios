@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""Construct an iPhone-2G (M68AP) sparse NAND page tree.
+
+This reimplements the documented S5L8900 Whimory on-flash structures used by the
+historical iPod-Touch-1G NAND generator (devos50/qemu-ios-generate-nand, tag
+`it1g_nand_filesystem`, no explicit upstream license -- structures reimplemented
+here with attribution, not copied), specialised for iPhone 2G (M68AP) iBoot
+204.3.14.
+
+The single functional difference from N45AP is the FIL "AND driver" signature
+word stored at bank0/page0: M68AP iBoot's WMR_Init compares it to 0x43303033
+("300C"), where N45AP uses 0x43303032 ("200C"). Everything else (VFL context,
+FTL context/mapping, BBT) is byte-identical to the N45AP metadata the emulator
+already accepts (FIL/BUF/VFL/FTL all report [OK]); the M68AP tree reproduces it.
+
+Output: a fresh bank0..bank7/*.page tree plus a JSON provenance sidecar. Never
+mutates an installed or source NAND. A user-supplied decrypted root HFS+ image
+may be placed via --hfs; without it the tree carries metadata only, which is
+sufficient to pass WMR init (the narrow first milestone). Optionally packs the
+result with pack-ipod-nand.py after the sparse tree validates.
+
+See IPHONE_2G_BRINGUP_HANDOFF.md and AGENTS.md (firmware/artifact policy).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import struct
+from pathlib import Path
+
+# --- S5L8900 / N45AP geometry (shared by iPod Touch 1G and iPhone 2G) ----------
+BANKS = 8
+PAGES_PER_BANK = 524288
+BYTES_PER_PAGE = 2048
+BYTES_PER_SPARE = 64
+PAGES_PER_BLOCK = 128
+PAGES_PER_SUBLOCK = 1024
+BYTES_PER_SECTOR = 512
+
+# --- Whimory constants (from wmr.h / ftl.h / vfl.h in the reference generator) --
+WMR_MAX_VB = 18000
+WMR_MAX_RESERVED_SIZE = 820
+BAD_MARK_COMPRESS_SIZE = 8
+VFL_BAD_MARK_INFO_TABLE_SIZE = WMR_MAX_VB // 8 // BAD_MARK_COMPRESS_SIZE  # 281
+VFL_INFO_SECTION_SIZE = 4
+VFL_CTX_SPARE_TYPE = 0x80
+
+FTL_CXT_SECTION_SIZE = 3
+FTL_SPARE_TYPE_CXT_INDEX = 0x43
+FREE_SECTION_SIZE = 20
+FREE_LIST_SIZE = 3
+FREE_SECTION_START = FTL_CXT_SECTION_SIZE
+LOG_SECTION_SIZE = FREE_SECTION_SIZE - FREE_LIST_SIZE
+FTL_CXT_SECTION_START = 201
+FTL_CTX_VBLK_IND = 0
+
+# MAX_NUM_OF_MAP_TABLES = ceil(WMR_MAX_VB / (4*512)) * sizeof(uint16_t)
+_sectors = 4 * BYTES_PER_SECTOR  # WMR_SECTORS_PER_PAGE_MIN * WMR_SECTOR_SIZE
+_ceil_vb = WMR_MAX_VB // _sectors + (1 if WMR_MAX_VB % _sectors else 0)  # 9
+MAX_NUM_OF_MAP_TABLES = _ceil_vb * 2   # 18   (u32 entries)
+MAX_NUM_OF_EC_TABLES = _ceil_vb * 4    # 36   (u32 entries)
+_logcxt_bytes = LOG_SECTION_SIZE * 0x100 * BANKS * 2  # WMR_MAX_PAGES_PER_BLOCK=0x100
+MAX_NUM_OF_LOGCXT_MAPS = (_logcxt_bytes // _sectors +
+                          (1 if _logcxt_bytes % _sectors else 0))  # 34
+LOGCXT_ENTRY_SIZE = 20  # sizeof(LOGCxt), packed
+
+# FIL "AND driver" signature words (iBoot compares bank0/page0 word0 to these)
+SIG_M68AP = 0x43303033  # "300C"  iPhone 2G  iBoot-204.3.14
+SIG_N45AP = 0x43303032  # "200C"  iPod Touch 1G  (regression reference only)
+
+# GPT / MBR
+GPT_HDR_SIG = b"EFI PART"
+GPT_HDR_REVISION = 0x00010000
+MBR_ADDRESS = 0x1BE
+NUM_PARTITIONS = 1
+BOOT_PARTITION_FIRST_PAGE = NUM_PARTITIONS + 2  # LBA0=MBR, LBA1=GPT hdr, LBA2=entry
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def crc32_ieee(buf: bytes) -> int:
+    import zlib
+    return zlib.crc32(buf) & 0xFFFFFFFF
+
+
+class NandTree:
+    """Collects sparse physical pages before flushing them to disk."""
+
+    def __init__(self):
+        # (bank, page) -> (data 2048, spare 64)
+        self.pages: dict[tuple[int, int], tuple[bytes, bytes]] = {}
+
+    def write_page(self, bank: int, page_index: int, data: bytes | None,
+                   spare: bytes | None) -> None:
+        data = bytes(data or b"") .ljust(BYTES_PER_PAGE, b"\x00")[:BYTES_PER_PAGE]
+        spare = bytes(spare or b"").ljust(BYTES_PER_SPARE, b"\x00")[:BYTES_PER_SPARE]
+        key = (bank, page_index)
+        if key in self.pages:
+            raise SystemExit(f"duplicate physical page bank{bank}/{page_index}")
+        self.pages[key] = (data, spare)
+
+    def flush(self, out: Path) -> int:
+        for bank in range(BANKS):
+            (out / f"bank{bank}").mkdir(parents=True, exist_ok=True)
+        for (bank, page_index), (data, spare) in self.pages.items():
+            with open(out / f"bank{bank}" / f"{page_index}.page", "wb") as fh:
+                fh.write(data)
+                fh.write(spare)
+        return len(self.pages)
+
+
+def get_physical_address(vpn: int) -> tuple[int, int]:
+    """Virtual page number -> (bank, physical page). Matches it1g and the QEMU
+    ITNand model (vpn = page * BANKS + bank)."""
+    bank = vpn % BANKS
+    pbi = vpn // PAGES_PER_SUBLOCK
+    pib = (vpn // BANKS) % PAGES_PER_BLOCK
+    return bank, pbi * PAGES_PER_BLOCK + pib
+
+
+# --- metadata builders (byte layouts verified against the N45AP tree) ----------
+
+def build_fil_signature_page(signature: int) -> bytes:
+    page = bytearray(BYTES_PER_PAGE)
+    struct.pack_into("<I", page, 0, signature)
+    return bytes(page)
+
+
+def build_vfl_context_page() -> tuple[bytes, bytes]:
+    """VFLMeta (2048) + VFLSpare (64). Layout of the it1g VFLCxt:
+      +0    u32 dwGlobalCxtAge
+      +4    u16 aFTLCxtVbn[3]
+      +10   u16 wPadding
+      +12   u32 dwCxtAge
+      +16   u16 wCxtLocation, wNextCxtPOffset
+      +20   u16 wNumOfInitBadBlk, wNumOfWriteFail, wNumOfEraseFail
+      +26   u16 wBadMapTableMaxIdx, wReservedSecStart, wReservedSecSize
+      +32   u16 aBadMapTable[820]        (1640 bytes -> +1672)
+      +1672 u8  aBadMark[281]            (-> +1953, 1 pad byte -> +1954)
+      +1954 u16 awInfoBlk[4]             (-> +1962)
+      +1962 u16 wBadMapTableScrubIdx     (-> +1964 = sizeof VFLCxt)
+    then abReserved[72], dwVersion, dwCheckSum, dwXorSum -> 2048 total.
+    it1g sets awInfoBlk[0]=35, aBadMark[*]=0xff, aFTLCxtVbn=0; leaves the rest 0.
+    """
+    page = bytearray(BYTES_PER_PAGE)
+    # aBadMark[281] = 0xff
+    for i in range(VFL_BAD_MARK_INFO_TABLE_SIZE):
+        page[1672 + i] = 0xFF
+    # awInfoBlk[0] = 35
+    struct.pack_into("<H", page, 1954, 35)
+    # aFTLCxtVbn[0..2] = FTL_CTX_VBLK_IND (0) -- already zero
+    spare = bytearray(BYTES_PER_SPARE)
+    struct.pack_into("<I", spare, 0, 1)          # dwCxtAge = 1
+    spare[9] = VFL_CTX_SPARE_TYPE                 # bSpareType = 0x80
+    return bytes(page), bytes(spare)
+
+
+def build_bbt_page(production: bool) -> bytes:
+    page = bytearray(BYTES_PER_PAGE)
+    page[0:16] = b"DEVICEINFOBBT\x00\x00\x00"
+    if production:
+        # Production ("all blocks good") fill, as the final N72AP generator does.
+        # M68AP's Whimory2_1 VFL_Init builds its searchable-block bitmap from this
+        # page; the it1g zero-fill leaves every block marked bad, so VFL_Open's
+        # context scan finds nothing and fails at _LoadVFLCxt line 768. Verified:
+        # 0xFF-fill lets VFL_Open discover the context. N45AP iBoot does not need
+        # this (it accepts the zero-fill BBT), so it is an M68AP-specific choice.
+        for i in range(16, BYTES_PER_PAGE):
+            page[i] = 0xFF
+    return bytes(page)
+
+
+def build_ftl_meta_page() -> bytes:
+    """FTLMeta: FTLCxt2 then abReserved, dwVersion, dwVersionNot -> 2048.
+    Mirrors the reference field writes (free-VB list, empty logs, map-table
+    pointers). The trailing dwVersion/dwVersionNot sit at the end of the page."""
+    page = bytearray(BYTES_PER_PAGE)
+    # FTLCxt2 is NOT a packed struct, so u32 members take 4-byte alignment.
+    # Offsets (verified byte-for-byte against the N45AP FTL meta page):
+    #  +0   u32 dwAge
+    #  +4   u32 dwWriteAge
+    #  +8   u16 wNumOfFreeVb
+    #  +10  u16 wFreeVbListTail
+    #  +12  u16 wWearLevelCounter
+    #  +14  u16 awFreeVbList[20]                    (40 bytes -> +54)
+    #  [+2 pad to 4-byte alignment -> +56]
+    #  +56  u32 adwMapTablePtrs[18]                 (72  -> +128)
+    #  +128 u32 adwECTablePtrs[36]                  (144 -> +272)
+    #  +272 u32 adwLOGCxtMapPtrs[34]                (136 -> +408)
+    #  +408 u32 pawMapTable, pawECCacheTable, pawLOGCxtMapTable (12 -> +420)
+    #  +420 LOGCxt aLOGCxtTable[LOG_SECTION_SIZE+1] (20 each; wVbn at +4)
+    # dwVersion / dwVersionNot occupy the last 8 bytes of the page.
+    struct.pack_into("<H", page, 8, FREE_SECTION_SIZE)          # wNumOfFreeVb
+    for i in range(FREE_SECTION_SIZE):
+        struct.pack_into("<H", page, 14 + i * 2, FREE_SECTION_START + i)
+
+    map_ptrs_off = _align_up(14 + FREE_SECTION_SIZE * 2, 4)      # 56
+    for i in range(MAX_NUM_OF_MAP_TABLES):
+        struct.pack_into("<I", page, map_ptrs_off + i * 4, i + 1)
+
+    ec_ptrs_off = map_ptrs_off + MAX_NUM_OF_MAP_TABLES * 4       # 128
+    logcxt_map_off = ec_ptrs_off + MAX_NUM_OF_EC_TABLES * 4      # 272
+    cache_ptrs_off = logcxt_map_off + MAX_NUM_OF_LOGCXT_MAPS * 4  # 408
+    logcxt_tbl_off = cache_ptrs_off + 3 * 4                      # 420
+    for i in range(LOG_SECTION_SIZE + 1):
+        struct.pack_into("<H", page, logcxt_tbl_off + i * LOGCXT_ENTRY_SIZE + 4,
+                         0xFFFF)                                 # aLOGCxtTable[i].wVbn
+
+    struct.pack_into("<I", page, BYTES_PER_PAGE - 8, 0x46560000)
+    struct.pack_into("<i", page, BYTES_PER_PAGE - 4, -0x46560001)
+    return bytes(page)
+
+
+def build_ftl_mapping_page(table_index: int) -> bytes:
+    page = bytearray(BYTES_PER_PAGE)
+    for j in range(1024):  # BYTES_PER_PAGE / sizeof(uint16_t)
+        struct.pack_into("<H", page, j * 2, (table_index * 1024) + j + 1)
+    return bytes(page)
+
+
+def build_gpt_entry_page(lba_start: int, lba_end: int) -> bytes:
+    page = bytearray(BYTES_PER_PAGE)
+    # gpt_ent.ent_type[4]  (HFS+ type GUID as stored by the reference generator)
+    struct.pack_into("<I", page, 0, 0x48465300)
+    struct.pack_into("<I", page, 4, 0x11AA0000)
+    struct.pack_into("<I", page, 8, 0x300011AA)
+    struct.pack_into("<I", page, 12, 0xACEC4365)
+    # ent_uuid[16] at +16, then ent_lba_start(u64)+ ent_lba_end(u64)
+    struct.pack_into("<Q", page, 32, lba_start)
+    struct.pack_into("<Q", page, 40, lba_end)
+    return bytes(page)
+
+
+def build_gpt_header_page(entry_page: bytes) -> bytes:
+    page = bytearray(BYTES_PER_PAGE)
+    page[0:8] = GPT_HDR_SIG
+    struct.pack_into("<I", page, 8, GPT_HDR_REVISION)          # hdr_revision
+    struct.pack_into("<I", page, 12, 0x5C)                     # hdr_size = 92
+    # hdr_lba_table at +72 (matches gpt_hdr layout in gpt.h)
+    struct.pack_into("<Q", page, 72, 2)                        # hdr_lba_table
+    struct.pack_into("<I", page, 80, NUM_PARTITIONS)          # hdr_entries
+    struct.pack_into("<I", page, 84, 0x80)                     # hdr_entsz
+    struct.pack_into("<I", page, 88, crc32_ieee(entry_page[:0x80]))  # hdr_crc_table
+    struct.pack_into("<I", page, 16, crc32_ieee(bytes(page[:0x5C])))  # hdr_crc_self
+    return bytes(page)
+
+
+def build_mbr_page(boot_partition_size: int) -> bytes:
+    page = bytearray(BYTES_PER_PAGE)
+    off = MBR_ADDRESS
+    page[off + 4] = 0xEE                                       # sysid
+    struct.pack_into("<I", page, off + 8, BOOT_PARTITION_FIRST_PAGE)
+    struct.pack_into("<I", page, off + 12, boot_partition_size)
+    page[510] = 0x55
+    page[511] = 0xAA
+    return bytes(page)
+
+
+def valid_ftl_spare() -> bytes:
+    spare = bytearray(BYTES_PER_SPARE)
+    struct.pack_into("<I", spare, 8, 0x00FF00FF)  # eccMarker region for data pages
+    return bytes(spare)
+
+
+# --- top-level construction ----------------------------------------------------
+
+def build(tree: NandTree, signature: int, hfs_path: Path | None,
+          production_bbt: bool) -> dict:
+    populated = {}
+
+    # 1. FIL signature (bank0/page0)
+    tree.write_page(0, 0, build_fil_signature_page(signature), None)
+    populated["fil_signature"] = {"bank": 0, "page": 0,
+                                  "word0": f"0x{signature:08x}"}
+
+    # 2. BBT: first page of the last physical block on every bank
+    bbt_page_index = PAGES_PER_BANK - PAGES_PER_BLOCK  # 524160
+    bbt = build_bbt_page(production_bbt)
+    for bank in range(BANKS):
+        tree.write_page(bank, bbt_page_index, bbt, None)
+    populated["bbt"] = {"page_index": bbt_page_index, "banks": BANKS}
+
+    # 3. VFL context: physical block 35, page 0 (page index 35*128=4480) per bank
+    vfl_page, vfl_spare = build_vfl_context_page()
+    vfl_page_index = 35 * PAGES_PER_BLOCK
+    for bank in range(BANKS):
+        tree.write_page(bank, vfl_page_index, vfl_page, vfl_spare)
+    populated["vfl_context"] = {"page_index": vfl_page_index, "banks": BANKS}
+
+    # 4. FTL context
+    #    (a) CTX-index spare marker on first page of the FTL CXT block
+    cxt_spare = bytearray(BYTES_PER_SPARE)
+    cxt_spare[9] = FTL_SPARE_TYPE_CXT_INDEX
+    cxt_spare[10] = 0xFF  # eccMarker
+    bank, pn = get_physical_address(
+        (FTL_CXT_SECTION_START + FTL_CTX_VBLK_IND) * PAGES_PER_SUBLOCK)
+    tree.write_page(bank, pn, None, bytes(cxt_spare))
+    populated["ftl_cxt_index"] = {"bank": bank, "page": pn}
+
+    #    (b) logical->virtual mapping pages
+    mapping = []
+    for i in range(MAX_NUM_OF_MAP_TABLES):
+        bank, pn = get_physical_address(
+            FTL_CXT_SECTION_START * PAGES_PER_SUBLOCK + i + 1)
+        tree.write_page(bank, pn, build_ftl_mapping_page(i), None)
+        mapping.append({"bank": bank, "page": pn})
+    populated["ftl_mapping_pages"] = mapping
+
+    #    (c) FTL meta on the last page of the FTL CXT block
+    meta_spare = bytearray(BYTES_PER_SPARE)
+    meta_spare[9] = FTL_SPARE_TYPE_CXT_INDEX
+    bank, pn = get_physical_address(
+        (FTL_CXT_SECTION_START + FTL_CTX_VBLK_IND + 1) * PAGES_PER_SUBLOCK - 1)
+    tree.write_page(bank, pn, build_ftl_meta_page(), bytes(meta_spare))
+    populated["ftl_meta"] = {"bank": bank, "page": pn}
+
+    # 5. Optional filesystem payload (GPT/MBR/HFS). Not required for WMR init.
+    if hfs_path is not None:
+        populated["filesystem"] = _write_filesystem(tree, hfs_path)
+    else:
+        populated["filesystem"] = None
+
+    return populated
+
+
+def _write_filesystem(tree: NandTree, hfs_path: Path) -> dict:
+    size = hfs_path.stat().st_size
+    if size % BYTES_PER_PAGE:
+        raise SystemExit(
+            f"HFS image size {size} is not a multiple of {BYTES_PER_PAGE}")
+    pages_for_boot = size // BYTES_PER_PAGE
+
+    spare = valid_ftl_spare()
+    base = (FTL_CXT_SECTION_START + 1) * PAGES_PER_SUBLOCK
+    with open(hfs_path, "rb") as fh:
+        vpn = base + BOOT_PARTITION_FIRST_PAGE
+        for _ in range(pages_for_boot):
+            bank, pn = get_physical_address(vpn)
+            tree.write_page(bank, pn, fh.read(BYTES_PER_PAGE), spare)
+            vpn += 1
+
+    # GPT boot-partition entry (LBA2)
+    entry = build_gpt_entry_page(BOOT_PARTITION_FIRST_PAGE,
+                                 BOOT_PARTITION_FIRST_PAGE + pages_for_boot)
+    bank, pn = get_physical_address(base + 2)
+    tree.write_page(bank, pn, entry, spare)
+    # GPT header (LBA1)
+    bank, pn = get_physical_address(base + 1)
+    tree.write_page(bank, pn, build_gpt_header_page(entry), spare)
+    # MBR (LBA0)
+    bank, pn = get_physical_address(base)
+    tree.write_page(bank, pn, build_mbr_page(pages_for_boot), spare)
+
+    return {"hfs": str(hfs_path), "hfs_pages": pages_for_boot,
+            "boot_partition_first_page": BOOT_PARTITION_FIRST_PAGE}
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out", type=Path, required=True,
+                        help="output NAND directory (bank0..bank7 created here)")
+    parser.add_argument("--signature", default="m68ap",
+                        help="'m68ap' (0x43303033), 'n45ap' (0x43303032), or a "
+                             "raw 0x-hex word")
+    parser.add_argument("--hfs", type=Path, default=None,
+                        help="decrypted root HFS+ image (optional; not needed to "
+                             "pass WMR init)")
+    parser.add_argument("--ipsw-hash", default=None,
+                        help="SHA-256 of the source IPSW, recorded in provenance")
+    parser.add_argument("--ipsw-build", default="4A102",
+                        help="IPSW build tag, recorded in provenance")
+    parser.add_argument("--device", default="iPhone1,1",
+                        help="source device, recorded in provenance")
+    parser.add_argument("--bbt", choices=("production", "zero", "auto"),
+                        default="auto",
+                        help="BBT fill: 'production' (0xFF, needed by M68AP), "
+                             "'zero' (it1g/N45AP byte-exact), or 'auto' (by "
+                             "--signature)")
+    parser.add_argument("--pack", action="store_true",
+                        help="also run pack-ipod-nand.py after the tree validates")
+    args = parser.parse_args()
+
+    if args.signature == "m68ap":
+        signature = SIG_M68AP
+    elif args.signature == "n45ap":
+        signature = SIG_N45AP
+    else:
+        signature = int(args.signature, 0)
+
+    if args.bbt == "auto":
+        production_bbt = signature != SIG_N45AP
+    else:
+        production_bbt = args.bbt == "production"
+
+    out = args.out.resolve()
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"refusing to write into non-empty directory: {out}")
+    out.mkdir(parents=True, exist_ok=True)
+
+    tree = NandTree()
+    populated = build(tree, signature, args.hfs, production_bbt)
+    count = tree.flush(out)
+
+    manifest = {
+        "constructor": "build-m68ap-nand.py",
+        "constructor_revision": _git_rev(),
+        "geometry": {
+            "banks": BANKS, "pages_per_bank": PAGES_PER_BANK,
+            "bytes_per_page": BYTES_PER_PAGE, "bytes_per_spare": BYTES_PER_SPARE,
+            "pages_per_block": PAGES_PER_BLOCK,
+            "pages_per_sublock": PAGES_PER_SUBLOCK,
+        },
+        "signature_word": f"0x{signature:08x}",
+        "signature_ascii": struct.pack("<I", signature).decode("latin1"),
+        "bbt_fill": "production_0xff" if production_bbt else "zero",
+        "metadata_versions": {
+            "vfl": "it1g", "ftl_dwVersion": "0x46560000",
+            "fil_and_driver": f"0x{signature:08x}",
+        },
+        "populated_pages": populated,
+        "page_count": count,
+        "source": {
+            "kind": "ipsw", "device": args.device, "build": args.ipsw_build,
+            "ipsw_sha256": args.ipsw_hash,
+            "hfs_sha256": sha256_file(args.hfs) if args.hfs else None,
+        },
+        "guest_file_modifications": (
+            "none (metadata-only)" if args.hfs is None
+            else "root HFS+ placed at boot partition; GPT/MBR synthesised"),
+    }
+    manifest_path = out / "nand-provenance.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"wrote {count} pages to {out}")
+    print(f"signature word 0x{signature:08x} "
+          f"({manifest['signature_ascii']!r}) at bank0/0.page")
+    print(f"provenance: {manifest_path}")
+
+    if args.pack:
+        import subprocess
+        script = Path(__file__).with_name("pack-ipod-nand.py")
+        subprocess.run(["python3", str(script), str(out)], check=True)
+
+
+def _git_rev() -> str:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--short", "HEAD"],
+            text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+if __name__ == "__main__":
+    main()

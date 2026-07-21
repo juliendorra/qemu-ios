@@ -21,3 +21,7 @@ GTAGS
 *.patch
 *.gcov
 /build-ipod/
+
+# iPhone 2G (M68AP) local artifacts: IPSW, decrypted Apple images, generated
+# NOR/NAND trees, provenance. Never commit (see AGENTS.md firmware policy).
+/m68ap-artifacts/
