@@ -165,6 +165,19 @@ It is NOT that the iPod's iBoot is more permissive — the two are identical her
   signature uses that the emulator's crypto accepts — the plain AES engine's
   GID path is a no-op, but AES-UID and the 8900/GID engine are implemented.)
 
+**Process lesson (how the patch was almost mistaken for the faithful path).**
+The secure-boot patch was first justified as "the standard pwnage-equivalent —
+what the iPod does too," stated without checking. It was wrong: N45AP boots
+UNPATCHED with signed images (proven above). The cheap check — how does the
+already-working reference (N45AP) pass this exact wall? — was skipped, even
+though N45AP had been used as an A/B oracle for the device-tree walls minutes
+earlier. **Rule for this project: when a parallel path already works, verify how
+IT passes a shared obstacle before adopting a hack; never justify a shortcut
+with "that's how it's normally done" unless it's checked against the actual
+artifact.** For a preservation/research emulator, every avoidable firmware patch
+is a real cost, so the faithful fix (sign the images) is the target and the
+patch is only a temporary unblock.
+
 **Dead ends / techniques this session (don't repeat these):**
 - **The "make the emulator report development mode to allow unsigned images"
   idea is a DEAD END — do not re-chase it.** iBoot DOES read a hardware
