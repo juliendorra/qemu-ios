@@ -104,6 +104,56 @@ matches M68AP, IOKit registers. The wall is now the kernel's `AppleNANDFTL`
 root device`. Both machines still reach the Darwin kernel in the acceptance
 batch (no regression from the shared UART change).
 
+## Session log — 2026-07-21 (real root FS DECRYPTED; kernel FTL needs a formatted NAND)
+
+Followed the strategic correction: got the authoritative sources instead of
+hand-crafting. Two results — one solved, one precisely diagnosed.
+
+**SOLVED: the real root filesystem is decrypted (the true gate).**
+`scripts/decrypt-m68ap-rootfs.sh` does the full pipeline:
+- VFDecrypt key for `022-3894-4.dmg` (1.1.4/4A102/iPhone1,1) from The iPhone Wiki
+  ("Little Bear 4A102"): `d0a0c0977bd4b6350b256d6650ec9eca419b6f961f593e74b7e5b93e010b698ca6cca1fe`.
+  (The GID key does NOT open it — it is vfdecrypt/encrcdsa, not an 8900 container.)
+- Compile the standard `vfdecrypt` (openssl); decrypt → a UDIF(zlib) DMG;
+  `hdiutil convert` → raw APM disk; slice out the HFS+ volume (`HX`, block 4096,
+  68246 blocks = 266 MB). Output `filesystem-m68ap-readonly.img` is a real,
+  bootable iPhone OS 1.1.4 root filesystem (with the kernelcache already inside).
+  Apple-derived output is never committed.
+
+**DIAGNOSED (the wall to SpringBoard): the kernel FTL needs a FULLY-FORMATTED
+NAND, which the generator alone does not produce.** With a full NAND generated
+from the real 266 MB root FS (`build-m68ap-nand.py --hfs`, 136 532 pages), the
+M68AP kernel still fails: `AppleNANDFTL` `FTL_Open` fails → `_FTLRestore` →
+`_ScanForFreeBlk(0xF35) failed` → `Still waiting for root device`. Evidence,
+narrowing it precisely:
+- **N45AP does a CLEAN `FTL_Open [OK]`** (never restores); M68AP always falls
+  into `_FTLRestore`. So M68AP's FTL *context* is rejected by `FTL_Open`.
+- **It is NOT filesystem size** (same failure with 16 MB and 266 MB filesystems).
+- **The released N45AP NAND has ~19 FTL-context pages in bank0/block 201; the
+  generator (and our port) produce only ~3.** The extra context is
+  KERNEL-WRITTEN: `generate_nand.c` emits a *seed* NAND that the kernel formats
+  on a successful first boot (NAND writes persist to `*_new.page`), and the
+  released N45AP NAND is that post-format state.
+- **M68AP's first-boot `_FTLRestore` cannot format the seed.** A NAND-model fix
+  to return erased pages as 0xFF (real NAND; `hw/arm/ipod_touch_nand.c:141`
+  returns 0x00 today) removed the `unidentified spare` misclassification but
+  `_ScanForFreeBlk` still failed — so the data blocks also lack the per-block
+  FTL spare (logical-block-number/type) that a real format writes. (That model
+  change was reverted: it did not unblock M68AP and N45AP's full SpringBoard
+  boot depends on the current behavior; land it only with full
+  `ipod-acceptance-test.py` validation.)
+
+**Realistic path to SpringBoard (next session):** produce a FORMATTED M68AP NAND,
+not a seed. Options: (a) make the kernel's first-boot `_FTLRestore` succeed on
+the seed (needs proper erased-page 0xFF + per-data-block FTL spare so
+`_ScanForFreeBlk` finds free blocks) and persist the kernel-written context; or
+(b) the DFU/USB restore path (iBSS/iBEC + restore ramdisk + `asr` formats the
+NAND) — the larger, more faithful project the design doc flagged as secondary.
+The N45AP release proves (a) is viable if the seed is `_FTLRestore`-able; the
+open question is exactly which spare/format fields N45AP's seed has that make its
+first-boot format succeed. Compare the installed N45AP NAND's data-block spares
+against the generator output to find them.
+
 ## STRATEGIC CORRECTION — 2026-07-21 (the NAND approach diverged from the iPod path)
 
 The M68AP NAND has been hand-crafted (copy N45AP's static FTL context + place a
