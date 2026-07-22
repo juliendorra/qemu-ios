@@ -63,6 +63,8 @@ typedef struct ITNandState {
     const uint8_t *pack_entries;
     const uint8_t *pack_data;
     uint32_t pack_entry_count;
+    uint8_t last_spare_type;
+    uint8_t num_banks;
 } ITNandState;
 
 void nand_set_buffered_page(ITNandState *s, uint32_t page);

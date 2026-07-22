@@ -1001,6 +1001,7 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("itnand");
     ITNandState *nand_state = ITNAND(dev);
     nand_state->nand_path = &nms->nand_path;
+    nand_state->num_banks = (nms->board_id == BOARD_ID_M68AP) ? 4 : 8;
     nms->nand_state = nand_state;
     memory_region_add_subregion(sysmem, NAND_MEM_BASE, &nand_state->iomem);
 

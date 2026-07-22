@@ -7,11 +7,11 @@ historical iPod-Touch-1G NAND generator (devos50/qemu-ios-generate-nand, tag
 here with attribution, not copied), specialised for iPhone 2G (M68AP) iBoot
 204.3.14.
 
-The single functional difference from N45AP is the FIL "AND driver" signature
-word stored at bank0/page0: M68AP iBoot's WMR_Init compares it to 0x43303033
-("300C"), where N45AP uses 0x43303032 ("200C"). Everything else (VFL context,
-FTL context/mapping, BBT) is byte-identical to the N45AP metadata the emulator
-already accepts (FIL/BUF/VFL/FTL all report [OK]); the M68AP tree reproduces it.
+The M68AP form uses its FIL "AND driver" signature, a production BBT, and four
+active NAND banks. With the controller identification handshake modeled
+correctly, M68AP iBoot reports four banks / 512 pages per subblock and uses the
+same four-bank layout as the 4A102 kernel. N45AP remains the proven eight-bank
+reference.
 
 Output: a fresh bank0..bank7/*.page tree plus a JSON provenance sidecar. Never
 mutates an installed or source NAND. A user-supplied decrypted root HFS+ image
@@ -31,8 +31,9 @@ import os
 import struct
 from pathlib import Path
 
-# --- S5L8900 / N45AP geometry (shared by iPod Touch 1G and iPhone 2G) ----------
+# --- S5L8900 NAND geometry -----------------------------------------------------
 BANKS = 8
+M68AP_ACTIVE_BANKS = 4
 PAGES_PER_BANK = 524288
 BYTES_PER_PAGE = 2048
 BYTES_PER_SPARE = 64
@@ -94,15 +95,24 @@ class NandTree:
     def __init__(self):
         # (bank, page) -> (data 2048, spare 64)
         self.pages: dict[tuple[int, int], tuple[bytes, bytes]] = {}
+        self.page_links: dict[tuple[int, int], Path] = {}
 
     def write_page(self, bank: int, page_index: int, data: bytes | None,
                    spare: bytes | None) -> None:
         data = bytes(data or b"") .ljust(BYTES_PER_PAGE, b"\x00")[:BYTES_PER_PAGE]
         spare = bytes(spare or b"").ljust(BYTES_PER_SPARE, b"\x00")[:BYTES_PER_SPARE]
         key = (bank, page_index)
-        if key in self.pages:
+        if key in self.pages or key in self.page_links:
             raise SystemExit(f"duplicate physical page bank{bank}/{page_index}")
         self.pages[key] = (data, spare)
+
+    def link_page(self, bank: int, page_index: int, source: Path) -> None:
+        key = (bank, page_index)
+        if key in self.pages or key in self.page_links:
+            raise SystemExit(f"duplicate physical page bank{bank}/{page_index}")
+        if source.stat().st_size != BYTES_PER_PAGE + BYTES_PER_SPARE:
+            raise SystemExit(f"invalid reusable NAND page size: {source}")
+        self.page_links[key] = source
 
     def flush(self, out: Path) -> int:
         for bank in range(BANKS):
@@ -111,15 +121,21 @@ class NandTree:
             with open(out / f"bank{bank}" / f"{page_index}.page", "wb") as fh:
                 fh.write(data)
                 fh.write(spare)
-        return len(self.pages)
+        for (bank, page_index), source in self.page_links.items():
+            os.link(source, out / f"bank{bank}" / f"{page_index}.page")
+        return len(self.pages) + len(self.page_links)
 
 
-def get_physical_address(vpn: int) -> tuple[int, int]:
-    """Virtual page number -> (bank, physical page). Matches it1g and the QEMU
-    ITNand model (vpn = page * BANKS + bank)."""
-    bank = vpn % BANKS
-    pbi = vpn // PAGES_PER_SUBLOCK
-    pib = (vpn // BANKS) % PAGES_PER_BLOCK
+def get_physical_address(vpn: int, active_banks: int = BANKS) -> tuple[int, int]:
+    """Virtual page number -> (bank, physical page).
+
+    M68AP interleaves four active banks and N45AP interleaves eight. The sparse
+    storage format always reserves eight bank directories.
+    """
+    bank = vpn % active_banks
+    pages_per_subblock = active_banks * PAGES_PER_BLOCK
+    pbi = vpn // pages_per_subblock
+    pib = (vpn // active_banks) % PAGES_PER_BLOCK
     return bank, pbi * PAGES_PER_BLOCK + pib
 
 
@@ -282,8 +298,14 @@ def valid_ftl_spare() -> bytes:
 # --- top-level construction ----------------------------------------------------
 
 def build(tree: NandTree, signature: int, hfs_path: Path | None,
-          production_bbt: bool) -> dict:
+          production_bbt: bool, active_banks: int = BANKS,
+          reuse_hfs_pages_from: Path | None = None) -> dict:
     populated = {}
+    if active_banks not in (M68AP_ACTIVE_BANKS, BANKS):
+        raise SystemExit(f"unsupported active bank count: {active_banks}")
+    if signature == SIG_N45AP and active_banks != BANKS:
+        raise SystemExit("N45AP construction requires eight-bank interleave")
+    pages_per_subblock = active_banks * PAGES_PER_BLOCK
 
     # 1. FIL signature (bank0/page0)
     tree.write_page(0, 0, build_fil_signature_page(signature), None)
@@ -293,16 +315,18 @@ def build(tree: NandTree, signature: int, hfs_path: Path | None,
     # 2. BBT: first page of the last physical block on every bank
     bbt_page_index = PAGES_PER_BANK - PAGES_PER_BLOCK  # 524160
     bbt = build_bbt_page(production_bbt)
-    for bank in range(BANKS):
+    for bank in range(active_banks):
         tree.write_page(bank, bbt_page_index, bbt, None)
-    populated["bbt"] = {"page_index": bbt_page_index, "banks": BANKS}
+    populated["bbt"] = {"page_index": bbt_page_index,
+                        "banks": active_banks}
 
     # 3. VFL context: physical block 35, page 0 (page index 35*128=4480) per bank
     vfl_page, vfl_spare = build_vfl_context_page()
     vfl_page_index = 35 * PAGES_PER_BLOCK
-    for bank in range(BANKS):
+    for bank in range(active_banks):
         tree.write_page(bank, vfl_page_index, vfl_page, vfl_spare)
-    populated["vfl_context"] = {"page_index": vfl_page_index, "banks": BANKS}
+    populated["vfl_context"] = {"page_index": vfl_page_index,
+                                "banks": active_banks}
 
     # 4. FTL context
     #    (a) CTX-index spare marker on first page of the FTL CXT block
@@ -310,7 +334,8 @@ def build(tree: NandTree, signature: int, hfs_path: Path | None,
     cxt_spare[9] = FTL_SPARE_TYPE_CXT_INDEX
     cxt_spare[10] = 0xFF  # eccMarker
     bank, pn = get_physical_address(
-        (FTL_CXT_SECTION_START + FTL_CTX_VBLK_IND) * PAGES_PER_SUBLOCK)
+        (FTL_CXT_SECTION_START + FTL_CTX_VBLK_IND) * pages_per_subblock,
+        active_banks)
     tree.write_page(bank, pn, None, bytes(cxt_spare))
     populated["ftl_cxt_index"] = {"bank": bank, "page": pn}
 
@@ -318,7 +343,8 @@ def build(tree: NandTree, signature: int, hfs_path: Path | None,
     mapping = []
     for i in range(MAX_NUM_OF_MAP_TABLES):
         bank, pn = get_physical_address(
-            FTL_CXT_SECTION_START * PAGES_PER_SUBLOCK + i + 1)
+            FTL_CXT_SECTION_START * pages_per_subblock + i + 1,
+            active_banks)
         tree.write_page(bank, pn, build_ftl_mapping_page(i), None)
         mapping.append({"bank": bank, "page": pn})
     populated["ftl_mapping_pages"] = mapping
@@ -327,20 +353,24 @@ def build(tree: NandTree, signature: int, hfs_path: Path | None,
     meta_spare = bytearray(BYTES_PER_SPARE)
     meta_spare[9] = FTL_SPARE_TYPE_CXT_INDEX
     bank, pn = get_physical_address(
-        (FTL_CXT_SECTION_START + FTL_CTX_VBLK_IND + 1) * PAGES_PER_SUBLOCK - 1)
-    tree.write_page(bank, pn, build_ftl_meta_page(), bytes(meta_spare))
+        (FTL_CXT_SECTION_START + FTL_CTX_VBLK_IND + 1) *
+        pages_per_subblock - 1, active_banks)
+    meta_page = build_ftl_meta_page()
+    tree.write_page(bank, pn, meta_page, bytes(meta_spare))
     populated["ftl_meta"] = {"bank": bank, "page": pn}
-
     # 5. Optional filesystem payload (GPT/MBR/HFS). Not required for WMR init.
     if hfs_path is not None:
-        populated["filesystem"] = _write_filesystem(tree, hfs_path)
+        populated["filesystem"] = _write_filesystem(
+            tree, hfs_path, active_banks, reuse_hfs_pages_from)
     else:
         populated["filesystem"] = None
 
     return populated
 
 
-def _write_filesystem(tree: NandTree, hfs_path: Path) -> dict:
+def _write_filesystem(tree: NandTree, hfs_path: Path,
+                      active_banks: int,
+                      reuse_hfs_pages_from: Path | None = None) -> dict:
     size = hfs_path.stat().st_size
     if size % BYTES_PER_PAGE:
         raise SystemExit(
@@ -348,28 +378,46 @@ def _write_filesystem(tree: NandTree, hfs_path: Path) -> dict:
     pages_for_boot = size // BYTES_PER_PAGE
 
     spare = valid_ftl_spare()
-    base = (FTL_CXT_SECTION_START + 1) * PAGES_PER_SUBLOCK
+    pages_per_subblock = active_banks * PAGES_PER_BLOCK
+    base = (FTL_CXT_SECTION_START + 1) * pages_per_subblock
     with open(hfs_path, "rb") as fh:
         vpn = base + BOOT_PARTITION_FIRST_PAGE
-        for _ in range(pages_for_boot):
-            bank, pn = get_physical_address(vpn)
-            tree.write_page(bank, pn, fh.read(BYTES_PER_PAGE), spare)
+        for index in range(pages_for_boot):
+            bank, pn = get_physical_address(vpn, active_banks)
+            data = fh.read(BYTES_PER_PAGE)
+            if reuse_hfs_pages_from is None:
+                tree.write_page(bank, pn, data, spare)
+            else:
+                old_base = (FTL_CXT_SECTION_START + 1) * PAGES_PER_SUBLOCK
+                old_vpn = old_base + BOOT_PARTITION_FIRST_PAGE + index
+                old_bank, old_pn = get_physical_address(old_vpn, BANKS)
+                source = (reuse_hfs_pages_from / f"bank{old_bank}" /
+                          f"{old_pn}.page")
+                source_bytes = source.read_bytes()
+                if source_bytes[:BYTES_PER_PAGE] != data or \
+                        source_bytes[BYTES_PER_PAGE:] != spare:
+                    raise SystemExit(
+                        f"reusable page does not match HFS/spare: {source}")
+                tree.link_page(bank, pn, source)
             vpn += 1
 
     # GPT boot-partition entry (LBA2)
     entry = build_gpt_entry_page(BOOT_PARTITION_FIRST_PAGE,
                                  BOOT_PARTITION_FIRST_PAGE + pages_for_boot)
-    bank, pn = get_physical_address(base + 2)
+    bank, pn = get_physical_address(base + 2, active_banks)
     tree.write_page(bank, pn, entry, spare)
     # GPT header (LBA1)
-    bank, pn = get_physical_address(base + 1)
+    bank, pn = get_physical_address(base + 1, active_banks)
     tree.write_page(bank, pn, build_gpt_header_page(entry), spare)
     # MBR (LBA0)
-    bank, pn = get_physical_address(base)
+    bank, pn = get_physical_address(base, active_banks)
     tree.write_page(bank, pn, build_mbr_page(pages_for_boot), spare)
 
     return {"hfs": str(hfs_path), "hfs_pages": pages_for_boot,
-            "boot_partition_first_page": BOOT_PARTITION_FIRST_PAGE}
+            "boot_partition_first_page": BOOT_PARTITION_FIRST_PAGE,
+            "active_banks": active_banks,
+            "reused_hfs_pages_from": (str(reuse_hfs_pages_from)
+                                      if reuse_hfs_pages_from else None)}
 
 
 def sha256_file(path: Path) -> str:
@@ -390,6 +438,12 @@ def main() -> None:
     parser.add_argument("--hfs", type=Path, default=None,
                         help="decrypted root HFS+ image (optional; not needed to "
                              "pass WMR init)")
+    parser.add_argument("--active-banks", type=int, choices=(4, 8), default=None,
+                        help="override filesystem/FTL interleave (default: "
+                             "M68AP=4, N45AP=8)")
+    parser.add_argument("--reuse-hfs-pages-from", type=Path, default=None,
+                        help="eight-bank staged NAND carrying the same HFS; "
+                             "verify and hard-link its immutable data pages")
     parser.add_argument("--ipsw-hash", default=None,
                         help="SHA-256 of the source IPSW, recorded in provenance")
     parser.add_argument("--ipsw-build", default="4A102",
@@ -417,23 +471,32 @@ def main() -> None:
     else:
         production_bbt = args.bbt == "production"
 
+    active_banks = (args.active_banks if args.active_banks is not None else
+                    (M68AP_ACTIVE_BANKS if signature == SIG_M68AP else BANKS))
+    if signature == SIG_N45AP and active_banks != BANKS:
+        raise SystemExit("N45AP construction requires --active-banks 8")
+
     out = args.out.resolve()
     if out.exists() and any(out.iterdir()):
         raise SystemExit(f"refusing to write into non-empty directory: {out}")
     out.mkdir(parents=True, exist_ok=True)
 
     tree = NandTree()
-    populated = build(tree, signature, args.hfs, production_bbt)
+    if args.reuse_hfs_pages_from is not None and args.hfs is None:
+        raise SystemExit("--reuse-hfs-pages-from requires --hfs")
+    populated = build(tree, signature, args.hfs, production_bbt,
+                      active_banks, args.reuse_hfs_pages_from)
     count = tree.flush(out)
 
     manifest = {
         "constructor": "build-m68ap-nand.py",
         "constructor_revision": _git_rev(),
         "geometry": {
-            "banks": BANKS, "pages_per_bank": PAGES_PER_BANK,
+            "active_banks": active_banks, "storage_bank_slots": BANKS,
+            "pages_per_bank": PAGES_PER_BANK,
             "bytes_per_page": BYTES_PER_PAGE, "bytes_per_spare": BYTES_PER_SPARE,
             "pages_per_block": PAGES_PER_BLOCK,
-            "pages_per_sublock": PAGES_PER_SUBLOCK,
+            "pages_per_sublock": active_banks * PAGES_PER_BLOCK,
         },
         "signature_word": f"0x{signature:08x}",
         "signature_ascii": struct.pack("<I", signature).decode("latin1"),
@@ -441,6 +504,8 @@ def main() -> None:
         "metadata_versions": {
             "vfl": "it1g", "ftl_dwVersion": "0x46560000",
             "fil_and_driver": f"0x{signature:08x}",
+            "bank_geometry": f"{active_banks}-bank-interleave",
+            "geometry_status": "proven-board-layout",
         },
         "populated_pages": populated,
         "page_count": count,

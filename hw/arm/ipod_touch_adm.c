@@ -4,6 +4,27 @@
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
+#include "trace.h"
+
+static void trace_root_read_request(uint32_t cmd, uint16_t count,
+                                    const uint32_t *pages,
+                                    const uint32_t *banks)
+{
+    bool relevant = false;
+
+    for (uint16_t i = 0; i < count; i++) {
+        if (pages[i] >= 25855 && pages[i] <= 25859) {
+            relevant = true;
+            break;
+        }
+    }
+    if (!relevant) {
+        return;
+    }
+    for (uint16_t i = 0; i < count; i++) {
+        trace_itadm_root_read(cmd, count, i, banks[i], pages[i]);
+    }
+}
 
 static uint8_t adm_read_u8(IPodTouchADMState *s, hwaddr addr)
 {
@@ -96,7 +117,8 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
 
                 // dunno, write some bytes to data4_sec_addr to indicate that the NAND banks are ready
                 for(int i = 0; i < NAND_NUM_BANKS; i++) {
-                    bank_ids[i] = NAND_CHIP_ID;
+                    bank_ids[i] = i < s->nand_state->num_banks ?
+                                  NAND_CHIP_ID : UINT32_MAX;
                 }
 
                 address_space_write(&s->downstream_as, s->data3_sec_addr,
@@ -144,6 +166,9 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                             }
                             page++;
                         }
+                        trace_root_read_request(cmd, num_pages,
+                                                s->nand_state->pages_to_read,
+                                                s->nand_state->banks_to_read);
 
                         s->nand_state->fmdnum = (num_pages * 0x800);
                         s->nand_state->cur_bank_reading = -1;
@@ -170,6 +195,10 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
 
                             page = adm_read_be32(
                                 s, s->data2_sec_addr + 0x1104 + 0x244);
+                            if (page >= 25855 && page <= 25859) {
+                                trace_itadm_root_read(cmd, num_pages, 0, bank,
+                                                     page);
+                            }
                             //printf("Reading single page: %d (bank: %d)\n", page, bank);
 
                             // set the bank, page, and operation.
@@ -198,6 +227,10 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                                 s->nand_state->pages_to_read[i] = page;
                                 s->nand_state->banks_to_read[i] = bank;
                             }
+                            trace_root_read_request(
+                                cmd, num_pages,
+                                s->nand_state->pages_to_read,
+                                s->nand_state->banks_to_read);
 
                             s->nand_state->fmdnum = (num_pages * 0x800);
                             s->nand_state->cur_bank_reading = -1;

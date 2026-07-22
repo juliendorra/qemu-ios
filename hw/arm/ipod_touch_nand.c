@@ -1,6 +1,7 @@
 #include "hw/arm/ipod_touch_nand.h"
 #include "hw/core/hw-error.h"
 #include "qemu/bswap.h"
+#include "trace.h"
 
 #define NAND_PACK_FILENAME "nand.pack"
 #define NAND_PACK_MAGIC "IPODNAND"
@@ -9,7 +10,7 @@
 
 static int get_bank(ITNandState *s) {
     uint32_t bank_bitmap = (s->fmctrl0 >> 1) & 0xFF;
-    for(int bank = 0; bank < NAND_NUM_BANKS; bank++) {
+    for(int bank = 0; bank < s->num_banks; bank++) {
         if((bank_bitmap & (1 << bank)) != 0) {
             return bank;
         }
@@ -131,6 +132,7 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
     if(bank != s->buffered_bank || page != s->buffered_page) {
         // refresh the buffered page
         char filename[200];
+        bool present = true;
         sprintf(filename, "%s/bank%d/%d.page", s->nand_path, bank, page);
         struct stat st = {0};
         if (nand_read_packed_page(s, bank, page)) {
@@ -138,6 +140,7 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
         }
         else if (stat(filename, &st) == -1) {
             // page storage does not exist - initialize an empty buffer
+            present = false;
             memset(s->page_buffer, 0, NAND_BYTES_PER_PAGE);
             memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
             s->page_spare_buffer[0xA] = 0xFF; // make sure we add the FTL mark to an empty page
@@ -152,6 +155,23 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
 
         s->buffered_page = page;
         s->buffered_bank = bank;
+        /* Context-page transitions are the useful geometry diagnostic.  Keep
+         * the opt-in trace sparse so it does not perturb guest startup timing. */
+        if (s->page_spare_buffer[9] == 0x43 || s->last_spare_type == 0x43) {
+            trace_itnand_read_page(bank, page, present,
+                                   s->page_spare_buffer[9]);
+        }
+        /* Keep the root-filesystem boundary diagnostic sparse while comparing
+         * the working N45AP path with M68AP.  The candidate context, volume
+         * header, and first extents-tree reads fall in this five-page window. */
+        if (page >= 25855 && page <= 25859) {
+            trace_itnand_root_page(bank, page, present,
+                                   ldl_le_p(s->page_buffer),
+                                   ldl_le_p(s->page_buffer + 0x20),
+                                   ldl_le_p(s->page_buffer + 0x400),
+                                   s->page_spare_buffer[9]);
+        }
+        s->last_spare_type = s->page_spare_buffer[9];
         // printf("Buffered bank: %d, page: %d\n", s->buffered_bank, s->buffered_page);
     }
 }
@@ -168,7 +188,10 @@ static uint64_t itnand_read(void *opaque, hwaddr addr, unsigned size)
             return s->fmctrl0;
         case NAND_FMFIFO:
             if(s->cmd == NAND_CMD_ID) {
-                return NAND_CHIP_ID;
+                int bank = get_bank(s);
+                uint32_t value = bank >= 0 ? NAND_CHIP_ID : UINT32_MAX;
+                trace_itnand_id(bank, value, s->num_banks);
+                return value;
             }
             else if(s->cmd == NAND_CMD_READSTATUS) {
                 return (1 << 6);

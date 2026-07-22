@@ -58,6 +58,22 @@ def generate(sig: str, bbt: str) -> Path:
     return out
 
 
+def generate_with_hfs(sig: str, pages: int,
+                      active_banks: int | None = None) -> Path:
+    root = Path(tempfile.mkdtemp(prefix=f"nand-{sig}-hfs-"))
+    hfs = root / "fixture.img"
+    hfs.write_bytes(b"".join(bytes([index]) * PAGE for index in range(pages)))
+    out = root / "nand"
+    command = [sys.executable, str(BUILDER), "--out", str(out),
+               "--signature", sig, "--bbt", "auto", "--hfs", str(hfs)]
+    if active_banks is not None:
+        command.extend(["--active-banks", str(active_banks)])
+    subprocess.run(
+        command,
+        check=True, capture_output=True, text=True)
+    return out
+
+
 def test_n45ap_metadata_reproduces() -> None:
     print("N45AP metadata reproduces recorded fingerprints (bbt=zero):")
     out = generate("n45ap", "zero")
@@ -93,6 +109,10 @@ def test_m68ap_signature_and_bbt() -> None:
           "BBT header padding (0x10..0x34) is zero")
     check(all(x == 0 for x in bbt[0x238:PAGE]),
           "BBT tail after bitmap is zero")
+    meta = out / "bank3" / "25855.page"
+    check(meta.exists(), "M68AP FTL metadata is at bank3/25855")
+    check(not (out / "bank7" / "25855.page").exists(),
+          "M68AP has no inactive-bank FTL metadata copy")
 
 
 def test_geometry_and_layout() -> None:
@@ -110,10 +130,13 @@ def test_geometry_and_layout() -> None:
     # awInfoBlk[0] == 35 at page offset 0x7A2 (the offset M68AP iBoot reads)
     check(struct.unpack_from("<H", vfl, 0x7A2)[0] == 35,
           "VFL context awInfoBlk[0] == 35 at offset 0x7A2")
-    # VFL context present on all 8 banks
-    for b in range(8):
+    # M68AP iBoot reports and scans four active NAND banks.
+    for b in range(4):
         check((out / f"bank{b}" / "4480.page").exists(),
               f"bank{b}/4480.page (VFL context) present")
+    for b in range(4, 8):
+        check(not (out / f"bank{b}" / "4480.page").exists(),
+              f"bank{b}/4480.page absent outside M68AP active geometry")
 
 
 def test_get_physical_address_matches_model() -> None:
@@ -133,11 +156,52 @@ def test_get_physical_address_matches_model() -> None:
     bank, pn = bm.get_physical_address(
         (bm.FTL_CXT_SECTION_START + 1) * bm.PAGES_PER_SUBLOCK - 1)
     check((bank, pn) == (7, 25855), f"FTL meta lands at bank7/25855 (got {bank}/{pn})")
+    m68_subblock = bm.M68AP_ACTIVE_BANKS * bm.PAGES_PER_BLOCK
+    bank, pn = bm.get_physical_address(
+        (bm.FTL_CXT_SECTION_START + 1) * m68_subblock - 1,
+        bm.M68AP_ACTIVE_BANKS)
+    check((bank, pn) == (3, 25855),
+          f"M68AP FTL meta lands at bank3/25855 (got {bank}/{pn})")
+
+
+def test_m68ap_filesystem_uses_four_bank_interleave() -> None:
+    print("M68AP four-bank filesystem interleave:")
+    out = generate_with_hfs("m68ap", 16)
+    page8 = (out / "bank3" / "25858.page").read_bytes()
+    check(page8[:PAGE] == bytes([8]) * PAGE,
+          "HFS page 8 is at bank3/25858")
+    page4 = (out / "bank3" / "25857.page").read_bytes()
+    check(page4[:PAGE] == bytes([4]) * PAGE,
+          "bank3/25857 contains HFS page 4, not the N45AP page-8 placement")
+
+
+def test_m68ap_can_hardlink_verified_eight_bank_pages() -> None:
+    print("M68AP compact restaging verifies and hard-links HFS pages:")
+    root = Path(tempfile.mkdtemp(prefix="nand-m68ap-reuse-"))
+    hfs = root / "fixture.img"
+    hfs.write_bytes(b"".join(bytes([index]) * PAGE for index in range(16)))
+    source = root / "source"
+    target = root / "target"
+    subprocess.run(
+        [sys.executable, str(BUILDER), "--out", str(source),
+         "--signature", "n45ap", "--bbt", "auto", "--hfs", str(hfs)],
+        check=True, capture_output=True, text=True)
+    subprocess.run(
+        [sys.executable, str(BUILDER), "--out", str(target),
+         "--signature", "m68ap", "--bbt", "auto", "--hfs", str(hfs),
+         "--reuse-hfs-pages-from", str(source), "--active-banks", "4"],
+        check=True, capture_output=True, text=True)
+    old_page8 = source / "bank3" / "25857.page"
+    new_page8 = target / "bank3" / "25858.page"
+    check(old_page8.stat().st_ino == new_page8.stat().st_ino,
+          "four-bank HFS page 8 reuses the verified eight-bank page inode")
 
 
 def main() -> int:
     for t in (test_n45ap_metadata_reproduces, test_m68ap_signature_and_bbt,
-              test_geometry_and_layout, test_get_physical_address_matches_model):
+              test_geometry_and_layout, test_get_physical_address_matches_model,
+              test_m68ap_filesystem_uses_four_bank_interleave,
+              test_m68ap_can_hardlink_verified_eight_bank_pages):
         t()
     print()
     if _failures:
