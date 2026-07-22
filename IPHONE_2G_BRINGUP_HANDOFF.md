@@ -132,17 +132,35 @@ and the real reference generator. New, firmer conclusions:
     than N45AP's, OR the production BBT it required for iBoot is what its own
     FTL_Open then rejects.
 
-**So the wall is a genuine M68AP Whimory/BBT mismatch, not a port bug and not a
-missing format step.** The two clean next experiments:
-1. **Isolate the BBT:** patch M68AP iBoot's VFL_Open BBT dependency (around the
-   DEVICEINFOBBT loader `0x18015fa0` / VFL_Open `0x18016194`) so the pure
-   zero-BBT reference seed reaches the kernel, and see if the kernel then does a
-   clean `FTL_Open`. If yes → the production BBT is the kernel's problem and the
-   real fix is the correct M68AP BBT/VFL format (or accept zero BBT throughout).
-2. **RE the M68AP kernelcache's `AppleNANDFTL` `FTL_Open`/`_ScanForFreeBlk`** to
-   learn exactly what it validates in the FTL context and the free-block scan
-   that N45AP's does not. This is the definitive route.
-Failing those, the DFU/`asr` restore path formats the NAND legitimately.
+**BBT ISOLATION TEST DONE — the BBT is RULED OUT as the kernel-FTL cause.**
+Patched M68AP iBoot's `_LoadVFLCxt` bitmap check to accept a zero BBT: the scan
+at `0x18016214` only reads a block if its bit is set in the BBT-derived
+searchable bitmap (`tst r2,r3; beq skip` at `0x18016220`/`0x18016222`); NOP-ing
+the `beq` (VA `0x18016222`, file `0x16222`: `08 d0` → `00 bf`) makes it scan
+every block and find the VFL context on block 35 regardless of the BBT. Result
+with the pure ZERO-BBT reference seed + that patch:
+- iBoot `VFL_Open [OK]` (no "fail bank") — the patch works, the zero-BBT seed
+  reaches the kernel.
+- **The kernel FTL still fails IDENTICALLY:** `_ScanForFreeBlk(0xF35) failed`,
+  `wDataBlkCnt=0xF20 wFreeBlkCnt=0x15`, `Still waiting for root device` — exactly
+  the same as with the production BBT.
+
+**Conclusion: the production BBT is needed only for M68AP iBoot; it does NOT
+affect the kernel FTL.** The kernel wall is entirely in the M68AP kernelcache's
+`AppleNANDFTL`: its `FTL_Open` rejects the (byte-identical to N45AP) FTL context
+and falls into `_FTLRestore`, where the N45AP kernel does a CLEAN `FTL_Open`. So
+the difference is the KERNEL DRIVER, not the NAND format, not the BBT, not our
+generator (proven faithful).
+
+**The one definitive next route:** RE the M68AP kernelcache's `AppleNANDFTL`
+`FTL_Open` (why it rejects the context N45AP accepts → clean open) and/or
+`_ScanForFreeBlk` (line 2516/2565 in its log). The M68AP kernelcache is the
+1.1.4 `kernelcache.release.s5l8900xrb` (in the decrypted root FS / IPSW);
+disassemble its AppleNANDFTL kext. Compare the FTL-context validation
+(version/checksum/mapping) against what the generator writes
+(`dwVersion=0x46560000`). Alternatively, the DFU/`asr` restore path formats the
+NAND the way the driver expects. (The VFL zero-BBT patch is a diagnostic only —
+not landed; M68AP iBoot legitimately needs the production BBT.)
 
 ## Session log — 2026-07-21 (real root FS DECRYPTED; kernel FTL needs a formatted NAND — SUPERSEDED above)
 
