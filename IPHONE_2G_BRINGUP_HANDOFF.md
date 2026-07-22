@@ -152,15 +152,34 @@ and falls into `_FTLRestore`, where the N45AP kernel does a CLEAN `FTL_Open`. So
 the difference is the KERNEL DRIVER, not the NAND format, not the BBT, not our
 generator (proven faithful).
 
-**The one definitive next route:** RE the M68AP kernelcache's `AppleNANDFTL`
-`FTL_Open` (why it rejects the context N45AP accepts → clean open) and/or
-`_ScanForFreeBlk` (line 2516/2565 in its log). The M68AP kernelcache is the
-1.1.4 `kernelcache.release.s5l8900xrb` (in the decrypted root FS / IPSW);
-disassemble its AppleNANDFTL kext. Compare the FTL-context validation
-(version/checksum/mapping) against what the generator writes
-(`dwVersion=0x46560000`). Alternatively, the DFU/`asr` restore path formats the
-NAND the way the driver expects. (The VFL zero-BBT patch is a diagnostic only —
-not landed; M68AP iBoot legitimately needs the production BBT.)
+**CRITICAL REFRAME — `_FTLRestore` and DFU/restore are BOTH dead ends; only a
+clean `FTL_Open` can work.** The emulator's NAND write model is write-ONLY:
+`hw/arm/ipod_touch_nand.c` writes modified pages to `%d_new.page` (line 275) but
+the READ path NEVER opens `_new.page` — it reads only `nand.pack` or the base
+`%d.page` (or an empty buffer). BUILD.md confirms: `_new.page` are "incomplete
+write captures, not a replayable overlay"; writable persistence "remains planned
+work." Therefore:
+- **N45AP MUST do a clean `FTL_Open` on the raw generator seed** — if it needed a
+  restore/format, those writes would be discarded (never read back) and it would
+  fail on EVERY boot. So the iPod boots the seed directly; it does NOT format,
+  restore, or use DFU. (The 1237 `_new.page` files in the installed N45AP NAND
+  are later, ignored write captures — not the source of its bootability.)
+- **Chasing M68AP's `_FTLRestore` to succeed is pointless** — even if it
+  completed, the rebuilt context could not persist. Likewise a DFU/`asr` restore
+  would not stick. Both are dead ends UNTIL a real NAND write/erase/persistence
+  model exists (the "planned work").
+
+**So the ONLY viable route: make the M68AP kernel's `AppleNANDFTL` `FTL_Open`
+CLEAN-OPEN the seed, exactly as N45AP's kernel does.** Our seed is byte-identical
+to the reference generator's (which N45AP clean-opens), so the M68AP kernelcache
+must VALIDATE the FTL context differently — it expects a field/version/format the
+generator does not write. Next step: disassemble the 1.1.4
+`kernelcache.release.s5l8900xrb` `AppleNANDFTL` kext's `FTL_Open` and find the
+context check that fails for M68AP where it passes for N45AP (compare against
+the generator's `dwVersion=0x46560000`, the FTL meta layout, and the mapping/
+free-VB-list fields). That is the whole remaining problem. (The VFL zero-BBT
+patch was diagnostic only — not landed; M68AP iBoot legitimately needs the
+production BBT for its own VFL_Open.)
 
 ## Session log — 2026-07-21 (real root FS DECRYPTED; kernel FTL needs a formatted NAND — SUPERSEDED above)
 
