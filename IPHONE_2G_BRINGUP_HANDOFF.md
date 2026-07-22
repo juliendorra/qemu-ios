@@ -104,7 +104,47 @@ matches M68AP, IOKit registers. The wall is now the kernel's `AppleNANDFTL`
 root device`. Both machines still reach the Darwin kernel in the acceptance
 batch (no regression from the shared UART change).
 
-## Session log — 2026-07-21 (real root FS DECRYPTED; kernel FTL needs a formatted NAND)
+## Session log — 2026-07-21 (generator port is FAITHFUL; the wall is an M68AP BBT/Whimory conflict)
+
+Corrected the earlier "needs a formatted NAND" theory using the repo's own docs
+and the real reference generator. New, firmer conclusions:
+
+- **BUILD.md is explicit: `*_new.page` files are "incomplete write captures, not
+  a replayable NAND overlay"; writable persistence "remains planned work."** So
+  the working N45AP NAND is the BASE seed (`nand_n45ap.zip`) that boots with a
+  CLEAN `FTL_Open` — NOT a kernel-formatted state. The blog part-1 "no
+  persistence" note is consistent: the generator seed is meant to boot directly.
+- **Our `build-m68ap-nand.py` port is FAITHFUL.** Compiled the real
+  `generate_nand.c` (it1g, FIL_ID→M68AP) and diffed its 136 532-page output
+  against ours: only 10 pages differ — 8 BBT pages (expected: our production
+  0xFF BBT vs the reference zero BBT) and 2 GPT pages (minor field diffs). The
+  FTL context, VFL context, mapping, and all data/spare pages are byte-identical.
+  (The data-block-spare bug was the last real port divergence and is now fixed.)
+- **The real remaining conflict is the BBT, and it is M68AP-specific:**
+  - Booting the reference generator's ZERO-BBT output on M68AP fails at iBoot:
+    `_LoadVFLCxt(line:768) fail bank 0` → `VFL_Open failed`. So M68AP
+    iBoot-204.3.14's Whimory GENUINELY needs the production (0xFF) BBT — its VFL
+    is stricter than N45AP iBoot's, which accepts the zero BBT.
+  - But WITH the production BBT, iBoot passes and the KERNEL's `AppleNANDFTL`
+    `FTL_Open` rejects the (reference-identical) FTL context → `_FTLRestore` →
+    `_ScanForFreeBlk` fails. N45AP's kernel does a clean `FTL_Open` on the same
+    context shape. So the M68AP kernelcache's `AppleNANDFTL` is also stricter
+    than N45AP's, OR the production BBT it required for iBoot is what its own
+    FTL_Open then rejects.
+
+**So the wall is a genuine M68AP Whimory/BBT mismatch, not a port bug and not a
+missing format step.** The two clean next experiments:
+1. **Isolate the BBT:** patch M68AP iBoot's VFL_Open BBT dependency (around the
+   DEVICEINFOBBT loader `0x18015fa0` / VFL_Open `0x18016194`) so the pure
+   zero-BBT reference seed reaches the kernel, and see if the kernel then does a
+   clean `FTL_Open`. If yes → the production BBT is the kernel's problem and the
+   real fix is the correct M68AP BBT/VFL format (or accept zero BBT throughout).
+2. **RE the M68AP kernelcache's `AppleNANDFTL` `FTL_Open`/`_ScanForFreeBlk`** to
+   learn exactly what it validates in the FTL context and the free-block scan
+   that N45AP's does not. This is the definitive route.
+Failing those, the DFU/`asr` restore path formats the NAND legitimately.
+
+## Session log — 2026-07-21 (real root FS DECRYPTED; kernel FTL needs a formatted NAND — SUPERSEDED above)
 
 Followed the strategic correction: got the authoritative sources instead of
 hand-crafting. Two results — one solved, one precisely diagnosed.
