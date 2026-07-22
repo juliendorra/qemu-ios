@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -55,6 +56,9 @@ M68AP_PHASES = [
     ("vfl_open", b"VFL_Open\t\t\t[OK]", False),
     ("ftl_open", b"FTL_Open\t\t\t[OK]", False),
     ("kernel", b"Darwin Kernel Version", False),
+    ("bsd_root", b"BSD root: disk0s1", False),
+    ("launchd", b"launchd[1]: BOOT_TIME", False),
+    ("springboard", b"Configuring SpringBoard for", False),
 ]
 # Markers that must be ABSENT for the milestone to hold.
 M68AP_MUST_NOT = [
@@ -67,17 +71,35 @@ N45AP_PHASES = [
     ("fil_init", b"FIL_Init\t\t\t[OK]", False),
     ("vfl_open", b"VFL_Open\t\t\t[OK]", False),
     ("kernel", b"Darwin Kernel Version", False),
+    ("bsd_root", b"BSD root: disk0s1", False),
+    ("launchd", b"launchd[1]: BOOT_TIME", False),
+    ("springboard", b"Configuring SpringBoard for", False),
 ]
+
+ROOT_PAGE_RE = re.compile(
+    r"itnand_root_page bank=(\d+) page=(\d+) present=(\d+) "
+    r"word_0=(0x[0-9a-f]+) word_20=(0x[0-9a-f]+) "
+    r"word_400=(0x[0-9a-f]+) spare_type=(0x[0-9a-f]+)")
+ROOT_READ_RE = re.compile(
+    r"itadm_root_read cmd=(0x[0-9a-f]+) count=(\d+) index=(\d+) "
+    r"bank=(\d+) page=(\d+)")
+NAND_ID_RE = re.compile(
+    r"itnand_id bank=(-?\d+) value=(0x[0-9a-f]+) active_banks=(\d+)")
 
 
 def run_qemu(qemu: Path, machine_arg: str, pflash: Path, serial: Path,
-             stderr: Path, monitor_log: Path, debug_log: Path, timeout_s: int,
-             icount_shift: int | None, interrupt_log: bool) -> None:
+             stderr: Path, monitor_log: Path, debug_log: Path, trace_log: Path,
+             timeout_s: int, icount_shift: int | None,
+             interrupt_log: bool) -> None:
     serial.write_bytes(b"")
     cmd = [str(qemu), "-M", machine_arg, "-m", "1G",
            "-pflash", str(pflash), "-L", str(APP / "Resources" / "pc-bios"),
            "-display", "none", "-serial", f"file:{serial}",
-           "-monitor", "stdio"]
+           "-monitor", "stdio",
+           "-trace", "enable=itnand_root_page",
+           "-trace", "enable=itadm_root_read",
+           "-trace", "enable=itnand_id",
+           "-trace", f"file={trace_log}"]
     if icount_shift is not None:
         cmd.extend(["-icount", f"shift={icount_shift}"])
     if interrupt_log:
@@ -120,6 +142,44 @@ def scan_phases(serial: Path, phases, must_not) -> dict:
             "deepest": deepest, "serial_bytes": len(data)}
 
 
+def scan_root_trace(trace_log: Path) -> dict:
+    """Summarize the identical controller boundary on N45AP and M68AP."""
+    text = trace_log.read_text(errors="replace") if trace_log.exists() else ""
+    pages = []
+    reads = []
+    identifications = []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        match = ROOT_PAGE_RE.search(line)
+        if match:
+            bank, page, present, word0, word20, word400, spare = match.groups()
+            pages.append({
+                "line": line_no, "bank": int(bank), "page": int(page),
+                "present": bool(int(present)), "word_0": word0,
+                "word_20": word20, "word_400": word400,
+                "spare_type": spare,
+            })
+            continue
+        match = ROOT_READ_RE.search(line)
+        if match:
+            cmd, count, index, bank, page = match.groups()
+            reads.append({
+                "line": line_no, "cmd": cmd, "count": int(count),
+                "index": int(index), "bank": int(bank), "page": int(page),
+            })
+            continue
+        match = NAND_ID_RE.search(line)
+        if match:
+            bank, value, active_banks = match.groups()
+            identifications.append({
+                "line": line_no, "bank": int(bank), "value": value,
+                "active_banks": int(active_banks),
+            })
+    return {"trace": str(trace_log),
+            "identifications": identifications,
+            "controller_reads": reads,
+            "physical_pages": pages}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--qemu", type=Path, default=DEFAULT_QEMU)
@@ -133,6 +193,8 @@ def main() -> int:
                     default=IPHONE_FILES / "nand")
     ap.add_argument("--skip-n45ap", action="store_true",
                     help="skip the iPod (N45AP) regression boot")
+    ap.add_argument("--skip-m68ap", action="store_true",
+                    help="run only the working iPod (N45AP) oracle")
     ap.add_argument("--timeout", type=int, default=45)
     ap.add_argument("--icount-shift", type=int, default=3,
                     help="deterministic QEMU icount shift (default: 3); "
@@ -152,7 +214,9 @@ def main() -> int:
     # --- M68AP case -----------------------------------------------------------
     missing = [str(p) for p in (args.qemu, args.bootrom, args.iboot_m68ap,
                                 args.nor_m68ap, args.nand_m68ap) if not p.exists()]
-    if missing:
+    if args.skip_m68ap:
+        result["cases"]["m68ap"] = {"status": "SKIP", "reason": "requested"}
+    elif missing:
         result["cases"]["m68ap"] = {"status": "SKIP",
                                     "reason": "missing inputs", "missing": missing}
     else:
@@ -163,13 +227,18 @@ def main() -> int:
         subprocess.run(["cp", "-Rc", str(args.nand_m68ap), str(m_nand)], check=True)
         m_nor = stage / "nor_m68ap.bin"
         shutil.copy2(args.nor_m68ap, m_nor)
+        m_bootrom = stage / "bootrom_s5l8900"
+        m_iboot = stage / "iboot_204_m68ap.bin"
+        shutil.copy2(args.bootrom, m_bootrom)
+        shutil.copy2(args.iboot_m68ap, m_iboot)
         serial = args.logs / "m68ap-serial.log"
-        machine = (f"iPhone-2G,bootrom={args.bootrom},"
-                   f"iboot={args.iboot_m68ap},nand={m_nand}")
+        machine = (f"iPhone-2G,bootrom={m_bootrom},"
+                   f"iboot={m_iboot},nand={m_nand}")
         run_qemu(args.qemu, machine, m_nor, serial,
                  args.logs / "m68ap-stderr.log",
                  args.logs / "m68ap-monitor.log",
-                 args.logs / "m68ap-interrupt.log", args.timeout,
+                 args.logs / "m68ap-interrupt.log",
+                 args.logs / "m68ap-nand-trace.log", args.timeout,
                  args.icount_shift if args.icount_shift >= 0 else None,
                  args.interrupt_log)
         scan = scan_phases(serial, M68AP_PHASES, M68AP_MUST_NOT)
@@ -182,7 +251,12 @@ def main() -> int:
             "status": "PASS" if milestone else "FAIL",
             "milestone_no_signature_error_cleared": milestone,
             "full_wmr_init": full_wmr,
+            "root_mounted": scan["reached"]["bsd_root"] is not None,
+            "launchd_started": scan["reached"]["launchd"] is not None,
+            "springboard_started": scan["reached"]["springboard"] is not None,
             "serial": str(serial),
+            "root_storage": scan_root_trace(
+                args.logs / "m68ap-nand-trace.log"),
             **scan,
         }
 
@@ -199,13 +273,20 @@ def main() -> int:
             if n_nand.exists():
                 shutil.rmtree(n_nand)
             subprocess.run(["cp", "-Rc", str(n_src), str(n_nand)], check=True)
+            n_bootrom = stage / "bootrom_s5l8900-n45ap"
+            n_iboot_staged = stage / "iboot_204_n45ap.bin"
+            n_nor_staged = stage / "nor_n45ap.bin"
+            shutil.copy2(args.bootrom, n_bootrom)
+            shutil.copy2(n_iboot, n_iboot_staged)
+            shutil.copy2(n_nor, n_nor_staged)
             serial = args.logs / "n45ap-serial.log"
-            machine = (f"iPod-Touch,bootrom={args.bootrom},"
-                       f"iboot={n_iboot},nand={n_nand}")
-            run_qemu(args.qemu, machine, n_nor, serial,
+            machine = (f"iPod-Touch,bootrom={n_bootrom},"
+                       f"iboot={n_iboot_staged},nand={n_nand}")
+            run_qemu(args.qemu, machine, n_nor_staged, serial,
                      args.logs / "n45ap-stderr.log",
                      args.logs / "n45ap-monitor.log",
-                     args.logs / "n45ap-interrupt.log", args.timeout,
+                     args.logs / "n45ap-interrupt.log",
+                     args.logs / "n45ap-nand-trace.log", args.timeout,
                      args.icount_shift if args.icount_shift >= 0 else None,
                      args.interrupt_log)
             scan = scan_phases(serial, N45AP_PHASES, None)
@@ -213,7 +294,13 @@ def main() -> int:
                   scan["reached"]["vfl_open"] is not None)
             result["cases"]["n45ap"] = {
                 "status": "PASS" if ok else "FAIL",
-                "serial": str(serial), **scan}
+                "root_mounted": scan["reached"]["bsd_root"] is not None,
+                "launchd_started": scan["reached"]["launchd"] is not None,
+                "springboard_started": scan["reached"]["springboard"] is not None,
+                "serial": str(serial),
+                "root_storage": scan_root_trace(
+                    args.logs / "n45ap-nand-trace.log"),
+                **scan}
 
     report = args.logs / "result.json"
     report.write_text(json.dumps(result, indent=2) + "\n")
