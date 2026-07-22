@@ -72,14 +72,20 @@ Not every problem found during this work was introduced by the iPhone profile:
   UART1 write does not spin before the kernel jump. Result: `Darwin Kernel
   Version ... RELEASE_ARM_S5L8900XRB`, platform expert matches M68AP, IOKit
   registers. Run in REAL TIME (`--icount-shift -1`).
-- **Still open (current blocker):** the kernel's `AppleNANDFTL` `_FTLRestore`
-  rejects the generated NAND (no free-block pool) → `Still waiting for root
-  device`. A NAND-generation fidelity task (the kernel FTL is stricter than
-  iBoot's). Full evidence and next-session prompt: `IPHONE_2G_BRINGUP_HANDOFF.md`.
-- **Root filesystem (for SpringBoard): separate, key-blocked.** The genuine
-  root FS `022-3894-4.dmg` is `encrcdsa`/vfdecrypt-encrypted (not an 8900
-  container), so the GID key does not open it; the kernelcache-only HFS+ reaches
-  kernel *load*, not a mountable root.
+- **Root filesystem: SOLVED.** `scripts/decrypt-m68ap-rootfs.sh` decrypts the real
+  1.1.4 root FS (`022-3894-4.dmg`, vfdecrypt/encrcdsa — NOT the GID key) with the
+  public VFDecrypt key and extracts the raw 266 MB HFS+ (kernelcache inside). The
+  NAND generator (`build-m68ap-nand.py --hfs`) was diffed byte-for-byte against the
+  real `generate_nand.c` — faithful (only BBT/GPT differ).
+- **Still open (current blocker): the M68AP kernelcache's `AppleNANDFTL`
+  `FTL_Open`.** It rejects the (reference-identical) FTL context → `_FTLRestore` →
+  `Still waiting for root device`, where N45AP's kernel does a CLEAN `FTL_Open`.
+  Proven NOT to be: the root FS, our generator, the data-block spare, erased-page
+  fidelity, or the BBT (isolation-tested). And because the emulator's NAND is
+  write-ONLY (`_new.page` never read back), `_FTLRestore`/format/DFU can never
+  persist — only a clean `FTL_Open` boots. So the sole remaining task is to make
+  the M68AP kernel clean-open the seed: RE its `AppleNANDFTL::FTL_Open` context
+  validation. Full evidence, addresses, and artifacts: `IPHONE_2G_BRINGUP_HANDOFF.md`.
 - **Deliberate mixed-artifact failures:** M68AP iBoot rejects N45AP NOR IMG2
   entries for their security epoch and rejects the N45AP NAND's WMR signature.
   A synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) clears the NOR

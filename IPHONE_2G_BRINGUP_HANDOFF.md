@@ -104,6 +104,72 @@ matches M68AP, IOKit registers. The wall is now the kernel's `AppleNANDFTL`
 root device`. Both machines still reach the Darwin kernel in the acceptance
 batch (no regression from the shared UART change).
 
+## Reference — key addresses, reusable artifacts, gotchas (consolidated 2026-07-21)
+
+**Key iBoot-204.3.14 (M68AP) addresses (VA base 0x18000000; file offset = VA − 0x18000000):**
+
+| What | VA |
+|---|---|
+| `load_macho_image` (kernelcache loader) | `0x1800d544` |
+| `dt_load` (device-tree loader) | `0x1800d060`; called `0x1800e07a`; post-load result `0x1800d0a6` |
+| `image_find_by_type('dtre'=0x64747265)` | `0x18008376`→`0x180083c0`; image-list head `0x180211a8` |
+| `image_load` → worker | `0x18008340` → `0x180088cc` |
+| IMG2 validator | `0x18008478` — magic@`0x18008498`, hdr-CRC@`0x180084a4` (CRC fn `0x18007780`), flags2 bit24@`0x180084aa`, epoch@`0x18008520`, `+0x3e0` sig memcmp@`0x180084f8` |
+| worker signed-path `+0x20` memcmp | `0x18008a0a` |
+| secure-boot decider (allow-unsigned) | `0x18005984`; config word `0x18022fa0` (seeded `0x2c0000` @ `security_init 0x18005a28`); CHIPID read `0x180018e4` → HW reg `0x3e500004` |
+| **secure-boot bypass patch** | file `0x5990`: `00 20`→`01 20` |
+| Signature crypto | `SHA1` fn `0x18003284` (HW SHA1 engine `0x38000000`); `AES` op `0x18001790` (HW AES `0x38c00000`); key const `0x18020200`, IV `0x18020210`, extra const `0x180201d4` |
+| VFL_Open / `_LoadVFLCxt` | `0x18016194`; block-read helper `0x18016120`; **BBT-bitmap skip** `tst/beq` `0x18016220`/`0x18016222` (file `0x16222`); "fail bank" print `0x18016344` (line 768) |
+| WMR_Init / DEVICEINFOBBT loader | `0x180164a0` / `0x18015fa0` |
+| UART: `uart_write` CTS spin / UART1 UMSTAT | `0x18003c9e` / MMIO `0x3cc0401c` |
+| Emulator MMIO bases | SHA1 `0x38000000`, AES `0x38c00000`, CHIPID `0x3e500000`, UART1 `0x3cc04000` |
+
+**IMG2 signature scheme (for signing NOR images faithfully instead of patching):**
+`+0x3e0` (0x20 B) = `AES(key@0x18020200, SHA1(header[0:0x3e0]))`; `+0x20` (0x40 B) =
+payload hash; flags2 `+0x1c` bit 1 = "signed"; `+0x64` = CRC32(header[0:0x64]).
+Signing order (per image): set flags2 (bit24+bit1) + fix `+0x64`; lldb-capture the
+worker's expected `+0x20` at `0x18008a0a`; write it + fix `+0x64`; lldb-capture the
+validator's expected `+0x3e0` at `0x180084f8` (now over the final header); write it.
+**Captured dtre values (for THIS dtre content only — recapture if it changes):**
+`+0x1c=0x01000002`; `+0x20 = 9607d927 bd39a9bf cc74064e 39b62ad2 788b3a73 51976319
+2ad530e1 61ed05b2 48e4e156 965ab1b1 f2ca47ff b9b71b98 8e5dda68 3cac2ce4 540c8d0a
+b0002dd1`; `+0x3e0 = ed93ebc3 c2335655 354a436b 128b925f d388d35d 345e8cd8 1dbde5a1
+187d0e5a`. Proven: an UNPATCHED iBoot accepts the signed dtre (logs `image … type
+dtre`). Blocked from completing only by the timer-consistency bug (`0x180034bc`).
+
+**VFDecrypt (root FS) key split (in `scripts/decrypt-m68ap-rootfs.sh`):** the 72-hex
+key = `aes_key(bytes 0:16) || hmacsha1_key(bytes 16:36)`; v2 encrcdsa header:
+blocksize@+0x34, datasize(u64)@+0x38, dataoffset(u64)@+0x40 (BE). Per-block IV =
+HMAC-SHA1(hmac_key, blockno_BE)[0:16]; AES-128-CBC per `blocksize` chunk from
+`dataoffset`. Key for `022-3894-4.dmg`:
+`d0a0c0977bd4b6350b256d6650ec9eca419b6f961f593e74b7e5b93e010b698ca6cca1fe`.
+
+**Reusable scratchpad artifacts (session-temp, not committed; regenerate as needed):**
+`filesystem-m68ap-readonly.img` (real 266 MB root FS), `gen-nand/` (compiled
+`generate_nand` + zero-BBT reference seed), `iboot_204_m68ap_sbpatch.bin`
+(secure-boot patched), `iboot_sb_vfl.bin` (secure-boot + diagnostic VFL zero-BBT
+patch), `nor_m68ap_fixed2.bin` (validator-normalised NOR), `vfdecrypt` (compiled) +
+`vfdecrypt.c`, plus `nor_dtre_signed_full.bin` (dtre faithfully signed) and the
+`sig-capture*.sh` / `dt-probe*.sh` lldb scripts.
+
+**Process gotchas / dead ends (don't repeat):**
+- **Disk:** each full NAND is ~288 MB (136 K page files); the scratchpad fills the
+  volume and then EVERY command ENOSPC-fails (even the harness output file). Delete
+  old NAND trees / boot-log dirs between runs. `rm` of a 136 K-file tree takes >120 s.
+- **Debugger:** only `lldb` is present (no `gdb`); it drives QEMU's gdbstub via
+  `gdb-remote` with `breakpoint set --hardware`. Always wrap in a host
+  `( sleep N; pkill -9 lldb qemu-system-arm )` watchdog. Break too EARLY (before an
+  operand is set) and registers read wrong (e.g. broke at `0x18008a02` instead of the
+  memcmp call `0x18008a0a`).
+- **Run kernel boots in REAL TIME** (`--icount-shift -1`); under icount the kernel
+  lacks wall-clock and parks in iBoot's UART loop before the banner.
+- **NAND is write-ONLY** (`_new.page` never read back) — so no `_FTLRestore`/format
+  can persist; only a clean `FTL_Open` boots. See the reframe below.
+- **CHIPID/dev-mode is a dead end** for unsigned images (config bit 4 never set).
+- **The BBT is NOT the kernel-FTL cause** (isolation test proved it).
+- **`_FTLRestore`/DFU restore are dead ends** until a real write/erase/persistence
+  model exists.
+
 ## Session log — 2026-07-21 (generator port is FAITHFUL; the wall is an M68AP BBT/Whimory conflict)
 
 Corrected the earlier "needs a formatted NAND" theory using the repo's own docs
