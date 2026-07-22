@@ -269,8 +269,13 @@ def build_mbr_page(boot_partition_size: int) -> bytes:
 
 
 def valid_ftl_spare() -> bytes:
+    # VFLSpare: dwCxtAge[0:4], dwReserved[4:8], cStatusMark[8], bSpareType[9],
+    # eccMarker[10]. The it1g generate_nand.c sets ONLY eccMarker=0xFF on data
+    # pages; the kernel-formatted N45AP data-block spares match (spare[10]=0xFF,
+    # spare[8]=0x00). A previous value of 0x00FF00FF at offset 8 also set
+    # cStatusMark (spare[8]) to 0xFF, diverging from the reference.
     spare = bytearray(BYTES_PER_SPARE)
-    struct.pack_into("<I", spare, 8, 0x00FF00FF)  # eccMarker region for data pages
+    spare[10] = 0xFF  # eccMarker
     return bytes(spare)
 
 

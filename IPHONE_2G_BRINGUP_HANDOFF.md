@@ -145,14 +145,34 @@ narrowing it precisely:
 
 **Realistic path to SpringBoard (next session):** produce a FORMATTED M68AP NAND,
 not a seed. Options: (a) make the kernel's first-boot `_FTLRestore` succeed on
-the seed (needs proper erased-page 0xFF + per-data-block FTL spare so
-`_ScanForFreeBlk` finds free blocks) and persist the kernel-written context; or
-(b) the DFU/USB restore path (iBSS/iBEC + restore ramdisk + `asr` formats the
-NAND) — the larger, more faithful project the design doc flagged as secondary.
-The N45AP release proves (a) is viable if the seed is `_FTLRestore`-able; the
-open question is exactly which spare/format fields N45AP's seed has that make its
-first-boot format succeed. Compare the installed N45AP NAND's data-block spares
-against the generator output to find them.
+the seed and persist the kernel-written context; or (b) the DFU/USB restore path
+(iBSS/iBEC + restore ramdisk + `asr` formats the NAND) — the larger, more
+faithful project the design doc flagged as secondary.
+
+**Update — (a) pushed hard, still blocked; two real fixes found, insufficient.**
+Two seed-vs-format divergences were identified and corrected, but the kernel's
+`_FTLRestore` still fails, so (a) needs deep AppleNANDFTL RE (or (b)):
+- **Data-block spare bug FIXED (landed in `build-m68ap-nand.py`):**
+  `valid_ftl_spare()` wrote `0x00FF00FF` at spare+8, which set BOTH
+  `VFLSpare.cStatusMark` (spare[8]) and `eccMarker` (spare[10]) to 0xFF. The
+  reference `generate_nand.c` and the kernel-formatted N45AP data blocks set ONLY
+  `eccMarker` (spare[8]=0x00, spare[10]=0xFF). Now matches byte-for-byte. This
+  is a genuine correctness fix regardless.
+- **Erased-page 0xFF (NAND model) reverted:** `hw/arm/ipod_touch_nand.c:141`
+  returns erased pages as 0x00+spare[0xA]=0xFF; real NAND is all-0xFF. Setting
+  0xFF removed the `unidentified spare` errors in one config but did NOT make
+  `_ScanForFreeBlk` succeed, and it touches shared code N45AP's full boot relies
+  on, so it was reverted (land only with `ipod-acceptance-test.py` validation).
+- **Even both together fail:** `_FTLRestore OK!` (with `lost part of the EC/RC
+  Table` warnings) but then `FTL_Open failed` / `_ScanForFreeBlk(0xF35) failed`.
+  So the free-block pool build needs more than erased-0xFF + correct data spare
+  — likely the production-BBT interpretation (M68AP uses a 0xFF BBT for iBoot;
+  N45AP uses zero) and/or EC/RC (erase-count/read-count) tables the kernel
+  format writes. This is genuinely deep: the format path is NOT demonstrated by
+  the N45AP example (N45AP ships a pre-formatted NAND and does a CLEAN FTL_Open,
+  never exercising `_FTLRestore` in the emulator). Next: either RE the kernel's
+  `_ScanForFreeBlk`/BBT handling from the kernelcache's AppleNANDFTL, or pivot to
+  the DFU/`asr` restore path (which is what legitimately *formats* a NAND).
 
 ## STRATEGIC CORRECTION — 2026-07-21 (the NAND approach diverged from the iPod path)
 
