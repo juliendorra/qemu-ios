@@ -90,7 +90,8 @@ NAND_ID_RE = re.compile(
 def run_qemu(qemu: Path, machine_arg: str, pflash: Path, serial: Path,
              stderr: Path, monitor_log: Path, debug_log: Path, trace_log: Path,
              timeout_s: int, icount_shift: int | None,
-             interrupt_log: bool) -> None:
+             interrupt_log: bool, observer_plugin: Path | None = None,
+             observer_args: str = "") -> None:
     serial.write_bytes(b"")
     cmd = [str(qemu), "-M", machine_arg, "-m", "1G",
            "-pflash", str(pflash), "-L", str(APP / "Resources" / "pc-bios"),
@@ -102,8 +103,18 @@ def run_qemu(qemu: Path, machine_arg: str, pflash: Path, serial: Path,
            "-trace", f"file={trace_log}"]
     if icount_shift is not None:
         cmd.extend(["-icount", f"shift={icount_shift}"])
+    debug_flags = []
+    if observer_plugin is not None:
+        plugin_spec = str(observer_plugin)
+        if observer_args:
+            plugin_spec += "," + observer_args.replace(
+                "{observer_log}", str(debug_log))
+        cmd.extend(["-plugin", plugin_spec])
+        debug_flags.append("plugin")
     if interrupt_log:
-        cmd.extend(["-d", "int", "-D", str(debug_log)])
+        debug_flags.append("int")
+    if debug_flags:
+        cmd.extend(["-d", ",".join(debug_flags), "-D", str(debug_log)])
     with stderr.open("wb") as errfh, monitor_log.open("wb") as monfh:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=monfh,
                                 stderr=errfh)
@@ -201,9 +212,17 @@ def main() -> int:
                          "use a negative value to disable icount")
     ap.add_argument("--interrupt-log", action="store_true",
                     help="write QEMU's verbose -d int exception trace")
+    ap.add_argument("--observer-plugin", type=Path,
+                    help="optional QEMU observer plugin used for both boards")
+    ap.add_argument("--observer-args", default="",
+                    help="comma-separated observer plugin arguments; "
+                         "{observer_log} expands to the board-specific log")
     ap.add_argument("--logs", type=Path,
                     default=Path(f"/private/tmp/iphone-nand-accept-{int(time.time())}"))
     args = ap.parse_args()
+
+    if args.observer_plugin is not None and not args.observer_plugin.is_file():
+        ap.error(f"observer plugin not found: {args.observer_plugin}")
 
     args.logs.mkdir(parents=True, exist_ok=True)
     stage = args.logs / "stage"
@@ -240,7 +259,8 @@ def main() -> int:
                  args.logs / "m68ap-interrupt.log",
                  args.logs / "m68ap-nand-trace.log", args.timeout,
                  args.icount_shift if args.icount_shift >= 0 else None,
-                 args.interrupt_log)
+                 args.interrupt_log, args.observer_plugin,
+                 args.observer_args)
         scan = scan_phases(serial, M68AP_PHASES, M68AP_MUST_NOT)
         milestone = (scan["reached"]["and_driver_m68ap"] is not None and
                      scan["reached"]["ftl_init"] is not None and
@@ -255,6 +275,8 @@ def main() -> int:
             "launchd_started": scan["reached"]["launchd"] is not None,
             "springboard_started": scan["reached"]["springboard"] is not None,
             "serial": str(serial),
+            "observer_log": (str(args.logs / "m68ap-interrupt.log")
+                             if args.observer_plugin else None),
             "root_storage": scan_root_trace(
                 args.logs / "m68ap-nand-trace.log"),
             **scan,
@@ -288,7 +310,8 @@ def main() -> int:
                      args.logs / "n45ap-interrupt.log",
                      args.logs / "n45ap-nand-trace.log", args.timeout,
                      args.icount_shift if args.icount_shift >= 0 else None,
-                     args.interrupt_log)
+                     args.interrupt_log, args.observer_plugin,
+                     args.observer_args)
             scan = scan_phases(serial, N45AP_PHASES, None)
             ok = (scan["reached"]["and_driver_n45ap"] is not None and
                   scan["reached"]["vfl_open"] is not None)
@@ -298,6 +321,8 @@ def main() -> int:
                 "launchd_started": scan["reached"]["launchd"] is not None,
                 "springboard_started": scan["reached"]["springboard"] is not None,
                 "serial": str(serial),
+                "observer_log": (str(args.logs / "n45ap-interrupt.log")
+                                 if args.observer_plugin else None),
                 "root_storage": scan_root_trace(
                     args.logs / "n45ap-nand-trace.log"),
                 **scan}

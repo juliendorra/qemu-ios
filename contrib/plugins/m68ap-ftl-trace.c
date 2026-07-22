@@ -27,26 +27,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define FTL_RESTORE_CALL        UINT64_C(0xc0473814)
 #define FTL_OPEN_SUCCESS        UINT64_C(0xc0473830)
 #define KERNEL_PANIC            UINT64_C(0xc0019790)
-#define USB_DEVICE_START_VA     UINT64_C(0xc04cb198)
 #define SDIO_START_VA           UINT64_C(0xc04ba0e8)
 #define FMC_FUNCTION_CALL       UINT64_C(0xc04ba240)
-#define ARM_FUNCTION_WITH       UINT64_C(0xc0158084)
-#define ARM_FUNCTION_WITH_CSTR  UINT64_C(0xc015816c)
-#define ARM_FUNCTION_WAIT_DONE  UINT64_C(0xc01580e4)
-#define ARM_FUNCTION_INIT_FAIL  UINT64_C(0xc015813e)
 #define GPIO_REGISTER_CALL      UINT64_C(0xc0492704)
 #define GPIO_REGISTER_RETURN    UINT64_C(0xc0492708)
 #define FUNCTION_SET_PROPERTY   UINT64_C(0xc01581da)
 #define FUNCTION_SET_RETURN     UINT64_C(0xc01581dc)
-#define WAIT_FOR_SERVICE        UINT64_C(0xc01351de)
-#define GET_EXISTING_SERVICES   UINT64_C(0xc0134d40)
-#define SERVICE_CANDIDATE       UINT64_C(0xc0134da0)
-#define SERVICE_MATCHED         UINT64_C(0xc0134dc8)
-#define SERVICE_ITER_RELEASE    UINT64_C(0xc0134dfa)
-#define GET_EXISTING_RETURN     UINT64_C(0xc0134e10)
-#define ROOT_DOMAIN_VTABLE      UINT32_C(0xc019a750)
-#define TAGGED_RELEASE_STORED   UINT64_C(0xc0122e04)
-#define TAGGED_RELEASE_UPDATED  UINT64_C(0xc0122e48)
 #define FTL_SCAN_READ_RETURN    UINT64_C(0xc0473100)
 #define FTL_SCAN_VALIDATE       UINT64_C(0xc0473128)
 #define FTL_SCAN_SELECT         UINT64_C(0xc0473140)
@@ -130,7 +116,61 @@ typedef struct TraceBlock {
     char *disassembly;
 } TraceBlock;
 
+typedef struct KernelProfile {
+    const char *name;
+    uint64_t usb_device_start;
+    uint64_t arm_function_with;
+    uint64_t arm_function_with_cstr;
+    uint64_t arm_function_wait_done;
+    uint64_t arm_function_init_fail;
+    uint64_t wait_for_service;
+    uint64_t get_existing_services;
+    uint64_t service_candidate;
+    uint64_t service_matched;
+    uint64_t service_iter_release;
+    uint64_t get_existing_return;
+    uint32_t root_domain_vtable;
+    uint64_t tagged_release_stored;
+    uint64_t tagged_release_updated;
+} KernelProfile;
+
+static const KernelProfile m68ap_profile = {
+    .name = "m68ap",
+    .usb_device_start = UINT64_C(0xc04cb198),
+    .arm_function_with = UINT64_C(0xc0158084),
+    .arm_function_with_cstr = UINT64_C(0xc015816c),
+    .arm_function_wait_done = UINT64_C(0xc01580e4),
+    .arm_function_init_fail = UINT64_C(0xc015813e),
+    .wait_for_service = UINT64_C(0xc01351de),
+    .get_existing_services = UINT64_C(0xc0134d40),
+    .service_candidate = UINT64_C(0xc0134da0),
+    .service_matched = UINT64_C(0xc0134dc8),
+    .service_iter_release = UINT64_C(0xc0134dfa),
+    .get_existing_return = UINT64_C(0xc0134e10),
+    .root_domain_vtable = UINT32_C(0xc019a750),
+    .tagged_release_stored = UINT64_C(0xc0122e04),
+    .tagged_release_updated = UINT64_C(0xc0122e48),
+};
+
+static const KernelProfile n45ap_profile = {
+    .name = "n45ap",
+    .usb_device_start = UINT64_C(0xc04c10c4),
+    .arm_function_with = UINT64_C(0xc0157e1c),
+    .arm_function_with_cstr = UINT64_C(0xc0157f04),
+    .arm_function_wait_done = UINT64_C(0xc0157e7c),
+    .arm_function_init_fail = UINT64_C(0xc0157ed6),
+    .wait_for_service = UINT64_C(0xc0134fba),
+    .get_existing_services = UINT64_C(0xc0134b1c),
+    .service_candidate = UINT64_C(0xc0134b7c),
+    .service_matched = UINT64_C(0xc0134ba4),
+    .service_iter_release = UINT64_C(0xc0134bd6),
+    .get_existing_return = UINT64_C(0xc0134bec),
+};
+
+static const KernelProfile *kernel_profile = &m68ap_profile;
+
 static bool skip_usb_start = true;
+static bool skip_usb_start_configured;
 static bool skip_sdio_start;
 static bool skip_platform_functions;
 static bool stop_at_verdict = true;
@@ -138,6 +178,7 @@ static bool stop_at_panic = true;
 static bool stop_at_verify_failure;
 static bool stabilize_root_domain;
 static bool trace_details = true;
+static bool service_observer_only;
 static bool root_domain_stabilized;
 static bool usb_patch_done;
 static bool usb_patch_reported;
@@ -175,6 +216,8 @@ static struct qemu_plugin_register *reg_sp;
 static struct qemu_plugin_register *reg_ip;
 static struct qemu_plugin_register *reg_lr;
 static struct qemu_plugin_register *reg_pc;
+static FILE *plugin_log_file;
+static char *plugin_log_path;
 
 static uint32_t read_u32_register(struct qemu_plugin_register *handle)
 {
@@ -190,8 +233,66 @@ static uint32_t read_u32_register(struct qemu_plugin_register *handle)
 
 static void plugin_log(const char *message)
 {
+    if (plugin_log_file) {
+        fprintf(plugin_log_file, "%s\n", message);
+        fflush(plugin_log_file);
+        return;
+    }
     qemu_plugin_outs(message);
     qemu_plugin_outs("\n");
+}
+
+static void trace_usb_start(unsigned int cpu_index, void *userdata)
+{
+    function_parent_wait_in_progress = true;
+    g_autofree char *line = g_strdup_printf(
+        "M68AP_FTL_TRACE usb_device_start profile=%s pc=0x%08" PRIx64,
+        kernel_profile->name, kernel_profile->usb_device_start);
+    plugin_log(line);
+}
+
+static bool is_m68ap_bsd_progress(uint64_t address)
+{
+    switch (address) {
+    case UINT64_C(0xc00f7000):
+    case UINT64_C(0xc00f702c):
+    case UINT64_C(0xc00f7078):
+    case UINT64_C(0xc00f707c):
+    case UINT64_C(0xc00f7088):
+    case UINT64_C(0xc01a3eca):
+    case UINT64_C(0xc01a3ed0):
+    case UINT64_C(0xc01a3eee):
+    case UINT64_C(0xc01a3ef2):
+    case UINT64_C(0xc01a3f02):
+    case UINT64_C(0xc01a3f06):
+    case UINT64_C(0xc01a3f08):
+    case UINT64_C(0xc01a3f0c):
+    case UINT64_C(0xc01a3f16):
+    case UINT64_C(0xc01a3f2c):
+    case UINT64_C(0xc01a3f30):
+    case UINT64_C(0xc01a3f32):
+    case UINT64_C(0xc01a3f36):
+    case UINT64_C(0xc01a3f3a):
+    case UINT64_C(0xc01a3f42):
+    case UINT64_C(0xc01a3f44):
+    case UINT64_C(0xc01a3f4a):
+    case UINT64_C(0xc01a3f4e):
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void trace_bsd_progress(unsigned int cpu_index, void *userdata)
+{
+    uint64_t address = (uintptr_t)userdata;
+    g_autofree char *line = g_strdup_printf(
+        "M68AP_FTL_TRACE bsd_progress pc=0x%08" PRIx64
+        " r0=0x%08" PRIx32 " r1=0x%08" PRIx32
+        " lr=0x%08" PRIx32,
+        address, read_u32_register(reg_r0), read_u32_register(reg_r1),
+        read_u32_register(reg_lr));
+    plugin_log(line);
 }
 
 static bool patch_start_method(uint64_t address, bool *done, bool *reported,
@@ -236,7 +337,7 @@ static bool patch_start_method(uint64_t address, bool *done, bool *reported,
 static void try_patch_unrelated_startups(unsigned int cpu_index, void *userdata)
 {
     if (skip_usb_start) {
-        patch_start_method(USB_DEVICE_START_VA, &usb_patch_done,
+        patch_start_method(kernel_profile->usb_device_start, &usb_patch_done,
                            &usb_patch_reported, "IOIpodUSBDevice");
     }
     if (skip_sdio_start) {
@@ -248,14 +349,14 @@ static void try_patch_unrelated_startups(unsigned int cpu_index, void *userdata)
         g_autoptr(GByteArray) patch = g_byte_array_new();
 
         if (qemu_plugin_read_memory_vaddr(
-                ARM_FUNCTION_WITH_CSTR, current,
+                kernel_profile->arm_function_with_cstr, current,
                 sizeof(platform_function_original))) {
             if (memcmp(current->data, platform_function_original,
                        sizeof(platform_function_original)) == 0) {
                 g_byte_array_append(patch, platform_function_unavailable,
                                     sizeof(platform_function_unavailable));
                 if (qemu_plugin_write_memory_vaddr(
-                        ARM_FUNCTION_WITH_CSTR, patch)) {
+                        kernel_profile->arm_function_with_cstr, patch)) {
                     platform_function_patch_done = true;
                     plugin_log("M68AP_FTL_TRACE diagnostic platform-function lookup unavailable at 0xc015816c");
                 }
@@ -351,7 +452,7 @@ static void trace_diagnostic_point(unsigned int cpu_index, void *userdata)
         regs[6], regs[7], regs[8], sl);
     plugin_log(line);
 
-    if (address == ARM_FUNCTION_WAIT_DONE) {
+    if (address == kernel_profile->arm_function_wait_done) {
         function_parent_wait_in_progress = true;
     }
 
@@ -391,7 +492,7 @@ static void trace_diagnostic_point(unsigned int cpu_index, void *userdata)
                 regs[1], value);
             plugin_log(text_line);
         }
-    } else if (address == ARM_FUNCTION_WAIT_DONE) {
+    } else if (address == kernel_profile->arm_function_wait_done) {
         g_autoptr(GByteArray) symbol = g_byte_array_new();
         g_autoptr(GByteArray) symbol_text = g_byte_array_new();
         g_autoptr(GByteArray) data_object = g_byte_array_new();
@@ -462,21 +563,21 @@ static void trace_service_matching(unsigned int cpu_index, void *userdata)
     if (!function_parent_wait_in_progress) {
         return;
     }
-    if (address == WAIT_FOR_SERVICE) {
+    if (address == kernel_profile->wait_for_service) {
         event = "wait_entry";
-    } else if (address == GET_EXISTING_SERVICES) {
+    } else if (address == kernel_profile->get_existing_services) {
         event = "enumeration_entry";
-    } else if (address == SERVICE_CANDIDATE) {
+    } else if (address == kernel_profile->service_candidate) {
         event = "candidate";
         object = read_memory_u32(sp);
-    } else if (address == SERVICE_MATCHED) {
+    } else if (address == kernel_profile->service_matched) {
         event = "matched";
         object = read_memory_u32(sp);
-    } else if (address == SERVICE_ITER_RELEASE) {
+    } else if (address == kernel_profile->service_iter_release) {
         event = "iterator_release";
         object = r8;
         service_iterator_teardown = true;
-    } else if (address == GET_EXISTING_RETURN) {
+    } else if (address == kernel_profile->get_existing_return) {
         event = "enumeration_return";
         object = r8;
     }
@@ -485,10 +586,12 @@ static void trace_service_matching(unsigned int cpu_index, void *userdata)
     uint32_t references = read_memory_u32(object + 4);
     uint32_t state = read_memory_u32(object + 0x24);
     uint32_t iterator_references = read_memory_u32(r4 + 4);
-    if (address == SERVICE_CANDIDATE && vtable == ROOT_DOMAIN_VTABLE) {
+    if (address == kernel_profile->service_candidate &&
+        kernel_profile->root_domain_vtable &&
+        vtable == kernel_profile->root_domain_vtable) {
         root_domain_object = object;
     }
-    if (address == SERVICE_ITER_RELEASE && stabilize_root_domain &&
+    if (address == kernel_profile->service_iter_release && stabilize_root_domain &&
         !root_domain_stabilized && root_domain_object) {
         uint32_t root_references = read_memory_u32(root_domain_object + 4);
 
@@ -514,6 +617,10 @@ static void trace_service_matching(unsigned int cpu_index, void *userdata)
         event, address, object, vtable, references, state, r4,
         iterator_references);
     plugin_log(line);
+    if (address == kernel_profile->get_existing_return) {
+        function_parent_wait_in_progress = false;
+        service_iterator_teardown = false;
+    }
 }
 
 static void trace_root_domain_release(unsigned int cpu_index, void *userdata)
@@ -535,7 +642,8 @@ static void trace_root_domain_release(unsigned int cpu_index, void *userdata)
     }
 
     references = read_memory_u32(object + 4);
-    event = address == TAGGED_RELEASE_STORED ? "entry" : "updated";
+    event = address == kernel_profile->tagged_release_stored ?
+            "entry" : "updated";
     g_autofree char *line = g_strdup_printf(
         "M68AP_FTL_TRACE root_domain_release event=%s pc=0x%08" PRIx64
         " object=0x%08" PRIx32 " references=0x%08" PRIx32
@@ -1214,6 +1322,50 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                              QEMU_PLUGIN_CB_NO_REGS, NULL);
     }
 
+    for (size_t i = 0; i < count; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        uint64_t address = qemu_plugin_insn_vaddr(insn);
+
+        if (address == kernel_profile->usb_device_start) {
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, trace_usb_start, QEMU_PLUGIN_CB_NO_REGS, NULL);
+        }
+    }
+
+    if (service_observer_only) {
+        for (size_t i = 0; i < count; i++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+            uint64_t address = qemu_plugin_insn_vaddr(insn);
+
+            if (address == kernel_profile->wait_for_service ||
+                address == kernel_profile->get_existing_services ||
+                address == kernel_profile->service_candidate ||
+                address == kernel_profile->service_matched ||
+                address == kernel_profile->service_iter_release ||
+                address == kernel_profile->get_existing_return) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_service_matching, QEMU_PLUGIN_CB_R_REGS,
+                    (void *)(uintptr_t)address);
+            } else if ((kernel_profile->tagged_release_stored &&
+                        address == kernel_profile->tagged_release_stored) ||
+                       (kernel_profile->tagged_release_updated &&
+                        address == kernel_profile->tagged_release_updated)) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_root_domain_release, QEMU_PLUGIN_CB_R_REGS,
+                    (void *)(uintptr_t)address);
+            } else if (address == KERNEL_PANIC) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_panic_exec, QEMU_PLUGIN_CB_R_REGS, NULL);
+            } else if (kernel_profile == &m68ap_profile &&
+                       is_m68ap_bsd_progress(address)) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_bsd_progress, QEMU_PLUGIN_CB_R_REGS,
+                    (void *)(uintptr_t)address);
+            }
+        }
+        return;
+    }
+
     if (!trace_details) {
         if (!stabilize_root_domain) {
             return;
@@ -1221,12 +1373,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         for (size_t i = 0; i < count; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
             uint64_t address = qemu_plugin_insn_vaddr(insn);
-            if (address == WAIT_FOR_SERVICE ||
-                address == GET_EXISTING_SERVICES ||
-                address == SERVICE_CANDIDATE ||
-                address == SERVICE_MATCHED ||
-                address == SERVICE_ITER_RELEASE ||
-                address == GET_EXISTING_RETURN) {
+            if (address == kernel_profile->wait_for_service ||
+                address == kernel_profile->get_existing_services ||
+                address == kernel_profile->service_candidate ||
+                address == kernel_profile->service_matched ||
+                address == kernel_profile->service_iter_release ||
+                address == kernel_profile->get_existing_return) {
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, trace_service_matching, QEMU_PLUGIN_CB_R_REGS,
                     (void *)(uintptr_t)address);
@@ -1315,9 +1467,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, trace_panic_exec, QEMU_PLUGIN_CB_R_REGS, NULL);
         } else if (address == FMC_FUNCTION_CALL ||
-                   address == ARM_FUNCTION_WITH ||
-                   address == ARM_FUNCTION_WAIT_DONE ||
-                   address == ARM_FUNCTION_INIT_FAIL ||
+                   address == kernel_profile->arm_function_with ||
+                   address == kernel_profile->arm_function_wait_done ||
+                   address == kernel_profile->arm_function_init_fail ||
                    address == GPIO_REGISTER_CALL ||
                    address == GPIO_REGISTER_RETURN ||
                    address == FUNCTION_SET_PROPERTY ||
@@ -1325,17 +1477,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, trace_diagnostic_point, QEMU_PLUGIN_CB_R_REGS,
                 (void *)(uintptr_t)address);
-        } else if (address == WAIT_FOR_SERVICE ||
-                   address == GET_EXISTING_SERVICES ||
-                   address == SERVICE_CANDIDATE ||
-                   address == SERVICE_MATCHED ||
-                   address == SERVICE_ITER_RELEASE ||
-                   address == GET_EXISTING_RETURN) {
+        } else if (address == kernel_profile->wait_for_service ||
+                   address == kernel_profile->get_existing_services ||
+                   address == kernel_profile->service_candidate ||
+                   address == kernel_profile->service_matched ||
+                   address == kernel_profile->service_iter_release ||
+                   address == kernel_profile->get_existing_return) {
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, trace_service_matching, QEMU_PLUGIN_CB_R_REGS,
                 (void *)(uintptr_t)address);
-        } else if (address == TAGGED_RELEASE_STORED ||
-                   address == TAGGED_RELEASE_UPDATED) {
+        } else if ((kernel_profile->tagged_release_stored &&
+                    address == kernel_profile->tagged_release_stored) ||
+                   (kernel_profile->tagged_release_updated &&
+                    address == kernel_profile->tagged_release_updated)) {
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, trace_root_domain_release, QEMU_PLUGIN_CB_R_REGS,
                 (void *)(uintptr_t)address);
@@ -1476,6 +1630,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     g_hash_table_destroy(storage_strategy_seen);
     g_hash_table_destroy(ftl_core_read_seen);
     g_ptr_array_free(trace_blocks, true);
+    if (plugin_log_file) {
+        fclose(plugin_log_file);
+    }
+    g_free(plugin_log_path);
 }
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
@@ -1495,6 +1653,17 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         }
         if (g_strcmp0(tokens[0], "skip-usb-start") == 0) {
             if (!qemu_plugin_bool_parse(tokens[0], tokens[1], &skip_usb_start)) {
+                return -1;
+            }
+            skip_usb_start_configured = true;
+        } else if (g_strcmp0(tokens[0], "profile") == 0) {
+            if (g_strcmp0(tokens[1], "m68ap") == 0) {
+                kernel_profile = &m68ap_profile;
+            } else if (g_strcmp0(tokens[1], "n45ap") == 0) {
+                kernel_profile = &n45ap_profile;
+            } else {
+                fprintf(stderr, "m68ap-ftl-trace: unknown profile: %s\n",
+                        tokens[1]);
                 return -1;
             }
         } else if (g_strcmp0(tokens[0], "skip-sdio-start") == 0) {
@@ -1530,11 +1699,36 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                                         &trace_details)) {
                 return -1;
             }
+        } else if (g_strcmp0(tokens[0], "service-observer-only") == 0) {
+            if (!qemu_plugin_bool_parse(tokens[0], tokens[1],
+                                        &service_observer_only)) {
+                return -1;
+            }
+        } else if (g_strcmp0(tokens[0], "log") == 0) {
+            g_free(plugin_log_path);
+            plugin_log_path = g_strdup(tokens[1]);
         } else {
             fprintf(stderr, "m68ap-ftl-trace: unknown option: %s\n", argv[i]);
             return -1;
         }
     }
+
+    if (kernel_profile == &n45ap_profile && !skip_usb_start_configured) {
+        skip_usb_start = false;
+    }
+
+    if (plugin_log_path) {
+        plugin_log_file = fopen(plugin_log_path, "w");
+        if (!plugin_log_file) {
+            fprintf(stderr, "m68ap-ftl-trace: cannot open log %s: %s\n",
+                    plugin_log_path, strerror(errno));
+            return -1;
+        }
+    }
+
+    g_autofree char *profile_line = g_strdup_printf(
+        "M68AP_FTL_TRACE kernel_profile=%s", kernel_profile->name);
+    plugin_log(profile_line);
 
     trace_blocks = g_ptr_array_new_with_free_func(free_trace_block);
     hfs_mountfs_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
