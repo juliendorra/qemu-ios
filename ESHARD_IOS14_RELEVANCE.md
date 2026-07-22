@@ -19,20 +19,22 @@ path.
 Consequently:
 
 - Direct code and hardware-model reuse is very low.
-- The log-led reverse-engineering loop, physical-buffer inspection, reversible
+- The log-led binary-analysis loop, physical-buffer inspection, reversible
   patch discipline, and minimal peripheral/service stubbing are highly
   relevant.
-- The most immediately useful lesson is to extend the existing M68AP
-  `FTL_Open` trace so it records the data consumed at each decisive branch,
-  rather than making further guesses about NAND metadata.
-- Once the root filesystem mounts, eShard's system-service triage is relevant
-  to activation, CommCenter, and SpringBoard bring-up, although none of its
-  exact iOS 14 patches should be carried over.
+- The decisive comparison was not with iOS 14 but with this repository's
+  working N45AP path. It exposed the real board difference: N45AP advertises
+  eight NAND chips while M68AP advertises four. Once the controller and
+  constructor used those board-specific layouts, M68AP clean-opened FTL,
+  validated both HFS B-trees, and mounted `disk0s1` as root.
+- eShard's system-service triage is relevant only after that legacy reference
+  path. It may help organize activation, CommCenter, and SpringBoard work, but
+  none of its exact iOS 14 patches should be carried over.
 - The modern restore and reverse-tethering paths do not bypass the current
   S5L8900 NAND write/persistence limitation.
 
 The recommended course is therefore to continue the present S5L8900 design
-and borrow eShard's forensic workflow, not to port or merge `qemu-t8030`.
+and borrow eShard's observational workflow, not to port or merge `qemu-t8030`.
 
 ## Sources reviewed
 
@@ -51,8 +53,8 @@ patch series for this repository.
 |---|---|---|
 | CPU and ABI | 64-bit modern Apple platform, including arm64e/PAC behavior | ARM1176, ARMv6, 32-bit ARM/Thumb |
 | Boards | T8030-era iPhone emulation, with experiments presenting older chip identities | N45AP iPod Touch 1G and M68AP original iPhone |
-| Security dependencies | SEP/keybag dependencies, PAC, modern signature enforcement | S5L8900 security epoch, IMG2 validation, AES/SHA engines, old secure-boot policy |
-| Storage | Modern restore-oriented stack | NOR plus eight-bank Whimory NAND/VFL/FTL and HFS+ |
+| Boot dependencies | SEP/keybag dependencies, PAC, modern signature enforcement | S5L8900 firmware epoch, IMG2 validation, AES/SHA engines, original boot policy |
+| Storage | Modern restore-oriented stack | NOR plus Whimory NAND/VFL/FTL and HFS+: eight active banks on N45AP, four on M68AP |
 | Graphics | IOSurface, IOMFB, compressed surfaces, Metal/AMX dependencies, software-rendering patches | Working S5L8900 LCD/framebuffer path shared by the iPod and iPhone profiles |
 | Input | Modern IOHID/AppleMultitouchDevice registration and injected events | Zephyr2 on N45AP and a modeled Zephyr1 SPI protocol on M68AP |
 | Userspace | backboardd, FrontBoard, PreBoard, SpringBoard, modern dyld cache | iPhone OS 1.x IOKit, launchd, CommCenter, SpringBoard, and launch-era activation |
@@ -72,19 +74,25 @@ and that planes were configured. It then dumped the physical DMA-backed
 surfaces and interpreted the buffers independently. This distinguished
 "display hardware exists" from "the guest produced a usable surface."
 
-The same distinction applies to the current M68AP blocker. It is already
-proven that:
+That method was applied to the M68AP storage path, but the closest working
+system supplied the answer before deeper `FTL_Open` disassembly was needed.
+The N45AP controller-identification trace showed eight valid NAND IDs and a
+1024-page superblock. M68AP firmware expects four valid IDs, four absent slots,
+and a 512-page superblock. The emulator had incorrectly advertised eight
+identical chips to both boards.
 
-- iBoot opens the generated NAND and loads the kernelcache;
-- the real M68AP Darwin kernel and IOKit start;
-- the kernel's `AppleNANDFTL` reaches `FTL_Open`;
-- the version/complement pair in the candidate context has the expected value;
-- execution nevertheless reaches `_LoadFTLCxt`'s failure sink and falls back
-  to `_FTLRestore`.
+After making NAND identification board-aware and constructing M68AP storage
+for four active banks, the real 4A102 kernel:
 
-The next question is not whether the on-disk context looks plausible. It is
-which copy and tables the driver actually selected, what it copied into RAM,
-and which validation operand first differed from the expected value.
+- clean-opens AppleNANDFTL without `_FTLRestore`;
+- receives the real extents B-tree header instead of a zero buffer;
+- validates the extents and catalog B-trees;
+- returns zero from `_vfs_mountroot`; and
+- reports `BSD root: disk0s1`.
+
+This replaces the earlier theory that an unknown M68AP-only FTL context check
+was the remaining storage variable. The context bytes were valid; the
+controller topology made the same logical block map differently.
 
 The repository already contains the correct foundation:
 
@@ -95,26 +103,11 @@ The repository already contains the correct foundation:
 - `contrib/plugins/m68ap-ftl-trace.c` records executed basic blocks and stops
   at the clean-open or restore verdict.
 
-At the time of this review, the runtime plugin records the control-flow path
-and some diagnostic registers, but it does not yet emit all FTL context and
-table inputs requested by `IPHONE_2G_BRINGUP_HANDOFF.md`.
-
-The next trace revision should record, at minimum:
-
-1. Every physical NAND bank/page read while the kernel is in `FTL_Open`, with
-   the page data/spare hashes.
-2. The selected context copy, its age, spare type, and source physical page.
-3. A bounded dump or hash-plus-field summary of the context after it is copied
-   into the kernel buffer.
-4. The mapping, erase-count, read-count, and log-table page selections and
-   their read results.
-5. Registers and comparison operands at each conditional edge capable of
-   reaching `0xc04737f8`.
-6. The first failing edge, expressed in the JSON report as an address, expected
-   value, observed value, and source page where known.
-
-This would turn the current basic-block trace into the NAND equivalent of
-eShard's physical-IOSurface inspection.
+The reusable outcome is the paired observation itself: trace the same semantic
+event on the working iPod and the iPhone, including controller identification,
+derived geometry, logical request, physical bank/page, and returned bytes.
+That evidence is more reliable than assuming the two S5L8900 boards have
+identical storage topology.
 
 ### 2. Use the closest working system as an oracle
 
@@ -280,21 +273,25 @@ categories of gates to look for in iPhone OS 1.x logs.
 
 ## Recommended application to the current M68AP work
 
-### Immediate priority: finish the `FTL_Open` input trace
+### Immediate priority: follow the working N45AP startup sequence
 
-Do not change the NAND constructor based on this review. Extend the existing
-bounded trace to capture the physical and in-memory inputs described above,
-then run it on a freshly generated full M68AP NAND with a staged NOR and iBoot.
-The test should stop at either clean-open success or the first edge into the
-known failure sink and should emit all evidence in one JSON result directory.
+The paired N45AP/M68AP storage observation is complete. Preserve its proven
+board distinction: N45AP advertises eight NAND chips; M68AP advertises four.
+Keep the constructor, controller identification, derived superblock size, HFS
+reads, and root-mount gates in one scripted regression. Do not resume
+`FTL_Open` disassembly unless a future run actually regresses before clean-open.
 
-Where feasible, add an equivalent N45AP observation at the same semantic
-boundary. Addresses will differ, so the comparison should be expressed in
-terms of events and fields rather than blindly reusing M68AP virtual addresses.
+The current frontier is after root mount. A detailed instrumented M68AP run
+continues through substantial driver setup, while lighter runs expose startup
+ordering failures as USB, SDIO, and then baseband request legacy GPIO platform
+functions. A blanket "platform functions unavailable" change is invalid: it
+breaks the common S5L8900 platform expert. The next comparison should therefore
+observe the working N45AP GPIO function-parent publication and consumer order,
+then compare the corresponding M68AP USB/SDIO/baseband requests.
 
 ### After root-device attachment
 
-Extend `scripts/iphone-nand-acceptance.py` with ordered gates for:
+Keep `scripts/iphone-nand-acceptance.py` reporting ordered gates for:
 
 1. root mount;
 2. launchd;
@@ -326,7 +323,8 @@ method rather than the implementation. The most valuable pattern is:
 > before retesting the whole case.
 
 That pattern already matches this repository's proven debugging loop. Applied
-to the current M68AP state, it reinforces the existing decision to trace
-`FTL_Open` context selection and table loading before changing NAND bytes. It
-also provides a useful playbook for activation, CommCenter, touch, and display
-issues after the root filesystem mounts.
+first to the working iPod, it found the four-bank/eight-bank controller
+difference and cleared M68AP storage through root mount. The same method should
+now be used at the legacy IOKit startup boundary. The iOS 14 implementation is
+not a design authority for that work; N45AP behavior and the iPhone OS 1.x
+DeviceTrees/drivers are.

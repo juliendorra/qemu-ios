@@ -10,68 +10,39 @@ the live bring-up state.
 
 ## ► NEXT-SESSION PROMPT (start here)
 
-> **THE M68AP DARWIN KERNEL NOW BOOTS.** With three fixes landed (below), m68ap
-> iBoot loads the device tree, hands off, and the real iPhone-2G kernelcache
-> runs: `Darwin Kernel Version 9.0.0d1 ... RELEASE_ARM_S5L8900XRB`, the platform
-> expert matches as **M68AP**, and IOKit registers cpu0 / vram@F400000 /
-> arm-io@3C000000 / buttons / dock / charger / FairPlay. (~5400 serial lines.)
+> **M68AP STORAGE NOW REACHES A CLEAN HFS ROOT MOUNT. SPRINGBOARD HAS NOT
+> STARTED.**
 >
-> **The next wall is the kernel's own NAND FTL.** After IOKit comes up, the
-> `AppleNANDFTL` kext's `_FTLRestore` scans the generated NAND, finds no valid
-> free-block pool (`_ScanForFreeBlk(0xF35) failed`, `wDataBlkCnt=0xF20
-> wFreeBlkCnt=0x15`, thousands of `found block (#N) with unidentified spare`),
-> so `FTL_Open failed`, `AppleNANDFTL::start ... failed`, and the kernel prints
-> `Still waiting for root device`. **This is a NAND-generation fidelity task,
-> not a hack:** the kernel FTL is stricter than iBoot's (iBoot's own `FTL_Open`
-> succeeds on this same NAND). Our tree has only metadata + a minimal 16 MB HFS
-> payload; every other block is bare-erased with empty spare, which the kernel
-> FTL rejects. Sub-tasks:
-> 1. Extend `scripts/build-m68ap-nand.py` to populate a proper FTL free-block
->    pool and per-block spare across all banks so `_FTLRestore` passes — match
->    the mature it1g/it2g generator's FTL context/free-list, not just the WMR
->    metadata pages. This is the same class as the earlier BBT/VFL work.
-> 2. Then place the real 1.1.4 root HFS+ (`022-3894-4.dmg`) so `rd=disk0s1`
->    mounts and boot proceeds to launchd/SpringBoard. Still blocked offline: the
->    dmg is `encrcdsa`/vfdecrypt-encrypted (GID key does not open it).
+> The breakthrough came from reproducing the working iPod Touch 1G path at the
+> NAND-controller identification boundary. N45AP advertises eight valid NAND
+> chips and derives `PAGES_PER_SUBLK 1024`. M68AP advertises four valid chips,
+> four absent ID slots, and derives `PAGES_PER_SUBLK 512`. QEMU had advertised
+> eight identical chips to both boards, so the M68AP kernel used the wrong
+> logical-to-physical mapping. The earlier "one unknown `FTL_Open` context
+> check" theory is superseded.
 >
-> **Verify with** `scripts/iphone-nand-acceptance.py` (its `kernel` JSON gate is
-> now reachable). **Use `--icount-shift -1` (real time)** so the kernel gets
-> enough wall-clock — the default icount path parks in iBoot's UART loop just
-> before the banner. The boot needs the patched iBoot (see fix 2) and the
-> validator-normalised NOR (fix 1).
+> With board-aware chip identification and a four-bank M68AP constructor, the
+> real 4A102 kernel clean-opens FTL, reads the real extents header at
+> `bank3/25858.page`, validates both HFS B-trees, returns zero from
+> `_vfs_mountroot`, and prints `BSD root: disk0s1`. The corresponding N45AP
+> regression still advertises eight chips and reaches SpringBoard.
 >
-> **The three fixes that got from "failed to load device tree" to a live kernel
-> (all landed this session):**
-> 1. **NOR IMG2 validator** — `build-m68ap-nor.py promote_loadable` normalises
->    each NOR image's flags2 (`+0x1c`) to bit 24 SET / bit 30 CLEAR and
->    recomputes the `+0x64` CRC, matching iBoot's RAM-normalised header. Faithful
->    format fix. (Committed earlier: `e44f44cad6`.)
-> 2. **Secure-boot bypass** — `scripts/patch-m68ap-iboot.py`: one 2-byte Thumb
->    edit at the unsigned-image decider (VA `0x18005984`, file `0x5990`
->    `00 20`→`01 20`). This RELEASE iBoot strictly enforces secure boot and our
->    synthetic images are unsigned; this is the standard "pwnage"-equivalent
->    every legacy-iOS emulator relies on. Apply to a STAGED iBoot copy; never
->    commit patched firmware.
-> 3. **UART CTS** — `hw/char/exynos4210_uart.c` UMSTAT now reports CTS asserted
->    (bit 0). Without it, m68ap iBoot's flow-controlled baseband write on UART1
->    (`0x3cc0401c`) spins forever right after `gBootArgs`. A genuine UART-model
->    completeness fix; N45AP never polls UMSTAT so it is unaffected.
+> **The current frontier is post-root legacy IOKit startup.** A detailed
+> instrumented M68AP run mounts root and continues through substantial driver
+> setup. Lightweight runs reveal a common GPIO-backed platform-function path:
+> a version-checked USB diagnostic decline moves the stop to SDIO, and an SDIO
+> diagnostic decline moves it to AppleBaseband. Globally hiding platform
+> functions is not valid because the common S5L8900 platform expert then fails.
 >
-> When M68AP finally boots through SpringBoard, create `iPhone 2G.app` from the
-> app scaffolding and the board-aware `s5l8900-profile=iphone-2g` launcher.
+> Next, script the same GPIO function-parent publication, service matching, and
+> consumer-start order on working N45AP and M68AP. Compare semantic events, not
+> virtual addresses. Preserve four-bank M68AP and eight-bank N45AP storage as a
+> combined regression. Do not return to NAND context changes unless that
+> regression actually stops before clean-open.
 >
-> ---
->
-> **(Historical, now solved) The device-tree secure-boot gate.** The full path
-> is reverse-engineered in the 2026-07-21 "device-tree load fully
-> reverse-engineered" session log below. Where it stood before the iBoot patch:
-> `dt_load` (`0x1800d060`) found the `dtre` descriptor and called `image_load`
-> (`0x18008340`→`0x180088cc`); the IMG2 validator (`0x18008478`) was cleared by
-> fix 1; the last gate was `image_load` (`0x180089b0`) taking the unsigned path
-> to decider `0x18005984`, which requires security-config `0x18022fa0` bit 4 —
-> never set in this RELEASE build — hence the secure-boot patch (fix 2). A more
-> faithful alternative to fix 2 is to reconstruct Apple's img2 GID signatures so
-> the bit-1 signed path passes; larger and separately licensable.
+> Always stage NAND/NOR/iBoot and bound the boot with the acceptance harness.
+> `_new.page` files are incomplete write captures and are not replayed, so
+> restore/format work remains a separate future fidelity track.
 
 **The former blocker (solved 2026-07-21, kept for the record):** after
 `FTL_Init [OK]`, iBoot Data-Aborted inside `memmove` (`DFAR=0x18100000`,
@@ -91,18 +62,47 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 
 ## Current state (one line)
 
-The iPhone-2G machine is merged onto the Wi-Fi/HTTPS line (one QEMU 11 binary
-registers both machines). SYSIC epoch, watchdog, M68AP extraction, synthetic
-NOR, NAND signature/production BBT/DEVICEINFOBBT fix, **and now the NAND
-filesystem payload** are all landed and verified. With a kernelcache-carrying
-HFS+ boot partition, m68ap iBoot mounts HFS+, loads/decrypts/decompresses the
-kernelcache. **The M68AP Darwin kernel now boots** (three fixes: NOR IMG2
-validator normalisation, an iBoot secure-boot bypass patch, and a UART CTS
-fix) — `Darwin Kernel Version ... RELEASE_ARM_S5L8900XRB`, platform expert
-matches M68AP, IOKit registers. The wall is now the kernel's `AppleNANDFTL`
-`_FTLRestore` (no free-block pool in the generated NAND) → `Still waiting for
-root device`. Both machines still reach the Darwin kernel in the acceptance
-batch (no regression from the shared UART change).
+The M68AP board, boot chain, four-bank NAND, AppleNANDFTL clean-open, both HFS
+B-trees, and root mount now work; launchd/SpringBoard parity has not yet been
+shown. The next milestone is a paired N45AP/M68AP trace of legacy GPIO
+function-parent publication and USB/SDIO/baseband consumer startup.
+
+## 2026-07-22 automated pre-FTL isolation — superseded by board-count result
+
+- `scripts/m68ap-ftl-trace.py` rebuilds a staged current NOR and scratch iBoot,
+  verifies a full-root NAND provenance manifest and metadata hash, bounds QEMU,
+  and emits `result.json`, serial, plugin, and preparation logs. It exits in
+  about 19 seconds on the current stop; repeated interaction is not required.
+- The current rebuilt NOR SHA-256 is
+  `89716fae81ac2817ddefe79a81e8ed3df878a5a5e4a5fd66c2563293e1726362`.
+  The older `7bf1668e...` NOR was stale and failed device-tree loading; do not
+  use it as a kernel-storage reference.
+- A fresh 266 MB HFS+ root image generated a 136,532-page NAND. Packing it into
+  a 288,901,732-byte `nand.pack` changed the stop time from about 21 to 19
+  seconds but not the result, ruling out sparse page-file lookup overhead.
+- The captured assertion is `IOPMrootDomain: attached at free()`. The decoded
+  return chain reaches `AppleARMFunction::withProvider`, called first for the
+  M68 SDIO `function-device_reset`. Its encoded parent is
+  `IOFunctionParent004040E0`, which correctly resolves to
+  `/device-tree/arm-io/gpio`; the GPIO driver logs a successful start.
+- A targeted registration trace proves GPIO startup calls
+  `AppleARMFunction::registerFunctionParent`, constructs
+  `IOFunctionParent004040E0`, and invokes `setProperty` on the GPIO service
+  before SDIO waits for it. Publication is therefore complete; the remaining
+  boundary is `waitForService` matching/retention and candidate enumeration.
+- Declining SDIO start moves the identical wait to AppleBaseband's
+  `function-bb_rst`. Making platform-function lookup globally unavailable
+  causes an earlier S5L driver stop. These were scoped diagnostic experiments,
+  not candidate fixes.
+- `scripts/inspect-apple-device-tree.py` accepts a raw tree, IMG2 container, or
+  full NOR and emits all `function-*` properties with resolved parent nodes.
+  Its M68/N45 comparison shows all references resolve; M68 adds telephone and
+  other board-specific GPIO functions, including SDIO `function-device_reset`,
+  while N45 SDIO uses `function-power_enable`.
+- These observations remain useful for the current post-root service-ordering
+  comparison, but the conclusion that the run stopped before FTL was caused by
+  the former eight-bank M68AP model. The four-bank result below supersedes that
+  storage boundary.
 
 ## Reference — key addresses, reusable artifacts, gotchas (consolidated 2026-07-21)
 
@@ -124,6 +124,26 @@ batch (no regression from the shared UART change).
 | UART: `uart_write` CTS spin / UART1 UMSTAT | `0x18003c9e` / MMIO `0x3cc0401c` |
 | Emulator MMIO bases | SHA1 `0x38000000`, AES `0x38c00000`, CHIPID `0x3e500000`, UART1 `0x3cc04000` |
 
+**Key 4A102 kernelcache AppleNANDFTL addresses** (decompressed Mach-O VA; ARM
+mode, not Thumb; reproduce with `scripts/analyze-m68ap-ftl-open.py`):
+
+| What | VA |
+|---|---|
+| WMR loaded call to `FTL_Open` | load target `0xc046df94`; call `0xc046df98` |
+| Whimory `FTL_Open` | `0xc047302c` |
+| Context version loads | `+0x7f8` at `0xc0473518`; `+0x7fc` at `0xc0473520` |
+| `_LoadFTLCxt` failure log | `0xc04737f8` |
+| `_FTLRestore` fallback | call `0xc0473814`; target `0xc0471ab8` |
+
+The version literals are `0x46560000` and `0xb9a9ffff`, exactly matching the
+generator and installed N45AP metadata page at `bank7/25855.page`. The page at
+`bank0/25728.page` is only the context-index spare marker and its 2 KiB data
+area is zero; it must not be passed to the metadata inspector. The real metadata
+page has SHA-256 `4877ba691c75b2134949c3e5a048700dc627d04ba0d65be842382c45519b7e3c`.
+Their match rules out the simplest
+"M68AP wants a different `dwVersion`" theory; a runtime trace must identify
+whether context selection, the copied page, or a mapping/EC/log-table read fails.
+
 **IMG2 signature scheme (for signing NOR images faithfully instead of patching):**
 `+0x3e0` (0x20 B) = `AES(key@0x18020200, SHA1(header[0:0x3e0]))`; `+0x20` (0x40 B) =
 payload hash; flags2 `+0x1c` bit 1 = "signed"; `+0x64` = CRC32(header[0:0x64]).
@@ -144,13 +164,13 @@ HMAC-SHA1(hmac_key, blockno_BE)[0:16]; AES-128-CBC per `blocksize` chunk from
 `dataoffset`. Key for `022-3894-4.dmg`:
 `d0a0c0977bd4b6350b256d6650ec9eca419b6f961f593e74b7e5b93e010b698ca6cca1fe`.
 
-**Reusable scratchpad artifacts (session-temp, not committed; regenerate as needed):**
-`filesystem-m68ap-readonly.img` (real 266 MB root FS), `gen-nand/` (compiled
-`generate_nand` + zero-BBT reference seed), `iboot_204_m68ap_sbpatch.bin`
-(secure-boot patched), `iboot_sb_vfl.bin` (secure-boot + diagnostic VFL zero-BBT
-patch), `nor_m68ap_fixed2.bin` (validator-normalised NOR), `vfdecrypt` (compiled) +
-`vfdecrypt.c`, plus `nor_dtre_signed_full.bin` (dtre faithfully signed) and the
-`sig-capture*.sh` / `dt-probe*.sh` lldb scripts.
+**Session-temp artifacts (not committed; regenerate, do not assume they remain):**
+`filesystem-m68ap-readonly.img` (real 266 MB root FS), a full NAND generated
+from it, `iboot_204_m68ap_sbpatch.bin`, and any diagnostic VFL patch. The
+2026-07-22 audit found that the surviving `m68ap-artifacts/stage-full/nand`
+directory is stale (old corrupt BBT plus an invalid kernelcache payload), so it
+is a negative fixture, not the kernel-FTL oracle. `scripts/analyze-m68ap-ftl-open.py`
+does not require a saved decrypted Mach-O; it decrypts/decompresses in memory.
 
 **Process gotchas / dead ends (don't repeat):**
 - **Disk:** each full NAND is ~288 MB (136 K page files); the scratchpad fills the
@@ -170,7 +190,207 @@ patch), `nor_m68ap_fixed2.bin` (validator-normalised NOR), `vfdecrypt` (compiled
 - **`_FTLRestore`/DFU restore are dead ends** until a real write/erase/persistence
   model exists.
 
-## Session log — 2026-07-21 (generator port is FAITHFUL; the wall is an M68AP BBT/Whimory conflict)
+## Session log — 2026-07-22 (FTL_Open statically located; version pair ruled out)
+
+Converted the kernelcache investigation into a reproducible, fixture-free tool:
+
+- `scripts/analyze-m68ap-ftl-open.py` parses the `89001.0` container, decrypts it
+  with the existing S5L8900 GID key through OpenSSL, decompresses `complzss`,
+  verifies Adler-32, parses the Mach-O segments, and locates the stripped
+  AppleNANDFTL call chain from its strings/literal references. It emits JSON and
+  writes no decrypted firmware unless `--macho-out` is explicitly requested.
+- For the 1.1.4/4A102 artifact, compressed size `0x332059` expands to `0x5bc520`;
+  Adler-32 is `0xd363ef9b`, and the Mach-O SHA-256 is
+  `82e538d71c8d867566f26678f08e8ecf27b74eab8e6a9e2ec30608ebbbcf2b5f`.
+- `FTL_Open` is ARM code at `0xc047302c`, called by WMR at `0xc046df98`.
+  Its failure sink logs `_LoadFTLCxt` at `0xc04737f8`, then calls
+  `_FTLRestore` at `0xc0473814` (target `0xc0471ab8`).
+- The code loads context offsets `0x7f8/0x7fc` and compares them with
+  `0x46560000/0xb9a9ffff`. The generator, installed N45AP base, and staged M68AP
+  metadata page (`bank7/25855.page`) all contain exactly that pair and share full-page SHA-256
+  `4877ba691c75b2134949c3e5a048700dc627d04ba0d65be842382c45519b7e3c`.
+  Therefore do not change `dwVersion`; the failure is elsewhere or the wrong
+  bytes reach the check at runtime.
+- A bounded acceptance rerun caught an artifact trap rather than a new emulator
+  bug: the surviving full scratch NAND still had the superseded BBT count
+  `0xffffffff` and Data-Aborted in iBoot. On a staged clone, replacing only the
+  eight BBT pages with the validated `count=0x200` pages restored iBoot
+  `VFL_Open [OK]` / `FTL_Open [OK]`, after which the stale payload reported
+  `Kernelcache image not valid`. Regenerate the full M68AP root NAND before the
+  kernel trace; do not mutate or promote this scratch tree.
+
+## Session log — 2026-07-22 (iPod comparison clears M68AP root mount)
+
+The working N45AP boot was observed at the same controller and filesystem
+boundaries as M68AP. That direct comparison found the board distinction that
+the earlier traces had missed:
+
+- N45AP returns eight valid NAND IDs, reports `BANKS_TOTAL 8`, derives
+  `PAGES_PER_SUBLK 1024`, and performs the expected eight-page interleaved read.
+- M68AP returns four valid IDs followed by four absent (`0xffffffff`) slots,
+  reports `BANKS_TOTAL 4`, and derives `PAGES_PER_SUBLK 512`.
+- The QEMU NAND model previously returned a valid identical ID for every slot
+  on both boards. Restricting later data reads to four banks did not fix the
+  identification handshake, which is why the earlier four-bank experiment was
+  a false negative.
+
+The production correction adds a board-aware active-bank count to the shared
+NAND controller, makes both direct and ADM identification report absent M68AP
+slots explicitly, and makes `build-m68ap-nand.py` default to four active banks
+for M68AP while retaining eight for N45AP. The M68AP metadata is emitted in its
+four-bank location; the speculative bank-7 mirror is removed.
+
+A bounded M68AP run with that layout proves the complete storage chain:
+
+- four valid and four absent NAND IDs;
+- iBoot kernel load and kernel FTL clean-open;
+- the real HFS extents header delivered at `bank3/25858.page`;
+- extents and catalog B-tree validation;
+- `_vfs_mountroot` return 0 and HFS mount result 0; and
+- `BSD root: disk0s1`.
+
+Machine-readable evidence is in
+`/private/tmp/m68ap-four-bank-identify-test-20260722/result.json`. A second run
+from a freshly generated current-default four-bank tree reproduced the result
+as `ROOT_MOUNTED` in
+`/private/tmp/m68ap-four-bank-current-root-20260722/result.json`; this run used
+the explicitly reported diagnostic root-domain retention to make the existing
+startup-order race deterministic, but no guest storage bytes were patched. The paired
+N45AP regression is
+`/private/tmp/n45ap-four-bank-board-regression-20260722/result.json`; it keeps
+eight valid IDs, reaches the Darwin kernel and `BSD root`, logs launchd's
+`BOOT_TIME` marker, and prints `Configuring SpringBoard for N45AP`. Neither
+result directory is a repository artifact.
+
+This materially closes the iPhone/iPod storage gap. It does not yet establish
+SpringBoard parity. Detailed M68AP observation proceeds well beyond root mount,
+while lightweight runs expose a timing/order-sensitive legacy IOKit failure at
+USB, then SDIO, then baseband when those consumers request GPIO-backed platform
+functions. The next reusable test should compare N45AP and M68AP service
+publication/consumer order in one run and emit ordered events to JSON.
+
+That comparison harness now exists as `scripts/compare-s5l8900-startup.py`.
+Against the paired logs above it reports 116 shared service-start events. N45AP
+reaches root, launchd, and SpringBoard without a panic. The 75-second detailed
+M68AP run reaches root without a panic but not launchd before its bounded stop;
+it has the diagnostic USB-start decline and root-domain retention explicitly
+recorded. The corresponding lightweight M68AP run reaches
+`IOIpodUSBDevice::start` and panics at that exact point, while N45AP starts and
+registers the same service and continues through storage to SpringBoard.
+
+The DeviceTree comparison also narrows the difference. Both boards register the
+charger before `IOIpodUSBDevice` and both charger USB functions ultimately use
+the GPIO parent. N45AP's SDIO uses GPIO `function-power_enable`; M68AP replaces
+that with GPIO `function-device_reset` and adds five baseband GPIO functions.
+All descriptors resolve structurally. Therefore the next target is the first
+M68AP `IOIpodUSBDevice::start` platform-function lookup and its service
+ownership/order, compared with the successful N45AP call—not another broad
+platform-function bypass.
+
+Static inspection and a bounded unadjusted M68AP trace now identify that call
+exactly. `IOIpodUSBDevice::start` is at `0xc04cb198`. It builds a service match
+for the literal `usb-otg`, calls `waitForService`, and, if that returns, asks
+`AppleARMFunction` for the literal `function-usb_500_100`. The unadjusted trace
+stops inside `waitForService` before the function constructor executes, with
+`IOPMrootDomain: attached at free()`. The GPIO driver had already published
+`IOFunctionParent004040E0`; no NAND read or HFS operation is involved. Evidence
+is `/private/tmp/m68ap-usb-start-trace-20260722/result.json`.
+
+This changes the immediate question from "which platform function is missing?"
+to "why does M68AP service enumeration release an attached candidate while
+N45AP's identical `usb-otg` lookup completes?" The next paired observation
+should record the `waitForService` candidate sequence and ownership transitions
+on N45AP, then compare that with the failing M68AP sequence.
+
+Machine-readable comparison output is
+`/private/tmp/s5l8900-startup-comparison-20260722.json`; the DeviceTree output is
+`/private/tmp/s5l8900-device-tree-comparison-20260722.json`.
+
+## Session log — 2026-07-22 (earlier kernel FTL placement result — superseded)
+
+> Historical diagnostic record only. Mirroring the context into bank 3 allowed
+> one intermediate clean-open, but it did not model the board correctly. The
+> four-bank controller-identification result above removes that mirror and also
+> clears the later zero-buffer/HFS failure described in this section.
+
+The scripted runtime trace identified and corrected the first failing storage
+edge:
+
+- `scripts/m68ap-ftl-trace.py` records context scan/read verdicts and physical
+  NAND context-page transitions. `scripts/m68ap-ftl-batch.py` retries bounded
+  boots automatically and stops at the first FTL verdict.
+- The 4A102 kernel accepts the context-index marker, then reads context offset
+  `0x1ff`. Its VFL maps that offset to `bank3/25855.page`; the historical iBoot
+  path reads the byte-identical context at `bank7/25855.page`.
+- Before the correction, `bank3/25855.page` was absent, so the kernel observed
+  spare type `0x00` and failed before its version check. This disproves the
+  earlier broad “different context validation” description: the failure was a
+  specific physical placement difference.
+- `build-m68ap-nand.py` now emits the same metadata page at both locations for
+  M68AP only. The N45AP constructor output is unchanged. A bounded boot then
+  observed spare type `0x43`, version `0x46560000`, complement `0xb9a9ffff`, and
+  `FTL_OPEN_SUCCESS` on the first attempt. iBoot also continued to clean-open.
+- A longer run created `IOFlashBlockDevice`, registered `disk0s1`, recognized
+  the GUID partition, and repeatedly reported `BSD root: disk0s1`. It has not
+  mounted HFSX or started launchd/SpringBoard yet.
+
+The active boundary is now the HFS extents B-tree after successful disk
+discovery. Follow-up scripted traces established all of these points:
+
+- `_bsd_init` calls `_vfs_mountroot` at `0xc01a3ec2`; at `0xc01a3ec8` the
+  nonzero return branches directly back to root selection.
+- The selected root is consistently `disk0s1` (`rootdev=0x0e000001`) and
+  `_bdevvp` has produced a non-null root vnode. The outer return is 19 only
+  because `_vfs_mountroot` discards the individual handler error and exhausts
+  the handler list.
+- The `hfs` mount-root callback is present at `0xc00da1d1`. Its primary
+  volume-header buffer read succeeds. Physical NAND tracing observes the
+  expected `HX`, version 5 word (`0x05005848`) at bank 3/page 25856 offset
+  `0x400`.
+- The deeper HFS mount returns error 5 (`EIO`). A unique-block trace of its
+  first attempt reaches `BTOpenPath` at `0xc00e3af4`, then
+  `_MacToVFSError`, and returns immediately. Thus the first failing filesystem
+  phase is opening the extents B-tree, not finding the disk or accepting the
+  primary volume header.
+- The staged image's volume header declares a 4096-byte allocation block and
+  an extents file of 2,387,968 bytes / 583 blocks in one extent beginning at
+  allocation block 4. The generated physical bytes begin at bank 3/page 25857,
+  but the page-25857 observation in the first sparse trace occurred during
+  iBoot, before the kernel trace markers. The kernel makes no extents data-page
+  NAND request during the failing mount, so the earlier instruction to verify
+  a direct kernel page-25857 transfer was too early.
+- Targeted `BTOpenPath` tracing proves its block-size setup and
+  `GetBTreeBlock`/`buf_meta_bread` call return 0. The subsequent
+  `_VerifyHeader` at `0xc00e5490` returns `-32730`, the kernel's
+  `fsBTInvalidHeaderErr`; its executed basic blocks isolate the first failed
+  check to `nodeSize`. The complete 38-byte in-memory `BTHeaderRec` is zero,
+  including `nodeSize=0`.
+- This is not a buffer-cache shortcut. The first read executes
+  `_hfs_vnop_strategy`, maps logical block 0 to device block 8, dispatches
+  through the `disk0s1` vnode (`dev=0x0e000001`), and reaches the dynamically
+  registered storage strategy at `0xc045c7bd`. That prelinked wrapper enters
+  `0xc045c4d0`, reports successful completion, but leaves the buffer zero and
+  never reaches the NAND data-page request path.
+- The next deterministic step is to trace the executed path within
+  `0xc045c4d0` and its provider-vtable call, identifying where block 8 stops
+  before AppleNANDFTL. Do not alter the HFS seed or bypass `VerifyHeader` unless
+  that trace demonstrates a constructor error. Once the real extents header
+  reaches the buffer, continue to catalog opening, mount success, launchd, and
+  SpringBoard, followed by an N45AP regression run.
+
+Evidence is machine-readable in
+`/private/tmp/m68ap-hfs-stage-trace/result.json` and
+`/private/tmp/m68ap-hfs-mountfs-blocks/result.json`, with the narrowed checks in
+`/private/tmp/m68ap-verify-header-path-20260722/result.json`,
+`/private/tmp/m68ap-bt-buffer-path-20260722/result.json`, and
+`/private/tmp/m68ap-bt-storage-strategy-20260722/result.json`. The last run uses
+the harness's `--stop-at-verify-failure` gate and completes in about 19 seconds
+instead of consuming the full timeout. These are staged local results, not
+repository artifacts. The root-domain reference adjustment used to make these
+runs deterministic is opt-in and diagnostic only; no firmware or NAND file was
+modified by it.
+
+## Session log — 2026-07-21 (generator faithful; BBT isolated; kernel clean-open wall)
 
 Corrected the earlier "needs a formatted NAND" theory using the repo's own docs
 and the real reference generator. New, firmer conclusions:
@@ -235,17 +455,14 @@ work." Therefore:
   would not stick. Both are dead ends UNTIL a real NAND write/erase/persistence
   model exists (the "planned work").
 
-**So the ONLY viable route: make the M68AP kernel's `AppleNANDFTL` `FTL_Open`
-CLEAN-OPEN the seed, exactly as N45AP's kernel does.** Our seed is byte-identical
-to the reference generator's (which N45AP clean-opens), so the M68AP kernelcache
-must VALIDATE the FTL context differently — it expects a field/version/format the
-generator does not write. Next step: disassemble the 1.1.4
-`kernelcache.release.s5l8900xrb` `AppleNANDFTL` kext's `FTL_Open` and find the
-context check that fails for M68AP where it passes for N45AP (compare against
-the generator's `dwVersion=0x46560000`, the FTL meta layout, and the mapping/
-free-VB-list fields). That is the whole remaining problem. (The VFL zero-BBT
-patch was diagnostic only — not landed; M68AP iBoot legitimately needs the
-production BBT for its own VFL_Open.)
+**So the viable route under the current NAND model is to make the M68AP kernel's
+AppleNANDFTL clean-open the seed, exactly as N45AP's kernel does.** The remaining
+scope is `FTL_Open` and the NAND/VFL inputs it consumes; it is not yet proven to
+be one missing static field. The 2026-07-22 analysis above subsequently located
+the function and proved that its `dwVersion/dwVersionNot` pair already matches.
+Trace context selection and table loading next. (The VFL zero-BBT patch was
+diagnostic only — not landed; M68AP iBoot legitimately needs the production BBT
+for its own VFL_Open.)
 
 ## Session log — 2026-07-21 (real root FS DECRYPTED; kernel FTL needs a formatted NAND — SUPERSEDED above)
 
@@ -430,8 +647,9 @@ the run parks in iBoot's UART loop before the banner.
 **Next wall (kernel NAND FTL):** `AppleNANDFTL::_FTLRestore` rejects the
 generated NAND (`_ScanForFreeBlk(0xF35) failed`, `wFreeBlkCnt=0x15`, many
 `unidentified spare`) → `FTL_Open failed` → `Still waiting for root device`.
-The kernel FTL is stricter than iBoot's; the generated tree needs a real
-free-block pool + per-block spare (see the NEXT-SESSION prompt).
+The kernel FTL is stricter than iBoot's. This was the then-current diagnosis;
+the later clean-open reframe and 2026-07-22 static analysis supersede the
+free-block-pool prescription.
 
 **Why N45AP boots UNPATCHED but M68AP needs the patch (proven, not assumed).**
 It is NOT that the iPod's iBoot is more permissive — the two are identical here:
@@ -933,8 +1151,8 @@ format-construction task:
   `NANDDRIVERSIGN` page, WMR/VFL production fields, mapping pages, BBT, GPT,
   and HFS data. This is the closest precedent for the M68AP rejection.
 - `scripts/pack-ipod-nand.py` still only compacts an existing page tree. The
-  missing repository component is a constructor equivalent to the public iPod
-  generators, specialized for M68AP.
+  M68AP constructor is now implemented and reference-diffed; the remaining
+  blocker is the M68AP kernel's clean `FTL_Open`, not physical-page construction.
 
 ### Route decision
 
@@ -1255,13 +1473,24 @@ this as a regression invariant.
 - `scripts/test-build-m68ap-nand.py` — structural fixture tests (no Apple
   payloads): N45AP fingerprints, M68AP signature/BBT, VFL spare, geometry.
 - `scripts/iphone-nand-acceptance.py` — board-aware M68AP NAND boot acceptance
-  (staged copies, hard timeout, JSON phase gates) + N45AP regression in the same
-  batch.
+  (staged copies, hard timeout, explicit root/launchd/SpringBoard JSON gates) +
+  N45AP regression in the same batch.
+- `scripts/m68ap-ftl-trace.py` and `contrib/plugins/m68ap-ftl-trace.c` — bounded
+  storage/filesystem and startup observation, including NAND identification,
+  HFS mount results, and explicitly labelled diagnostic startup adjustments.
+- `scripts/compare-s5l8900-startup.py` — ordered semantic comparison of N45AP
+  and M68AP serial startup events and parity milestones; output is JSON.
+- `scripts/analyze-m68ap-ftl-open.py` — in-memory 8900 decrypt + `complzss`
+  verification + Mach-O/ARM literal analysis for the stripped AppleNANDFTL
+  `FTL_Open`/`_FTLRestore` call chain; emits JSON and optionally checks a physical
+  FTL metadata page.
+- `scripts/test-analyze-m68ap-ftl-open.py` — fixture-free LZSS, Mach-O mapping,
+  and FTL metadata-field tests; no Apple artifact required.
 - `scripts/iphone-smoke-test.py` — N45AP-firmware board-divergence regression;
   it is not a real M68AP kernel test.
 - The IPSW, decrypted images, generated M68AP NAND, and any physical comparison
-  dump stay uncommitted. The extractor and NOR builder are complete; the next
-  repository artifact is the constructor plus structural/boot tests.
+  dump stay uncommitted. The next repository work is the paired N45AP/M68AP
+  `IOIpodUSBDevice::start` platform-function observation described above.
 - Every generated NAND must carry a sidecar provenance manifest with IPSW
   device/build and hash, extracted HFS/kernelcache hashes, constructor commit,
   output geometry, and declared guest-file modifications.
