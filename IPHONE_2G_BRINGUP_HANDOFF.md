@@ -27,18 +27,21 @@ the live bring-up state.
 > `_vfs_mountroot`, and prints `BSD root: disk0s1`. The corresponding N45AP
 > regression still advertises eight chips and reaches SpringBoard.
 >
-> **The current frontier is post-root legacy IOKit startup.** A detailed
-> instrumented M68AP run mounts root and continues through substantial driver
-> setup. Lightweight runs reveal a common GPIO-backed platform-function path:
-> a version-checked USB diagnostic decline moves the stop to SDIO, and an SDIO
-> diagnostic decline moves it to AppleBaseband. Globally hiding platform
-> functions is not valid because the common S5L8900 platform expert then fails.
+> **The first post-root failure is now isolated to one IOKit object-lifetime
+> difference.** The N45AP and M68AP USB drivers contain the same start routine
+> and both find the same `usb-otg` service. During that lookup, however, the
+> M68AP `IOPMrootDomain` candidate has references `0x00010002`; its N45AP
+> counterpart has `0x00130016`. Iterator teardown drops M68AP to its last
+> reference and triggers `IOPMrootDomain: attached at free()`.
 >
-> Next, script the same GPIO function-parent publication, service matching, and
-> consumer-start order on working N45AP and M68AP. Compare semantic events, not
-> virtual addresses. Preserve four-bank M68AP and eight-bank N45AP storage as a
-> combined regression. Do not return to NAND context changes unless that
-> regression actually stops before clean-open.
+> A clearly labelled diagnostic extra retain proves causality: without skipping
+> USB or hiding platform functions, M68AP then registers USB, starts SDIO,
+> baseband and Wi-Fi, mounts root, completes `bsd_init`, and successfully
+> executes `/sbin/launchd`. The process still emits no `BOOT_TIME` marker and
+> the CPU becomes idle, so SpringBoard parity is not reached. The production
+> work is (1) find which real M68AP power-management relationship supplies the
+> missing root-domain ownership, then (2) trace the successfully loaded launchd
+> process to its first wait. The direct reference edit remains diagnostic-only.
 >
 > Always stage NAND/NOR/iBoot and bound the boot with the acceptance harness.
 > `_new.page` files are incomplete write captures and are not replayed, so
@@ -63,9 +66,10 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 ## Current state (one line)
 
 The M68AP board, boot chain, four-bank NAND, AppleNANDFTL clean-open, both HFS
-B-trees, and root mount now work; launchd/SpringBoard parity has not yet been
-shown. The next milestone is a paired N45AP/M68AP trace of legacy GPIO
-function-parent publication and USB/SDIO/baseband consumer startup.
+B-trees, and root mount now work. Paired observation proves the first remaining
+failure is an under-retained M68AP `IOPMrootDomain` during an otherwise
+successful USB service lookup. A diagnostic retain advances through launchd's
+successful kernel exec, but launchd/SpringBoard output has not yet appeared.
 
 ## 2026-07-22 automated pre-FTL isolation — superseded by board-count result
 
@@ -296,11 +300,36 @@ stops inside `waitForService` before the function constructor executes, with
 `IOFunctionParent004040E0`; no NAND read or HFS operation is involved. Evidence
 is `/private/tmp/m68ap-usb-start-trace-20260722/result.json`.
 
-This changes the immediate question from "which platform function is missing?"
-to "why does M68AP service enumeration release an attached candidate while
-N45AP's identical `usb-otg` lookup completes?" The next paired observation
-should record the `waitForService` candidate sequence and ownership transitions
-on N45AP, then compare that with the failing M68AP sequence.
+That paired observation is now complete. `scripts/analyze-s5l8900-usb-start.py`
+finds both stripped routines directly from their strings and loaded calls. The
+driver bodies have the same instruction layout: N45AP starts at `0xc04c10c4`,
+waits at `0xc0134fba`, and enumerates at `0xc0134b1c`; M68AP uses
+`0xc04cb198`, `0xc01351de`, and `0xc0134d40`, respectively. The observer's
+board profiles record the same semantic candidate sequence without assuming
+shared virtual addresses.
+
+Both boards match the final `usb-otg` candidate with references `0x00060008`.
+The decisive earlier candidate is `IOPMrootDomain`: M68AP presents it with
+`0x00010002`, while N45AP presents its corresponding third candidate with
+`0x00130016`. M68AP iterator teardown then reaches `0x00010001` and asserts
+because the object is still attached. A diagnostic-only adjustment to
+`0x00020002` lets teardown return `0x00010001`; USB registers normally and the
+same run continues through SDIO, baseband, Wi-Fi, and `BSD root: disk0s1`.
+
+The longer bounded run also closes the next uncertainty. Instrumented
+`bsd_init` reaches every post-mount checkpoint and returns. The stripped
+launchd loader at `0xc00f7000` selects `/sbin/launchd`, calls exec at
+`0xc00f7078`, and receives result zero at `0xc00f707c`. The remaining visible
+gap is after successful launchd exec: there is no `BOOT_TIME` output, and the
+sampled kernel PC is the idle path. The next trace should be process-aware and
+capture launchd's first user instruction/syscall/wait; it should not revisit
+storage or USB matching unless their combined regression fails.
+
+Evidence from the current runs is
+`/private/tmp/n45ap-service-sequence-20260723.log`,
+`/private/tmp/m68ap-service-sequence-four-bank-kernel-20260723.log`, and
+`/private/tmp/m68ap-init-exec-progress-20260723.log`. These are local evidence,
+not repository artifacts.
 
 Machine-readable comparison output is
 `/private/tmp/s5l8900-startup-comparison-20260722.json`; the DeviceTree output is

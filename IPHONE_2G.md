@@ -258,9 +258,12 @@ IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
 > iBoot with **0** firmware-epoch rejections. With real m68ap iBoot, that NOR,
 > and the four-bank generated M68AP NAND, iBoot and the kernel clean-open FTL,
 > both HFS B-trees validate, and `disk0s1` mounts as root. SpringBoard has not
-> started; the live boundary is legacy IOKit startup ordering across GPIO-backed
-> USB, SDIO, and baseband platform functions. See the handoff for evidence and
-> the scripted continuation procedure.
+> started. Paired N45AP/M68AP observation now isolates an under-retained
+> `IOPMrootDomain` during USB's otherwise successful `usb-otg` enumeration. A
+> diagnostic retain advances through USB, SDIO, baseband, Wi-Fi, root mount,
+> complete `bsd_init`, and successful `/sbin/launchd` exec; the next boundary
+> is launchd's first user-space wait, not storage or platform-function lookup.
+> See the handoff for evidence and the scripted continuation procedure.
 
 - **Firmware obtained** (1.1.4 IPSW, iBoot-204 — same build as n45ap): iBoot,
   LLB, and device tree all decrypt with the shared S5L8900 GID key. The Zephyr1
@@ -295,11 +298,15 @@ What remains between today's real M68AP Darwin-kernel boot and SpringBoard:
    validate, `_vfs_mountroot` returns zero, the HFS mount result is zero, and
    the kernel prints `BSD root: disk0s1`.
 5. **launchd and SpringBoard:** ⛔ **Current blocker.** No reproducible M68AP
-   acceptance run has reached SpringBoard yet. The next boundary is early IOKit
-   service ordering/lifetime: under lightweight observation, USB, then SDIO,
-   then AppleBaseband encounter the same GPIO-backed platform-function path.
-   The next scripted comparison should record the working N45AP function-parent
-   publication and consumer order, then compare the M68AP-only consumers.
+   acceptance run has reached SpringBoard yet. The paired kernel trace proves
+   USB finds the same service as N45AP; M68AP instead reaches iterator cleanup
+   with `IOPMrootDomain` at `0x00010002` references versus N45AP's
+   `0x00130016`. One diagnostic extra retain advances the unmodified drivers
+   through USB, SDIO, baseband, Wi-Fi, and root. `bsd_init` then completes and
+   the `/sbin/launchd` exec returns zero, but no `BOOT_TIME` marker appears.
+   Find the real power-management owner missing before USB, and trace launchd's
+   first user instruction/syscall/wait. The reference adjustment is not a
+   production fix.
 6. **iPhone-only services:** then validate Zephyr1 touch, proximity/ALS, PMU,
    CommCenter/baseband behavior, and call audio against the real drivers.
 
