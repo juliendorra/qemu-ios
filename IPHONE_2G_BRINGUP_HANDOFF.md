@@ -46,9 +46,19 @@ the live bring-up state.
 > seed uses one writable root. `build-m68ap-nand.py --data-hfs` now emits both
 > GPT/HFS partitions. A bounded run discovers and mounts both, starts launchd
 > services and mDNSResponder, and no longer reports the former libz failure or
-> reboots. The remaining boundary is SpringBoard's launch/first visible frame.
-> Capture the framebuffer and observe SpringBoard exec before changing more
-> storage code. The direct root-domain reference edit remains diagnostic-only.
+> reboots.
+>
+> SpringBoard launch is now directly observed. Launchd requests the expected
+> executable, the M68AP kernel returns zero from `execve`, and the assigned
+> process does not enter the common exit path during the bounded run.
+> Process-specific trap logging shows dyld loading the same dependency sequence
+> as a clean N45AP oracle through event 280. Both guests then enter the same
+> initializer phase and match through event 313, with successful kernel
+> returns. Both then execute corresponding libSystem allocator and Mach-O
+> section-scan paths for hundreds of thousands of observed blocks. N45AP does
+> not request its next 64 KiB allocation until after at least one million such
+> blocks. M68AP still has no visible frame. The direct root-domain reference
+> edit remains diagnostic-only.
 >
 > Always stage NAND/NOR/iBoot and bound the boot with the acceptance harness.
 > `_new.page` files are incomplete write captures and are not replayed, so
@@ -75,8 +85,13 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 The M68AP board, boot chain, four-bank NAND, AppleNANDFTL clean-open, root and
 data HFS partitions, dyld, and launchd service startup now work. A diagnostic
 retain remains necessary for the under-retained M68AP `IOPMrootDomain`.
-SpringBoard has not yet printed its configuration marker; framebuffer capture
-and SpringBoard exec observation are the next bounded tests.
+SpringBoard exec succeeds and its live process advances through dyld's
+dependency graph and into initialization, but has not yet reached its
+configuration marker or a visible frame. A 300-second low-overhead run reaches
+the same state. The working-N45AP comparison now proves that both guests pass
+initializer event 313 and enter corresponding long-running libSystem allocator
+and Mach-O section scans. The first semantic divergence has not yet been
+captured.
 
 ## 2026-07-23 launchd breakthrough — active-bank ADM reads and disk0s2
 
@@ -105,6 +120,134 @@ and SpringBoard exec observation are the next bounded tests.
   and mDNSResponder startup. A 90-second bounded framebuffer capture is still
   fully black, so a visible SpringBoard frame is not being mistaken for a
   missing serial marker. Generated firmware and images remain uncommitted.
+
+## 2026-07-23 SpringBoard execution boundary
+
+- The reusable observer now recognizes kernel `_execve` requests and correlates
+  concurrent calls by kernel stack. SpringBoard's request is
+  `/System/Library/CoreServices/SpringBoard.app/SpringBoard`; its correctly
+  paired kernel return is `error=0`.
+- Correlation at stable post-prologue instructions assigns SpringBoard process
+  `0xc0c2f244` in the recorded deterministic run. The common `_exit1` path is
+  also process-aware; SpringBoard does not traverse it during the bounded run.
+  This rules out an immediate launch or loader termination.
+- The S5L8900 software-interrupt observer resolves the current process from the
+  per-CPU state and records only SpringBoard's traps. Its program counter stays
+  in dyld while it opens and maps a non-repeating dependency list: UIKit,
+  CoreGraphics, Foundation, GraphicsServices, LayerKit, the telephony
+  frameworks, WebKit, audio, MBX, OpenGLES, and CoreVideo.
+- A staged clean N45AP oracle built from the verified `nand.pack` reaches
+  SpringBoard and provides the decisive paired boundary. Both guests have
+  identical dependency semantics through event 280, then enter corresponding
+  initializer code. M68AP continues through event 313 and every observed
+  kernel return is zero.
+- The post-event-313 observer corrected the former boundary. Both builds return
+  through their generic `syscall` wrappers into corresponding `munmap`,
+  `allocate_pages`, small/large malloc, `malloc_zone_calloc`, string, copy, and
+  Mach-O section-scan paths. The iPod uses Snowbird 3A101a libSystem while the
+  iPhone uses LittleBear 4A102 libSystem, so their virtual addresses differ but
+  symbol-level flow agrees. N45AP executes at least one million observed
+  libSystem blocks before event 314 requests 64 KiB. M68AP was observed through
+  at least 810,000 such blocks without a next SpringBoard trap before the
+  latest probe was interrupted. This count is a progress indicator, not a
+  strict per-process metric: a user-mode block callback cannot identify the
+  current process after a scheduler switch.
+- Therefore the current gap is after a successful event-313 return inside
+  initialization. Do not revisit FTL restore, root construction, launchd
+  policy, executable lookup, or dependency loading unless their combined
+  acceptance gates regress. Extend the observer with scheduler-aware process
+  tracking, retain only SpringBoard's post-313 blocks, and compare symbol-level
+  flow with N45AP until their first divergence. Do not interpret a block-count
+  cap as a guest stop.
+- Evidence:
+  `/private/tmp/m68ap-kernel-exec-threaded-20260723/`,
+  `/private/tmp/m68ap-process-exit-v2-20260723/`,
+  `/private/tmp/m68ap-springboard-objects-20260723/`,
+  `/private/tmp/n45ap-clean-springboard-traps-v2-20260723/`, and
+  `/private/tmp/m68ap-springboard-close-return-20260723/`. The 300-second
+  low-overhead result was
+  `/private/tmp/m68ap-long-low-overhead-20260723/result.json`. These transient
+  local artifacts are not committed and may be reclaimed; reproduce them with
+  the scripted command below.
+
+## 2026-07-23 post-event-313 handoff — current continuation point
+
+The former statement that M68AP stopped after event 313 is superseded. It was
+an observer-limit artifact. The paired result now establishes:
+
+1. N45AP and M68AP have the same dependency semantics through event 280.
+2. Both enter corresponding initializer code and complete events 281–313.
+3. Event 313 returns zero to each build's generic `syscall` wrapper.
+4. Both then execute corresponding libSystem allocation and Mach-O inspection
+   paths. The first 64 observed blocks resolve in the same semantic order even
+   though their addresses differ because N45AP uses Snowbird 3A101a libSystem
+   and M68AP uses LittleBear 4A102 libSystem.
+5. N45AP executes at least 1,000,000 observed libSystem blocks before event 314
+   requests a 64 KiB mapping and then reaches SpringBoard. M68AP reached at
+   least 810,000 observed libSystem blocks without a next SpringBoard trap in
+   the interrupted comparison run. This proves forward progress beyond event
+   313, but does not yet locate the first divergence.
+
+The block counts are deliberately qualified. The observer arms on a
+process-identified SpringBoard kernel return, but a user-mode block callback
+cannot identify the current process after scheduling. The first uninterrupted
+path is reliable; a long aggregate count can include another process. The next
+observer must track scheduler process changes and filter the block stream
+before using counts as a parity measure.
+
+Do not use the current app-bundle defaults for a reproduction without checking
+their hashes. Two stale inputs consumed otherwise-valid bounded runs:
+
+- NOR SHA-256 `7bf1668e...` fails device-tree loading. Use the reconstructed
+  NOR SHA-256
+  `89716fae81ac2817ddefe79a81e8ed3df878a5a5e4a5fd66c2563293e1726362`.
+- Extracted iBoot SHA-256
+  `17bb2b762e32b7230334fd453bd9ffe408b514f497b3df26911f5023ca6d5f22`
+  still enforces the image policy. Stage the output of
+  `scripts/patch-m68ap-iboot.py`; the verified patched SHA-256 is
+  `ab9d4136ed12f96d5d20e147932b523f93f2c653f880d72b8d9e4456728a4ff4`.
+- Use a verified two-partition M68AP NAND pack, not the app bundle's older
+  sparse diagnostic pages. The acceptance harness always copies it to a
+  writable stage.
+
+Reproduce the focused M68AP case with explicit inputs:
+
+```sh
+python3 scripts/iphone-nand-acceptance.py \
+  --skip-n45ap \
+  --iboot-m68ap <patched-m68ap-iboot> \
+  --nor-m68ap <reconstructed-m68ap-nor> \
+  --nand-m68ap <verified-two-partition-m68ap-nand-directory> \
+  --timeout 220 \
+  --icount-shift -1 \
+  --observer-plugin build-ipod11/contrib/plugins/libm68ap-ftl-trace.dylib \
+  --observer-args 'profile={profile},service-observer-only=true,stabilize-root-domain=true,trace-execve=true,trace-details=false,trace-springboard-resume-after=313,log={observer_log}' \
+  --logs <new-output-directory>
+```
+
+Run the N45AP oracle with the same plugin arguments, `--skip-m68ap`, and
+`--nand-n45ap <clean-pack-only-n45ap-directory>`, changing
+`stabilize-root-domain` to `false`. Never run from installed loose N45AP pages
+when a clean pack-only oracle is available.
+
+The exact continuation is:
+
+1. Locate a stable scheduler/context-switch point in each 1.1.4 kernel profile
+   and maintain the current process in the observer.
+2. Record only SpringBoard's post-313 blocks, summarized by symbol and edge
+   counts rather than one log line per execution.
+3. Resolve M68AP addresses against LittleBear 4A102 `libSystem.B.dylib` and
+   N45AP addresses against Snowbird 3A101a `libSystem.B.dylib`; compare symbols
+   and control-flow edges, not raw virtual addresses.
+4. Stop at the first process-specific divergence or SpringBoard's next trap.
+   If M68AP reaches the N45AP event-314 allocation, advance the same automated
+   comparison to the next mismatch.
+
+Storage construction, AppleNANDFTL clean-open, both HFS mounts, launchd policy,
+SpringBoard lookup, SpringBoard exec, dependency loading, and the event-313
+kernel return are closed gates. Do not reopen them unless the acceptance
+markers regress. The diagnostic root-domain stabilization remains the separate
+production-quality issue.
 
 ## 2026-07-22 automated pre-FTL isolation — superseded by board-count result
 
@@ -351,14 +494,12 @@ because the object is still attached. A diagnostic-only adjustment to
 `0x00020002` lets teardown return `0x00010001`; USB registers normally and the
 same run continues through SDIO, baseband, Wi-Fi, and `BSD root: disk0s1`.
 
-The longer bounded run also closes the next uncertainty. Instrumented
-`bsd_init` reaches every post-mount checkpoint and returns. The stripped
-launchd loader at `0xc00f7000` selects `/sbin/launchd`, calls exec at
-`0xc00f7078`, and receives result zero at `0xc00f707c`. The remaining visible
-gap is after successful launchd exec: there is no `BOOT_TIME` output, and the
-sampled kernel PC is the idle path. The next trace should be process-aware and
-capture launchd's first user instruction/syscall/wait; it should not revisit
-storage or USB matching unless their combined regression fails.
+The longer bounded run also closed that uncertainty. Instrumented `bsd_init`
+reaches every post-mount checkpoint and returns. The stripped launchd loader at
+`0xc00f7000` selects `/sbin/launchd`, calls exec at `0xc00f7078`, and receives
+result zero at `0xc00f707c`. Subsequent process-aware observation (documented
+above) proves launchd starts its service set and successfully execs
+SpringBoard; the active boundary is now inside SpringBoard's initializer phase.
 
 Evidence from the current runs is
 `/private/tmp/n45ap-service-sequence-20260723.log`,

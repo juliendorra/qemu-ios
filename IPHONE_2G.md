@@ -95,15 +95,25 @@ Not every problem found during this work was introduced by the iPhone profile:
   `build-m68ap-nand.py --data-hfs` now emits both GPT/HFS partitions.
   A bounded run mounts both, starts launchd services and mDNSResponder, with no
   former libz failure or reboot.
-- **Still open (current blocker): SpringBoard service launch.** The latest
-  bounded run reaches launchd but not the `Configuring SpringBoard` marker and
-  becomes kernel-idle after Wi-Fi initialization. The emulator still does not
-  replay guest `_new.page` writes, so the data-partition seed must contain any
-  state required before SpringBoard. A bounded 320×480 framebuffer capture is
-  fully black, confirming that the missing serial marker is not hiding a
-  visible UI. The next test observes SpringBoard's launch/exec result. The
-  root-domain reference adjustment used in these runs remains diagnostic-only;
-  its production ownership source is still unresolved.
+- **Still open (current blocker): SpringBoard's initializer phase.** A
+  process-aware kernel observer proves launchd requests
+  `/System/Library/CoreServices/SpringBoard.app/SpringBoard`, kernel `execve`
+  returns zero, and the resulting process does not enter the common exit path
+  during the bounded run. SpringBoard then executes in `dyld`, loads the same
+  dependency sequence as the working N45AP guest through event 280, and enters
+  the same initializer phase. M68AP matches the N45AP call semantics through
+  event 313, with every observed kernel return successful. A post-return trace
+  then corrected the apparent stop: both guests execute the corresponding
+  libSystem allocator and Mach-O section-scan path for hundreds of thousands
+  of blocks. N45AP makes its next VM allocation only after at least one million
+  observed libSystem blocks. This removes
+  executable lookup, launchd policy, dependency loading, and an immediate
+  loader crash from the blocker set. A 300-second low-overhead boot still does
+  not reach the marker, so another blind wait is not useful; the next scripted
+  test must retain process identity across the long post-313 user path and
+  report its first semantic divergence. The root-domain reference
+  adjustment used in these runs remains diagnostic-only; its production
+  ownership source is still unresolved.
 - **The iPod comparison is scripted.** `scripts/compare-s5l8900-startup.py`
   converts both serial logs into ordered JSON events. The current pair has 116
   shared service starts: N45AP successfully registers `IOIpodUSBDevice` and
@@ -266,13 +276,17 @@ IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
 > synthetic `nor_m68ap.bin` (`scripts/build-m68ap-nor.py`) is accepted by m68ap
 > iBoot with **0** firmware-epoch rejections. With real m68ap iBoot, that NOR,
 > and the four-bank generated M68AP NAND, iBoot and the kernel clean-open FTL,
-> both HFS B-trees validate, and `disk0s1` mounts as root. SpringBoard has not
-> started. Paired N45AP/M68AP observation now isolates an under-retained
-> `IOPMrootDomain` during USB's otherwise successful `usb-otg` enumeration. A
-> diagnostic retain advances through USB, SDIO, baseband, Wi-Fi, root mount,
-> complete `bsd_init`, and successful `/sbin/launchd` exec; the next boundary
-> is launchd's first user-space wait, not storage or platform-function lookup.
-> See the handoff for evidence and the scripted continuation procedure.
+> both HFS B-trees validate, `disk0s1` mounts as root, `disk0s2` mounts at
+> `/private/var`, and launchd starts services. A process-aware kernel trace
+> proves SpringBoard's `execve` succeeds and the process remains alive. A clean
+> N45AP oracle matches M68AP through loader event 280 and initializer event
+> 313. Both then execute corresponding allocator/section-scan code for a long
+> user-space interval; N45AP's next allocation occurs only after at least one
+> million observed libSystem blocks. The boundary is therefore late inside
+> initialization, not storage, launchd
+> policy, dependency loading, or platform-function lookup. The
+> diagnostic root-domain retain remains necessary; see the handoff for
+> evidence and the scripted continuation procedure.
 
 - **Firmware obtained** (1.1.4 IPSW, iBoot-204 — same build as n45ap): iBoot,
   LLB, and device tree all decrypt with the shared S5L8900 GID key. The Zephyr1
@@ -306,17 +320,23 @@ What remains between today's real M68AP Darwin-kernel boot and SpringBoard:
    real extents header at `bank3/25858.page`; both extents and catalog B-trees
    validate, `_vfs_mountroot` returns zero, the HFS mount result is zero, and
    the kernel prints `BSD root: disk0s1`.
-5. **launchd and SpringBoard:** ⛔ **Current blocker.** No reproducible M68AP
-   acceptance run has reached SpringBoard yet. The paired kernel trace proves
-   USB finds the same service as N45AP; M68AP instead reaches iterator cleanup
-   with `IOPMrootDomain` at `0x00010002` references versus N45AP's
-   `0x00130016`. One diagnostic extra retain advances the unmodified drivers
-   through USB, SDIO, baseband, Wi-Fi, and root. `bsd_init` then completes and
-   the `/sbin/launchd` exec returns zero, but no `BOOT_TIME` marker appears.
-   Find the real power-management owner missing before USB, and trace launchd's
-   first user instruction/syscall/wait. The reference adjustment is not a
-   production fix.
-6. **iPhone-only services:** then validate Zephyr1 touch, proximity/ALS, PMU,
+5. **launchd:** ✅ **Done under the diagnostic root-domain retain.** `bsd_init`
+   completes, `/sbin/launchd` exec returns zero, both required HFS volumes are
+   mounted, and launchd starts CommCenter, configd, mDNSResponder, lockdownd,
+   mediaserverd, notifyd, and the other launch-era services.
+6. **SpringBoard:** ⛔ **Current blocker.** Launchd requests the correct
+   executable; the kernel returns zero from its `execve`, assigns a distinct
+   process, and that process does not exit during the bounded observation.
+   Process-specific trap logging proves dyld loads more than forty distinct
+   frameworks and libraries. A clean N45AP oracle and M68AP then enter the same
+   initializer sequence and match through event 313, including successful
+   returns. Both then traverse corresponding allocator and Mach-O section-scan
+   functions; the earlier 512-block M68AP limit was a tracing cap, not a stop.
+   N45AP requests a 64 KiB VM allocation only after at least one million
+   observed libSystem blocks. Preserve current-process identity across this
+   long interval and find the first semantic divergence rather than extending
+   a blind timeout.
+7. **iPhone-only services:** then validate Zephyr1 touch, proximity/ALS, PMU,
    CommCenter/baseband behavior, and call audio against the real drivers.
 
 Full DFU/restore belongs to a later fidelity track after NAND program, erase,
