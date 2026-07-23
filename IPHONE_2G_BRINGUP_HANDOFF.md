@@ -10,8 +10,8 @@ the live bring-up state.
 
 ## ► NEXT-SESSION PROMPT (start here)
 
-> **M68AP STORAGE NOW REACHES A CLEAN HFS ROOT MOUNT. SPRINGBOARD HAS NOT
-> STARTED.**
+> **M68AP NOW MOUNTS BOTH IPHONE PARTITIONS AND STARTS LAUNCHD SERVICES.
+> SPRINGBOARD HAS NOT YET BEEN CONFIRMED.**
 >
 > The breakthrough came from reproducing the working iPod Touch 1G path at the
 > NAND-controller identification boundary. N45AP advertises eight valid NAND
@@ -34,14 +34,21 @@ the live bring-up state.
 > counterpart has `0x00130016`. Iterator teardown drops M68AP to its last
 > reference and triggers `IOPMrootDomain: attached at free()`.
 >
-> A clearly labelled diagnostic extra retain proves causality: without skipping
-> USB or hiding platform functions, M68AP then registers USB, starts SDIO,
-> baseband and Wi-Fi, mounts root, completes `bsd_init`, and successfully
-> executes `/sbin/launchd`. The process still emits no `BOOT_TIME` marker and
-> the CPU becomes idle, so SpringBoard parity is not reached. The production
-> work is (1) find which real M68AP power-management relationship supplies the
-> missing root-domain ownership, then (2) trace the successfully loaded launchd
-> process to its first wait. The direct reference edit remains diagnostic-only.
+> The apparent post-exec stop was a second fixed-eight assumption in QEMU:
+> ADM multi-page command `0x200` assigned pages in groups of eight. M68AP's
+> four-page loader request therefore returned zero/stale data. The staged HFS
+> contained the correct dyld instruction at offset `0xd580`; runtime memory did
+> not. Striping over the board's active bank count restores valid dyld
+> execution.
+>
+> iPhone 1.1.4 then exposed a real layout difference: its `/etc/fstab` requires
+> `disk0s1` as read-only root and `disk0s2` at `/private/var`, while the iPod
+> seed uses one writable root. `build-m68ap-nand.py --data-hfs` now emits both
+> GPT/HFS partitions. A bounded run discovers and mounts both, starts launchd
+> services and mDNSResponder, and no longer reports the former libz failure or
+> reboots. The remaining boundary is SpringBoard's launch/first visible frame.
+> Capture the framebuffer and observe SpringBoard exec before changing more
+> storage code. The direct root-domain reference edit remains diagnostic-only.
 >
 > Always stage NAND/NOR/iBoot and bound the boot with the acceptance harness.
 > `_new.page` files are incomplete write captures and are not replayed, so
@@ -65,11 +72,39 @@ S5L8900 emulation that already boots the iPod Touch 1G (`-M iPod-Touch`).
 
 ## Current state (one line)
 
-The M68AP board, boot chain, four-bank NAND, AppleNANDFTL clean-open, both HFS
-B-trees, and root mount now work. Paired observation proves the first remaining
-failure is an under-retained M68AP `IOPMrootDomain` during an otherwise
-successful USB service lookup. A diagnostic retain advances through launchd's
-successful kernel exec, but launchd/SpringBoard output has not yet appeared.
+The M68AP board, boot chain, four-bank NAND, AppleNANDFTL clean-open, root and
+data HFS partitions, dyld, and launchd service startup now work. A diagnostic
+retain remains necessary for the under-retained M68AP `IOPMrootDomain`.
+SpringBoard has not yet printed its configuration marker; framebuffer capture
+and SpringBoard exec observation are the next bounded tests.
+
+## 2026-07-23 launchd breakthrough — active-bank ADM reads and disk0s2
+
+- The successful kernel exec was not an idle launchd wait. A paired
+  `trace-user-blocks` run showed both boards reach dyld `0x2fe0d580`; N45AP
+  executes `0xe92d40f0`, while M68AP received `0x00000000` and walked through
+  page-sized blank regions. The mounted M68AP HFS file contains the correct
+  `0xe92d40f0`, proving construction and catalog lookup were sound.
+- ADM command `0x200` used `num_pages / 8` and banks `0..7` unconditionally.
+  A four-page M68AP request performed zero assignments. It now stripes every
+  requested page across `nand_state->num_banks`; the eight-bank N45AP behavior
+  is unchanged. After rebuilding, M68AP executes hundreds of valid dyld blocks
+  and reaches launchctl.
+- The next failure explicitly named `/dev/disk0s2`. The IPSW-derived iPhone
+  `/etc/fstab` requires `disk0s1 / hfs ro` and
+  `disk0s2 /private/var hfs rw,noexec,nodev`; N45AP requires only a writable
+  root. The prior one-partition constructor could not satisfy that.
+- `build-m68ap-nand.py --data-hfs` now writes a second Apple-HFS GPT entry and
+  four-bank-interleaved data image. Structural fixtures verify both entries and
+  the first data page while retaining all recorded N45AP metadata hashes.
+- Evidence:
+  `/private/tmp/m68ap-four-bank-adm-fix-20260723/` proves corrected dyld
+  execution; `/private/tmp/m68ap-two-partition-long-20260723/result.json`
+  records both mounts and `launchd_started: true`. Serial includes
+  `/dev/disk0s2 on /private/var`, launchd service messages, Wi-Fi completion,
+  and mDNSResponder startup. A 90-second bounded framebuffer capture is still
+  fully black, so a visible SpringBoard frame is not being mistaken for a
+  missing serial marker. Generated firmware and images remain uncommitted.
 
 ## 2026-07-22 automated pre-FTL isolation — superseded by board-count result
 

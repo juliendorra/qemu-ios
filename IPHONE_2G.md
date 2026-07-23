@@ -29,7 +29,7 @@ and added only the board distinctions that real M68AP firmware requires:
 |---|---|
 | `-M iPhone-2G` QOM subclass | Gives M68AP an explicit board identity without duplicating the working S5L8900 machine. |
 | `board_id` on the machine state/class | Allows shared peripherals to select M68AP or N45AP behavior while preserving the iPod path. |
-| Board-aware NAND identification | N45AP exposes eight active chips and a 1024-page superblock; M68AP exposes four active chips, four absent ID slots, and a 512-page superblock. |
+| Board-aware NAND identification and ADM striping | N45AP exposes eight active chips and a 1024-page superblock; M68AP exposes four active chips, four absent ID slots, and a 512-page superblock. Multi-page ADM reads now stripe across the board's active bank count instead of a fixed eight. |
 | S-Gold2 chardev on UART1 | The iPhone has a cellular baseband and routes its vibrator through that interface. |
 | ISL29003 on I2C0 | The iPhone firmware probes this ambient-light sensor. |
 | Zephyr1 multitouch mode and M68AP ATN GPIO | The iPhone controller protocol and interrupt line differ from the iPod's Zephyr2/HBPP setup. |
@@ -85,16 +85,25 @@ Not every problem found during this work was introduced by the iPhone profile:
   identification and the constructor's four-bank M68AP layout, the 4A102
   kernel clean-opens FTL, receives the real extents and catalog B-tree data,
   returns zero from `_vfs_mountroot`, and prints `BSD root: disk0s1`.
-- **Still open (current blocker): post-root legacy IOKit startup.** SpringBoard
-  has not started. A detailed instrumented run mounts root and proceeds through
-  substantial driver setup. Lighter runs expose an ordering/lifetime problem
-  as USB, then SDIO, then AppleBaseband request GPIO-backed platform functions.
-  Targeted diagnostic declines merely move the stop to the next consumer, and
-  making all platform functions unavailable breaks the common S5L8900 platform
-  expert. The next production task is a paired N45AP/M68AP observation of GPIO
-  function-parent publication, service matching, and consumer startup order.
-  Resume FTL analysis only if storage itself regresses. Full evidence is in
-  `IPHONE_2G_BRINGUP_HANDOFF.md`.
+- **Launchd and service startup now run.** Two further iPod-guided corrections
+  closed the post-root gap. First, ADM command `0x200` was hard-coded to eight
+  banks; an M68AP four-page request therefore assigned no pages and delivered
+  zeroes at dyld `0x2fe0d580`. Board-count striping restores the exact loader
+  instruction and hundreds of normal user blocks. Second, iPhone 1.1.4's
+  `/etc/fstab` requires a read-only root (`disk0s1`) plus writable
+  `/private/var` (`disk0s2`), unlike the one-partition iPod seed.
+  `build-m68ap-nand.py --data-hfs` now emits both GPT/HFS partitions.
+  A bounded run mounts both, starts launchd services and mDNSResponder, with no
+  former libz failure or reboot.
+- **Still open (current blocker): SpringBoard service launch.** The latest
+  bounded run reaches launchd but not the `Configuring SpringBoard` marker and
+  becomes kernel-idle after Wi-Fi initialization. The emulator still does not
+  replay guest `_new.page` writes, so the data-partition seed must contain any
+  state required before SpringBoard. A bounded 320×480 framebuffer capture is
+  fully black, confirming that the missing serial marker is not hiding a
+  visible UI. The next test observes SpringBoard's launch/exec result. The
+  root-domain reference adjustment used in these runs remains diagnostic-only;
+  its production ownership source is still unresolved.
 - **The iPod comparison is scripted.** `scripts/compare-s5l8900-startup.py`
   converts both serial logs into ordered JSON events. The current pair has 116
   shared service starts: N45AP successfully registers `IOIpodUSBDevice` and
