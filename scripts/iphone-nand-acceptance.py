@@ -210,6 +210,10 @@ def main() -> int:
                     default=IPHONE_FILES / "nor_m68ap.bin")
     ap.add_argument("--nand-m68ap", type=Path,
                     default=IPHONE_FILES / "nand")
+    ap.add_argument("--nand-n45ap", type=Path,
+                    default=IPOD_FILES / "nand",
+                    help="working iPod NAND source (prefer a clean pack-only "
+                         "directory when installed loose pages are present)")
     ap.add_argument("--skip-n45ap", action="store_true",
                     help="skip the iPod (N45AP) regression boot")
     ap.add_argument("--skip-m68ap", action="store_true",
@@ -295,7 +299,7 @@ def main() -> int:
     if not args.skip_n45ap:
         n_iboot = IPOD_FILES / "iboot_204_n45ap.bin"
         n_nor = IPOD_FILES / "nor_n45ap.bin"
-        n_src = IPOD_FILES / "nand"
+        n_src = args.nand_n45ap
         if not (args.qemu.exists() and n_iboot.exists() and n_src.exists()):
             result["cases"]["n45ap"] = {"status": "SKIP",
                                         "reason": "installed iPod firmware absent"}
@@ -304,6 +308,11 @@ def main() -> int:
             if n_nand.exists():
                 shutil.rmtree(n_nand)
             subprocess.run(["cp", "-Rc", str(n_src), str(n_nand)], check=True)
+            # A clean oracle may intentionally contain only nand.pack.  The
+            # emulator still needs bank directories for its diagnostic
+            # _new.page write captures, even though those are not replayed.
+            for bank in range(8):
+                (n_nand / f"bank{bank}").mkdir(exist_ok=True)
             n_bootrom = stage / "bootrom_s5l8900-n45ap"
             n_iboot_staged = stage / "iboot_204_n45ap.bin"
             n_nor_staged = stage / "nor_n45ap.bin"

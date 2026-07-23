@@ -134,6 +134,10 @@ typedef struct KernelProfile {
     uint32_t root_domain_vtable;
     uint64_t tagged_release_stored;
     uint64_t tagged_release_updated;
+    uint64_t exec_entry;
+    uint64_t exec_return;
+    uint64_t exec_process;
+    uint64_t exit_process;
 } KernelProfile;
 
 static const KernelProfile m68ap_profile = {
@@ -152,6 +156,10 @@ static const KernelProfile m68ap_profile = {
     .root_domain_vtable = UINT32_C(0xc019a750),
     .tagged_release_stored = UINT64_C(0xc0122e04),
     .tagged_release_updated = UINT64_C(0xc0122e48),
+    .exec_entry = UINT64_C(0xc00f6fe0),
+    .exec_return = UINT64_C(0xc00f6ffc),
+    .exec_process = UINT64_C(0xc00f6ef8),
+    .exit_process = UINT64_C(0xc00f8260),
 };
 
 static const KernelProfile n45ap_profile = {
@@ -167,6 +175,10 @@ static const KernelProfile n45ap_profile = {
     .service_matched = UINT64_C(0xc0134ba4),
     .service_iter_release = UINT64_C(0xc0134bd6),
     .get_existing_return = UINT64_C(0xc0134bec),
+    .exec_entry = UINT64_C(0xc00f6e24),
+    .exec_return = UINT64_C(0xc00f6e40),
+    .exec_process = UINT64_C(0xc00f6d3c),
+    .exit_process = UINT64_C(0xc00f80a4),
 };
 
 static const KernelProfile *kernel_profile = &m68ap_profile;
@@ -181,6 +193,7 @@ static bool stop_at_verify_failure;
 static bool stabilize_root_domain;
 static bool trace_details = true;
 static bool service_observer_only;
+static bool trace_execve;
 static uint32_t trace_user_blocks_limit;
 static uint32_t user_block_count;
 static uint64_t user_block_executions;
@@ -210,6 +223,20 @@ static GHashTable *storage_strategy_seen;
 static GHashTable *ftl_core_read_seen;
 static GPtrArray *trace_blocks;
 static GHashTable *user_blocks_seen;
+static GHashTable *kernel_execs;
+static GHashTable *kernel_stack_execs;
+static GHashTable *process_execs;
+static uint32_t springboard_traps;
+static uint32_t springboard_trap_returns;
+static uint32_t springboard_resume_after;
+static uint32_t springboard_resume_blocks;
+static uint32_t springboard_resume_count;
+static uint32_t springboard_resume_pc;
+static uint32_t springboard_resume_last_pc;
+static uint64_t springboard_resume_hash = UINT64_C(1469598103934665603);
+static bool springboard_resume_pending;
+static bool springboard_resume_active;
+static bool springboard_resume_done;
 static struct qemu_plugin_register *reg_r0;
 static struct qemu_plugin_register *reg_r1;
 static struct qemu_plugin_register *reg_r2;
@@ -239,6 +266,8 @@ static uint32_t read_u32_register(struct qemu_plugin_register *handle)
     return result;
 }
 
+static uint32_t read_memory_u32(uint32_t address);
+
 static void plugin_log(const char *message)
 {
     if (plugin_log_file) {
@@ -257,6 +286,209 @@ static void trace_usb_start(unsigned int cpu_index, void *userdata)
         "M68AP_FTL_TRACE usb_device_start profile=%s pc=0x%08" PRIx64,
         kernel_profile->name, kernel_profile->usb_device_start);
     plugin_log(line);
+}
+
+static void trace_kernel_exec(unsigned int cpu_index, void *userdata)
+{
+    uint64_t address = (uintptr_t)userdata;
+
+    if (address == kernel_profile->exec_entry) {
+        uint32_t argument_block = read_u32_register(reg_r1);
+        uint32_t path_pointer = read_memory_u32(argument_block);
+        g_autoptr(GByteArray) path = g_byte_array_new();
+
+        if (path_pointer &&
+            qemu_plugin_read_memory_vaddr(path_pointer, path, 256)) {
+            path->data[path->len - 1] = '\0';
+        }
+        const char *path_text =
+            path->len ? (char *)path->data : "<unreadable>";
+        uint32_t sp = read_u32_register(reg_sp);
+        g_hash_table_replace(
+            kernel_execs, GUINT_TO_POINTER(sp), g_strdup(path_text));
+        g_hash_table_replace(
+            kernel_stack_execs, GUINT_TO_POINTER(sp & ~UINT32_C(0x7fff)),
+            g_strdup(path_text));
+        g_autofree char *line = g_strdup_printf(
+            "M68AP_FTL_TRACE kernel_exec event=entry"
+            " sp=0x%08" PRIx32 " path=%s", sp, path_text);
+        plugin_log(line);
+    } else {
+        uint32_t entry_sp = read_u32_register(reg_sp) + 24;
+        const char *path = g_hash_table_lookup(
+            kernel_execs, GUINT_TO_POINTER(entry_sp));
+        g_autofree char *line = g_strdup_printf(
+            "M68AP_FTL_TRACE kernel_exec event=return path=%s"
+            " error=%" PRIu32,
+            path ? path : "<unknown>",
+            read_u32_register(reg_r0));
+        plugin_log(line);
+        g_hash_table_remove(kernel_execs, GUINT_TO_POINTER(entry_sp));
+    }
+}
+
+static void trace_kernel_exec_process(unsigned int cpu_index, void *userdata)
+{
+    uint32_t process = read_u32_register(reg_r6);
+    uint32_t stack_base =
+        read_u32_register(reg_sp) & ~UINT32_C(0x7fff);
+    const char *path = g_hash_table_lookup(
+        kernel_stack_execs, GUINT_TO_POINTER(stack_base));
+
+    if (!path) {
+        return;
+    }
+    g_hash_table_replace(
+        process_execs, GUINT_TO_POINTER(process), g_strdup(path));
+    g_autofree char *line = g_strdup_printf(
+        "M68AP_FTL_TRACE kernel_exec event=process"
+        " process=0x%08" PRIx32 " path=%s", process, path);
+    plugin_log(line);
+}
+
+static void trace_kernel_exit(unsigned int cpu_index, void *userdata)
+{
+    uint32_t process = read_u32_register(reg_r4);
+    const char *path = g_hash_table_lookup(
+        process_execs, GUINT_TO_POINTER(process));
+    g_autofree char *line = g_strdup_printf(
+        "M68AP_FTL_TRACE kernel_exit process=0x%08" PRIx32
+        " path=%s status=0x%08" PRIx32 " reason=0x%08" PRIx32,
+        process, path ? path : "<unknown>",
+        read_u32_register(reg_sl), read_u32_register(reg_r6));
+    plugin_log(line);
+}
+
+static void trace_kernel_trap(unsigned int cpu_index, void *userdata)
+{
+    uint32_t process =
+        read_memory_u32(read_u32_register(reg_sl) + 0x178);
+    const char *path = g_hash_table_lookup(
+        process_execs, GUINT_TO_POINTER(process));
+
+    if (!path || !strstr(path, "/SpringBoard.app/SpringBoard") ||
+        springboard_traps >= 1024) {
+        return;
+    }
+    springboard_traps++;
+    if (springboard_resume_after &&
+        springboard_traps + 8 < springboard_resume_after) {
+        return;
+    }
+    uint32_t state = read_u32_register(reg_r8);
+    int32_t trap_number = (int32_t)read_u32_register(reg_fp);
+    uint32_t argument0 = read_memory_u32(state);
+    g_autoptr(GByteArray) object = g_byte_array_new();
+
+    if (springboard_resume_active &&
+        springboard_traps > springboard_resume_after) {
+        springboard_resume_active = false;
+        springboard_resume_done = true;
+        g_autofree char *resume_line = g_strdup_printf(
+            "M68AP_FTL_TRACE springboard_resume event=next_trap"
+            " blocks=%" PRIu32 " hash=0x%016" PRIx64
+            " last_pc=0x%08" PRIx32 " number=%" PRId32,
+            springboard_resume_count, springboard_resume_hash,
+            springboard_resume_last_pc, trap_number);
+        plugin_log(resume_line);
+    }
+    if ((trap_number == 5 || trap_number == 188) && argument0 &&
+        qemu_plugin_read_memory_vaddr(argument0, object, 256)) {
+        object->data[object->len - 1] = '\0';
+    }
+    g_autofree char *line = g_strdup_printf(
+        "M68AP_FTL_TRACE springboard_trap sequence=%" PRIu32
+        " process=0x%08" PRIx32 " number=%" PRId32
+        " pc=0x%08" PRIx32
+        " r0=0x%08" PRIx32 " r1=0x%08" PRIx32
+        " r2=0x%08" PRIx32 " r3=0x%08" PRIx32 " object=%s",
+        springboard_traps, process, trap_number,
+        read_memory_u32(state + 0x3c),
+        argument0, read_memory_u32(state + 4),
+        read_memory_u32(state + 8), read_memory_u32(state + 12),
+        object->len ? (char *)object->data : "");
+    plugin_log(line);
+}
+
+static void trace_kernel_trap_return(unsigned int cpu_index, void *userdata)
+{
+    uint32_t process = read_u32_register(reg_sl);
+    const char *path = g_hash_table_lookup(
+        process_execs, GUINT_TO_POINTER(process));
+
+    if (!path || !strstr(path, "/SpringBoard.app/SpringBoard")) {
+        return;
+    }
+    if (springboard_resume_after &&
+        (springboard_traps + 8 < springboard_resume_after ||
+         springboard_resume_done)) {
+        return;
+    }
+    springboard_trap_returns++;
+    uint32_t state = read_u32_register(reg_r6);
+    uint32_t resume_pc = read_memory_u32(state + 0x3c);
+    g_autofree char *line = g_strdup_printf(
+        "M68AP_FTL_TRACE springboard_trap_return sequence=%" PRIu32
+        " process=0x%08" PRIx32 " number=%" PRId32
+        " result=0x%08" PRIx32 " resume_pc=0x%08" PRIx32,
+        springboard_trap_returns, process,
+        (int32_t)read_u32_register(reg_r8),
+        read_u32_register(reg_r0), resume_pc);
+    plugin_log(line);
+
+    if (springboard_resume_after &&
+        springboard_traps == springboard_resume_after &&
+        !springboard_resume_pending && !springboard_resume_active) {
+        springboard_resume_pc = resume_pc;
+        springboard_resume_pending = true;
+        g_autofree char *resume_line = g_strdup_printf(
+            "M68AP_FTL_TRACE springboard_resume event=armed"
+            " trap=%" PRIu32 " pc=0x%08" PRIx32,
+            springboard_traps, springboard_resume_pc);
+        plugin_log(resume_line);
+    }
+}
+
+static void trace_springboard_resume_block(unsigned int cpu_index,
+                                           void *userdata)
+{
+    uint32_t address = (uintptr_t)userdata;
+
+    if (springboard_resume_pending &&
+        (address & ~UINT32_C(1)) ==
+            (springboard_resume_pc & ~UINT32_C(1))) {
+        springboard_resume_pending = false;
+        springboard_resume_active = true;
+        plugin_log("M68AP_FTL_TRACE springboard_resume event=entered");
+    }
+    if (!springboard_resume_active ||
+        springboard_resume_count >= springboard_resume_blocks) {
+        return;
+    }
+    springboard_resume_count++;
+    springboard_resume_last_pc = address;
+    springboard_resume_hash ^= address;
+    springboard_resume_hash *= UINT64_C(1099511628211);
+    if (springboard_resume_count <= 64 ||
+        springboard_resume_count % 10000 == 0) {
+        g_autofree char *line = g_strdup_printf(
+            "M68AP_FTL_TRACE springboard_resume event=block"
+            " sequence=%" PRIu32 " pc=0x%08" PRIx32
+            " hash=0x%016" PRIx64,
+            springboard_resume_count, address, springboard_resume_hash);
+        plugin_log(line);
+    }
+    if (springboard_resume_count == springboard_resume_blocks) {
+        springboard_resume_active = false;
+        springboard_resume_done = true;
+        g_autofree char *line = g_strdup_printf(
+            "M68AP_FTL_TRACE springboard_resume event=limit"
+            " blocks=%" PRIu32 " hash=0x%016" PRIx64
+            " last_pc=0x%08" PRIx32,
+            springboard_resume_count, springboard_resume_hash,
+            springboard_resume_last_pc);
+        plugin_log(line);
+    }
 }
 
 static bool is_m68ap_bsd_progress(uint64_t address)
@@ -674,6 +906,9 @@ static void trace_root_domain_release(unsigned int cpu_index, void *userdata)
     sp = read_u32_register(reg_sp);
     object = read_memory_u32(sp);
     if (object != root_domain_object) {
+        return;
+    }
+    if (!trace_details) {
         return;
     }
 
@@ -1366,6 +1601,45 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, trace_usb_start, QEMU_PLUGIN_CB_NO_REGS, NULL);
         }
+        if (trace_execve) {
+            if (address == kernel_profile->exec_entry ||
+                address == kernel_profile->exec_return) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_kernel_exec, QEMU_PLUGIN_CB_R_REGS,
+                    (void *)(uintptr_t)address);
+            }
+            if (address == kernel_profile->exec_process) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_kernel_exec_process,
+                    QEMU_PLUGIN_CB_R_REGS, NULL);
+            }
+            if (address == kernel_profile->exit_process) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_kernel_exit, QEMU_PLUGIN_CB_R_REGS, NULL);
+            }
+            if (address == UINT64_C(0xc00600cc)) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_kernel_trap, QEMU_PLUGIN_CB_R_REGS, NULL);
+            }
+            uint32_t opcode = 0;
+            size_t opcode_size = qemu_plugin_insn_data(
+                insn, &opcode, sizeof(opcode));
+
+            /*
+             * Both 1.1.4 kernels enter the common post-syscall path at
+             * `cmn r0, #1`, but preceding board-specific code shifts its
+             * address.  Match the instruction in the narrow unix_syscall
+             * region instead of carrying another fragile absolute address.
+             */
+            if (address >= UINT64_C(0xc0120000) &&
+                address < UINT64_C(0xc0121000) &&
+                opcode_size == sizeof(opcode) &&
+                opcode == UINT32_C(0xe3700001)) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, trace_kernel_trap_return,
+                    QEMU_PLUGIN_CB_R_REGS, NULL);
+            }
+        }
     }
 
     /*
@@ -1388,7 +1662,18 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         qemu_plugin_register_vcpu_tb_exec_cb(
             tb, trace_user_block, QEMU_PLUGIN_CB_NO_REGS, block);
     }
-
+    /*
+     * The post-dyld initializer path used by both boards lives in this shared
+     * libSystem mapping.  Avoid an execution callback on every user block:
+     * that observer overhead alone can keep M68AP from reaching event 313.
+     */
+    if (springboard_resume_after &&
+        first_address >= UINT64_C(0x30000000) &&
+        first_address < UINT64_C(0x30100000)) {
+        qemu_plugin_register_vcpu_tb_exec_cb(
+            tb, trace_springboard_resume_block, QEMU_PLUGIN_CB_NO_REGS,
+            (void *)(uintptr_t)first_address);
+    }
     if (service_observer_only) {
         for (size_t i = 0; i < count; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -1689,11 +1974,24 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
             user_block_count, user_block_executions, last_user_block);
         plugin_log(line);
     }
+    if (springboard_resume_after && !springboard_resume_done) {
+        g_autofree char *line = g_strdup_printf(
+            "M68AP_FTL_TRACE springboard_resume event=exit"
+            " pending=%u active=%u blocks=%" PRIu32
+            " hash=0x%016" PRIx64 " last_pc=0x%08" PRIx32,
+            springboard_resume_pending, springboard_resume_active,
+            springboard_resume_count, springboard_resume_hash,
+            springboard_resume_last_pc);
+        plugin_log(line);
+    }
     g_hash_table_destroy(hfs_mountfs_seen);
     g_hash_table_destroy(verify_header_seen);
     g_hash_table_destroy(storage_strategy_seen);
     g_hash_table_destroy(ftl_core_read_seen);
     g_hash_table_destroy(user_blocks_seen);
+    g_hash_table_destroy(kernel_execs);
+    g_hash_table_destroy(kernel_stack_execs);
+    g_hash_table_destroy(process_execs);
     g_ptr_array_free(trace_blocks, true);
     if (plugin_log_file) {
         fclose(plugin_log_file);
@@ -1764,6 +2062,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                                         &trace_details)) {
                 return -1;
             }
+        } else if (g_strcmp0(tokens[0], "trace-execve") == 0) {
+            if (!qemu_plugin_bool_parse(tokens[0], tokens[1],
+                                        &trace_execve)) {
+                return -1;
+            }
         } else if (g_strcmp0(tokens[0], "service-observer-only") == 0) {
             if (!qemu_plugin_bool_parse(tokens[0], tokens[1],
                                         &service_observer_only)) {
@@ -1783,6 +2086,21 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                 return -1;
             }
             trace_user_blocks_limit = value;
+        } else if (g_strcmp0(tokens[0],
+                            "trace-springboard-resume-after") == 0) {
+            char *end = NULL;
+            uint64_t value = g_ascii_strtoull(tokens[1], &end, 10);
+
+            if (!tokens[1][0] || (end && *end) ||
+                value == 0 || value > 1024) {
+                fprintf(stderr,
+                        "m68ap-ftl-trace: invalid "
+                        "trace-springboard-resume-after: %s\n",
+                        tokens[1]);
+                return -1;
+            }
+            springboard_resume_after = value;
+            springboard_resume_blocks = 1000000;
         } else {
             fprintf(stderr, "m68ap-ftl-trace: unknown option: %s\n", argv[i]);
             return -1;
@@ -1812,6 +2130,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     storage_strategy_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     ftl_core_read_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     user_blocks_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    kernel_execs = g_hash_table_new_full(
+        g_direct_hash, g_direct_equal, NULL, g_free);
+    kernel_stack_execs = g_hash_table_new_full(
+        g_direct_hash, g_direct_equal, NULL, g_free);
+    process_execs = g_hash_table_new_full(
+        g_direct_hash, g_direct_equal, NULL, g_free);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
