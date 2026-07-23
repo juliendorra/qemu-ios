@@ -113,6 +113,8 @@ static const uint8_t platform_function_unavailable[] = {
 
 typedef struct TraceBlock {
     uint64_t address;
+    uint32_t opcode;
+    size_t opcode_size;
     char *disassembly;
 } TraceBlock;
 
@@ -179,6 +181,11 @@ static bool stop_at_verify_failure;
 static bool stabilize_root_domain;
 static bool trace_details = true;
 static bool service_observer_only;
+static uint32_t trace_user_blocks_limit;
+static uint32_t user_block_count;
+static uint64_t user_block_executions;
+static uint64_t last_user_block;
+static bool init_exec_completed;
 static bool root_domain_stabilized;
 static bool usb_patch_done;
 static bool usb_patch_reported;
@@ -202,6 +209,7 @@ static GHashTable *verify_header_seen;
 static GHashTable *storage_strategy_seen;
 static GHashTable *ftl_core_read_seen;
 static GPtrArray *trace_blocks;
+static GHashTable *user_blocks_seen;
 static struct qemu_plugin_register *reg_r0;
 static struct qemu_plugin_register *reg_r1;
 static struct qemu_plugin_register *reg_r2;
@@ -286,13 +294,41 @@ static bool is_m68ap_bsd_progress(uint64_t address)
 static void trace_bsd_progress(unsigned int cpu_index, void *userdata)
 {
     uint64_t address = (uintptr_t)userdata;
+    uint32_t r0 = read_u32_register(reg_r0);
+
+    if (address == UINT64_C(0xc00f707c) && r0 == 0) {
+        init_exec_completed = true;
+    }
     g_autofree char *line = g_strdup_printf(
         "M68AP_FTL_TRACE bsd_progress pc=0x%08" PRIx64
         " r0=0x%08" PRIx32 " r1=0x%08" PRIx32
         " lr=0x%08" PRIx32,
-        address, read_u32_register(reg_r0), read_u32_register(reg_r1),
+        address, r0, read_u32_register(reg_r1),
         read_u32_register(reg_lr));
     plugin_log(line);
+}
+
+static void trace_user_block(unsigned int cpu_index, void *userdata)
+{
+    TraceBlock *block = userdata;
+
+    last_user_block = block->address;
+    user_block_executions++;
+    if (g_hash_table_contains(user_blocks_seen,
+                              (gpointer)(uintptr_t)block->address)) {
+        return;
+    }
+    g_hash_table_add(user_blocks_seen, (gpointer)(uintptr_t)block->address);
+    user_block_count++;
+    if (user_block_count <= trace_user_blocks_limit) {
+        g_autofree char *line = g_strdup_printf(
+            "M68AP_FTL_TRACE user_block sequence=%" PRIu32
+            " address=0x%08" PRIx64 " opcode=0x%0*" PRIx32 " insn=%s",
+            user_block_count, block->address,
+            (int)(block->opcode_size * 2), block->opcode,
+            block->disassembly);
+        plugin_log(line);
+    }
 }
 
 static bool patch_start_method(uint64_t address, bool *done, bool *reported,
@@ -1332,6 +1368,27 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         }
     }
 
+    /*
+     * dyld is mapped in this range on both boards.  Register its blocks even
+     * before the board-specific exec return marker is known so the same
+     * observer can capture the working N45AP reference path.
+     */
+    if (trace_user_blocks_limit &&
+        (init_exec_completed ||
+         (first_address >= UINT64_C(0x2fe00000) &&
+          first_address < UINT64_C(0x30000000))) &&
+        first_address < KERNEL_MIN &&
+        user_block_count < trace_user_blocks_limit) {
+        TraceBlock *block = g_new0(TraceBlock, 1);
+        block->address = first_address;
+        block->opcode_size = qemu_plugin_insn_data(
+            first, &block->opcode, sizeof(block->opcode));
+        block->disassembly = qemu_plugin_insn_disas(first);
+        g_ptr_array_add(trace_blocks, block);
+        qemu_plugin_register_vcpu_tb_exec_cb(
+            tb, trace_user_block, QEMU_PLUGIN_CB_NO_REGS, block);
+    }
+
     if (service_observer_only) {
         for (size_t i = 0; i < count; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -1625,10 +1682,18 @@ static void free_trace_block(gpointer data)
 
 static void plugin_exit(qemu_plugin_id_t id, void *userdata)
 {
+    if (trace_user_blocks_limit) {
+        g_autofree char *line = g_strdup_printf(
+            "M68AP_FTL_TRACE user_summary unique=%" PRIu32
+            " executions=%" PRIu64 " last=0x%08" PRIx64,
+            user_block_count, user_block_executions, last_user_block);
+        plugin_log(line);
+    }
     g_hash_table_destroy(hfs_mountfs_seen);
     g_hash_table_destroy(verify_header_seen);
     g_hash_table_destroy(storage_strategy_seen);
     g_hash_table_destroy(ftl_core_read_seen);
+    g_hash_table_destroy(user_blocks_seen);
     g_ptr_array_free(trace_blocks, true);
     if (plugin_log_file) {
         fclose(plugin_log_file);
@@ -1707,6 +1772,17 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else if (g_strcmp0(tokens[0], "log") == 0) {
             g_free(plugin_log_path);
             plugin_log_path = g_strdup(tokens[1]);
+        } else if (g_strcmp0(tokens[0], "trace-user-blocks") == 0) {
+            char *end = NULL;
+            uint64_t value = g_ascii_strtoull(tokens[1], &end, 10);
+
+            if (!tokens[1][0] || (end && *end) || value > 10000) {
+                fprintf(stderr,
+                        "m68ap-ftl-trace: invalid trace-user-blocks: %s\n",
+                        tokens[1]);
+                return -1;
+            }
+            trace_user_blocks_limit = value;
         } else {
             fprintf(stderr, "m68ap-ftl-trace: unknown option: %s\n", argv[i]);
             return -1;
@@ -1735,6 +1811,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     verify_header_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     storage_strategy_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     ftl_core_read_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    user_blocks_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);

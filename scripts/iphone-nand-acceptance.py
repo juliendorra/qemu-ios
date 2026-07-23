@@ -57,7 +57,10 @@ M68AP_PHASES = [
     ("ftl_open", b"FTL_Open\t\t\t[OK]", False),
     ("kernel", b"Darwin Kernel Version", False),
     ("bsd_root", b"BSD root: disk0s1", False),
-    ("launchd", b"launchd[1]: BOOT_TIME", False),
+    # M68AP 1.1.4 does not consistently print N45AP's exact PID-1 BOOT_TIME
+    # line, but its timestamped launchd service messages prove user-space
+    # service startup.
+    ("launchd", b" launchd[", False),
     ("springboard", b"Configuring SpringBoard for", False),
 ]
 # Markers that must be ABSENT for the milestone to hold.
@@ -91,7 +94,7 @@ def run_qemu(qemu: Path, machine_arg: str, pflash: Path, serial: Path,
              stderr: Path, monitor_log: Path, debug_log: Path, trace_log: Path,
              timeout_s: int, icount_shift: int | None,
              interrupt_log: bool, observer_plugin: Path | None = None,
-             observer_args: str = "") -> None:
+             observer_args: str = "", observer_profile: str = "") -> None:
     serial.write_bytes(b"")
     cmd = [str(qemu), "-M", machine_arg, "-m", "1G",
            "-pflash", str(pflash), "-L", str(APP / "Resources" / "pc-bios"),
@@ -107,8 +110,10 @@ def run_qemu(qemu: Path, machine_arg: str, pflash: Path, serial: Path,
     if observer_plugin is not None:
         plugin_spec = str(observer_plugin)
         if observer_args:
-            plugin_spec += "," + observer_args.replace(
-                "{observer_log}", str(debug_log))
+            expanded_args = observer_args.replace(
+                "{observer_log}", str(debug_log)).replace(
+                    "{profile}", observer_profile)
+            plugin_spec += "," + expanded_args
         cmd.extend(["-plugin", plugin_spec])
         debug_flags.append("plugin")
     if interrupt_log:
@@ -126,7 +131,10 @@ def run_qemu(qemu: Path, machine_arg: str, pflash: Path, serial: Path,
         if proc.poll() is None:
             try:
                 assert proc.stdin is not None
-                proc.stdin.write(b"stop\ninfo registers\nxp/64wx $sp\n")
+                screenshot = serial.with_suffix(".ppm")
+                proc.stdin.write(
+                    f"stop\nscreendump {screenshot}\n"
+                    "info registers\nxp/64wx $sp\n".encode())
                 proc.stdin.flush()
                 time.sleep(0.25)
             except (OSError, BrokenPipeError) as exc:
@@ -216,7 +224,7 @@ def main() -> int:
                     help="optional QEMU observer plugin used for both boards")
     ap.add_argument("--observer-args", default="",
                     help="comma-separated observer plugin arguments; "
-                         "{observer_log} expands to the board-specific log")
+                         "{observer_log} and {profile} expand per board")
     ap.add_argument("--logs", type=Path,
                     default=Path(f"/private/tmp/iphone-nand-accept-{int(time.time())}"))
     args = ap.parse_args()
@@ -260,7 +268,7 @@ def main() -> int:
                  args.logs / "m68ap-nand-trace.log", args.timeout,
                  args.icount_shift if args.icount_shift >= 0 else None,
                  args.interrupt_log, args.observer_plugin,
-                 args.observer_args)
+                 args.observer_args, "m68ap")
         scan = scan_phases(serial, M68AP_PHASES, M68AP_MUST_NOT)
         milestone = (scan["reached"]["and_driver_m68ap"] is not None and
                      scan["reached"]["ftl_init"] is not None and
@@ -275,6 +283,7 @@ def main() -> int:
             "launchd_started": scan["reached"]["launchd"] is not None,
             "springboard_started": scan["reached"]["springboard"] is not None,
             "serial": str(serial),
+            "screenshot": str(serial.with_suffix(".ppm")),
             "observer_log": (str(args.logs / "m68ap-interrupt.log")
                              if args.observer_plugin else None),
             "root_storage": scan_root_trace(
@@ -311,7 +320,7 @@ def main() -> int:
                      args.logs / "n45ap-nand-trace.log", args.timeout,
                      args.icount_shift if args.icount_shift >= 0 else None,
                      args.interrupt_log, args.observer_plugin,
-                     args.observer_args)
+                     args.observer_args, "n45ap")
             scan = scan_phases(serial, N45AP_PHASES, None)
             ok = (scan["reached"]["and_driver_n45ap"] is not None and
                   scan["reached"]["vfl_open"] is not None)
@@ -321,6 +330,7 @@ def main() -> int:
                 "launchd_started": scan["reached"]["launchd"] is not None,
                 "springboard_started": scan["reached"]["springboard"] is not None,
                 "serial": str(serial),
+                "screenshot": str(serial.with_suffix(".ppm")),
                 "observer_log": (str(args.logs / "n45ap-interrupt.log")
                                  if args.observer_plugin else None),
                 "root_storage": scan_root_trace(
