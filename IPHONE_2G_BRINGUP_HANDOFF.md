@@ -8,6 +8,46 @@ the live bring-up state.
 
 ---
 
+## 2026-07-23 BREAKTHROUGH — UART Tx-interrupt storm fixed; M68AP now REACHES SPRINGBOARD
+
+The configd/launchd freeze was a **UART Tx-interrupt storm** in the emulator.
+`hw/char/exynos4210_uart.c`'s `update_irq()` re-asserted `UINTSP_TXD` on every
+call while the Tx FIFO merely sat at/below the trigger level (i.e. continuously
+when idle-empty). The S5L8900 driver (`AppleS5L8900XSerial`) acks TXD, update_irq
+instantly re-raises it, and every UART the guest actually opens livelocks the CPU
+in the driver's IRQ handler. The iPod dodges it (polled console only); the iPhone
+opens the baseband (uart1) and bluetooth (uart3) lines and wedged.
+
+How it was found (repeatable, no plugin): PC-sampling at the freeze
+(`scripts/m68ap-freeze-probe.py`) showed CPU idle + `AppleS5L8900XSerial`
+(`0xc04bd868`) + `AppleARMPL192VIC` only — symbolicated by mapping PCs to the
+kernelcache's kmod_info. A QMP register dump confirmed uart0/1/3
+`UINTP=UINTSP=0x4` (TXD), `UFSTAT=0`, TXD unmasked, VIC RAW `0x1b000000`.
+
+Fix (committed): make TXD edge-triggered — assert only on a real `UTXH`
+transmit, not continuously in `update_irq`. N45AP regression-checked (still
+reaches `Configuring SpringBoard for N45AP` + framebuffer attach).
+
+**Result: with the fix + `IT_M68AP_NO_BASEBAND=1`, M68AP boots to SpringBoard.**
+`SpringBoard[15]` runs (`[Unactivated]`), `IOMobileFramebufferUserClient::attach`
++ `IOCoreSurfaceRootUserClient` attach — the display bring-up N45AP does. Guest
+clock 20s->75s, 1611->1918 serial lines. Furthest the port has ever booted.
+
+**Two remaining layers:**
+1. **Baseband RX storm** — the S-Gold2 stub still storms uart1's RX path, so the
+   baseband must be silenced to progress. Fix the RX side the same way so
+   telephony can be present.
+2. **SpringBoard display/activation stall** — after the framebuffer attach,
+   SpringBoard stalls (no LCD base flips, kernel FB black): unactivated,
+   telephony-less. Likely waiting on CommCenter/activation (needs layer 1).
+
+Reproduce: rebuild, then `IT_M68AP_NO_BASEBAND=1 python3 scripts/fb-snapshot.py
+--board m68ap --iboot-m68ap m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin
+--nor-m68ap m68ap-artifacts/stage/nor_m68ap.bin
+--nand-m68ap m68ap-artifacts/stage/nand-m68ap-fresh --boot-wait 220 --samples 40`.
+
+---
+
 ## 2026-07-23 MAJOR REFRAME — the black screen is display auto-sleep + scanout, NOT a SpringBoard failure
 
 **The long-running "SpringBoard never reaches a visible frame" premise was wrong.**
