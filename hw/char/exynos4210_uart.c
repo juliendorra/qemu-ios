@@ -289,16 +289,23 @@ static void exynos4210_uart_update_irq(Exynos4210UartState *s)
      * transmit FIFO is smaller than the trigger level.
      */
     if (s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) {
-        uint32_t count = (s->reg[I_(UFSTAT)] & UFSTAT_Tx_FIFO_COUNT) >>
-                UFSTAT_Tx_FIFO_COUNT_SHIFT;
-
-        if (count <= exynos4210_uart_Tx_FIFO_trigger_level(s)) {
-            s->reg[I_(UINTSP)] |= UINTSP_TXD;
-        }
+        uint32_t count;
 
         /*
+         * The S5L8900 UART Tx interrupt is edge-triggered on the transmit path
+         * (asserted from the UTXH write below), NOT re-asserted here on every
+         * update while the Tx FIFO merely sits at/below the trigger level.
+         *
+         * The stock exynos "level" behaviour storms this SoC: the guest driver
+         * acks TXD, update_irq immediately re-raises it (the FIFO is still
+         * empty), and any UART the guest actually opens — baseband (uart1),
+         * bluetooth (uart3), etc. — livelocks the CPU in AppleS5L8900XSerial's
+         * interrupt handler and wedges the boot. The iPod dodges it because it
+         * only drives the polled kernel console. Assert TXD only when a byte is
+         * genuinely transmitted (see UTXH), so an idle UART stays quiet.
+         *
          * Rx interrupt if trigger level is reached or if rx timeout
-         * interrupt is disabled and there is data in the receive buffer
+         * interrupt is disabled and there is data in the receive buffer.
          */
         count = fifo_elements_number(&s->rx);
         if ((count && !(s->reg[I_(UCON)] & 0x80)) ||

@@ -918,7 +918,7 @@ static void ipod_touch_machine_init(MachineState *machine)
     // The iPhone's S-Gold2 baseband hangs off UART1; give it an AT-command
     // stub there so radio (and vibrator) bring-up sees "OK" instead of silence.
     Chardev *uart1_chr = serial_hd(1);
-    if (nms->board_id == BOARD_ID_M68AP) {
+    if (nms->board_id == BOARD_ID_M68AP && !getenv("IT_M68AP_NO_BASEBAND")) {
         uart1_chr = qemu_chardev_new("sgold2-baseband", TYPE_CHARDEV_SGOLD2, NULL, NULL, &error_fatal);
     }
     dev = exynos4210_uart_create(UART1_MEM_BASE, 256, 1, uart1_chr, nms->irq[0][25]);
