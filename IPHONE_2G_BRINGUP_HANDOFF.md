@@ -8,6 +8,46 @@ the live bring-up state.
 
 ---
 
+## 2026-07-23 MAJOR REFRAME — the black screen is display auto-sleep + scanout, NOT a SpringBoard failure
+
+**The long-running "SpringBoard never reaches a visible frame" premise was wrong.**
+Proven on the *working iPod* (N45AP) this session with new capture-independent tooling:
+
+- Booted N45AP exactly like the shipping app (real-time, `-serial null`, no observer).
+  On-screen output (`screendump`, which follows the LCD scanout) is **black** for 10+ min.
+- But reading guest RAM directly (QMP `pmemsave`) shows the kernel framebuffers at
+  **0x0f400000 / 0x0f496000 are 47% non-black and hold a complete, correct SpringBoard
+  home screen** (status bar, Safari/YouTube/Calendar "Thursday 23"/Contacts/Clock/
+  Calculator/Settings, Music/Videos/Photos/iTunes dock). Rendered PNG proof was captured.
+- An LCD base trace (`IT_LCD_TRACE=1`, added to `hw/arm/ipod_touch_lcd.c`) shows the OS
+  **page-flipping** `w1_framebuffer_base` across 0x0f400000→0x0f496000→0x0fe00000 (triple
+  buffer, each ~4/6 visible), then **`Merlot panel entered sleep` + `PMU powered panel off`**
+  — the OS auto-sleeps the display after idle (no input in a headless boot).
+
+So the screen is black in captures because (a) the panel **auto-sleeps** after ~1 min of
+no input (`panel_off=true` → `lcd_refresh` paints black), and (b) a one-shot `screendump`
+catches a **mid-flip back-buffer**. A continuous display (real SDL/60 Hz) shows the front
+buffer. **This is shared iPod+iPhone behavior — not the M68AP blocker.** Do not treat a
+black `screendump` as "SpringBoard failed"; dump the FB bases from RAM instead.
+
+**New repeatable tooling (committed):**
+- `scripts/fb-snapshot.py` — boot a board, pause via QMP, dump 0x0fe00000/0x0f400000/
+  0x0f496000 from RAM, measure non-black %, render each to PPM. `--samples/--sample-interval`
+  for a live timeline; `--observer --stabilize-root-domain` for M68AP. QMP (not HMP —
+  HMP-over-socket readline echo mangles rapid `pmemsave`).
+- `scripts/boot-frame-probe.py` — periodic `screendump` darkness timeline; `--serial-null`
+  / `--no-observer` to match the app. Real time = **omit** `-icount` (shift=-1 is invalid).
+- `hw/arm/ipod_touch_lcd.c` gains `IT_LCD_TRACE=1` logging of every window-base program.
+
+**What this means for M68AP:** the real gap is **not** "no visible frame". It is that
+M68AP does not reach `Configuring SpringBoard for M68AP` — in lightweight runs its serial
+freezes at the launchd hand-off (`BTServer: No bluetooth on this device`, ~line 1611) and
+never prints the SpringBoard config marker that N45AP prints (~100 s in). The open question
+is whether M68AP's SpringBoard renders to 0x0f400000 at all (run `fb-snapshot.py --board
+m68ap --observer --stabilize-root-domain`). Memory map: main RAM 0x08000000–0x10000000.
+
+---
+
 ## ► NEXT-SESSION PROMPT (start here)
 
 > **M68AP NOW MOUNTS BOTH IPHONE PARTITIONS AND STARTS LAUNCHD SERVICES.

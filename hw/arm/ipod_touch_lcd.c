@@ -5,6 +5,20 @@
 #include "exec/cpu-common.h"
 #include "system/address-spaces.h"
 
+/* Diagnostic: how much of a 320x480x4 frame at `base` is non-black, sampled
+ * straight from guest RAM (independent of what the LCD scans out). Set
+ * IT_LCD_TRACE=1 to log every window-base program the guest performs. */
+static int lcd_visible_sample_count(uint32_t base);
+
+static void it_lcd_trace_base(const char *win, uint32_t base)
+{
+    if (!getenv("IT_LCD_TRACE")) {
+        return;
+    }
+    fprintf(stderr, "[LCD] %s base <- 0x%08x (visible %d/6 at that base)\n",
+            win, base, lcd_visible_sample_count(base));
+}
+
 static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
 {
     //fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
@@ -129,6 +143,7 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             s->w1_framebuffer_base = val;
             if (s->w1_framebuffer_base != old_framebuffer_base) {
                 s->invalidate = 1;
+                it_lcd_trace_base("w1", (uint32_t)val);
             }
             if (s->retained_resume &&
                 (val == 0x0f400000 || val == 0x0f496000)) {
@@ -156,6 +171,9 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             s->w2_display_depth_info = val;
             break;
         case 0x78:
+            if (val != s->w2_framebuffer_base) {
+                it_lcd_trace_base("w2", (uint32_t)val);
+            }
             s->w2_framebuffer_base = val;
             break;
         case 0x7c:
