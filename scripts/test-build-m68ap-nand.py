@@ -59,13 +59,20 @@ def generate(sig: str, bbt: str) -> Path:
 
 
 def generate_with_hfs(sig: str, pages: int,
-                      active_banks: int | None = None) -> Path:
+                      active_banks: int | None = None,
+                      data_pages: int = 0) -> Path:
     root = Path(tempfile.mkdtemp(prefix=f"nand-{sig}-hfs-"))
     hfs = root / "fixture.img"
     hfs.write_bytes(b"".join(bytes([index]) * PAGE for index in range(pages)))
     out = root / "nand"
     command = [sys.executable, str(BUILDER), "--out", str(out),
                "--signature", sig, "--bbt", "auto", "--hfs", str(hfs)]
+    if data_pages:
+        data_hfs = root / "data-fixture.img"
+        data_hfs.write_bytes(
+            b"".join(bytes([0x80 + index]) * PAGE
+                     for index in range(data_pages)))
+        command.extend(["--data-hfs", str(data_hfs)])
     if active_banks is not None:
         command.extend(["--active-banks", str(active_banks)])
     subprocess.run(
@@ -197,11 +204,40 @@ def test_m68ap_can_hardlink_verified_eight_bank_pages() -> None:
           "four-bank HFS page 8 reuses the verified eight-bank page inode")
 
 
+def test_m68ap_two_partition_layout() -> None:
+    print("M68AP iPhone root + data partition layout:")
+    out = generate_with_hfs("m68ap", 8, data_pages=4)
+    sys.path.insert(0, str(HERE))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("bm_partitions", BUILDER)
+    bm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bm)
+    base = ((bm.FTL_CXT_SECTION_START + 1) *
+            bm.M68AP_ACTIVE_BANKS * bm.PAGES_PER_BLOCK)
+    entry_bank, entry_page = bm.get_physical_address(
+        base + 2, bm.M68AP_ACTIVE_BANKS)
+    entries = (out / f"bank{entry_bank}" /
+               f"{entry_page}.page").read_bytes()
+    root_start, root_end = struct.unpack_from("<QQ", entries, 32)
+    data_start, data_end = struct.unpack_from("<QQ", entries, 0x80 + 32)
+    check((root_start, root_end) == (3, 10),
+          "GPT entry 1 advertises disk0s1 root pages")
+    check((data_start, data_end) == (11, 14),
+          "GPT entry 2 advertises disk0s2 data pages")
+    first_data_bank, first_data_page = bm.get_physical_address(
+        base + data_start, bm.M68AP_ACTIVE_BANKS)
+    first_data = (out / f"bank{first_data_bank}" /
+                  f"{first_data_page}.page").read_bytes()
+    check(first_data[:PAGE] == bytes([0x80]) * PAGE,
+          "disk0s2 first HFS page uses four-bank interleave")
+
+
 def main() -> int:
     for t in (test_n45ap_metadata_reproduces, test_m68ap_signature_and_bbt,
               test_geometry_and_layout, test_get_physical_address_matches_model,
               test_m68ap_filesystem_uses_four_bank_interleave,
-              test_m68ap_can_hardlink_verified_eight_bank_pages):
+              test_m68ap_can_hardlink_verified_eight_bank_pages,
+              test_m68ap_two_partition_layout):
         t()
     print()
     if _failures:

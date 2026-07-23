@@ -76,8 +76,7 @@ SIG_N45AP = 0x43303032  # "200C"  iPod Touch 1G  (regression reference only)
 GPT_HDR_SIG = b"EFI PART"
 GPT_HDR_REVISION = 0x00010000
 MBR_ADDRESS = 0x1BE
-NUM_PARTITIONS = 1
-BOOT_PARTITION_FIRST_PAGE = NUM_PARTITIONS + 2  # LBA0=MBR, LBA1=GPT hdr, LBA2=entry
+ROOT_PARTITION_FIRST_PAGE = 3  # LBA0=MBR, LBA1=GPT hdr, LBA2=entry array
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -246,39 +245,42 @@ def build_ftl_mapping_page(table_index: int) -> bytes:
     return bytes(page)
 
 
-def build_gpt_entry_page(lba_start: int, lba_end: int) -> bytes:
+def build_gpt_entry_page(partitions: list[tuple[int, int]]) -> bytes:
     page = bytearray(BYTES_PER_PAGE)
-    # gpt_ent.ent_type[4]  (HFS+ type GUID as stored by the reference generator)
-    struct.pack_into("<I", page, 0, 0x48465300)
-    struct.pack_into("<I", page, 4, 0x11AA0000)
-    struct.pack_into("<I", page, 8, 0x300011AA)
-    struct.pack_into("<I", page, 12, 0xACEC4365)
-    # ent_uuid[16] at +16, then ent_lba_start(u64)+ ent_lba_end(u64)
-    struct.pack_into("<Q", page, 32, lba_start)
-    struct.pack_into("<Q", page, 40, lba_end)
+    for index, (lba_start, lba_end) in enumerate(partitions):
+        off = index * 0x80
+        # gpt_ent.ent_type[4] (Apple HFS GUID, reference-generator order)
+        struct.pack_into("<I", page, off + 0, 0x48465300)
+        struct.pack_into("<I", page, off + 4, 0x11AA0000)
+        struct.pack_into("<I", page, off + 8, 0x300011AA)
+        struct.pack_into("<I", page, off + 12, 0xACEC4365)
+        # ent_uuid[16] at +16, then ent_lba_start(u64)+ ent_lba_end(u64)
+        struct.pack_into("<Q", page, off + 32, lba_start)
+        struct.pack_into("<Q", page, off + 40, lba_end)
     return bytes(page)
 
 
-def build_gpt_header_page(entry_page: bytes) -> bytes:
+def build_gpt_header_page(entry_page: bytes, partition_count: int) -> bytes:
     page = bytearray(BYTES_PER_PAGE)
     page[0:8] = GPT_HDR_SIG
     struct.pack_into("<I", page, 8, GPT_HDR_REVISION)          # hdr_revision
     struct.pack_into("<I", page, 12, 0x5C)                     # hdr_size = 92
     # hdr_lba_table at +72 (matches gpt_hdr layout in gpt.h)
     struct.pack_into("<Q", page, 72, 2)                        # hdr_lba_table
-    struct.pack_into("<I", page, 80, NUM_PARTITIONS)          # hdr_entries
+    struct.pack_into("<I", page, 80, partition_count)         # hdr_entries
     struct.pack_into("<I", page, 84, 0x80)                     # hdr_entsz
-    struct.pack_into("<I", page, 88, crc32_ieee(entry_page[:0x80]))  # hdr_crc_table
+    struct.pack_into("<I", page, 88,
+                     crc32_ieee(entry_page[:partition_count * 0x80]))
     struct.pack_into("<I", page, 16, crc32_ieee(bytes(page[:0x5C])))  # hdr_crc_self
     return bytes(page)
 
 
-def build_mbr_page(boot_partition_size: int) -> bytes:
+def build_mbr_page(disk_partition_size: int) -> bytes:
     page = bytearray(BYTES_PER_PAGE)
     off = MBR_ADDRESS
     page[off + 4] = 0xEE                                       # sysid
-    struct.pack_into("<I", page, off + 8, BOOT_PARTITION_FIRST_PAGE)
-    struct.pack_into("<I", page, off + 12, boot_partition_size)
+    struct.pack_into("<I", page, off + 8, ROOT_PARTITION_FIRST_PAGE)
+    struct.pack_into("<I", page, off + 12, disk_partition_size)
     page[510] = 0x55
     page[511] = 0xAA
     return bytes(page)
@@ -298,6 +300,7 @@ def valid_ftl_spare() -> bytes:
 # --- top-level construction ----------------------------------------------------
 
 def build(tree: NandTree, signature: int, hfs_path: Path | None,
+          data_hfs_path: Path | None,
           production_bbt: bool, active_banks: int = BANKS,
           reuse_hfs_pages_from: Path | None = None) -> dict:
     populated = {}
@@ -361,7 +364,10 @@ def build(tree: NandTree, signature: int, hfs_path: Path | None,
     # 5. Optional filesystem payload (GPT/MBR/HFS). Not required for WMR init.
     if hfs_path is not None:
         populated["filesystem"] = _write_filesystem(
-            tree, hfs_path, active_banks, reuse_hfs_pages_from)
+            tree, hfs_path, active_banks, reuse_hfs_pages_from,
+            data_hfs_path)
+    elif data_hfs_path is not None:
+        raise SystemExit("--data-hfs requires --hfs")
     else:
         populated["filesystem"] = None
 
@@ -370,7 +376,8 @@ def build(tree: NandTree, signature: int, hfs_path: Path | None,
 
 def _write_filesystem(tree: NandTree, hfs_path: Path,
                       active_banks: int,
-                      reuse_hfs_pages_from: Path | None = None) -> dict:
+                      reuse_hfs_pages_from: Path | None = None,
+                      data_hfs_path: Path | None = None) -> dict:
     size = hfs_path.stat().st_size
     if size % BYTES_PER_PAGE:
         raise SystemExit(
@@ -381,7 +388,7 @@ def _write_filesystem(tree: NandTree, hfs_path: Path,
     pages_per_subblock = active_banks * PAGES_PER_BLOCK
     base = (FTL_CXT_SECTION_START + 1) * pages_per_subblock
     with open(hfs_path, "rb") as fh:
-        vpn = base + BOOT_PARTITION_FIRST_PAGE
+        vpn = base + ROOT_PARTITION_FIRST_PAGE
         for index in range(pages_for_boot):
             bank, pn = get_physical_address(vpn, active_banks)
             data = fh.read(BYTES_PER_PAGE)
@@ -389,7 +396,7 @@ def _write_filesystem(tree: NandTree, hfs_path: Path,
                 tree.write_page(bank, pn, data, spare)
             else:
                 old_base = (FTL_CXT_SECTION_START + 1) * PAGES_PER_SUBLOCK
-                old_vpn = old_base + BOOT_PARTITION_FIRST_PAGE + index
+                old_vpn = old_base + ROOT_PARTITION_FIRST_PAGE + index
                 old_bank, old_pn = get_physical_address(old_vpn, BANKS)
                 source = (reuse_hfs_pages_from / f"bank{old_bank}" /
                           f"{old_pn}.page")
@@ -401,20 +408,48 @@ def _write_filesystem(tree: NandTree, hfs_path: Path,
                 tree.link_page(bank, pn, source)
             vpn += 1
 
-    # GPT boot-partition entry (LBA2)
-    entry = build_gpt_entry_page(BOOT_PARTITION_FIRST_PAGE,
-                                 BOOT_PARTITION_FIRST_PAGE + pages_for_boot)
+    partitions = [
+        (ROOT_PARTITION_FIRST_PAGE,
+         ROOT_PARTITION_FIRST_PAGE + pages_for_boot - 1),
+    ]
+    pages_for_data = 0
+    if data_hfs_path is not None:
+        data_size = data_hfs_path.stat().st_size
+        if data_size % BYTES_PER_PAGE:
+            raise SystemExit(
+                f"data HFS image size {data_size} is not a multiple of "
+                f"{BYTES_PER_PAGE}")
+        pages_for_data = data_size // BYTES_PER_PAGE
+        data_first_page = partitions[0][1] + 1
+        with open(data_hfs_path, "rb") as fh:
+            for index in range(pages_for_data):
+                bank, pn = get_physical_address(
+                    base + data_first_page + index, active_banks)
+                tree.write_page(bank, pn, fh.read(BYTES_PER_PAGE), spare)
+        partitions.append(
+            (data_first_page, data_first_page + pages_for_data - 1))
+
+    # GPT partition-entry array (LBA2)
+    entry = build_gpt_entry_page(partitions)
     bank, pn = get_physical_address(base + 2, active_banks)
     tree.write_page(bank, pn, entry, spare)
     # GPT header (LBA1)
     bank, pn = get_physical_address(base + 1, active_banks)
-    tree.write_page(bank, pn, build_gpt_header_page(entry), spare)
+    tree.write_page(
+        bank, pn, build_gpt_header_page(entry, len(partitions)), spare)
     # MBR (LBA0)
     bank, pn = get_physical_address(base, active_banks)
-    tree.write_page(bank, pn, build_mbr_page(pages_for_boot), spare)
+    tree.write_page(
+        bank, pn, build_mbr_page(partitions[-1][1] -
+                                 ROOT_PARTITION_FIRST_PAGE + 1), spare)
 
     return {"hfs": str(hfs_path), "hfs_pages": pages_for_boot,
-            "boot_partition_first_page": BOOT_PARTITION_FIRST_PAGE,
+            "boot_partition_first_page": ROOT_PARTITION_FIRST_PAGE,
+            "data_hfs": str(data_hfs_path) if data_hfs_path else None,
+            "data_hfs_pages": pages_for_data,
+            "data_partition_first_page": (
+                partitions[1][0] if len(partitions) > 1 else None),
+            "partition_count": len(partitions),
             "active_banks": active_banks,
             "reused_hfs_pages_from": (str(reuse_hfs_pages_from)
                                       if reuse_hfs_pages_from else None)}
@@ -438,6 +473,9 @@ def main() -> None:
     parser.add_argument("--hfs", type=Path, default=None,
                         help="decrypted root HFS+ image (optional; not needed to "
                              "pass WMR init)")
+    parser.add_argument("--data-hfs", type=Path, default=None,
+                        help="optional writable HFS+ image for iPhone disk0s2 "
+                             "(/private/var)")
     parser.add_argument("--active-banks", type=int, choices=(4, 8), default=None,
                         help="override filesystem/FTL interleave (default: "
                              "M68AP=4, N45AP=8)")
@@ -484,7 +522,7 @@ def main() -> None:
     tree = NandTree()
     if args.reuse_hfs_pages_from is not None and args.hfs is None:
         raise SystemExit("--reuse-hfs-pages-from requires --hfs")
-    populated = build(tree, signature, args.hfs, production_bbt,
+    populated = build(tree, signature, args.hfs, args.data_hfs, production_bbt,
                       active_banks, args.reuse_hfs_pages_from)
     count = tree.flush(out)
 
@@ -513,10 +551,14 @@ def main() -> None:
             "kind": "ipsw", "device": args.device, "build": args.ipsw_build,
             "ipsw_sha256": args.ipsw_hash,
             "hfs_sha256": sha256_file(args.hfs) if args.hfs else None,
+            "data_hfs_sha256": (
+                sha256_file(args.data_hfs) if args.data_hfs else None),
         },
         "guest_file_modifications": (
             "none (metadata-only)" if args.hfs is None
-            else "root HFS+ placed at boot partition; GPT/MBR synthesised"),
+            else ("root and data HFS+ partitions placed; GPT/MBR synthesised"
+                  if args.data_hfs else
+                  "root HFS+ placed at boot partition; GPT/MBR synthesised")),
     }
     manifest_path = out / "nand-provenance.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
