@@ -43,8 +43,46 @@ black `screendump` as "SpringBoard failed"; dump the FB bases from RAM instead.
 M68AP does not reach `Configuring SpringBoard for M68AP` — in lightweight runs its serial
 freezes at the launchd hand-off (`BTServer: No bluetooth on this device`, ~line 1611) and
 never prints the SpringBoard config marker that N45AP prints (~100 s in). The open question
-is whether M68AP's SpringBoard renders to 0x0f400000 at all (run `fb-snapshot.py --board
-m68ap --observer --stabilize-root-domain`). Memory map: main RAM 0x08000000–0x10000000.
+is whether M68AP's SpringBoard renders to 0x0f400000 at all. Memory map: main RAM
+0x08000000–0x10000000.
+
+---
+
+## 2026-07-23 SECOND REFRAME — the "power-management retain" is an OBSERVER ARTIFACT
+
+The diagnostic `stabilize-root-domain` retain (the `IOPMrootDomain: attached at free()`
+work-around) is **not needed for a plain boot**. It was a Heisenbug created by the
+observer plugin's own instruction hooking.
+
+Booting `-M iPhone-2G` with the real m68ap iBoot/NOR/NAND and **no plugin at all**
+(`scripts/fb-snapshot.py --board m68ap` without `--observer`), across three runs:
+
+- `attached at free`: **0** occurrences; a single kernel banner (no reboot);
+- `IOIpodUSBDevice` starts normally (present ~10×) — it is *not* skipped;
+- reaches `BSD root: disk0s1`, `/dev/disk0s2 on /private/var`, `launchd[1]: BOOT_TIME`,
+  `configd`, `mDNSResponder`.
+
+The observer runs, by contrast, apply `skip_usb_start` and hook the service-iteration
+PCs; that instrumentation is what perturbs timing into the path that frees IOPMrootDomain.
+**Do not reintroduce the retain.** A WIP in-emulator port (an `arm_debug_check_breakpoint`
+hook + `cpu_breakpoint_insert` at the two service PCs) was built and then reverted: it was
+both unnecessary *and* its BP_CPU breakpoints never fired for arm1176 (guest debug is off;
+a machine-side PC hook needs a different mechanism than `cpu_breakpoint_insert`, e.g. a
+translate-time hook — noted for future in-emulator tracing, but not needed here).
+
+### The real remaining blocker (now free of instrumentation confounds)
+
+Observer-free, M68AP boots **fast** to launchd + configd + mDNSResponder, then the serial
+**freezes at ~line 1609** (`configd[16]: loading com.apple.SystemConfiguration.MobileWatchdog`)
+with a black framebuffer and no SpringBoard exec marker, for the rest of an 8-minute run.
+So the stall is **real and not observer-induced**, and appears to sit at the early launchd
+service phase (configd) — possibly before SpringBoard even execs, not deep in dyld as the
+older observer traces suggested. This is the divergence to chase next; the confound that
+made "slow vs hung" undecidable (the observer overhead) is now gone. Note the ~12× TCG
+slowdown: at the freeze the guest clock is only ~20 s in. Next step: determine whether the
+guest is deadlocked or crawling (sample the guest PC over time via a QMP `human-monitor-command
+info registers` — use a dedicated boot with the monitor free, since `fb-snapshot.py` holds
+the single QMP connection), and whether launchd ever execs SpringBoard.
 
 ---
 
