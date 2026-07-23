@@ -158,13 +158,19 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                             s, s->data2_sec_addr + 0x1104 + 0x244);
                         //printf("starting with page %d\n", page);
 
-                        uint16_t ops = num_pages / 8;
-                        for(int op = 0; op < ops; op++) {
-                            for(int i = 0; i < 8; i++) {
-                                s->nand_state->pages_to_read[op * 8 + i] = page;
-                                s->nand_state->banks_to_read[op * 8 + i] = i;
-                            }
-                            page++;
+                        /*
+                         * The transfer is striped across the banks present on
+                         * the board.  N45AP has eight; M68AP has four.  The
+                         * old fixed-eight loop assigned no entries at all for
+                         * a four-page M68AP request, returning stale/zero data
+                         * to the vnode pager even though the HFS image itself
+                         * was correct.
+                         */
+                        for (int i = 0; i < num_pages; i++) {
+                            s->nand_state->pages_to_read[i] =
+                                page + i / s->nand_state->num_banks;
+                            s->nand_state->banks_to_read[i] =
+                                i % s->nand_state->num_banks;
                         }
                         trace_root_read_request(cmd, num_pages,
                                                 s->nand_state->pages_to_read,
