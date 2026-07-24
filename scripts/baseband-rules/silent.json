@@ -1,0 +1,6 @@
+{
+  "_comment": "Pure capture: never answer. Reproduces IT_M68AP_NO_BASEBAND-ish silence but with the uart1 conversation recorded. Use to see what AppleBaseband sends unprompted.",
+  "default": null,
+  "non_at": null,
+  "rules": []
+}

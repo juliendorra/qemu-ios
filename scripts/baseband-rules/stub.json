@@ -1,0 +1,27 @@
+{
+  "_comment": "Faithful replica of the in-QEMU C stub (hw/arm/ipod_touch_baseband.c) so its baseband-on stall reproduces under the lab with a full trace.",
+  "default": "\r\nOK\r\n",
+  "non_at": null,
+  "rules": [
+    {"match": "(?i)^at\\+xdrv=9,1,(\\d+)",
+     "response": "\r\n+XDRV: 9,1,0,{1},NULL\r\n\r\nOK\r\n",
+     "note": "baseband NVRAM read -> empty store"},
+    {"match": "(?i)^at\\+xdrv=4,",
+     "response": "\r\nOK\r\n",
+     "note": "vibrator"},
+    {"match": "(?i)^at\\+cops\\?",
+     "response": "\r\n+COPS: 0,0,\"QEMU\",0\r\n\r\nOK\r\n",
+     "note": "carrier registration"},
+    {"match": "(?i)^at\\+xcallstat=(\\d)",
+     "response": "\r\nOK\r\n",
+     "set": {"xcallstat": "{1}"},
+     "note": "call status notifications toggle"},
+    {"match": "(?i)^atd.*",
+     "response": "\r\nOK\r\n\r\n+XCALLSTAT: 1,0\r\n",
+     "if": {"var": "xcallstat", "equals": "1"},
+     "note": "dial with call-status reporting"},
+    {"match": "(?i)^atd.*",
+     "response": "\r\nOK\r\n",
+     "note": "dial"}
+  ]
+}
