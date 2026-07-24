@@ -207,6 +207,122 @@ must be non-UART. Next moves, reordered:
    tames the panic.)
 3. Only then revisit AT content.
 
+### Runs 5–7: the stall was never the baseband — it was the UART model. ROOT CAUSE FOUND
+
+Chasing next-move 1 reframed everything, in four steps.
+
+**GPIO ruled out by instrumentation** (`IT_GPIO_TRACE=<path|stderr>` in
+`hw/arm/ipod_touch_gpio.c`, per-(dir,addr,pc) dedup). A stalling `builtin`
+boot and a SpringBoard `none` boot produce essentially IDENTICAL GPIO
+traces (71 accesses; diff = one extra late read): iBoot pokes port7-pin1
+before each AT command, the kernel configures pins at ~16.5 s + three
+one-shot reads at 17 s, then NOTHING in either boot. Nobody polls GPIO
+during the stall.
+
+**The stall is in userland, not the kernel driver.** Reading the stall
+tail properly: the "baseband_retry_loop" boots get ALL the way through
+root mount, launchd, mDNSResponder, and park at `lockdown[20]:
+data_ark_load` — one step before `lookup_baseband_info`, the step where
+the `none` boot declares the baseband dead (29× AppleBasebandUserClient
+attach→terminate churn) and sails on to SpringBoard. In stalling boots
+the user client NEVER attaches. (The ≥20-AppleBaseband-lines verdict
+signature counts the audio/serial-layer lines every boot prints; the
+name "baseband_retry_loop" was a misnomer all along.)
+
+**Run 5 killed the response hypothesis entirely.** New `.rules` seats
+`silent` (everything mute), `xdrv-only`, `cgsn-only`: ALL THREE stall.
+A byte-mute stub is guest-visibly identical to `none` in traffic — yet
+`none` boots and `silent` doesn't. The only remaining difference is
+INSIDE the uart model: with a NULL chardev the whole `UTXH` branch is
+skipped, so no `UINTSP_TXD` ever latches; with any chardev, iBoot's
+transmits latch TXD pending that survives into the kernel handoff.
+
+**Run 6, register-level proof** (`IT_UART_TRACE=<path|stderr>` +
+`IT_UART_TRACE_CHANNEL`, in `hw/char/exynos4210_uart.c`): the stalling
+boot's kernel spends 15k+ trace lines in a two-instruction loop at
+`0xc04bd868/78` — AppleS5L8900XSerial's ISR reading `UTRSTAT` and
+writing `UTRSTAT=0` forever. The stale iBoot-era TXD storms the ISR the
+moment lockdownd opens the baseband tty. That is the "uart1-mute
+AppleBaseband": the driver is livelocked in its own ISR before it ever
+transmits. (Same PC the run-1 samples flagged.)
+
+The driver's register idiom tells us what the real S5L8900 UART must do
+(it never writes UINTP/UINTSP with a non-zero value — ALL its acking is
+`UCON` mode toggles and `UTRSTAT` writes):
+
+1. `UCON` direction mode = 00 (disable) withdraws that direction's
+   pending interrupt (S3C-family documented behaviour). Driver init
+   writes `UCON=0x400` before unmasking.
+2. `UFCON` Rx-FIFO-reset must also clear `UTRSTAT` data-ready/timeout
+   and pending RXD — otherwise iBoot's last consumed-response state
+   reads back as a ghost byte after the kernel's FIFO reset.
+3. A `UTRSTAT` write is the Tx-interrupt ack (clears TXD pending) —
+   there is no other ack in the driver's vocabulary, and the PL192 VIC
+   has no sub-pending register to do it elsewhere.
+
+All three implemented in `hw/char/exynos4210_uart.c` (alongside the
+earlier edge-triggered-TXD storm fix, which stands).
+
+**Run 7 validation, fix 1 alone**: `silent-ct` → **springboard_reached**
+— the FIRST chardev-connected uart1 boot ever to get there. `stub-ct`
+got further than ever: AppleBasebandUserClient attaches, **CommCenter
+launches**, and the kernel driver transmitted its FIRST uart1 byte
+('a' of a lowercase `at` command) — then hit the ghost-Rx/TXD-ack storm
+(`UTRSTAT=0x7` ISR loop), which fixes 2+3 target.
+
+Watch out: two parallel seats sharing one `IT_UART_TRACE` path
+interleave in the same file — use one trace path per seat.
+
+### Run 8 detour — an ack must never SYNTHESIZE an interrupt
+
+First cut of fixes 2+3 called full `update_irq()` from the ack paths.
+`update_irq` has a side effect: it re-raises RXD whenever the Rx FIFO is
+non-empty. Result: a `UTRSTAT` write with leftover iBoot bytes still in
+the FIFO fired a brand-new uart1 interrupt in the middle of the kernel's
+serial init — and every answering seat (stub, builtin, cgsn-only) died
+6/6 in the `IOIpodUSBDevice::start` panic, which that spurious-IRQ
+timing shift makes ~deterministic (silent/none, no RX bytes, kept
+passing). Fixed with `update_irq_line()` — ack paths recompute
+UINTP/the IRQ line from CURRENT pending bits only. Lesson for every
+future ack: clear-and-recompute, never re-derive new events.
+
+### Run 9 — SPRINGBOARD WITH A LIVE BASEBAND; CommCenter talks AT; new frontier is transport mode
+
+Last piece: after the handshake the ISR stormed again — `update_irq`
+held RXD asserted as long as ANY byte sat in the FIFO (level), but the
+driver acks in the ISR and drains from a separate thread, so the ISR
+re-entered forever and the reader never ran. RXD is now an EVENT like
+TXD: raised on byte arrival (receive path), on trigger-level crossing,
+and on Rx timeout; acked by the `UTRSTAT` write (which clears TXD+RXD
+pending; FIFO contents and UTRSTAT/UFSTAT data-ready remain for the
+reader thread).
+
+With all four UART semantics in place (`hw/char/exynos4210_uart.c`:
+edge TXD from b045bb7e2b, UCON-disable clears pending, Rx-FIFO-reset
+clears rx status+pending, UTRSTAT-write acks TXD+RXD; all acks via
+side-effect-free `update_irq_line`):
+
+    stub-ct  →  springboard_reached at 84.3 s wall, baseband ALIVE
+
+CommCenter runs a real kernel-era AT session against the C-table stub
+(6.6k trace lines): `at`, `ate0`, `at+xsio?`, `at+ipr=750000` (baud
+raise), `at+xlog=0/2`, `at+xtransportmode` — all currently answered
+with the default bare `OK` — then switches to an HDLC-style framed
+transport (`0x7E`-flagged frames on the wire), gets no valid frames
+back, resets the link (`at` … `at+xtransportmode` again) and loops.
+SpringBoard boots regardless.
+
+So the baseband bring-up ladder now stands at:
+1. DONE — kernel driver alive, AT conversation rule-drivable
+   (`IT_BASEBAND_RULES` / `sgold2d.py` both usable; extend rulesets
+   with real `+XSIO:` answers etc. and see what changes).
+2. NEXT — the post-`at+xtransportmode` framed protocol (Apple reliable
+   serial layer / MUX). Real telephony/SIM/activation state lives
+   behind it. Options: answer `at+xtransportmode` with an error to keep
+   CommCenter in plain AT mode (cheap probe), or implement the framing.
+3. Verify the `-ct` results replicate on the socket modem path
+   (sgold2d) now that the storms are gone.
+
 ---
 
 ## 2026-07-23 BREAKTHROUGH — UART Tx-interrupt storm fixed; M68AP now REACHES SPRINGBOARD

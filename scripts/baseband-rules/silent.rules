@@ -1,0 +1,5 @@
+# Fully mute C-table stub: guest-visible ≡ `none` (NULL chardev), but via
+# the same in-QEMU stub path. Discriminator for the run-5 hypothesis that
+# iBoot's ANSWERED baseband NVRAM read is what later parks lockdownd
+# (IPHONE_2G_BRINGUP_HANDOFF.md): silent → SpringBoard would confirm.
+default	-

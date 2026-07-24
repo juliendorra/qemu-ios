@@ -1,0 +1,6 @@
+# Answer ONLY iBoot's AT+xdrv NVRAM reads; mute AT+cgsn and everything
+# else. Pairs with cgsn-only.rules to isolate which answered iBoot
+# transaction triggers the lockdownd-era stall.
+at+xdrv=9,1,	\r\n+XDRV: 9,1,0,{int},NULL\r\n\r\nOK\r\n
+at+xdrv=4,	\r\nOK\r\n
+default	-

@@ -282,6 +282,8 @@ static void exynos4210_uart_update_dmabusy(Exynos4210UartState *s)
     }
 }
 
+static void exynos4210_uart_update_irq_line(Exynos4210UartState *s);
+
 static void exynos4210_uart_update_irq(Exynos4210UartState *s)
 {
     /*
@@ -307,9 +309,16 @@ static void exynos4210_uart_update_irq(Exynos4210UartState *s)
          * Rx interrupt if trigger level is reached or if rx timeout
          * interrupt is disabled and there is data in the receive buffer.
          */
+        /* Like TXD above, the S5L8900 RXD is an EVENT (bytes arrived /
+         * trigger level crossed / rx timeout), not a level held while data
+         * merely sits in the FIFO: AppleS5L8900XSerial's ISR acks via a
+         * UTRSTAT write and drains URXH from a separate thread, so a
+         * count>0 re-raise here would re-enter the ISR forever and that
+         * thread never runs (the post-handshake storm of run 7). Arrival
+         * raises RXD in exynos4210_uart_receive(); here only the trigger
+         * level sustains it. */
         count = fifo_elements_number(&s->rx);
-        if ((count && !(s->reg[I_(UCON)] & 0x80)) ||
-            count >= exynos4210_uart_Rx_FIFO_trigger_level(s)) {
+        if (count >= exynos4210_uart_Rx_FIFO_trigger_level(s)) {
             exynos4210_uart_update_dmabusy(s);
             s->reg[I_(UINTSP)] |= UINTSP_RXD;
             timer_del(s->fifo_timeout_timer);
@@ -319,6 +328,18 @@ static void exynos4210_uart_update_irq(Exynos4210UartState *s)
         s->reg[I_(UINTSP)] |= UINTSP_RXD;
     }
 
+    exynos4210_uart_update_irq_line(s);
+}
+
+/* Recompute UINTP and the IRQ line from the CURRENT pending bits, without
+ * update_irq's side effect of re-raising RXD from FIFO state. Ack paths
+ * (UTRSTAT write, UCON mode-disable, Rx FIFO reset) must use this: calling
+ * full update_irq there can synthesize a brand-new Rx interrupt in the
+ * middle of the guest's init sequence (leftover iBoot bytes still in the
+ * FIFO), which the S5L8900 never does and which perturbs the M68AP boot
+ * into the IOIpodUSBDevice::start panic. */
+static void exynos4210_uart_update_irq_line(Exynos4210UartState *s)
+{
     s->reg[I_(UINTP)] = s->reg[I_(UINTSP)] & ~s->reg[I_(UINTM)];
 
     if (s->reg[I_(UINTP)]) {
@@ -404,6 +425,66 @@ static void exynos4210_uart_rx_timeout_set(Exynos4210UartState *s)
     }
 }
 
+/*
+ * IT_UART_TRACE=<path|stderr> logs every register access on the channel
+ * selected by IT_UART_TRACE_CHANNEL (default 1, the M68AP baseband uart)
+ * with guest time, value and PC. Register polling would swamp the file, so
+ * per (dir,offset,pc,value) key the first 16 hits log verbatim, then only
+ * every 4096th with the running count. Used to diff a stalling boot
+ * against a working one at the register level (see
+ * IPHONE_2G_BRINGUP_HANDOFF.md, baseband runs).
+ */
+static FILE *it_uart_trace_fp;
+static GHashTable *it_uart_trace_counts;
+static int it_uart_trace_channel = -1;
+
+static void it_uart_trace(Exynos4210UartState *s, char dir, hwaddr offset,
+                          uint32_t val)
+{
+    static bool checked;
+
+    if (!checked) {
+        checked = true;
+        const char *path = getenv("IT_UART_TRACE");
+        if (path && *path) {
+            if (!strcmp(path, "1") || !strcmp(path, "stderr")) {
+                it_uart_trace_fp = stderr;
+            } else {
+                it_uart_trace_fp = fopen(path, "a");
+            }
+            it_uart_trace_counts = g_hash_table_new(NULL, NULL);
+            const char *chan = getenv("IT_UART_TRACE_CHANNEL");
+            it_uart_trace_channel = chan ? atoi(chan) : 1;
+        }
+    }
+    if (!it_uart_trace_fp || s->channel != it_uart_trace_channel) {
+        return;
+    }
+    uint64_t pc = 0;
+    if (current_cpu) {
+        CPUClass *cc = CPU_GET_CLASS(current_cpu);
+        if (cc->get_pc) {
+            pc = cc->get_pc(current_cpu);
+        }
+    }
+    /* val folded to 16 bits in the key: enough to separate the status-bit
+     * patterns that matter without exploding the table on data bytes. */
+    gpointer key = (gpointer)((pc << 24) ^ ((uint64_t)(val & 0xffff) << 8) ^
+                              (offset << 1) ^ (dir == 'W'));
+    uint64_t n = (uint64_t)g_hash_table_lookup(it_uart_trace_counts, key) + 1;
+    g_hash_table_insert(it_uart_trace_counts, key, (gpointer)n);
+    if (n > 16 && n % 4096 != 0) {
+        return;
+    }
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+    fprintf(it_uart_trace_fp,
+            "[%3lld.%06lld] %c %-7s = 0x%08x pc=%08llx n=%llu\n",
+            now / 1000000LL, now % 1000000LL, dir,
+            exynos4210_uart_regname(offset), val,
+            (unsigned long long)pc, (unsigned long long)n);
+    fflush(it_uart_trace_fp);
+}
+
 static void exynos4210_uart_write(void *opaque, hwaddr offset,
                                uint64_t val, unsigned size)
 {
@@ -412,6 +493,7 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
 
     trace_exynos_uart_write(s->channel, offset,
                             exynos4210_uart_regname(offset), val);
+    it_uart_trace(s, 'W', offset, val);
 
     switch (offset) {
     case ULCON:
@@ -424,6 +506,16 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
         s->reg[I_(UFCON)] = val;
         if (val & UFCON_Rx_FIFO_RESET) {
             fifo_reset(&s->rx);
+            /* Discarding the FIFO must also drop the receive status and any
+             * pending Rx interrupt, or a data-ready bit left by an earlier
+             * boot stage (iBoot's last AT response on the M68AP baseband
+             * uart) reads back after the reset and the kernel ISR storms on
+             * a byte that no longer exists. */
+            s->reg[I_(UTRSTAT)] &= ~(UTRSTAT_Rx_BUFFER_DATA_READY |
+                                     UTRSTAT_Rx_TIMEOUT);
+            s->reg[I_(UINTP)] &= ~UINTSP_RXD;
+            s->reg[I_(UINTSP)] &= ~UINTSP_RXD;
+            exynos4210_uart_update_irq_line(s);
             s->reg[I_(UFCON)] &= ~UFCON_Rx_FIFO_RESET;
             trace_exynos_uart_rx_fifo_reset(s->channel);
         }
@@ -460,6 +552,16 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
         if (val & UTRSTAT_Rx_TIMEOUT) {
             s->reg[I_(UTRSTAT)] &= ~UTRSTAT_Rx_TIMEOUT;
         }
+        /* On the S5L8900 the UTRSTAT write is the interrupt ack:
+         * AppleS5L8900XSerial's ISR does exactly R UTRSTAT / W UTRSTAT and
+         * never touches UINTP/UINTSP, so a TXD latched by its own UTXH
+         * write or the RXD from a received burst has no other way to drop
+         * and the level IRQ into the PL192 re-enters the ISR forever. The
+         * FIFO keeps its bytes; UTRSTAT/UFSTAT still show them for the
+         * driver's reader thread. */
+        s->reg[I_(UINTP)] &= ~(UINTSP_TXD | UINTSP_RXD);
+        s->reg[I_(UINTSP)] &= ~(UINTSP_TXD | UINTSP_RXD);
+        exynos4210_uart_update_irq_line(s);
         break;
     case UERSTAT:
     case UFSTAT:
@@ -476,6 +578,25 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
         exynos4210_uart_update_irq(s);
         break;
     case UCON:
+        /* Per the S3C-family UART spec, setting a direction's mode to 00
+         * (disable) also withdraws that direction's interrupt request.
+         * AppleS5L8900XSerial relies on this: its init writes UCON=0x400
+         * (both modes off) and never touches UINTP/UINTSP with a non-zero
+         * value, so a TXD latched by iBoot-era transmits would otherwise
+         * survive into the unmask and storm the ISR (UTRSTAT read/write
+         * loop at 0xc04bd868) the moment lockdownd opens the baseband
+         * tty -- the M68AP "uart1-mute AppleBaseband" stall. */
+        s->reg[I_(UCON)] = val;
+        if (((val >> 2) & 3) == 0) {
+            s->reg[I_(UINTP)] &= ~UINTSP_TXD;
+            s->reg[I_(UINTSP)] &= ~UINTSP_TXD;
+        }
+        if ((val & 3) == 0) {
+            s->reg[I_(UINTP)] &= ~UINTSP_RXD;
+            s->reg[I_(UINTSP)] &= ~UINTSP_RXD;
+        }
+        exynos4210_uart_update_irq_line(s);
+        break;
     case UMCON:
     default:
         s->reg[I_(offset)] = val;
@@ -483,7 +604,7 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
     }
 }
 
-static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
+static uint64_t exynos4210_uart_read_internal(void *opaque, hwaddr offset,
                                   unsigned size)
 {
     Exynos4210UartState *s = (Exynos4210UartState *)opaque;
@@ -559,6 +680,15 @@ static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
     return 0;
 }
 
+static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
+                                     unsigned size)
+{
+    uint64_t res = exynos4210_uart_read_internal(opaque, offset, size);
+
+    it_uart_trace((Exynos4210UartState *)opaque, 'R', offset, res);
+    return res;
+}
+
 static const MemoryRegionOps exynos4210_uart_ops = {
     .read = exynos4210_uart_read,
     .write = exynos4210_uart_write,
@@ -598,6 +728,8 @@ static void exynos4210_uart_receive(void *opaque, const uint8_t *buf, int size)
         s->reg[I_(URXH)] = buf[0];
     }
     s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_BUFFER_DATA_READY;
+    /* Data arrival is the RXD edge (see update_irq). */
+    s->reg[I_(UINTSP)] |= UINTSP_RXD;
 
     exynos4210_uart_update_irq(s);
 }

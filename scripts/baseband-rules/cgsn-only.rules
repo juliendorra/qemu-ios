@@ -1,0 +1,4 @@
+# Answer ONLY AT+cgsn (bare OK, like the shipping stub); mute the xdrv
+# NVRAM reads. Pairs with xdrv-only.rules.
+at+cgsn	\r\nOK\r\n
+default	-
