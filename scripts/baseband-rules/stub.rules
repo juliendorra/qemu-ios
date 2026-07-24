@@ -1,0 +1,6 @@
+# C-table replica of the built-in stub (IT_BASEBAND_RULES format).
+# prefix<TAB>response ; first match wins ; {int}/{rest} = text after prefix.
+at+xdrv=9,1,	\r\n+XDRV: 9,1,0,{int},NULL\r\n\r\nOK\r\n
+at+xdrv=4,	\r\nOK\r\n
+at+cops?	\r\n+COPS: 0,0,"QEMU",0\r\n\r\nOK\r\n
+default	\r\nOK\r\n

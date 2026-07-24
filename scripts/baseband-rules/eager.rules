@@ -1,0 +1,15 @@
+# C-table version of eager.json: real-shaped answers to standard AT
+# identity/SIM/registration queries. IT_BASEBAND_RULES format.
+at+xdrv=9,1,	\r\n+XDRV: 9,1,0,{int},NULL\r\n\r\nOK\r\n
+at+xdrv=4,	\r\nOK\r\n
+at+cgmi	\r\nINFINEON\r\n\r\nOK\r\n
+at+cgmm	\r\nS-GOLD2\r\n\r\nOK\r\n
+at+cgmr	\r\n04.05.04_G\r\n\r\nOK\r\n
+at+cgsn	\r\n012345678901237\r\n\r\nOK\r\n
+at+xgendata	\r\n+XGENDATA: "DEBUG_BB 04.05.04_G"\r\n\r\nOK\r\n
+at+cpin?	\r\n+CPIN: READY\r\n\r\nOK\r\n
+at+creg?	\r\n+CREG: 0,1\r\n\r\nOK\r\n
+at+csq	\r\n+CSQ: 24,0\r\n\r\nOK\r\n
+at+cops?	\r\n+COPS: 0,0,"QEMU",0\r\n\r\nOK\r\n
+at+cimi	\r\n001010123456789\r\n\r\nOK\r\n
+default	\r\nOK\r\n

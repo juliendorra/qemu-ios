@@ -80,12 +80,162 @@ static void sgold2_queue(SGold2State *s, const char *resp)
     sgold2_flush(CHARDEV(s));
 }
 
+/*
+ * IT_BASEBAND_RULES=<path> replaces the hardcoded responses below with a
+ * text table, so response hypotheses iterate by editing a file and
+ * relaunching QEMU -- no rebuild -- while keeping the in-MMIO instant
+ * reply timing that the external-socket modem (scripts/sgold2d.py)
+ * cannot provide (its ~ms asynchrony perturbs the IOIpodUSBDevice::start
+ * race; see DEVICE_BRINGUP_PLAYBOOK.md).
+ *
+ * Format, one rule per line, first match wins:
+ *     <prefix>\t<response>
+ *     default\t<response>          # unmatched AT lines ("-" = stay silent)
+ *     # comment / blank lines ignored
+ * <prefix> matches case-insensitively at the start of the AT line.
+ * <response> understands \r \n \t \\ escapes, "-" for silent, and the
+ * tokens {int} (atoi of the text after the prefix) and {rest} (raw text
+ * after the prefix).
+ */
+typedef struct {
+    char *match;
+    char *response;              /* unescaped; NULL = silent match */
+} SGold2Rule;
+
+static SGold2Rule *sgold2_rules;
+static int sgold2_num_rules;
+static char *sgold2_default_resp;    /* NULL = "\r\nOK\r\n"; "" = silent */
+static bool sgold2_use_rules;
+
+static char *sgold2_unescape(const char *in)
+{
+    char *out = g_malloc(strlen(in) + 1);
+    char *w = out;
+
+    for (const char *r = in; *r; r++) {
+        if (*r == '\\' && r[1]) {
+            r++;
+            switch (*r) {
+            case 'r': *w++ = '\r'; break;
+            case 'n': *w++ = '\n'; break;
+            case 't': *w++ = '\t'; break;
+            default:  *w++ = *r;   break;
+            }
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+    return out;
+}
+
+static void sgold2_load_rules(void)
+{
+    static bool checked;
+
+    if (checked) {
+        return;
+    }
+    checked = true;
+    const char *path = getenv("IT_BASEBAND_RULES");
+    if (!path || !*path) {
+        return;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "sgold2: cannot open IT_BASEBAND_RULES %s\n", path);
+        exit(1);
+    }
+    char linebuf[1024];
+    while (fgets(linebuf, sizeof(linebuf), fp)) {
+        char *nl = strpbrk(linebuf, "\r\n");
+        if (nl) {
+            *nl = '\0';
+        }
+        if (!linebuf[0] || linebuf[0] == '#') {
+            continue;
+        }
+        char *tab = strchr(linebuf, '\t');
+        if (!tab) {
+            fprintf(stderr, "sgold2: bad rules line (no TAB): %s\n", linebuf);
+            exit(1);
+        }
+        *tab = '\0';
+        const char *resp_raw = tab + 1;
+        char *resp = strcmp(resp_raw, "-") == 0 ? NULL
+                                                : sgold2_unescape(resp_raw);
+        if (strcmp(linebuf, "default") == 0) {
+            sgold2_default_resp = resp ? resp : g_strdup("");
+            continue;
+        }
+        sgold2_rules = g_realloc(sgold2_rules,
+                                 (sgold2_num_rules + 1) * sizeof(SGold2Rule));
+        sgold2_rules[sgold2_num_rules].match = g_strdup(linebuf);
+        sgold2_rules[sgold2_num_rules].response = resp;
+        sgold2_num_rules++;
+    }
+    fclose(fp);
+    sgold2_use_rules = true;
+    fprintf(stderr, "sgold2: loaded %d rules from %s\n",
+            sgold2_num_rules, path);
+}
+
+static void sgold2_queue_template(SGold2State *s, const char *tmpl,
+                                  const char *rest)
+{
+    char resp[1024];
+    size_t n = 0;
+
+    for (const char *r = tmpl; *r && n < sizeof(resp) - 1; ) {
+        if (strncmp(r, "{int}", 5) == 0) {
+            n += snprintf(resp + n, sizeof(resp) - n, "%d", atoi(rest));
+            r += 5;
+        } else if (strncmp(r, "{rest}", 6) == 0) {
+            n += snprintf(resp + n, sizeof(resp) - n, "%s", rest);
+            r += 6;
+        } else {
+            resp[n++] = *r++;
+        }
+    }
+    resp[n < sizeof(resp) ? n : sizeof(resp) - 1] = '\0';
+    sgold2_queue(s, resp);
+}
+
+static bool sgold2_process_line_rules(SGold2State *s, const char *line)
+{
+    for (int i = 0; i < sgold2_num_rules; i++) {
+        SGold2Rule *rule = &sgold2_rules[i];
+        size_t mlen = strlen(rule->match);
+
+        if (strncasecmp(line, rule->match, mlen) == 0) {
+            if (rule->response) {
+                sgold2_queue_template(s, rule->response, line + mlen);
+            }
+            return true;
+        }
+    }
+    if (sgold2_default_resp) {
+        if (sgold2_default_resp[0]) {
+            sgold2_queue(s, sgold2_default_resp);
+        }
+        return true;
+    }
+    sgold2_queue(s, "\r\nOK\r\n");
+    return true;
+}
+
 static void sgold2_process_line(SGold2State *s)
 {
     const char *line = s->line;
 
     if (strncasecmp(line, "at", 2) != 0) {
         return; // not an AT command; a real modem would stay silent too
+    }
+
+    sgold2_load_rules();
+    if (sgold2_use_rules) {
+        sgold2_process_line_rules(s, line);
+        return;
     }
 
     if (strncasecmp(line, "at+xdrv=9,1,", 12) == 0) {

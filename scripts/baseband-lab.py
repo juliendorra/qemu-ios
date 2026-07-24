@@ -173,9 +173,14 @@ class Instance:
                "-serial", f"file:{self.serial}",
                "-qmp", f"unix:{self.qmp_path},server,nowait"]
         env = dict(os.environ)
-        if self.ruleset == "builtin":
+        if self.ruleset == "builtin" or self.ruleset.endswith(".rules"):
+            # In-QEMU stub: instant in-MMIO replies. A .rules path loads a
+            # file-driven response table (IT_BASEBAND_RULES) so hypotheses
+            # iterate without a rebuild but with builtin timing.
             env.pop("IT_M68AP_NO_BASEBAND", None)
             env["IT_BASEBAND_TRACE"] = str(self.logs / "bb-c-trace.log")
+            if self.ruleset.endswith(".rules"):
+                env["IT_BASEBAND_RULES"] = self.ruleset
         else:
             # Disable only the BUILT-IN stub; for external-modem instances
             # uart1 then falls through to the second -serial (the socket).
@@ -190,7 +195,8 @@ class Instance:
             cmd, env=env,
             stdout=(self.logs / "qemu-stdout.log").open("wb"),
             stderr=(self.logs / "qemu-stderr.log").open("wb"))
-        if self.ruleset not in ("none", "builtin"):
+        if self.ruleset not in ("none", "builtin") and \
+                not self.ruleset.endswith(".rules"):
             mcmd = [sys.executable, str(SGOLD2D),
                     "--socket", self.bb_path,
                     "--rules", self.ruleset,
@@ -354,6 +360,14 @@ def main() -> int:
     ap.add_argument("--retry-threshold", type=int, default=20,
                     help="AppleBaseband lines that qualify a stall as the "
                     "baseband retry-loop signature")
+    ap.add_argument("--stagger-secs", type=float, default=30,
+                    help="delay between instance launches. Host contention "
+                    "during the guest's USB-start window (~15-25s into a "
+                    "boot) stretches driver starts and flips the "
+                    "IOPMrootDomain under-retain race into the "
+                    "IOIpodUSBDevice::start panic; staggering keeps at most "
+                    "one instance in that window at a time. 0 = simultaneous "
+                    "(only safe for 1-2 instances).")
     ap.add_argument("--poll-secs", type=float, default=2.0)
     ap.add_argument("--pc-samples", type=int, default=8)
     ap.add_argument("--tail-lines", type=int, default=40)
@@ -372,7 +386,9 @@ def main() -> int:
             path = Path(spec)
             if not path.is_file():
                 ap.error(f"ruleset not found: {spec}")
-            name, ruleset = path.stem, str(path.resolve())
+            # .json = external socket modem; .rules = in-QEMU C table.
+            name = path.stem + ("-ct" if path.suffix == ".rules" else "")
+            ruleset = str(path.resolve())
         # The same ruleset may be listed multiple times to measure flaky
         # boots (e.g. the nondeterministic IOIpodUSBDevice::start panic);
         # suffix repeats so instances stay distinct.
@@ -385,6 +401,7 @@ def main() -> int:
     results: list[dict] = [None] * len(instances)  # type: ignore
 
     def worker(i: int) -> None:
+        time.sleep(i * args.stagger_secs)
         results[i] = instances[i].run()
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True)

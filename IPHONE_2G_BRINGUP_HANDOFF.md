@@ -136,6 +136,77 @@ Next moves (in order of information-per-minute):
    `DEVICE_BRINGUP_PLAYBOOK.md`, step 5 — this rule is what exposed the
    race in two runs).
 
+### Run 3 (flake measurement) — the panic is HOST CONTENTION, not socket asynchrony
+
+Next-move 1 executed: `stub.json ×3 + none + builtin`, all five launched
+**simultaneously**. Result: `stub`/`stub-2`/`stub-3` **and `builtin`** all
+panicked at `IOIpodUSBDevice::start` at wall 20.1 s (17 AppleBaseband
+lines each); only `none` reached SpringBoard (134.8 s — slow, again from
+contention). A panicking `builtin` kills run 2's socket-asynchrony theory:
+the C stub replies in-MMIO with zero latency and still panicked. The real
+variable is **host CPU contention while the guest is inside its USB-start
+window (~15–25 s into boot)** — five QEMUs booting in lockstep stretch
+driver starts and flip the IOPMrootDomain under-retain race. (`none`
+survives because with no baseband chatter its boot timeline is shifted.)
+
+Fixes committed to the lab:
+- **`--stagger-secs N`** (default 30): delays instance i by i×N so at most
+  one guest occupies the USB-start window at a time.
+- **`IT_BASEBAND_RULES=<path>`** in `hw/arm/ipod_touch_baseband.c`: the
+  built-in stub's response table externalized to a TAB-separated `.rules`
+  file (prefix→response, `\r\n` escapes, `{int}`/`{rest}` tokens,
+  `default` row, `-` = silent). Passing a `.rules` path to `--rules` uses
+  the in-QEMU stub (instance suffix `-ct`) — hypothesis iteration with NO
+  rebuild but with in-MMIO instant-reply timing, sidestepping the socket
+  path entirely. `scripts/baseband-rules/stub.rules` and `eager.rules`
+  replicate their JSON namesakes.
+
+### Run 4 (staggered, 2026-07-24) — content and latency BOTH ruled out; the driver is deaf
+
+Protocol: 30 s stagger. Seats: `builtin` (solo), then `stub.json` +
+`stub.rules` + `eager.rules` in one staggered invocation, plus one
+`stub.rules` solo re-run.
+
+| instance | transport | verdict | wall | bb lines |
+|---|---|---|---|---|
+| builtin  | in-MMIO C stub        | baseband_retry_loop | 112.3 | 22 |
+| stub     | external socket modem | baseband_retry_loop | 112.3 | 22 |
+| stub-ct  | in-MMIO, stub.rules   | panicked (USB race) → re-run: baseband_retry_loop | 18.1 / 112.2 | 17 / 22 |
+| eager-ct | in-MMIO, eager.rules  | baseband_retry_loop | 112.2 | 22 |
+
+Flake rate under stagger: 1 panic in 5 staggered boots (vs 4/4
+simultaneous socket+builtin in run 3) — stagger works well enough to
+iterate; repeat any `panicked` seat once.
+
+Findings:
+- **Response content is irrelevant.** `eager` (real-shaped IMEI/SIM/
+  registration answers) is byte-for-byte the same outcome as the shallow
+  stub: identical verdict, wall time, 22 AppleBaseband lines, ~1615
+  serial lines. The run-2 "IMEI question" is now answered: NO.
+- **Response latency is irrelevant.** In-MMIO instant replies
+  (`stub-ct`/`eager-ct`) behave identically to the ~ms-async socket
+  modem.
+- **The kernel driver is uart1-deaf and uart1-mute.** The C-table traces
+  show the whole boot's uart1 traffic is three iBoot-era commands
+  (`AT+xdrv=9,1,0;` ×3, 13–15 s guest time), answered instantly; then
+  zero bytes either way through the entire retry loop. (Run-4 detail:
+  iBoot still re-sends `AT+xdrv` ~1 Hz even when answered instantly —
+  its NVRAM loop is time-boxed, not response-gated.)
+- One cosmetic gap: `stub.json` leaves iBoot's `AT+cgsn;` unmatched
+  (bare-OK default); add an IMEI row if it ever matters.
+
+Consequence: rulesets alone CANNOT unstick AppleBaseband. The stall input
+must be non-UART. Next moves, reordered:
+1. **GPIO**: instrument what AppleBaseband reads/polls (openiboot
+   `hardware/radio.h`: BB_ON 0x1807, RADIO_ON 0x1507, BB_RESET,
+   host-wake) and what our GPIO model returns; make the "baseband
+   present/awake" lines read as asserted.
+2. **Unsolicited probes** (`sgold2d.py` `"unsolicited"` rules): periodic
+   `\r\nOK\r\n`, `RING`, `+XDRV` lines — does ANY baseband-initiated
+   byte move the driver? (Socket path is usable again now that staggering
+   tames the panic.)
+3. Only then revisit AT content.
+
 ---
 
 ## 2026-07-23 BREAKTHROUGH — UART Tx-interrupt storm fixed; M68AP now REACHES SPRINGBOARD
