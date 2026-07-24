@@ -517,12 +517,49 @@ Active): header b0 = seq(0-2)/ack(3-5), bit6=CRC-present, bit7=reliable;
 type in b1 (link-control was 0xf; data/HCI uses other types); 16-bit
 payload CRC when bit6 set (`"payload checksum 0x%x doesn't match"`);
 processed only in Active (`"Received %d packet while _h5State != Active"`).
-NEXT: identify the specific unsolicited packet CommCenter's baseband
-manager waits for — that manager is in **CommCenter** (userland Mach-O in
-the root FS, `CoreTelephony.framework/Support/CommCenter`), so this drops
-below the kernel H5 layer into CommCenter's own protocol. Emit that
-packet as a reliable H5 frame (seq=0, ack=0, RP set) and see whether
-CommCenter proceeds to SIM/registration.
+
+### Run 19 — the upper layer is CommCenter's IPC/MUX; blocker is a "wakeup flags" handshake
+
+The idle-after-Active manager is in **CommCenter** (ARM Mach-O, mount the
+root FS read-only: `hdiutil attach -readonly
+m68ap-artifacts/stage/filesystem-m68ap-readonly.img`; binary at
+`System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter`,
+unencrypted). Its strings lay out the whole post-H5 stack:
+
+- device node **`/dev/h5.baseband`** — CommCenter opens this; the kernel
+  `AppleReliableSerialLayer` runs H5 under it.
+- **`class DoubleBufferedIpcDriver` / `::powerOn()`**,
+  **`fSupportsH5TransportMode=%s, fInH5TransportMode=%s`** — the transport
+  driver.
+- **`"baseband not responding to wakeup flags"`** (cstring vm `0x3a7a0`)
+  — the exact blocker: after the link is up CommCenter runs a *wakeup
+  flags* handshake and the (stub) baseband never answers it, so it gives
+  up. This is BEFORE any AT/MUX traffic, which is why run 18 saw zero
+  reliable frames.
+- then **`+cmux=0,0,0,%d`** (GSM 07.10 basic-mode MUX) and per-**DLCI**
+  channels (`"DLCI %d fLocalModemBits fRemoteModemBits"`, modem-status
+  bits) carry the AT command channels; `"AT response timeout"` /
+  `"Command channel received timeout"` / `"DLCI %d received timeout"` are
+  the resets.
+
+So the full ladder to telephony is: H5 link (DONE) → **wakeup-flags
+handshake** (next) → `+CMUX` GSM 07.10 MUX → AT channels over DLCIs →
+SIM/registration/activation. Each tier is a real, documented-ish
+protocol, but implementing them (plus H5 *reliable* TX with seq/ack/CRC,
+which none of this stub does yet) is a multi-step build.
+
+Concrete next step: disassemble the `"baseband not responding to wakeup
+flags"` function (`CommCenter` cstring `0x3a7a0` is referenced from a
+Thumb/PIC function — the earlier plain-ARM `ldr[pc]` scan missed it;
+scan Thumb + PIC `ldr;add pc`) to recover the wakeup-flag bytes CommCenter
+writes and the response it expects, then send that response as a reliable
+H5 frame.
+
+**Perspective:** this whole H5→MUX→AT path is the road to *telephony /
+activation* ([Unactivated] → [Activated]). It is NOT required for the
+device to boot — **M68AP already reaches SpringBoard with the baseband
+attached** (the original bring-up goal). Baseband activation is a
+stretch goal from here, and a large one.
 
 ---
 
