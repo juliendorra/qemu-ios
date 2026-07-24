@@ -5,6 +5,11 @@ of its JSON and screenshots. Driving one touch at a time through an agent is
 slow, races iPhone OS Auto-Lock, and tends to over-test whichever screen is
 currently visible.
 
+For bringing up an emulated *device* against an unknown guest-driver
+protocol (baseband, bluetooth, sensors), see `DEVICE_BRINGUP_PLAYBOOK.md`:
+trace at the boundary, externalize the device brain, self-judging parallel
+matrices with controls.
+
 ## HTTPS/Safari harness
 
 `scripts/ipod-https-acceptance.py` connects to an already-running QEMU QMP

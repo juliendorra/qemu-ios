@@ -93,18 +93,48 @@ Four findings, each of which reframes the plan:
    dependency. Run a `none` instance alongside before believing anything
    about this panic.
 
+### Second matrix (eager vs stub vs none) — the USB-start panic is a RACE
+
+Run 2 (same defaults, 900 s cap): `none` **reached SpringBoard under the
+lab** (fb_attach ×2, SpringBoard[…], sim_status + activation lines;
+verdict `springboard_reached` at t≈72 s wall) — baseline and verdict path
+both validated. But `eager` and `stub` both **panicked at
+`IOIpodUSBDevice::start` (caller `0xC012D963`)** at serial line ~1276,
+the very panic run 1's `silent` hit — while run 1's `stub`, byte-identical
+config, instead sailed past USB start into the 1617-line baseband stall.
+
+Conclusion: the `IOIpodUSBDevice::start` panic is a **nondeterministic
+race**, not a response-content effect. Score so far: 3/4 socket-wired
+boots hit it, 0/3 non-socket boots (builtin C stub or bare `none`). The
+socket chardev's asynchronous RX delivery (a few hundred µs vs the C
+stub's in-MMIO instant reply) plausibly widens the same timing window the
+observer plugin used to hit (the IOPMrootDomain under-retain family).
+The eager-IMEI hypothesis is therefore UNTESTED — both candidates died
+before the kernel baseband phase.
+
+Lab upgrades from this lesson (committed): a `panic` marker + immediate
+`panicked` verdict (no more mislabeling as `stalled`, and ~90 s faster),
+and duplicate-ruleset support (`--rules stub.json stub.json stub.json`
+auto-suffixes instances) so flake rates can be measured directly.
+
 Next moves (in order of information-per-minute):
-1. Matrix `eager.json` (real IMEI for `AT+cgsn`) vs `stub` — does a
-   plausible IMEI change the kernel-era behavior at all?
-2. Since the kernel driver is uart1-mute, chase its non-UART inputs: what
+1. **Measure the flake**: `--rules stub.json ×3 none builtin` — how often
+   does a socket boot pass USB start? If ≥1/3 passes, matrices simply need
+   repeats; if ~0, chase the race itself (or add a tiny artificial delay
+   in the C stub to reproduce it deterministically, which would also
+   pin down the IOPMrootDomain window).
+2. Re-test `eager` vs `stub` with repeats — the IMEI question is still
+   open.
+3. Since the kernel driver is uart1-mute, chase its non-UART inputs: what
    GPIOs/registers does AppleBaseband poll (openiboot `hardware/radio.h`:
    BB_ON 0x1807, RADIO_ON 0x1507, BB_RESET…) and what does our GPIO model
    return for them? A ruleset alone cannot fix a GPIO wait.
-3. Probe with `"unsolicited"` sends (e.g. periodic `\r\nOK\r\n`, `RING`,
+4. Probe with `"unsolicited"` sends (e.g. periodic `\r\nOK\r\n`, `RING`,
    `+XDRV` status lines) to learn whether ANY baseband-initiated traffic
    moves the driver.
-4. Keep a `none` control instance in every matrix to separate real effects
-   from timing artifacts.
+5. Keep `none` AND `builtin` controls in every matrix (see
+   `DEVICE_BRINGUP_PLAYBOOK.md`, step 5 — this rule is what exposed the
+   race in two runs).
 
 ---
 

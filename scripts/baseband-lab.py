@@ -68,6 +68,7 @@ FB_BASES = {"iboot_0x0fe00000": 0x0FE00000,
 FB_SIZE = 320 * 480 * 4
 
 MARKERS = {
+    "panic": rb"panic\(cpu",
     "springboard_config": rb"Configuring SpringBoard",
     "fb_attach": rb"IOMobileFramebufferUserClient",
     "applebaseband": rb"AppleBaseband",
@@ -240,6 +241,9 @@ class Instance:
                 if time.monotonic() - success_at >= self.args.post_success:
                     verdict = "springboard_reached"
                     break
+            elif counts["panic"] > 0:
+                verdict = "panicked"
+                break
             elif stalled_for >= self.args.stall_secs:
                 if counts["applebaseband"] >= self.args.retry_threshold:
                     verdict = "baseband_retry_loop"
@@ -360,6 +364,7 @@ def main() -> int:
             ap.error(f"missing artifact: {p}")
 
     instances = []
+    seen: dict[str, int] = {}
     for spec in args.rules:
         if spec in ("none", "builtin"):
             name, ruleset = spec, spec
@@ -368,6 +373,12 @@ def main() -> int:
             if not path.is_file():
                 ap.error(f"ruleset not found: {spec}")
             name, ruleset = path.stem, str(path.resolve())
+        # The same ruleset may be listed multiple times to measure flaky
+        # boots (e.g. the nondeterministic IOIpodUSBDevice::start panic);
+        # suffix repeats so instances stay distinct.
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] > 1:
+            name = f"{name}-{seen[name]}"
         instances.append(Instance(name, ruleset, args))
 
     args.logs.mkdir(parents=True, exist_ok=True)

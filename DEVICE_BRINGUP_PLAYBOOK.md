@@ -1,0 +1,133 @@
+# Device bring-up playbook: trace-driven, externalized, parallel
+
+A general method for making a guest driver happy with an emulated device
+when the device's protocol is unknown or half-known. It was proven on WiFi
+(SDIO/Marvell mailbox) and is now tooled end-to-end for the baseband
+(S-Gold2 on uart1); most of its steps apply to any device the guest talks
+to. The concrete baseband implementation of every step lives in
+`scripts/sgold2d.py`, `scripts/baseband-lab.py`, `scripts/baseband-rules/`.
+
+The core inversion: **stop guessing what the device should do; record what
+the driver actually asks, answer it, and let the driver tell you what's
+missing.** ("Respond until the driver is satisfied.")
+
+## The six steps
+
+### 1. Trace at the boundary before hypothesizing
+
+Capture every byte/register access in BOTH directions, timestamped, from
+the running guest — not from datasheets, not from what the driver "should"
+do. Traces are ground truth; datasheet-first emulation is how the WiFi
+work accumulated its long dead-ends file (`WIFI_SDIO_DEADENDS.md`).
+
+Baseband: `sgold2d.py` logs `raw.log` (hexdump), `lines.log`
+(conversation), `events.jsonl` (machine-diffable). In-QEMU stub:
+`IT_BASEBAND_TRACE`. LCD: `IT_LCD_TRACE`. SDIO: `IPOD_SDIO_TRACE`.
+
+The first baseband capture instantly falsified the standing theory: the
+"deep init handshake" was three iBoot-era commands, and the kernel driver
+stalls while sending *nothing* — no amount of response-guessing could have
+found that.
+
+### 2. Move the device brain OUT of the compiled emulator while iterating
+
+An iteration must cost seconds, not a rebuild. For any chardev-backed
+device (all five UARTs — baseband, bluetooth on uart3), QEMU already
+supports this with zero C changes: point the machine's chardev at
+`-serial unix:<sock>,server=on,wait=off` and implement the device in a
+script on the other end. The guest cannot tell the difference — verified
+byte-identical for the baseband (Python `stub` == C `builtin`, same 1617
+serial lines, same stall).
+
+Make the external brain's behavior *data*, not code: an ordered
+match→response ruleset, hot-reloaded on mtime change, so behavior changes
+mid-boot without a restart. Keep support for timed **unsolicited** sends —
+drivers sometimes wait for device-initiated traffic (the kernel-era
+AppleBaseband apparently does).
+
+Non-chardev devices (SDIO, SPI, I2C, MMIO blocks) need a one-time C-side
+tap (trace + optionally a socket bridge); everything else in this playbook
+still applies to them.
+
+### 3. Make every run self-judging and bounded
+
+A human (or LLM) watching a serial log is the slowest component. Encode
+the verdicts: scan the serial log for marker regexes and terminate the
+instance the moment a decisive state is reached —
+`springboard_reached` / `baseband_retry_loop` / `stalled` / `timeout` in
+`baseband-lab.py`; pass/fail events in `ipod-https-acceptance.py`;
+`iphone-nand-acceptance.py` for NAND. On the terminal verdict,
+auto-collect the diagnostics you always end up wanting anyway: PC samples
+(deadlock vs crawl), framebuffer non-black % from RAM (never trust a
+black `screendump` — see the scanout finding), serial tail, and the
+device-conversation summary.
+
+### 4. Run hypotheses as a parallel matrix, never serially
+
+One instance per hypothesis, launched together: N hypotheses cost one
+boot's wall time (~2–8 min here), and identical staging removes
+run-to-run drift from the comparison. `baseband-lab.py --rules a.json
+b.json none builtin` is the template; its `matrix.json` + printed table
+is the deliverable.
+
+### 5. Always include two controls
+
+- a **known-good baseline** (baseband: `none`) — catches environment
+  regressions and separates real effects from timing artifacts;
+- a **current-behavior replica** (baseband: `stub`) — proves the
+  externalized path is faithful before you credit any difference to your
+  change.
+
+This rule has already paid twice: the `stabilize-root-domain` retain
+turned out to be an observer-plugin artifact (weeks of confound), and the
+lab's very first run showed "silent socket" panicking at
+`IOIpodUSBDevice::start` — same timing-sensitive region, flagged as
+artifact-suspect *immediately* because the controls made it comparable.
+
+### 6. Consolidate: bake the winning behavior back in
+
+The external brain is scaffolding, not the product. When the driver is
+satisfied, port the final ruleset (by then a small fixed protocol) into
+the C device so the machine is self-contained, and verify the port
+byte-for-byte against the recorded traces (`IT_BASEBAND_TRACE` vs the
+daemon's `raw.log`). This is how WiFi ended: trace-driven discovery,
+then a real in-emulator implementation that associates and gets an IP.
+
+## The iteration loop, compressed
+
+```
+edit/fork ruleset  ->  baseband-lab.py --rules <candidates> none builtin
+                   ->  read matrix.json + each summary.json
+                   ->  "unmatched commands" = what to answer next
+                   ->  repeat
+```
+
+Minutes per cycle, no rebuilds, no manual watching.
+
+## Retrospective: where this would have saved time
+
+- **WiFi SDIO** (the proof case, pre-tooling): every hypothesis was a C
+  edit + rebuild + reboot + eyeball loop; the dead-ends doc is 152 lines
+  long partly because cycles were expensive enough that theories were
+  batched instead of tested one-per-minute.
+- **The observer-artifact retain**: a standing "always run the no-plugin
+  control" rule would have exposed it the first day, not weeks in.
+- **The UART Tx-storm / freeze hunts**: PC-sampling + marker verdicts were
+  reinvented per-investigation (`m68ap-freeze-probe.py`, `fb-snapshot.py`,
+  ad-hoc QMP loops); step 3 makes them a standard attachment of every run.
+- **Black-screen misdiagnosis**: "SpringBoard never renders" survived for
+  a long time because one-shot `screendump` was trusted; step 3's
+  RAM-framebuffer dump is now part of every terminal verdict.
+
+## Applying it to the next candidates
+
+- **Bluetooth (uart3, BlueCore)**: identical wiring to the baseband — a
+  chardev socket, a `bluecored` ruleset, the same lab (add a uart3 socket
+  option to `baseband-lab.py`).
+- **Kernel-era AppleBaseband stall**: the trace says it is NOT a uart1
+  request/response problem — investigate GPIO/host-wake lines (openiboot
+  `hardware/radio.h`: BB_ON 0x1807, RADIO_ON 0x1507) and unsolicited
+  traffic; if the fix is a GPIO, it lands in C directly (step 2 does not
+  apply, steps 1/3/4/5 still do).
+- **Any new sensor/codec**: start at step 1; do not write the C stub
+  first.
