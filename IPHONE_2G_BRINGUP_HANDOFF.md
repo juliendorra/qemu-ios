@@ -453,15 +453,60 @@ without the disassembly):
 Conclusion: the modem-side bring-up (exact frame ordering, whether the
 guest resets on receiving a peer SYNC, the reliable-packet seq/ack
 handshake, and when the choke is actually released) cannot be guessed
-from the wire — 4 iterations plateaued. The committed responder is
-therefore responder-only (clean, one-way establishment); the real fix is
-to read `AppleReliableSerialLayer`'s H5 state machine out of the
-decrypted kernelcache. Concrete disassembly start points now in hand:
-the kext text is prelinked in `__PRELINK` (vm `0xc029b000-0xc0601000`);
-its H5 strings sit at vm ~`0xc048e4aa` ("Enabling h5 …"), `0xc048e530`
-("waitLineBreak"), `0xc0354834` ("recevied unexpected serial event"),
-and `0xc048eb63` ("h5State"); ARMv6 → Thumb, literal-pool string loads.
-Find the function that transitions on CONFIG-RESP / releases the choke.
+from the wire — 4 iterations plateaued. Read it out of the kernelcache
+instead (next section).
+
+### Runs 18+ — the H5 state machine, REVERSE-ENGINEERED from the kernelcache
+
+`scripts/extract-kernelcache.py` → raw ARM Mach-O (the kext is **ARM**,
+not Thumb; `0xc04bd380: str r1,[r3,#0x20]` is exactly the UTXH write).
+`AppleReliableSerialLayer` code is at vm ~`0xc0489000-0xc048d000`, its
+strings at ~`0xc048e3c0`+. The strings alone reveal the design; the
+disassembly nails the fields. Object = `r4`; key instance offsets:
+
+| off | meaning |
+|-----|---------|
+| `0xac` | `_h5State`: **1=Uninitialized, 2=Initialized, 3=Active** |
+| `0xa8` | debug level (gates the `H5/%d-…` logs) |
+| `0xb7` | data-integrity/CRC enabled |
+| `0xb8` | OOF software-flow-control enabled |
+| `0xb9` | negotiated TX sliding-window size |
+| `0xea`/`0xeb` | tx-seq / rx-ack window pointers (mod 8) |
+| `0xee` | pending-link-response bitmask |
+| `0xf4…` | tx packet-slot array (window) |
+
+Receive state machine (`~0xc048c980`), on a link-control frame:
+- **rx SYNC** → queue SYNC-RESP; if already Active, log "Received Sync
+  message in Active state" and RESET (call `0xc048b014`). *This is why
+  runs 14-16 stormed: the modem sending its own SYNC after the guest
+  went Active reset it every round.*
+- **rx SYNC-RESP** → if not Active, `setState(2)=Initialized`.
+- **rx CONFIG** → if payload>2 bytes, `processConfigField`; queue CONFIG-RESP.
+- **rx CONFIG-RESP** → **only if state==2**: `processConfigField` (if
+  payload>2), call vtable +0xbc, then `setState(3)=Active`.
+
+`processConfigField` (`0xc048b5f8`, arg = config field byte `b`):
+- `window = b & 7`
+- `integrity(CRC) = (b>>3)&1`  → stored at `0xb7`
+- `OOF flow control = (b>>4)&1` → stored at `0xb8`
+- `[0xb9] = min([0xb9], window)`  (sliding-window negotiation)
+
+The muzzle: the tx-reliable path ("Waiting for remote window to open.
+_h5_txNewSeq=%d, _h5_rxLastAck=%d, _h5Window=%d", `~0xc048b4c0`) will not
+emit a reliable packet while the window is closed. A CONFIG-RESP with NO
+config field leaves the window unset (runs 12/16 → muzzled); run 13's
+`0x17` set the window to 7 but ALSO set bit4 = **OOF flow control**,
+which the stub doesn't implement — so data still stalls. Correct field:
+window bits only, e.g. **`0x07`** (window 7, no OOF, no CRC). Run 18
+tests exactly this: `CONFIG-RESP = 04 7b 07`. If the tx window opens the
+guest finally sends reliable data packets (its first real baseband
+commands) instead of muzzle-silence.
+
+Reliable-packet layer (the tier above, once unmuzzled): header b0 carries
+seq(0-2)/ack(3-5), bit6=CRC-present, bit7=reliable; the driver acks via
+seq/ack (`0xea/0xeb`) and there is a 16-bit payload CRC when bit6 is set
+(`"payload checksum 0x%x doesn't match"`). Packets are only processed in
+Active state (`"Received %d packet while _h5State != Active"`).
 
 ---
 
