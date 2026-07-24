@@ -280,6 +280,62 @@ static void sgold2_process_line(SGold2State *s)
     sgold2_queue(s, "\r\nOK\r\n");
 }
 
+/*
+ * IT_BASEBAND_FRAME_ECHO=1: after at+xtransportmode CommCenter abandons AT
+ * lines for 0xC0-delimited AppleReliableSerialLayer frames (link probe
+ * C0 00 2F 00 D0 01 7E C0 retried at ~13 Hz -- see
+ * IPHONE_2G_BRINGUP_HANDOFF.md run 10). The protocol is undocumented; as a
+ * first probe this echoes every complete frame straight back and logs it,
+ * so a change in the guest's retry pattern tells us the frame reached the
+ * right layer. Frame bytes bypass the AT line accumulator.
+ */
+static bool sgold2_frame_echo_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *env = getenv("IT_BASEBAND_FRAME_ECHO");
+        cached = env && *env && strcmp(env, "0") != 0;
+    }
+    return cached;
+}
+
+static bool sgold2_frame_byte(SGold2State *s, uint8_t byte)
+{
+    if (!sgold2_frame_echo_enabled()) {
+        return false;
+    }
+    if (!s->in_frame) {
+        if (byte != 0xC0) {
+            return false;
+        }
+        s->in_frame = true;
+        s->frame_len = 0;
+        return true;
+    }
+    if (byte == 0xC0) {
+        if (s->frame_len > 0) {
+            uint8_t echo[2 + sizeof(s->frame)];
+            echo[0] = 0xC0;
+            memcpy(echo + 1, s->frame, s->frame_len);
+            echo[1 + s->frame_len] = 0xC0;
+            sgold2_trace("<E", echo, 2 + s->frame_len);
+            if (s->outlen + 2 + s->frame_len <= sizeof(s->outbuf)) {
+                memcpy(s->outbuf + s->outlen, echo, 2 + s->frame_len);
+                s->outlen += 2 + s->frame_len;
+                sgold2_flush(CHARDEV(s));
+            }
+            s->frame_len = 0;
+            /* stay in_frame: back-to-back frames share delimiters */
+        }
+        return true;
+    }
+    if (s->frame_len < sizeof(s->frame)) {
+        s->frame[s->frame_len++] = byte;
+    }
+    return true;
+}
+
 static int sgold2_chr_write(Chardev *chr, const uint8_t *buf, int len)
 {
     SGold2State *s = SGOLD2_CHARDEV(chr);
@@ -287,6 +343,9 @@ static int sgold2_chr_write(Chardev *chr, const uint8_t *buf, int len)
     sgold2_trace("->", buf, len);
     for (int i = 0; i < len; i++) {
         uint8_t byte = buf[i];
+        if (sgold2_frame_byte(s, byte)) {
+            continue;
+        }
         if (byte == '\r' || byte == '\n') {
             if (s->line_len > 0) {
                 s->line[s->line_len] = '\0';

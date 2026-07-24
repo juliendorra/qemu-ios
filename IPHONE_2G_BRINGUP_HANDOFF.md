@@ -323,6 +323,53 @@ So the baseband bring-up ladder now stands at:
 3. Verify the `-ct` results replicate on the socket modem path
    (sgold2d) now that the storms are gone.
 
+### Run 10 — plain AT mode is NOT enough; the framed layer is mandatory
+
+`atmode.rules` (answers `at+xtransportmode` with `ERROR`, plus
+real-shaped `+XSIO: 4`, IMEI, `+CPIN: READY`, `+CREG`, `+CSQ`, `+COPS`,
+`+CIMI`): still reaches SpringBoard, and lockdownd DID advance —
+`lookup_baseband_info: We now have SIM status` — but CommCenter ignores
+the `ERROR` and switches to framing anyway (device stays
+`[Unactivated]`). Refusing transport mode does not keep it in AT mode;
+the framed layer is required, not optional.
+
+### Run 11 — the framed transport is SLIP; echo advances the guest but is not an ACK
+
+`IT_BASEBAND_FRAME_ECHO=1` (in `hw/arm/ipod_touch_baseband.c`) collects
+each `0xC0`-delimited frame and echoes it back verbatim. Under echo the
+guest STOPS spamming one frame 460× and instead walks a real sequence
+(first four frames, `<E` = echoed):
+
+    C0 00 2f 00 d0 01 7e C0
+    C0 00 2f 00 d0 02 7d C0
+    C0 00 2f 00 d0 03 fc C0
+    C0 00 3f 00 db dc 04 7b 17 C0   (type 0x3f, longer)
+
+then gives up: `CommCenter[13]: Baseband reset: AT response timeout`,
+and the AT/transport cycle restarts. So echo reaches the right layer
+(behaviour changed) but a verbatim bounce is not a valid reply.
+
+Decoded structure:
+- **SLIP framing** (RFC 1055): `0xC0` = END delimiter, `0xDB` = ESC;
+  frame 4's `db dc` is ESC+ESC_END, i.e. a literal `0xC0` in the
+  payload → unescaped frame 4 = `00 3f 00 c0 04 7b 17`. The stub's
+  echo collector must SLIP-unescape on the way in and re-escape out
+  (currently it doesn't — it round-trips raw, which is why the literal
+  `0xC0` frame's checksum can't validate).
+- Header `00 [LEN] 00 …`: `LEN` 0x2f vs 0x3f distinguishes message
+  types/sizes; byte after header increments `01,02,03,04` = a sequence
+  counter; trailing byte(s) a checksum (2f frames: seq 01→`7e`,
+  02→`7d`, 03→`fc`; not a plain XOR/sum — needs the kext's algorithm).
+
+This is `AppleReliableSerialLayer`'s wire format and is undocumented
+(theiphonewiki has AT commands, not this MUX). The tractable next step
+is to disassemble the kext's frame builder/validator from a decrypted
+M68AP ramdisk (it maps at the `0xc04bd…` PCs the traces already flag)
+to recover the checksum and the expected ACK frame, rather than guess.
+A cheaper interim probe: reply to each frame with a fixed
+`C0 00 2f 00 d0 <echo-seq> <cksum> C0`-shaped ACK once the checksum is
+known, and watch whether the sequence advances past 4.
+
 ---
 
 ## 2026-07-23 BREAKTHROUGH — UART Tx-interrupt storm fixed; M68AP now REACHES SPRINGBOARD

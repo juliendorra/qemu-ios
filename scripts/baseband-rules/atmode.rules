@@ -1,0 +1,19 @@
+# Keep CommCenter in PLAIN AT MODE: refuse at+xtransportmode (ERROR) so it
+# cannot switch to the 0x7E-framed transport, and answer the kernel-era
+# commands captured in run 9 with real-shaped payloads. Goal: see what
+# CommCenter asks next when the AT path stays open (SIM? registration?).
+at+xtransportmode	\r\nERROR\r\n
+at+xsio?	\r\n+XSIO: 4\r\n\r\nOK\r\n
+at+xdrv=9,1,	\r\n+XDRV: 9,1,0,{int},NULL\r\n\r\nOK\r\n
+at+xdrv=4,	\r\nOK\r\n
+at+cgmi	\r\nINFINEON\r\n\r\nOK\r\n
+at+cgmm	\r\nS-GOLD2\r\n\r\nOK\r\n
+at+cgmr	\r\n04.05.04_G\r\n\r\nOK\r\n
+at+cgsn	\r\n012345678901237\r\n\r\nOK\r\n
+at+xgendata	\r\n+XGENDATA: "DEBUG_BB 04.05.04_G"\r\n\r\nOK\r\n
+at+cpin?	\r\n+CPIN: READY\r\n\r\nOK\r\n
+at+creg?	\r\n+CREG: 0,1\r\n\r\nOK\r\n
+at+csq	\r\n+CSQ: 24,0\r\n\r\nOK\r\n
+at+cops?	\r\n+COPS: 0,0,"QEMU",0\r\n\r\nOK\r\n
+at+cimi	\r\n001010123456789\r\n\r\nOK\r\n
+default	\r\nOK\r\n
