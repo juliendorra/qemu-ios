@@ -1,5 +1,52 @@
 #include "hw/arm/ipod_touch_baseband.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
+
+/*
+ * IT_BASEBAND_TRACE=<path> logs every byte AppleBaseband writes to the
+ * S-Gold2 stub and every response the stub queues, with guest-visible
+ * timestamps. "1"/"stderr" log to stderr. The trace is the ground truth
+ * for reconstructing the init handshake (see scripts/sgold2d.py for the
+ * external, hot-reloadable variant of this stub).
+ */
+static FILE *sgold2_trace_file(void)
+{
+    static FILE *fp;
+    static bool checked;
+
+    if (!checked) {
+        checked = true;
+        const char *path = getenv("IT_BASEBAND_TRACE");
+        if (path && *path) {
+            if (!strcmp(path, "1") || !strcmp(path, "stderr")) {
+                fp = stderr;
+            } else {
+                fp = fopen(path, "a");
+            }
+        }
+    }
+    return fp;
+}
+
+static void sgold2_trace(const char *dir, const uint8_t *buf, int len)
+{
+    FILE *fp = sgold2_trace_file();
+
+    if (!fp) {
+        return;
+    }
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+    fprintf(fp, "[%3lld.%06lld] %s ", now / 1000000LL, now % 1000000LL, dir);
+    for (int i = 0; i < len; i++) {
+        fprintf(fp, "%02x ", buf[i]);
+    }
+    fprintf(fp, " |");
+    for (int i = 0; i < len; i++) {
+        fputc(buf[i] >= 0x20 && buf[i] < 0x7f ? buf[i] : '.', fp);
+    }
+    fprintf(fp, "|\n");
+    fflush(fp);
+}
 
 static void sgold2_flush(Chardev *chr)
 {
@@ -29,6 +76,7 @@ static void sgold2_queue(SGold2State *s, const char *resp)
     }
     memcpy(s->outbuf + s->outlen, resp, len);
     s->outlen += len;
+    sgold2_trace("<-", (const uint8_t *)resp, len);
     sgold2_flush(CHARDEV(s));
 }
 
@@ -86,6 +134,7 @@ static int sgold2_chr_write(Chardev *chr, const uint8_t *buf, int len)
 {
     SGold2State *s = SGOLD2_CHARDEV(chr);
 
+    sgold2_trace("->", buf, len);
     for (int i = 0; i < len; i++) {
         uint8_t byte = buf[i];
         if (byte == '\r' || byte == '\n') {
