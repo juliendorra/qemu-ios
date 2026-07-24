@@ -363,12 +363,24 @@ Decoded structure:
 
 This is `AppleReliableSerialLayer`'s wire format and is undocumented
 (theiphonewiki has AT commands, not this MUX). The tractable next step
-is to disassemble the kext's frame builder/validator from a decrypted
-M68AP ramdisk (it maps at the `0xc04bd…` PCs the traces already flag)
-to recover the checksum and the expected ACK frame, rather than guess.
-A cheaper interim probe: reply to each frame with a fixed
-`C0 00 2f 00 d0 <echo-seq> <cksum> C0`-shaped ACK once the checksum is
-known, and watch whether the sequence advances past 4.
+is to disassemble the kext's frame builder/validator (it maps at the
+`0xc04bd…` PCs the traces already flag) to recover the checksum and the
+expected ACK frame, rather than guess. A cheaper interim probe: reply
+to each frame with a fixed `C0 00 2f 00 d0 <echo-seq> <cksum> C0`-shaped
+ACK once the checksum is known, and watch whether the sequence advances
+past 4.
+
+**Disassembly target located** (no kernelcache decrypt needed): the
+kernelcache (`m68ap-artifacts/ipsw/kernelcache.release.s5l8900xrb`) is
+8900-wrapped and encrypted (magic `89001.0`, no readable strings), BUT
+the read-only root FS `m68ap-artifacts/stage/filesystem-m68ap-readonly.img`
+carries the on-disk kext plaintext: the `xtransportmode` string is at
+byte offset ~45,660,033 and an `AppleBaseband` string cluster is ~10 KB
+before it (~45,649,584), i.e. the transport code lives in one Mach-O
+there. Carve it out of the HFS image (see `scripts/` NAND/HFS extraction
+utility, commit ddec748338) and disassemble the frame path for the
+checksum + ACK shape. A second `AppleBaseband` hit at ~176,911,412 is a
+different file (userland CommCenter side).
 
 ---
 
