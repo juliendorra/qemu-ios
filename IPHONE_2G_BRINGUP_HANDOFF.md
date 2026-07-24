@@ -34,17 +34,27 @@ reaches `Configuring SpringBoard for N45AP` + framebuffer attach).
 clock 20s->75s, 1611->1918 serial lines. Furthest the port has ever booted.
 
 **Two remaining layers:**
-1. **Baseband RX storm** — the S-Gold2 stub still storms uart1's RX path, so the
-   baseband must be silenced to progress. Fix the RX side the same way so
-   telephony can be present.
-2. **SpringBoard display/activation stall** — after the framebuffer attach,
-   SpringBoard stalls (no LCD base flips, kernel FB black): unactivated,
-   telephony-less. Likely waiting on CommCenter/activation (needs layer 1).
-
-Reproduce: rebuild, then `IT_M68AP_NO_BASEBAND=1 python3 scripts/fb-snapshot.py
---board m68ap --iboot-m68ap m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin
---nor-m68ap m68ap-artifacts/stage/nor_m68ap.bin
---nand-m68ap m68ap-artifacts/stage/nand-m68ap-fresh --boot-wait 220 --samples 40`.
+1. **Baseband-on stall — NOT a fixable UART storm (2026-07-24 result, don't retry).**
+   A register dump at the baseband-on stall did show a real spurious-RX-timeout
+   defect (uart1 `UTRSTAT=0x7`/`UINTSP=0x5` with `UFSTAT=0`: Rx-ready + RXD
+   pending on an EMPTY FIFO, because `UCON[11]` makes `timeout_int` re-assert
+   RXD unconditionally). The symmetric fix — gate the Rx-timeout interrupt on
+   `fifo_elements_number(&s->rx) > 0` in `exynos4210_uart_timeout_int` — was
+   tried and **did NOT unblock the boot**: PC-sampling still showed the identical
+   storm signature (`AppleS5L8900XSerial 0xc04bd868` + VIC) and the same
+   `00:00:20` stall with `AppleBaseband` looping attach/detach ~22x. So the
+   baseband-on interrupts are **real Tx/Rx traffic from AppleBaseband
+   retry-looping against the incomplete S-Gold2 stub**, not the spurious-timeout
+   bug. The Rx fix was reverted (correct-but-ineffective; re-derive from a
+   register dump if ever revisited — do not re-add speculatively). The genuine
+   blocker is the **AppleBaseband <-> S-Gold2 init handshake** (a deep
+   baseband-emulation track), so the pragmatic path to SpringBoard stays
+   `IT_M68AP_NO_BASEBAND=1`.
+2. **SpringBoard display/activation stall** (baseband silenced) — after the
+   framebuffer attach SpringBoard stalls (no LCD base flips, kernel FB black):
+   `[Unactivated]`, telephony-less. `lockdown` logs `lookup_baseband_info: We now
+   have SIM status` / `determine_activation_state: ... has not changed`, so
+   activation queries the baseband — likely coupled to layer 1.
 
 ---
 
