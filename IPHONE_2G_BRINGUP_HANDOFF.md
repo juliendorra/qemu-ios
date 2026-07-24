@@ -491,22 +491,38 @@ Receive state machine (`~0xc048c980`), on a link-control frame:
 - `OOF flow control = (b>>4)&1` → stored at `0xb8`
 - `[0xb9] = min([0xb9], window)`  (sliding-window negotiation)
 
-The muzzle: the tx-reliable path ("Waiting for remote window to open.
+The tx-reliable path ("Waiting for remote window to open.
 _h5_txNewSeq=%d, _h5_rxLastAck=%d, _h5Window=%d", `~0xc048b4c0`) will not
-emit a reliable packet while the window is closed. A CONFIG-RESP with NO
-config field leaves the window unset (runs 12/16 → muzzled); run 13's
-`0x17` set the window to 7 but ALSO set bit4 = **OOF flow control**,
-which the stub doesn't implement — so data still stalls. Correct field:
-window bits only, e.g. **`0x07`** (window 7, no OOF, no CRC). Run 18
-tests exactly this: `CONFIG-RESP = 04 7b 07`. If the tx window opens the
-guest finally sends reliable data packets (its first real baseband
-commands) instead of muzzle-silence.
+emit a reliable packet while the window is closed.
 
-Reliable-packet layer (the tier above, once unmuzzled): header b0 carries
-seq(0-2)/ack(3-5), bit6=CRC-present, bit7=reliable; the driver acks via
-seq/ack (`0xea/0xeb`) and there is a 16-bit payload CRC when bit6 is set
-(`"payload checksum 0x%x doesn't match"`). Packets are only processed in
-Active state (`"Received %d packet while _h5State != Active"`).
+**Run 18 result — the window is NOT the blocker.** Tested
+`CONFIG-RESP = 04 7b 07` (window 7, no OOF/CRC): the guest STILL sends
+only SYNC + CONFIG once and goes silent — byte-identical to bare
+CONFIG-RESP. Two things are now certain from this:
+1. The guest **does reach Active** — it sends CONFIG exactly once and
+   never retransmits it, and per the state machine the write thread only
+   stops sending CONFIG on the Initialized→Active transition. So link
+   establishment fully completes.
+2. Yet it emits **no reliable data packet at all** (no type≠0xf frame),
+   then `Baseband reset: AT response timeout`. An Active BCSP peer that
+   had a command queued would send it regardless of a window≥1. So the
+   blocker is ABOVE H5: CommCenter's baseband layer has nothing queued —
+   it is **waiting for the modem to speak first** (a real S-Gold2 emits
+   an unsolicited "ready"/boot-complete indication over the freshly-up
+   link; CommCenter's manager waits for it before driving the session,
+   then times out).
+
+Reliable-packet layer (what the modem must now SEND, unprompted, once
+Active): header b0 = seq(0-2)/ack(3-5), bit6=CRC-present, bit7=reliable;
+type in b1 (link-control was 0xf; data/HCI uses other types); 16-bit
+payload CRC when bit6 set (`"payload checksum 0x%x doesn't match"`);
+processed only in Active (`"Received %d packet while _h5State != Active"`).
+NEXT: identify the specific unsolicited packet CommCenter's baseband
+manager waits for — that manager is in **CommCenter** (userland Mach-O in
+the root FS, `CoreTelephony.framework/Support/CommCenter`), so this drops
+below the kernel H5 layer into CommCenter's own protocol. Emit that
+packet as a reliable H5 frame (seq=0, ack=0, RP set) and see whether
+CommCenter proceeds to SIM/registration.
 
 ---
 
