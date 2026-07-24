@@ -179,8 +179,35 @@ M68AP unchanged. Association (E) and DHCP (F) are **driver-initiated on
 network selection** — a `CMD_802_11_ASSOCIATE` the guest sends when a
 network is joined from Settings — so NEITHER board auto-associates in a
 headless boot (both show 0 associations without UI). This is expected and
-identical across boards; it is not an M68AP gap. Conclusion: **M68AP
-inherits the iPod's working Wi-Fi with no board-specific work**; to reach
-Safari, drive the SpringBoard UI to select "iPod Emulator Network", same
-as N45AP. Telephony/baseband is therefore not required for M68AP network
-connectivity.
+identical across boards; it is not an M68AP gap.
+
+**Verification boundary (be precise):** what is *observed* on M68AP is the
+driver-ready state above (A–C, byte-identical to N45AP). Association (E),
+DHCP (F), and Safari (G) are so far **inferred** for M68AP from the
+board-agnostic model + N45AP's proven path, NOT yet observed end-to-end on
+M68AP.
+
+**Attempted the UI-driven Safari test on M68AP (2026-07-24) — BLOCKED, and
+it revealed a bigger M68AP gap.** Ran the proven `ipod-https-acceptance.py`
+harness (QMP taps + keyboard + screendump, `--select-wifi`) against a
+booted M68AP. It failed at "Safari URL keyboard did not appear" because
+**every screendump is black.** Investigation: M68AP reaches SpringBoard
+(`SpringBoard[15]`) and attaches the whole display stack (`AppleH1CLCD`,
+`IOMobileFramebufferUserClient`, `IOCoreSurfaceRoot`), but paints **no
+framebuffer** — all bases 0% non-black and a full 0x08000000–0x10000000 RAM
+scan shows the FB region empty (N45AP paints ~47% at 0x0f400000 under the
+same conditions). Serial shows the device is **`[Unactivated]`**. On
+iPhone OS 1.x an unactivated iPhone presents an activation screen (not the
+home screen), and full activation needs the baseband (IMEI/ICCID) or a
+hacktivation bypass. N45AP (iPod Touch) side-steps this — it activates
+trivially and renders.
+
+**Consequence / correction:** M68AP is NOT yet a visually usable device.
+"Boots to SpringBoard with WiFi driver up" is true, but the screen is
+black (unactivated), so the WiFi→Safari path can't be *driven or seen*
+yet. Getting a usable M68AP home screen requires **activation** — either
+the shelved baseband telephony stack, or an activation/SpringBoard bypass
+("hacktivation"). This partially revises the earlier "telephony not
+needed" conclusion: telephony (or a bypass) IS on the path to a usable
+M68AP UI, even though the WiFi *driver* itself is board-agnostic and works.
+See `IPHONE_2G_BRINGUP_HANDOFF.md`.
