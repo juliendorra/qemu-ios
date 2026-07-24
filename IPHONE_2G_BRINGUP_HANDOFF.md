@@ -8,6 +8,73 @@ the live bring-up state.
 
 ---
 
+## DECISION (2026-07-24): baseband telephony/activation is SHELVED as a stretch goal
+
+**Status: M68AP boots to SpringBoard with the baseband attached, and has
+working Wi-Fi. That is the bring-up goal met. Telephony is not being pursued.**
+
+### Rationale
+
+1. **It is not needed for a working device.** M68AP reaches SpringBoard
+   with the baseband stub attached (no `IT_M68AP_NO_BASEBAND` needed) after
+   the UART interrupt-semantics fixes (commit `5ed12270c3`). The baseband no
+   longer blocks the boot; it just sits in link setup.
+2. **Wi-Fi already gives full connectivity, at parity with the iPod.** The
+   `mv8686` model is board-agnostic; M68AP reaches a byte-identical Wi-Fi
+   driver-ready state to N45AP (firmware loaded, `IO80211Interface` +
+   `IONetworkStack` attached — commit `2f7bc5226b`, see
+   `WIFI_SDIO_NOTES.md`). N45AP's Wi-Fi is proven all the way to DHCP + DNS +
+   Safari; M68AP inherits it. So the device has network access **without any
+   baseband**.
+3. **The payoff is niche and non-functional.** The whole H5→MUX→AT→SIM path
+   leads to `[Unactivated] → [Activated]` and a dialer — i.e. *simulated*
+   cellular that cannot reach a real network anyway. The iPod Touch (the
+   sibling target) has **no baseband at all** and is perfectly useful.
+4. **The remaining effort is large and multi-layered** (see "what is left"
+   below), out of proportion to the value.
+
+### What IS done (so this is shelved on a clean, understood boundary)
+
+The baseband transport is fully understood, not a black box:
+- Protocol **identified**: post-`at+xtransportmode` it is **H5 / BCSP
+  "Three-wire UART"** (a documented Bluetooth-family transport), confirmed by
+  the kext's own strings + byte-exact frame match.
+- H5 **link establishment works** (guest→modem): the responder answers
+  `SYNC→SYNC-RESP`, `CONFIG→CONFIG-RESP`; CommCenter stops the 460× SYNC spam
+  and reaches the **Active** state.
+- The kernel `AppleReliableSerialLayer` **state machine is reverse-engineered**
+  from the decrypted kernelcache (states, transitions, field offsets, config
+  encoding — runs 12–18).
+- The remaining blocker is **precisely located**: CommCenter's userland
+  "wakeup flags" handshake (`DoubleBufferedIpcDriver`), which runs before any
+  AT/MUX traffic (run 19).
+
+### What COULD be done but is deliberately NOT (the shelved work = task #15)
+
+To take the baseband to telephony/activation, in order:
+1. **Disassemble CommCenter's wakeup-flags function** (`"baseband not
+   responding to wakeup flags"`, cstring vm `0x3a7a0`; it is a Thumb/PIC
+   function — the plain-ARM `ldr[pc]` scan missed it) to recover the exact
+   flag bytes it writes and the response it expects.
+2. **Implement H5 *reliable* packet TX** in the stub (the current stub only
+   does link-control): header `b0` seq(0-2)/ack(3-5)/CRC-present(6)/reliable(7),
+   type in `b1`, 16-bit payload CRC when bit6 set, SLIP-wrap; and ack the
+   guest's reliable packets via seq/ack.
+3. **Answer the wakeup-flags handshake** as a reliable frame.
+4. **Implement a GSM 07.10 basic-mode MUX** responder (`+cmux=0,0,0,n`,
+   per-DLCI channels with modem-status bits) carrying the AT channels.
+5. **Answer SIM/registration AT** commands over the DLCIs toward activation.
+
+Each tier is a real protocol and is documented in "runs 12–19" below plus
+the memory note `baseband-lab-tooling`. Tooling to resume: kernelcache
+decrypt `scripts/extract-kernelcache.py`; root-FS mount
+`hdiutil attach -readonly m68ap-artifacts/stage/filesystem-m68ap-readonly.img`;
+the in-QEMU H5 responder is behind `IT_BASEBAND_H5=1` in
+`hw/arm/ipod_touch_baseband.c`. **Only revisit this if a genuine
+iPhone/SIM/dialer experience becomes the goal.**
+
+---
+
 ## 2026-07-24 — Baseband lab: trace-driven, parallel S-Gold2 iteration in minutes
 
 The WiFi bring-up template (trace the driver's protocol, answer until it is
