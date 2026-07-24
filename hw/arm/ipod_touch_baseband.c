@@ -281,28 +281,113 @@ static void sgold2_process_line(SGold2State *s)
 }
 
 /*
- * IT_BASEBAND_FRAME_ECHO=1: after at+xtransportmode CommCenter abandons AT
- * lines for 0xC0-delimited AppleReliableSerialLayer frames (link probe
- * C0 00 2F 00 D0 01 7E C0 retried at ~13 Hz -- see
- * IPHONE_2G_BRINGUP_HANDOFF.md run 10). The protocol is undocumented; as a
- * first probe this echoes every complete frame straight back and logs it,
- * so a change in the guest's retry pattern tells us the frame reached the
- * right layer. Frame bytes bypass the AT line accumulator.
+ * IT_BASEBAND_H5=1: after at+xtransportmode ("Enabling h5 (snooped
+ * at+xtransportmode)" -- string in the kernel AppleReliableSerialLayer
+ * kext), CommCenter drives the baseband link with the H5 / BCSP
+ * "Three-wire UART" transport (a documented Bluetooth-family protocol):
+ *
+ *   SLIP framing  : 0xC0 delimiter, 0xDB escape (DB DC = literal C0,
+ *                   DB DD = literal DB); RFC 1055.
+ *   4-byte header : b0 = SEQ(0-2) ACK(3-5) CRC-present(6) reliable(7)
+ *                   b1 = type(0-3) payload-len-low(4-7)
+ *                   b2 = payload-len-high(0-7)   (12-bit length)
+ *                   b3 = ~(b0+b1+b2) & 0xff      (header checksum)
+ *   type 0xf      = Link Control; payload = the link-establishment magic
+ *                   SYNC 01 7e / SYNC-RESP 02 7d / CONFIG 03 fc /
+ *                   CONFIG-RESP 04 7b (all verified byte-exact on the wire,
+ *                   see IPHONE_2G_BRINGUP_HANDOFF.md runs 11-12).
+ *
+ * A bare echo (the earlier IT_BASEBAND_FRAME_ECHO probe) never advanced the
+ * state machine because bouncing SYNC back is not SYNC-RESP. This responds
+ * per the H5 link-establishment rules: SYNC->SYNC-RESP, CONFIG->CONFIG-RESP,
+ * enough to bring CommCenter's link up. Frame bytes bypass the AT accumulator.
  */
-static bool sgold2_frame_echo_enabled(void)
+static bool sgold2_h5_enabled(void)
 {
     static int cached = -1;
 
     if (cached < 0) {
-        const char *env = getenv("IT_BASEBAND_FRAME_ECHO");
+        const char *env = getenv("IT_BASEBAND_H5");
         cached = env && *env && strcmp(env, "0") != 0;
     }
     return cached;
 }
 
+/* SLIP-encode payload into dst (which already holds a leading 0xC0); returns
+ * total bytes written including both delimiters. */
+static int sgold2_slip_wrap(uint8_t *dst, const uint8_t *src, int n)
+{
+    int w = 0;
+    dst[w++] = 0xC0;
+    for (int i = 0; i < n; i++) {
+        if (src[i] == 0xC0) {
+            dst[w++] = 0xDB; dst[w++] = 0xDC;
+        } else if (src[i] == 0xDB) {
+            dst[w++] = 0xDB; dst[w++] = 0xDD;
+        } else {
+            dst[w++] = src[i];
+        }
+    }
+    dst[w++] = 0xC0;
+    return w;
+}
+
+/* Build + queue an H5 Link-Control frame carrying `payload`. */
+static void sgold2_h5_send_link(SGold2State *s, const uint8_t *payload, int n)
+{
+    uint8_t pkt[4 + 8];
+    pkt[0] = 0x00;                         /* seq0 ack0, unreliable, no CRC */
+    pkt[1] = ((n & 0x0f) << 4) | 0x0f;     /* len-low | type 0xf (link ctrl) */
+    pkt[2] = (n >> 4) & 0xff;              /* len-high */
+    pkt[3] = (~(pkt[0] + pkt[1] + pkt[2])) & 0xff;
+    memcpy(pkt + 4, payload, n);
+
+    uint8_t framed[2 + 2 * (4 + 8)];
+    int fn = sgold2_slip_wrap(framed, pkt, 4 + n);
+    sgold2_trace("<H", framed, fn);
+    if (s->outlen + fn <= sizeof(s->outbuf)) {
+        memcpy(s->outbuf + s->outlen, framed, fn);
+        s->outlen += fn;
+        sgold2_flush(CHARDEV(s));
+    }
+}
+
+/* Process one fully-received, still-SLIP-escaped frame. */
+static void sgold2_h5_frame(SGold2State *s)
+{
+    /* SLIP-unescape in place. */
+    uint8_t u[sizeof(s->frame)];
+    int un = 0;
+    for (int i = 0; i < s->frame_len; i++) {
+        uint8_t b = s->frame[i];
+        if (b == 0xDB && i + 1 < s->frame_len) {
+            uint8_t n = s->frame[++i];
+            u[un++] = (n == 0xDC) ? 0xC0 : (n == 0xDD) ? 0xDB : n;
+        } else {
+            u[un++] = b;
+        }
+    }
+    if (un < 5) {
+        return;                            /* too short for header + payload */
+    }
+    uint8_t type = u[1] & 0x0f;
+    const uint8_t *pl = u + 4;
+    static const uint8_t sync_resp[] = { 0x02, 0x7d };
+    static const uint8_t conf_resp[] = { 0x04, 0x7b };
+    if (type == 0x0f) {                    /* Link Control */
+        if (pl[0] == 0x01) {               /* SYNC   -> SYNC-RESP */
+            sgold2_h5_send_link(s, sync_resp, sizeof(sync_resp));
+        } else if (pl[0] == 0x03) {        /* CONFIG -> CONFIG-RESP */
+            sgold2_h5_send_link(s, conf_resp, sizeof(conf_resp));
+        }
+        /* 02 (SYNC-RESP) / 04 (CONFIG-RESP) from the guest: link is coming
+         * up, nothing to answer at the link-establishment layer. */
+    }
+}
+
 static bool sgold2_frame_byte(SGold2State *s, uint8_t byte)
 {
-    if (!sgold2_frame_echo_enabled()) {
+    if (!sgold2_h5_enabled()) {
         return false;
     }
     if (!s->in_frame) {
@@ -315,16 +400,8 @@ static bool sgold2_frame_byte(SGold2State *s, uint8_t byte)
     }
     if (byte == 0xC0) {
         if (s->frame_len > 0) {
-            uint8_t echo[2 + sizeof(s->frame)];
-            echo[0] = 0xC0;
-            memcpy(echo + 1, s->frame, s->frame_len);
-            echo[1 + s->frame_len] = 0xC0;
-            sgold2_trace("<E", echo, 2 + s->frame_len);
-            if (s->outlen + 2 + s->frame_len <= sizeof(s->outbuf)) {
-                memcpy(s->outbuf + s->outlen, echo, 2 + s->frame_len);
-                s->outlen += 2 + s->frame_len;
-                sgold2_flush(CHARDEV(s));
-            }
+            sgold2_trace("->", s->frame, s->frame_len);
+            sgold2_h5_frame(s);
             s->frame_len = 0;
             /* stay in_frame: back-to-back frames share delimiters */
         }

@@ -370,17 +370,58 @@ to each frame with a fixed `C0 00 2f 00 d0 <echo-seq> <cksum> C0`-shaped
 ACK once the checksum is known, and watch whether the sequence advances
 past 4.
 
-**Disassembly target located** (no kernelcache decrypt needed): the
-kernelcache (`m68ap-artifacts/ipsw/kernelcache.release.s5l8900xrb`) is
-8900-wrapped and encrypted (magic `89001.0`, no readable strings), BUT
-the read-only root FS `m68ap-artifacts/stage/filesystem-m68ap-readonly.img`
-carries the on-disk kext plaintext: the `xtransportmode` string is at
-byte offset ~45,660,033 and an `AppleBaseband` string cluster is ~10 KB
-before it (~45,649,584), i.e. the transport code lives in one Mach-O
-there. Carve it out of the HFS image (see `scripts/` NAND/HFS extraction
-utility, commit ddec748338) and disassemble the frame path for the
-checksum + ACK shape. A second `AppleBaseband` hit at ~176,911,412 is a
-different file (userland CommCenter side).
+**Disassembly target located** (needs the kernelcache): CORRECTION to an
+earlier claim in commit c21c352aba — the `xtransportmode` string at FS
+offset ~45.66M is **CommCenter** (`/System/Library/Frameworks/
+CoreTelephony.framework/Support/CommCenter`, userland), which SENDS the
+AT command; it is NOT the frame builder. The framing lives in the kernel
+kext `AppleReliableSerialLayer`, prelinked into the ENCRYPTED
+kernelcache. It has zero pointer xrefs to `xtransportmode` (that string
+is CommCenter's), so grepping the root FS for it is a red herring.
+
+### Run 12 — the frame builder decrypted, and the protocol IS H5 (BCSP three-wire UART)
+
+`scripts/extract-kernelcache.py` turns the 8900 cache into a raw ARM
+Mach-O: strip the 0x800 header, AES-128-CBC (key = the S5L8900 GID
+`188458A6D15034DFE386F23B61D43774`, already in
+`hw/arm/ipod_touch_8900_engine.h`; iv 0), then Apple LZSS
+(`complzss`; canonical ring buffer `r = N-F`, an off-by-one there
+corrupts every ~4th word). Out comes `MH_MAGIC` + 140 prelinked kexts;
+`AppleReliableSerialLayer` __cstrings land at vm ~0xc048e3c0 and settle
+it outright:
+
+    "H5/%d-Enabling h5 (snooped at+xtransportmode)"
+    "%s: AppleReliableSerialLayer recevied unexpected serial event ..."
+    "H5/%d-> waitLineBreak, @%d called %dms"
+
+So after `at+xtransportmode` the link switches to **H5 / BCSP
+"Three-wire UART"** — a documented Bluetooth-family transport, not a
+bespoke Apple format. No further disassembly of the checksum was needed:
+the captured frames match the H5 spec byte-for-byte.
+
+- SLIP framing (RFC 1055): `C0` delim, `DB` esc (`DB DC`=C0, `DB DD`=DB).
+- 4-byte header: `b0`=SEQ(0-2) ACK(3-5) CRC-present(6) reliable(7);
+  `b1`=type(0-3) len-low(4-7); `b2`=len-high; `b3`=`~(b0+b1+b2)&0xff`
+  (the header checksum — validated on all four captured frames).
+- type `0xf` = Link Control; payloads are the standard H5
+  link-establishment magic: **SYNC `01 7e`, SYNC-RESP `02 7d`, CONFIG
+  `03 fc`, CONFIG-RESP `04 7b`** (the exact BlueZ/hciattach constants).
+
+Why run 11's echo failed: bouncing the guest's SYNC back looks like an
+inbound SYNC, never a SYNC-RESP, so the link state machine never moved
+(guest walked SYNC→SYNC→… then AT-timeout). The fix is a real H5
+link-establishment responder: SYNC→SYNC-RESP, CONFIG→CONFIG-RESP, SLIP
+unescape in / escape out. Implemented behind `IT_BASEBAND_H5=1` in
+`hw/arm/ipod_touch_baseband.c` (replaces the throwaway
+`IT_BASEBAND_FRAME_ECHO` probe). Run 12 result: pending — see below /
+next entry.
+
+Next once the link is up: CommCenter will exchange real H5 *reliable*
+packets (seq/ack matter, `b0` bit7 set, and CRC-present frames need the
+16-bit CCITT CRC in `b1`-type≠0xf packets) carrying HCI-like baseband
+commands — SIM, registration, activation. That is the layer above link
+establishment; disassemble `AppleReliableSerialLayer`'s packet handlers
+(now that the kext is decrypted and mapped) for the command set.
 
 ---
 
