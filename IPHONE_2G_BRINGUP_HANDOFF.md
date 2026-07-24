@@ -423,6 +423,46 @@ commands — SIM, registration, activation. That is the layer above link
 establishment; disassemble `AppleReliableSerialLayer`'s packet handlers
 (now that the kext is decrypted and mapped) for the command set.
 
+### Runs 13-17 — link establishment works one-way; the "muzzle" needs the state machine
+
+The `IT_BASEBAND_H5=1` responder answers `SYNC->SYNC-RESP` and
+`CONFIG->CONFIG-RESP`. Confirmed clean behaviour: the guest sends SYNC
+**once** (not the 460× spam), accepts SYNC-RESP, sends CONFIG once,
+accepts CONFIG-RESP — the guest->modem direction is fully established
+byte-for-byte. Then it goes **quiet** and ~40 s later
+`CommCenter[13]: Baseband reset: AT response timeout`. That quiet is the
+frontier: a BCSP peer that has finished its own link establishment stays
+"muzzled" (sends no reliable data) until the *reverse* direction is up
+too.
+
+Attempts to unmuzzle it, all recorded as DEAD ENDS (do not repeat
+without the disassembly):
+- **Config field in CONFIG-RESP** (run 13, `04 7b 17`): no change — the
+  guest's CONFIG is bare, so the response should be bare; a field is not
+  what it waits on.
+- **Bidirectional piggyback** (runs 14-16): the modem also sends its OWN
+  SYNC then CONFIG, piggybacked on the guest's frames. This *did* prove
+  the guest processes modem frames (it replied SYNC-RESP `02 7d` to the
+  modem's SYNC — real two-way engagement) but did NOT unmuzzle it:
+  instead the guest storms CONFIG ~250× and never sends a CONFIG-RESP
+  (`04`) to the modem's CONFIG. A subtle bug found here (the H5 link
+  messages are 2-byte magics, so the config field starts at payload
+  index 2, not 1 — index 1 is the fixed magic byte `fc`/`7d`) was fixed
+  but did not change the outcome.
+
+Conclusion: the modem-side bring-up (exact frame ordering, whether the
+guest resets on receiving a peer SYNC, the reliable-packet seq/ack
+handshake, and when the choke is actually released) cannot be guessed
+from the wire — 4 iterations plateaued. The committed responder is
+therefore responder-only (clean, one-way establishment); the real fix is
+to read `AppleReliableSerialLayer`'s H5 state machine out of the
+decrypted kernelcache. Concrete disassembly start points now in hand:
+the kext text is prelinked in `__PRELINK` (vm `0xc029b000-0xc0601000`);
+its H5 strings sit at vm ~`0xc048e4aa` ("Enabling h5 …"), `0xc048e530`
+("waitLineBreak"), `0xc0354834` ("recevied unexpected serial event"),
+and `0xc048eb63` ("h5State"); ARMv6 → Thumb, literal-pool string loads.
+Find the function that transitions on CONFIG-RESP / releases the choke.
+
 ---
 
 ## 2026-07-23 BREAKTHROUGH — UART Tx-interrupt storm fixed; M68AP now REACHES SPRINGBOARD

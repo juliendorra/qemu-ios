@@ -24,7 +24,7 @@ struct SGold2State {
     char line[256];
     int line_len;
     uint8_t outbuf[1024];
-    /* IT_BASEBAND_FRAME_ECHO: 0xC0-delimited transport-mode frame collector */
+    /* IT_BASEBAND_H5: 0xC0-delimited H5/BCSP transport-mode frame collector. */
     bool in_frame;
     uint8_t frame[256];
     int frame_len;

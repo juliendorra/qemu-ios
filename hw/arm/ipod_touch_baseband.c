@@ -374,14 +374,34 @@ static void sgold2_h5_frame(SGold2State *s)
     const uint8_t *pl = u + 4;
     static const uint8_t sync_resp[] = { 0x02, 0x7d };
     static const uint8_t conf_resp[] = { 0x04, 0x7b };
-    if (type == 0x0f) {                    /* Link Control */
-        if (pl[0] == 0x01) {               /* SYNC   -> SYNC-RESP */
-            sgold2_h5_send_link(s, sync_resp, sizeof(sync_resp));
-        } else if (pl[0] == 0x03) {        /* CONFIG -> CONFIG-RESP */
-            sgold2_h5_send_link(s, conf_resp, sizeof(conf_resp));
-        }
-        /* 02 (SYNC-RESP) / 04 (CONFIG-RESP) from the guest: link is coming
-         * up, nothing to answer at the link-establishment layer. */
+    if (type != 0x0f) {                    /* not Link Control */
+        return;
+    }
+    /*
+     * H5/BCSP link establishment. Responding to the guest's SYNC/CONFIG
+     * cleanly brings up the guest->modem direction: the guest sends SYNC
+     * once (not the pre-responder 460x spam), accepts SYNC-RESP, sends
+     * CONFIG once, accepts CONFIG-RESP -- then goes quiet ("muzzled") and
+     * later AT-timeout-resets. That quiet is the frontier: CommCenter will
+     * not send reliable data until the modem->guest direction is also up.
+     *
+     * DEAD END (runs 14-16): piggybacking the modem's OWN SYNC/CONFIG onto
+     * the guest's frames does NOT unmuzzle it -- instead the guest storms
+     * CONFIG ~250x and never sends CONFIG-RESP to the modem's CONFIG. The
+     * correct modem-side bring-up (timing, the reliable-packet seq/ack, the
+     * config-field semantics) needs AppleReliableSerialLayer's state machine
+     * from the decrypted kernelcache (scripts/extract-kernelcache.py); see
+     * IPHONE_2G_BRINGUP_HANDOFF.md. Until then, respond only.
+     */
+    switch (pl[0]) {
+    case 0x01:                             /* guest SYNC   -> SYNC-RESP */
+        sgold2_h5_send_link(s, sync_resp, sizeof(sync_resp));
+        break;
+    case 0x03:                             /* guest CONFIG -> CONFIG-RESP */
+        sgold2_h5_send_link(s, conf_resp, sizeof(conf_resp));
+        break;
+    default:                               /* 02/04 (resp to a modem frame) */
+        break;                             /* -- unused until modem inits */
     }
 }
 
