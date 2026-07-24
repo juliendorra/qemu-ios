@@ -8,6 +8,106 @@ the live bring-up state.
 
 ---
 
+## 2026-07-24 — Baseband lab: trace-driven, parallel S-Gold2 iteration in minutes
+
+The WiFi bring-up template (trace the driver's protocol, answer until it is
+satisfied) is now tooled for the baseband, with the modem brain moved OUT of
+compiled C so an iteration costs an edit + relaunch, not a rebuild:
+
+- **`scripts/sgold2d.py`** — external S-Gold2 modem. QEMU wires uart1 to a
+  unix socket (`IT_M68AP_NO_BASEBAND=1` disables only the built-in C stub;
+  uart1 then falls through to the *second* `-serial` argument); this daemon
+  answers AT commands per a JSON ruleset that is **hot-reloaded on mtime
+  change** (edit responses mid-boot, no restart). Every byte both ways is
+  logged (`raw.log` hexdump, `lines.log` conversation, `events.jsonl` for
+  diffing), and `summary.json` — refreshed after every command — lists the
+  **unmatched commands**: exactly what AppleBaseband asked that the ruleset
+  had no specific answer for. That file is the iteration loop.
+- **`scripts/baseband-rules/*.json`** — rulesets: `silent.json` (record-only),
+  `stub.json` (faithful replica of the C stub), `eager.json` (standard AT
+  init/status answers as a first hypothesis). Format: ordered regex rules
+  with group-substituted responses, optional delays, state vars and guards.
+- **`scripts/baseband-lab.py`** — parallel, self-judging matrix runner: one
+  M68AP instance per ruleset (plus special names `none` = known-good silence
+  baseline, `builtin` = the C stub under `IT_BASEBAND_TRACE`), each watched
+  until a decisive verdict — `springboard_reached` (SpringBoard config / FB
+  attach markers), `baseband_retry_loop` (serial stall + ≥20 AppleBaseband
+  lines: the known failure signature), `stalled`, or `timeout` — then PC
+  samples (deadlock vs crawl), framebuffer non-black %, serial tail, and the
+  modem summary are folded into `matrix.json` + a printed comparison table.
+  A whole hypothesis matrix costs one boot's wall time.
+- **`IT_BASEBAND_TRACE=<path|stderr>`** (in `hw/arm/ipod_touch_baseband.c`)
+  — same byte-level trace for the in-QEMU stub, so the shipping-app
+  configuration is observable too.
+
+Usage (the standard experiment):
+
+    python3 scripts/baseband-lab.py --logs /tmp/bblab \
+        --rules scripts/baseband-rules/silent.json \
+                scripts/baseband-rules/stub.json builtin
+
+Then read each instance's `modem/lines.log` (what AppleBaseband said) and
+`modem/summary.json` (what went unanswered), edit/fork a ruleset, re-run the
+matrix. Defaults point at `m68ap-artifacts/stage/` (sbpatch iBoot, fresh
+NAND); override with `--iboot/--nor/--nand`.
+
+### First capture results (the exact run above; verdicts in 114–158 s wall, in parallel)
+
+| instance | verdict | serial lines | uart1 conversation |
+|---|---|---|---|
+| silent  | stalled (panic → KDP wait) | 2084 | ~54 unanswered iBoot retries |
+| stub    | baseband_retry_loop        | 1617 | 3 commands, then nothing |
+| builtin | baseband_retry_loop        | 1617 | identical to stub |
+
+Four findings, each of which reframes the plan:
+
+1. **The Python replica is faithful.** `stub` (external socket modem) and
+   `builtin` (in-QEMU C stub) produce byte-identical progress: 1617 serial
+   lines, 22 AppleBaseband lines, the same stall, the same storm PC
+   (`AppleS5L8900XSerial 0xc04bd868`) in the terminal samples. All further
+   iteration can happen in Python without touching C.
+2. **The entire known uart1 conversation is iBoot's, not the kernel's.**
+   `AT+xdrv=9,1,0;` is iBoot's baseband-NVRAM read (the serial lines
+   `Read 0 bytes from nvram` / `Installing WIFI Calibration` ARE these uart1
+   transactions): answered `+XDRV: 9,1,0,0,NULL` it completes in ~1 s;
+   unanswered it retries at 1 Hz inside 5 s-per-read windows and errors out.
+   Then one `AT+cgsn;` (IMEI query — today answered with a bare `OK`, no
+   IMEI payload; `eager.json` has a real-shaped answer to try). That is ALL
+   the uart1 traffic in the whole boot.
+3. **The kernel-era AppleBaseband stalls WITHOUT writing a single byte to
+   uart1.** After `AppleBaseband::start` / `config ... starting on
+   AppleBaseband, 10` the retry loop runs with an empty uart1 trace. So the
+   baseband-on stall is NOT an unanswered AT command; the driver is waiting
+   on something baseband-initiated or out-of-band (unsolicited bytes after
+   its reset sequence, a GPIO/host-wake line, flow control). `sgold2d.py`
+   grew a top-level `"unsolicited"` ruleset feature (timed/periodic sends,
+   timers re-fire on hot reload) specifically to probe this.
+4. **Total silence is worse than a shallow stub.** With no answers, iBoot's
+   NVRAM reads add ~20 s of timeouts and the kernel later panics at
+   `IOIpodUSBDevice::start` (caller `0xC012D963`) into the KDP debugger
+   wait. Caution: this socket-connected-but-mute config is NOT the same as
+   the known-good `IT_M68AP_NO_BASEBAND=1` bare config that reaches
+   SpringBoard, and the panic sits in the same timing-sensitive USB-start
+   region as the old observer-artifact retain — likely another timing
+   perturbation (the three 5 s NVRAM delays), not a real baseband
+   dependency. Run a `none` instance alongside before believing anything
+   about this panic.
+
+Next moves (in order of information-per-minute):
+1. Matrix `eager.json` (real IMEI for `AT+cgsn`) vs `stub` — does a
+   plausible IMEI change the kernel-era behavior at all?
+2. Since the kernel driver is uart1-mute, chase its non-UART inputs: what
+   GPIOs/registers does AppleBaseband poll (openiboot `hardware/radio.h`:
+   BB_ON 0x1807, RADIO_ON 0x1507, BB_RESET…) and what does our GPIO model
+   return for them? A ruleset alone cannot fix a GPIO wait.
+3. Probe with `"unsolicited"` sends (e.g. periodic `\r\nOK\r\n`, `RING`,
+   `+XDRV` status lines) to learn whether ANY baseband-initiated traffic
+   moves the driver.
+4. Keep a `none` control instance in every matrix to separate real effects
+   from timing artifacts.
+
+---
+
 ## 2026-07-23 BREAKTHROUGH — UART Tx-interrupt storm fixed; M68AP now REACHES SPRINGBOARD
 
 The configd/launchd freeze was a **UART Tx-interrupt storm** in the emulator.
