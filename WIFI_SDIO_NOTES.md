@@ -159,3 +159,28 @@ hatch; `IPOD_SDIO_TRACE=1` enables the verbose controller/card trace.
 | G. Safari demo | **Done** — Safari rendered `http://10.0.2.2:8080/` from a host HTTP server |
 | H. Power lifecycle | **Done** — deep-sleep/wake loops no longer trigger the Apple command watchdog; when one does fire (idle-lock churn), the card model now survives the driver's hand-of-god power cycle and warm-reloads its firmware |
 | I. DNS / hostnames | **Done** — the distributed NAND was missing the mDNSResponder launchd job; `scripts/ipod-nand-restore-dns.py` restores it and Safari resolves hostnames directly (see `DNS_RESOLVER_NOTES.md`) |
+
+## M68AP (iPhone 2G) parity — verified 2026-07-24
+
+The Wi-Fi model is board-agnostic: `ipod_touch.c` creates the `mv8686` NIC
+unconditionally for both boards, and the milestone ladder above was proven
+on N45AP. A direct A/B (both booted headless to SpringBoard) shows M68AP
+reaches a **byte-identical driver-ready state** to N45AP:
+
+    AppleMRVL868x: Firmware loaded.
+    AppleMRVL868x Hardware Details:
+    AppleMRVL868x: Ethernet address 52:54:00:12:34:56
+    IO80211Controller::attachInterfaceWithMacAddress called!
+    IO80211Interface::attach(AppleMRVL868x)
+    IONetworkStack::attach(IO80211Interface)
+
+So milestones A–C (host controller, enumeration, firmware mailbox) hold on
+M68AP unchanged. Association (E) and DHCP (F) are **driver-initiated on
+network selection** — a `CMD_802_11_ASSOCIATE` the guest sends when a
+network is joined from Settings — so NEITHER board auto-associates in a
+headless boot (both show 0 associations without UI). This is expected and
+identical across boards; it is not an M68AP gap. Conclusion: **M68AP
+inherits the iPod's working Wi-Fi with no board-specific work**; to reach
+Safari, drive the SpringBoard UI to select "iPod Emulator Network", same
+as N45AP. Telephony/baseband is therefore not required for M68AP network
+connectivity.
