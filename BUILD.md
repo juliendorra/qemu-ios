@@ -506,6 +506,40 @@ cp m68ap-artifacts/appdbg/bootrom_s5l8900 \
 and the NAND must be a **generated** tree (`build-m68ap-nand.py`, e.g.
 `m68ap-artifacts/stage/nand-m68ap-fresh`), not an N45AP dump.
 
+### 2b. One-command packaging (recommended)
+
+Both bundles have an end-to-end packaging script. They are the supported path;
+the manual steps below remain for understanding and for repair work.
+
+```bash
+scripts/package-ipod-app.sh   --build          # /Applications/iPod Touch.app
+scripts/package-iphone-app.sh --build          # /Applications/iPhone 2G.app
+scripts/package-iphone-app.sh --verify-only    # audit an installed bundle
+```
+
+`package-iphone-app.sh` also GENERATES the guest image it installs, via
+`scripts/build-m68ap-homescreen-nand.py` — the lockdownd activation patch,
+`LK_ENABLE_MBX2D=0`, and the reference-shaped data ark, i.e. the exact
+combination measured to reach the home screen. Packaging can therefore not
+drift from the verified configuration.
+
+**Ship a PACKED NAND — this is a correctness requirement, not an optimisation.**
+The launcher clones the M68AP NAND on every launch (the kernel needs a clean
+one). A sparse tree is ~148 000 page files, and cloning it takes minutes during
+which no QEMU window appears — the app just bounces in the Dock and looks hung.
+The QEMU NAND model reads pages from `nand.pack` and writes to
+`bank<N>/<page>_new.page`, so the bundle ships **`nand.pack` plus empty bank
+directories** (the write path `fopen()`s into them and `hw_error()`s if they are
+missing). Staging then takes ~0 s. The packaging script does this and its
+`--verify-only` audit fails if a bundle ever regains a sparse tree.
+
+**`codesign --remove-signature` must NOT be run before `install_name_tool`.**
+A freshly linked binary carries a *linker-signed* ad-hoc signature; stripping it
+leaves a hole in `__LINKEDIT` and `install_name_tool` then refuses the file
+("link edit information does not fill the __LINKEDIT segment"), which broke
+engine installs outright. Rewriting the load commands invalidates the signature
+anyway and everything is re-signed at the end.
+
 ### 3. Fresh NAND per launch (M68AP only)
 
 The M68AP kernel completes `FTL_Open` only against a **clean** NAND, and the

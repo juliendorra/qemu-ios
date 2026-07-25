@@ -74,6 +74,14 @@ fi
 # clone per launch and throw it away on exit. `cp -Rc` clones on APFS, so this
 # is cheap. N45AP keeps the historical in-place behaviour, which its real
 # device-dump NAND tolerates.
+#
+# IMPORTANT: this per-launch clone is why the bundle must ship a PACKED NAND
+# (nand.pack + empty bank dirs), which package-iphone-app.sh does. Cloning a
+# sparse tree of ~148_000 page files takes minutes on every launch, and since
+# no QEMU window appears until it finishes, the app just bounces in the Dock
+# and looks hung. With the pack it is a single-file clone (~0 s). The QEMU NAND
+# model reads pages from the pack and writes to bank<N>/<page>_new.page, so the
+# empty bank dirs must exist and must be writable.
 STAGE_DIR=""
 if [[ "$PROFILE" == "iphone-2g" && "${S5L8900_STAGE_NAND:-1}" != "0" ]]; then
     STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s5l8900-nand.XXXXXX")"

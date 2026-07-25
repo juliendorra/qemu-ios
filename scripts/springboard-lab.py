@@ -276,6 +276,25 @@ VARIANTS = {
     "m68ap-everreg-1": dict(board="m68ap", dataark=True, patch=True,
                             sb_env="mbx2d", ark_profile="everreg-1",
                             env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # --- M68AP button idle levels. The device tree puts menu/volup/voldown/
+    # ringer/hold on GPIO 0x1600/01/02/03/05 (port 0x16, bits 0/1/2/3/5) with
+    # two different flag values (0x100 vs 0x000 = two polarities). The model
+    # leaves the whole port at 0, and the guest samples it only twice before
+    # switching to interrupts, so a pin that reads "pressed" at boot stays
+    # pressed -- the stuck ringer/volume HUD. Masks are tested one bit at a
+    # time because forcing the volume pair (0x6) PANICS the kernel early.
+    "m68ap-gpio-volup": dict(board="m68ap", dataark=True, patch=True,
+                             sb_env="mbx2d", ark_profile="reference-reg",
+                             env={"IT_M68AP_NO_BASEBAND": "1",
+                                  "IT_M68AP_GPIO_IDLE": "0x2"}),
+    "m68ap-gpio-voldown": dict(board="m68ap", dataark=True, patch=True,
+                               sb_env="mbx2d", ark_profile="reference-reg",
+                               env={"IT_M68AP_NO_BASEBAND": "1",
+                                    "IT_M68AP_GPIO_IDLE": "0x4"}),
+    "m68ap-gpio-ringer": dict(board="m68ap", dataark=True, patch=True,
+                              sb_env="mbx2d", ark_profile="reference-reg",
+                              env={"IT_M68AP_NO_BASEBAND": "1",
+                                   "IT_M68AP_GPIO_IDLE": "0x8"}),
     # THE REFERENCE ARK: key names/types read off the iPod's own shipped ark
     # (a device that reaches the home screen) -- booleans where we wrote
     # numbers, plus the international/SIM/timezone keys we never wrote at all.
