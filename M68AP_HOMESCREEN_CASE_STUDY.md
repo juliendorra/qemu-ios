@@ -93,6 +93,19 @@ time. They are listed so nobody re-runs them.
 
 ## 4. What actually cracked each fault
 
+**Verification of the derived window (both boards, 2026-07-25).** The runtime
+derivation independently reproduces each board's constant from the guest's own
+announcement, with no mismatch and no "never read" warning:
+
+```
+n45ap-control: [TVOUT-WA] derived 0x08a25960 from the guest (swap device VA 0xc0a25800 + 0x160) - matches the board default
+m68ap-refreg:  [TVOUT-WA] derived 0x089c8560 from the guest (swap device VA 0xc09c8400 + 0x160) - matches the board default
+```
+
+Reproducing devos50's 2022 constant exactly, from the guest, is what makes the
+mechanism trustworthy rather than a coincidence — and it means the iPod is not
+"patched to match the iPhone": both boards now use one address-free mechanism.
+
 **Fault 1 — decoded by reading the upstream hack instead of the symptom.**
 `git log -S TVOUT_WORKAROUND` found `f59f20f60e` ("Got past TVOut", 2022): a
 4-byte always-zero MMIO window at physical `0x8a25960`. That decodes as kernel
