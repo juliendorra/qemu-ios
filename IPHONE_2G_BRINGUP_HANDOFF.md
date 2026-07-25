@@ -119,12 +119,25 @@ carries no Apple material:
    consumer (SpringBoard, CommCenter, Preferences…). That keeps the hack at one
    well-understood point instead of spreading it.
 
-The open question — whether step 2 can be dropped entirely — is being measured
-by the `ark-minimal|factory|unactsvc|all` variants in
-`scripts/springboard-lab.py` (does `[Activated]` survive
-`determine_activation_state`'s boot re-validation using only lockdownd's
-data-driven levers `FactoryActivated` / `AllowUnactivatedService`?). If one
-holds, hacktivation becomes **pure data**, and the binary patch is deleted.
+**MEASURED (2026-07-25): no data-only ark holds — the lockdownd patch IS
+required.** All four ark profiles were run through `springboard-lab.py`
+(`--variants ark-minimal ark-factory ark-unactsvc ark-all`), each reaching
+`[Activated]` and then logging the re-validation flip:
+
+| ark profile | keys added | `[Activated]` | Unactivated flip | holds? |
+|---|---|---|---|---|
+| `minimal` | cached ActivationState only | 1 | **1** | no |
+| `factory` | `FactoryActivated`, `ActivationState=FactoryActivated` | 1 | **1** | no |
+| `unactsvc` | `AllowUnactivatedService` | 1 | **1** | no |
+| `all` | all of the above + lockdown-domain ActivationState | 1 | **1** | no |
+
+So `determine_activation_state` re-validates against the *record*, and none of
+lockdownd's data-driven levers substitute for one. **Conclusion: step 2 stays.**
+Our activation = data ark (universal values) **+ one** byte patch in lockdownd
+(the activation authority). The iPod does not need that patch only because it
+ships a genuine Apple-signed record — which we cannot obtain or forge (see
+above). This is now a measured fact, not an assumption; do not re-litigate it
+without new information (e.g. a user-supplied iPhone 1,1 record).
 
 ### RESOLVED THE RIGHT WAY: authentic data-ark injection (one source of truth, no per-binary patches)
 
