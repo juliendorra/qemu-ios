@@ -166,8 +166,55 @@ static void tvout_workaround_move(hwaddr pa)
 }
 
 /*
- * Console tap. Two jobs: derive the workaround address from the kernel's own
- * "Added swap device" announcement, and refuse to fail silently.
+ * M68AP button idle levels.
+ *
+ * The iPhone's five buttons sit on GPIO port 0x16 (see ipod_touch_gpio.h for
+ * the device-tree evidence). MEASURED polarity for the volume pair: the pins
+ * are ACTIVE LOW, so the model's all-zero port reads as "both volume buttons
+ * held down" from the moment the OS starts. The buttons driver samples this
+ * port only twice and then relies on interrupts, so the press never ends: the
+ * ringer/volume HUD appears on the home screen and stays there forever.
+ * (Proof: idling volup high drives the ringer volume to MINIMUM -- voldown
+ * still held -- and idling voldown high drives it to MAXIMUM.)
+ *
+ * Why this is applied when the kernel starts rather than at reset: iBoot also
+ * samples this port, at t=0.087 s (pc=0x180024ba), to decide its boot mode.
+ * Presenting released volume buttons that early makes it take a path that
+ * panics the kernel before the OS version is even set -- reproduced 3/3.
+ * Installing the levels at the kernel banner is after iBoot's sampling and
+ * long before the driver's first read (t=64 s), so both consumers see what
+ * they expect.
+ *
+ * SHORTCUT, recorded honestly: the faithful model would drive these pins from
+ * reset and understand what iBoot does with them. Override the mask with
+ * IT_M68AP_GPIO_IDLE=<hex> (0 disables) to keep experimenting.
+ */
+static void ipod_touch_button_idle_level(void)
+{
+    IPodTouchMachineState *nms = g_ipod_touch_nms;
+    const char *env;
+    uint32_t mask;
+
+    if (!nms || !nms->gpio_state || nms->board_id != BOARD_ID_M68AP) {
+        return;
+    }
+    mask = IPOD_TOUCH_GPIO_M68AP_IDLE;
+    env = getenv("IT_M68AP_GPIO_IDLE");
+    if (env && *env) {
+        mask = (uint32_t)strtoul(env, NULL, 0);
+    }
+    if (!mask || (nms->gpio_state->gpio_state & mask) == mask) {
+        return;
+    }
+    nms->gpio_state->gpio_state |= mask;
+    fprintf(stderr, "[BTN] M68AP button idle levels applied (mask 0x%x): "
+            "volume buttons released\n", mask);
+}
+
+/*
+ * Console tap. Three jobs: derive the workaround address from the kernel's own
+ * "Added swap device" announcement, install the button idle levels once the
+ * kernel is running, and refuse to fail silently.
  */
 static void ipod_touch_console_line(const char *line)
 {
@@ -195,6 +242,9 @@ static void ipod_touch_console_line(const char *line)
             }
         }
         return;
+    }
+    if (strstr(line, "Darwin Kernel Version")) {
+        ipod_touch_button_idle_level();
     }
     /* SpringBoard is the consumer that hangs when the window is misplaced, so
      * its start is the moment to check that the window is real. */
@@ -1006,6 +1056,8 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("ipodtouch.gpio");
     IPodTouchGPIOState *gpio_state = IPOD_TOUCH_GPIO(dev);
     nms->gpio_state = gpio_state;
+    /* M68AP button idle levels are installed once the KERNEL starts, not at
+     * reset -- see ipod_touch_button_idle_level() and the comment above it. */
     memory_region_add_subregion(sysmem, GPIO_MEM_BASE, &gpio_state->iomem);
 
     // init SDIO
