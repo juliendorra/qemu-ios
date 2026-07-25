@@ -8,6 +8,11 @@ the live bring-up state.
 
 ---
 
+> **Start here for the current wall:** `M68AP_RENDER_HANDOFF.md` — a focused
+> handoff (status, what is ruled out with the measurement that did it, the
+> tools + exact reproduction commands, ranked next steps, and the traps).
+> This file remains the long-form log of every run and trace.
+
 ## FINDING + DECISION (2026-07-25): the M68AP black screen is the ACTIVATION gate — hacktivate
 
 **What the iPod (N45AP) taught us, and the original author's own words.** devos50
