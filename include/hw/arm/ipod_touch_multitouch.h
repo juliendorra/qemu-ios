@@ -56,14 +56,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
 #define MT_CMD_SHORT_CONTROL_READ    0xE6
 #define MT_CMD_FRAME_READ            0xEA
 #define MT_CMD_READ_INTERRUPT_DATA   0xEB
-/* A second interrupt-data read the Z2 driver uses after a sleep/wake cycle.
- * Observed (scripts/lock-unlock-probe.py, N45AP): the first unlock after boot
- * reads frames with 0xEB, but after the NEXT wake the driver answers the ATN
- * with 0xEC instead. Left unimplemented it fell through to the unknown-command
- * branch, the driver got a zero reply, tried 0xE4/0xE1 recovery and never read
- * the touch -- i.e. slide-to-unlock died on every wake after the first. It is
- * answered exactly like 0xEB. */
-#define MT_CMD_READ_INTERRUPT_DATA2  0xEC
 #define MT_REPLY_INTERRUPT_DATA      0xE1
 
 // frame types

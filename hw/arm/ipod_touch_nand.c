@@ -193,9 +193,14 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
         {
             const char *watch = getenv("IT_NAND_WATCH");
             if (watch) {
-                char needle[32];
-                snprintf(needle, sizeof(needle), "%u/%u", bank, page);
-                if (strstr(watch, needle)) {
+                char needle[40];
+                /* EXACT token match. A plain strstr() matched "1/6" inside
+                 * "1/60547" and reported reads that never happened -- the
+                 * first use of this trace produced a void measurement. */
+                snprintf(needle, sizeof(needle), ",%u/%u,", bank, page);
+                char list[512];
+                snprintf(list, sizeof(list), ",%s,", watch);
+                if (strstr(list, needle)) {
                     fprintf(stderr, "[NAND-WATCH] guest read bank%u/%u "
                             "(present=%d)\n", bank, page, present);
                 }

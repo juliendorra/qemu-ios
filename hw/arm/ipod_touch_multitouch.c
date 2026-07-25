@@ -20,6 +20,24 @@ static bool it_mt_trace_enabled(void)
     return cached;
 }
 
+/* IT_MT_TRACE=2 additionally logs every SPI byte, but only from the first
+ * touch onward -- the firmware upload would otherwise bury the interesting
+ * part. This exists because an UNKNOWN command is not a harmless no-op in
+ * this model: it sets buf_size = 1, so after a single byte cur_cmd resets and
+ * every remaining byte of that transaction is re-interpreted as a NEW command.
+ * A desync therefore looks like a plausible-but-fictional command sequence. */
+static bool mt_trace_bytes_armed;
+
+static bool it_mt_trace_bytes(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("IT_MT_TRACE");
+        cached = (v && atoi(v) >= 2);
+    }
+    return cached && mt_trace_bytes_armed;
+}
+
 #define MT_TRACE(...) do { \
     if (it_mt_trace_enabled()) { \
         fprintf(stderr, "[MT] " __VA_ARGS__); \
@@ -474,7 +492,25 @@ static uint32_t z1_transfer(IPodTouchMultitouchState *s, uint32_t value)
     return ret_val;
 }
 
+static uint32_t mt_transfer_inner(SSIPeripheral *dev, uint32_t value);
+
 static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t value)
+{
+    IPodTouchMultitouchState *s = IPOD_TOUCH_MULTITOUCH(dev);
+    uint8_t cmd_before = s->cur_cmd;
+    uint32_t ind_before = s->buf_ind, size_before = s->buf_size;
+    uint32_t ret = mt_transfer_inner(dev, value);
+
+    if (it_mt_trace_bytes()) {
+        fprintf(stderr, "[MTB] in 0x%02x -> out 0x%02x  (cmd 0x%02x "
+                "%u/%u -> cmd 0x%02x %u/%u)\n", (uint8_t)value, (uint8_t)ret,
+                cmd_before, ind_before, size_before,
+                s->cur_cmd, s->buf_ind, s->buf_size);
+    }
+    return ret;
+}
+
+static uint32_t mt_transfer_inner(SSIPeripheral *dev, uint32_t value)
 {
     IPodTouchMultitouchState *s = IPOD_TOUCH_MULTITOUCH(dev);
 
@@ -602,8 +638,7 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
                 memset(s->out_buffer, 0, s->buf_size);
             }
         }
-        else if (value == MT_CMD_READ_INTERRUPT_DATA ||
-                 value == MT_CMD_READ_INTERRUPT_DATA2) {
+        else if (value == MT_CMD_READ_INTERRUPT_DATA) {
             s->buf_size = sizeof(MTFrameLengthPacket);
             if (s->next_frame) {
                 memcpy(s->out_buffer, &s->next_frame->frame_length,
@@ -872,6 +907,7 @@ static void ipod_touch_multitouch_consume_frame(IPodTouchMultitouchState *s)
 }
 
 void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s) {
+    mt_trace_bytes_armed = true;
     s->touch_down = true;
 
     ipod_touch_multitouch_queue_frame(
