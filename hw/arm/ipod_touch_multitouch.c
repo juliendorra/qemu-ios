@@ -750,6 +750,41 @@ static uint32_t mt_transfer_inner(SSIPeripheral *dev, uint32_t value)
     return ret_val;
 }
 
+/*
+ * End of an SPI transaction: drop any half-consumed command.
+ *
+ * This model had NO transaction framing. `cur_cmd`/`buf_ind` reset only once
+ * the guest clocked exactly `buf_size` bytes, so a driver that asked for
+ * FEWER bytes than our reply is long -- e.g. a short status poll, or a 0xEB
+ * frame poll it abandons once the length reads zero -- left the device stuck
+ * mid-command. The next command byte was then eaten as data and every byte
+ * after it misread as a new command: a permanent desync that made
+ * slide-to-unlock work exactly once per boot (T7).
+ *
+ * The controller supplies the boundary: R_RXCNT is the length the driver
+ * asked for, and reaching 0 ends the transfer (measured: a 16-byte read is 4
+ * runs of an 8-byte FIFO, completing when RXCNT hits 0). Chip-select would be
+ * the textbook signal, but this guest never drives it (0 edges measured).
+ *
+ * Protocol state that legitimately spans transactions is preserved:
+ * `frame_data_pending` (the EB length reply and the frame read are two
+ * transactions by design) and the firmware-upload flags.
+ */
+void ipod_touch_multitouch_transaction_end(IPodTouchMultitouchState *s)
+{
+    if (!s || !s->cur_cmd) {
+        return;
+    }
+    if (s->buf_ind < s->buf_size) {
+        MT_TRACE("transaction ended mid-command 0x%02x at %u/%u - resetting\n",
+                 s->cur_cmd, s->buf_ind, s->buf_size);
+    }
+    s->cur_cmd = 0;
+    s->buf_size = 0;
+    s->buf_ind = 0;
+    s->in_buffer_ind = 0;
+}
+
 static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, float y, uint16_t radius1, uint16_t radius2, uint16_t radius3, uint16_t contactDensity) {
     MTFrame *frame = calloc(1, sizeof(*frame));
 

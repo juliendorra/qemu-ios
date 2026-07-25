@@ -87,14 +87,18 @@ static void apple_spi_run(S5L8900SPIState *s)
 {
     uint32_t tx;
     uint32_t rx;
+    uint32_t rxcnt_in;
+    unsigned moved = 0;
 
     if (!(REG(s, R_CTRL) & R_CTRL_RUN)) {
         return;
     }
+    rxcnt_in = REG(s, R_RXCNT);
 
     while (!fifo8_is_empty(&s->tx_fifo)) {
         tx = (uint32_t)fifo8_pop(&s->tx_fifo);
         rx = ssi_transfer(s->spi, tx);
+        moved++;
         apple_spi_update_xfer_tx(s);
         if (REG(s, R_RXCNT) > 0) {
             if (fifo8_is_full(&s->rx_fifo)) {
@@ -125,6 +129,25 @@ static void apple_spi_run(S5L8900SPIState *s)
         REG(s, R_STATUS) |= R_STATUS_COMPLETE;
         REG(s, R_CTRL) &= ~R_CTRL_RUN;
     }
+    /* A receive transaction that has delivered every byte the driver asked
+     * for is over; tell the peripheral so it does not stay mid-command. */
+    if (rxcnt_in > 0 && REG(s, R_RXCNT) == 0) {
+        ipod_touch_multitouch_transaction_end(s->mt);
+    }
+
+    /* IT_SPI_BURST_TRACE=1: is one "run" one SPI transaction? R_RXCNT is the
+     * length the driver asked for, so RXCNT reaching 0 is a candidate
+     * transaction boundary -- the framing this model lacks (T7). Logged with
+     * the peripheral index so multitouch (spi2) can be told apart. */
+    if (getenv("IT_SPI_BURST_TRACE")) {
+        static unsigned n;
+        if (++n <= 400) {
+            fprintf(stderr, "[SPI%d] run: tx=%u rxcnt %u -> %u%s\n",
+                    s->base, moved, rxcnt_in, REG(s, R_RXCNT),
+                    REG(s, R_RXCNT) == 0 ? "  (complete)" : "");
+        }
+    }
+
 }
 
 static uint64_t s5l8900_spi_read(void *opaque, hwaddr addr, unsigned size)

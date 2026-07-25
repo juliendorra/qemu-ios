@@ -207,3 +207,86 @@ python3 scripts/springboard-lab.py --logs /tmp/sblab \
 * **Don't copy Apple-signed material.** The reference's activation record and
   StoreIdentityCookie stay on the reference; only key names, types and generic
   values were mirrored.
+
+
+---
+
+# Case 2 — slide-to-unlock died after the first sleep/wake (T7)
+
+**Reported:** power, home, slide-to-unlock works; do it again and the slide is
+ignored. **Fixed 2026-07-25.** Root cause: the multitouch model had **no SPI
+transaction framing**, so one short transfer desynced it permanently.
+
+## The real bug, in one paragraph
+
+`ipod_touch_multitouch.c` tracked a command with `cur_cmd` / `buf_ind` /
+`buf_size` and reset them **only** when the guest clocked exactly `buf_size`
+bytes. Real drivers do not always do that: a status poll asks for 2 bytes, and
+a `0xEB` frame poll is abandoned as soon as the length field reads zero. Every
+such short transfer left the device stuck mid-command. The next command byte
+was then consumed as *data*, and every byte after it was misread as a new
+command — a permanent desync. Touch kept being delivered to the model, and the
+guest simply never received a frame it could parse.
+
+## The fix
+
+The SPI controller supplies the boundary the peripheral was missing:
+`R_RXCNT` is the number of bytes the driver asked for, and the transfer is
+over when it reaches 0. Measured: a 16-byte read is four runs of the 8-byte
+FIFO, completing exactly when `RXCNT` hits 0.
+
+    [SPI2] run: tx=0 rxcnt 16 -> 16
+    [SPI2] run: tx=8 rxcnt 16 -> 8
+    [SPI2] run: tx=0 rxcnt  8 -> 8
+    [SPI2] run: tx=8 rxcnt  8 -> 0  (complete)
+
+`apple_spi_run()` now calls `ipod_touch_multitouch_transaction_end()` when a
+receive transaction completes, which drops any half-consumed command while
+preserving state that legitimately spans transactions (`frame_data_pending`,
+the firmware-upload flags). Verified: 4/4 unlock cycles pass, where cycle 2
+previously failed every time; M68AP still reaches its home screen.
+
+## Dead ends and false paths, in order
+
+1. **"It's the readiness gate."** Plausible: the gate clears on sleep. Killed
+   by the model's own log — the touch WAS delivered (`[TOUCH] mouse DOWN`).
+2. **"My first probe run proves the old code was better."** It did not: with
+   `-display none` the gate is evaluated in `gfx_update`, which never runs, so
+   the run refused all 39 touches. **A test artifact that would have "proved"
+   a false regression.** Fixed by evaluating readiness on the LCD refresh
+   timer — a real model bug, since touch should not depend on a host window.
+3. **`--warmup` screendumps** to arm the gate on an unmodified old binary:
+   does not work, screendumps do not drive `gfx_update` often enough. Kept in
+   the probe, documented, so it is not reinvented.
+4. **"The driver sends 0xEC, so implement 0xEC."** The whole command sequence
+   after the failure (`0xEC`, `0xED`, `0xE4`, `0xE1`) was **fictional** — an
+   artifact of the desync. Implementing `0xEC` as an interrupt-data read
+   changed nothing and was reverted. *Lesson: in a byte-stream model, an
+   unknown command is not a harmless no-op; it fabricates plausible evidence.*
+5. **"Frame transactions on chip-select."** Textbook-correct and completely
+   dead here: the guest never drives CS through `R_PIN` — **0 edges** over a
+   full boot (`IT_SPI_CS_TRACE`). Reverted.
+6. **"It's a regression from the iPhone 2G work."** Measured and refuted: the
+   pre-iPhone baseline (`151e64d305`) fails identically. Also A/B-tested the
+   most suspicious commit of that era (`151e64d305`'s early return in the wake
+   path, via `IT_LCD_LEGACY_WAKE`) — same failure either way.
+
+## Tests and tools this produced
+
+| Tool | Use |
+|---|---|
+| `scripts/lock-unlock-probe.py` | Drives power → home → slide N times over QMP, classifies the screen, and reports the first failing cycle with the model's own `[LCD]`/`[TOUCH]` lines. This is the regression test for T7. |
+| `IT_MT_TRACE=2` | Byte-level SPI logging, armed from the first touch. It is what revealed `cmd 0xeb 2/16` — the model mid-transaction — and exposed the fictional command sequence. |
+| `IT_SPI_BURST_TRACE=1` | Per-run TX count and `RXCNT` before/after: how the controller frames transfers. |
+| `IT_SPI_CS_TRACE=1` | Chip-select edges (used to prove there are none). |
+
+## Lessons
+
+* **A model that consumes a byte stream needs the protocol's framing.** Byte
+  counts alone are not framing: they assume the peer always finishes what it
+  started, and real drivers abort early.
+* **Unknown input must fail loudly, not plausibly.** The unknown-command path
+  silently produced a valid-looking command stream and sent two investigations
+  down invented protocol details.
+* **Check whether your test can even observe the thing you are testing.**
+  Two of the six dead ends above were measurement artifacts, not behaviour.

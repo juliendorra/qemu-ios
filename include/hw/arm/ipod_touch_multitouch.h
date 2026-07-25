@@ -205,6 +205,7 @@ typedef struct IPodTouchMultitouchState {
 } IPodTouchMultitouchState;
 
 void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s);
+void ipod_touch_multitouch_transaction_end(IPodTouchMultitouchState *s);
 void ipod_touch_multitouch_on_release(IPodTouchMultitouchState *s);
 
 /* Keep IRQ/FIQ delivery open while the guest leaves its masked idle path. */
