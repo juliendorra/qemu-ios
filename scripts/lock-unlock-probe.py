@@ -172,6 +172,13 @@ def main() -> int:
     ap.add_argument("--settle", type=float, default=8,
                     help="seconds to wait after each input before grabbing")
     ap.add_argument("--qemu", type=Path, default=QEMU)
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="issue N screendumps before touching. Builds that "
+                         "evaluate touch readiness inside gfx_update (i.e. "
+                         "anything before the LCD-timer fix) never arm the "
+                         "gate under -display none; a screendump forces one "
+                         "gfx_update, and the gate needs 2*60 frames. Use "
+                         "~200 when testing an OLD binary.")
     args = ap.parse_args()
 
     args.logs.mkdir(parents=True, exist_ok=True)
@@ -202,6 +209,12 @@ def main() -> int:
     try:
         time.sleep(args.boot_wait)
         q = QMP(qmp_path)
+        if args.warmup:
+            shot = args.logs / "warmup.ppm"
+            for _ in range(args.warmup):
+                q.cmd("screendump", {"filename": str(shot)})
+            shot.unlink(missing_ok=True)
+            print(f"warmup: {args.warmup} screendumps issued")
         d, kind = grab(q, args.logs, classify)
         png(d, args.logs / "00-booted.png")
         report["booted"] = kind
