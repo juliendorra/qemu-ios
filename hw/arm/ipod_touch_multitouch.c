@@ -602,7 +602,8 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
                 memset(s->out_buffer, 0, s->buf_size);
             }
         }
-        else if (value == MT_CMD_READ_INTERRUPT_DATA) {
+        else if (value == MT_CMD_READ_INTERRUPT_DATA ||
+                 value == MT_CMD_READ_INTERRUPT_DATA2) {
             s->buf_size = sizeof(MTFrameLengthPacket);
             if (s->next_frame) {
                 memcpy(s->out_buffer, &s->next_frame->frame_length,

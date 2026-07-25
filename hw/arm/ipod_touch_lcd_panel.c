@@ -63,7 +63,10 @@ static uint32_t ipod_touch_lcd_panel_transfer_internal(SSIPeripheral *dev, uint3
         }
         s->lcd->panel_off = false;
         s->lcd->invalidate = 1;
-        if (s->lcd->relight_input_fast) {
+        if (s->lcd->relight_input_fast || s->lcd->input_ever_ready) {
+            /* A device that has already been interactive stays interactive
+             * across a panel sleep; requiring it to re-prove readiness is what
+             * left slide-to-unlock dead after power/home. */
             s->lcd->relight_input_fast = false;
             s->lcd->input_ready = true;
         }

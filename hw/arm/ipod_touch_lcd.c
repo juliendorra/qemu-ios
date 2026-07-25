@@ -327,6 +327,15 @@ static void lcd_refresh(void *opaque)
     }
     lcd->invalidate = 0;
 
+}
+
+/* Touch readiness is evaluated on the LCD's own refresh timer, NOT from
+ * gfx_update. gfx_update only runs when a host display client exists, so
+ * under `-display none` the gate never armed and every touch was refused --
+ * which made headless input tests (scripts/lock-unlock-probe.py) impossible
+ * and would equally affect any UI automation. The timer runs regardless. */
+static void lcd_update_input_ready(IPodTouchLCDState *lcd)
+{
     /* Do not accept touch during the early boot overlays. A useful OS frame
      * must remain visible for two seconds before input becomes ready. This is
      * deliberately a boolean readiness gate: QEMU never copies or restores
@@ -338,11 +347,30 @@ static void lcd_refresh(void *opaque)
         };
         int best_visible_count = 0;
 
+        /* The gate exists to refuse touch during the boot overlays. Once the
+         * device HAS been interactive, that has been proven for good: a later
+         * wake must not depend on the touch controller's firmware being
+         * re-uploaded, because the guest treats a retained-RAM resume as a
+         * resume and may never re-upload it -- leaving input dead forever.
+         * Measured symptom (scripts/lock-unlock-probe.py): power/home, then
+         * slide-to-unlock is ignored, with "[TOUCH] Ignoring input until
+         * display/driver startup is stable" on every touch. */
+        if (lcd->retained_input_wait && lcd->input_ever_ready &&
+            !lcd->panel_off &&
+            (lcd->w1_framebuffer_base == 0x0f400000 ||
+             lcd->w1_framebuffer_base == 0x0f496000)) {
+            lcd->input_ready = true;
+            lcd->retained_input_wait = false;
+            fprintf(stderr, "[LCD] Touch input restored after wake "
+                    "(device was already interactive)\n");
+            return;
+        }
         if (lcd->retained_input_wait && lcd->mt->firmware_loaded &&
             !lcd->panel_off &&
             (lcd->w1_framebuffer_base == 0x0f400000 ||
              lcd->w1_framebuffer_base == 0x0f496000)) {
             lcd->input_ready = true;
+            lcd->input_ever_ready = true;
             lcd->retained_input_wait = false;
             fprintf(stderr,
                     "[LCD] Retained touch input ready after Z2 reload\n");
@@ -371,6 +399,7 @@ static void lcd_refresh(void *opaque)
         if (lcd->input_ready_frames >=
             2 * LCD_REFRESH_RATE_FREQUENCY) {
             lcd->input_ready = true;
+            lcd->input_ever_ready = true;
             fprintf(stderr, "[LCD] Touch input ready "
                     "(%d/6 visible after %d frames)\n",
                     best_visible_count, lcd->input_ready_frames);
@@ -454,6 +483,7 @@ static void refresh_timer_tick(void *opaque)
 
     s->int_status |= 1;
     s5l8900_lcd_update_irq(s);
+    lcd_update_input_ready(s);
 
     timer_mod(s->refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / LCD_REFRESH_RATE_FREQUENCY);
 }

@@ -59,6 +59,7 @@ typedef struct IPodTouchLCDState
     QEMUTimer *refresh_timer;
 
     bool input_ready;          // stable OS scanout has enabled touch input
+    bool input_ever_ready;     // the device HAS been interactive at least once
     int input_ready_frames;
     bool retained_input_wait;  // wait for OS scanout and Z2 firmware reload
     bool panel_off;            // PMU-powered LCD panel state

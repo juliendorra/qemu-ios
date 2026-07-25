@@ -186,6 +186,21 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
 
         s->buffered_page = page;
         s->buffered_bank = bank;
+        /* IT_NAND_WATCH=<bank>/<page>[,...]: report when the guest reads
+         * specific physical pages. Used to tell "the guest never looked at
+         * this file" from "the guest read it and rejected it" -- the two
+         * have identical symptoms at the application level. */
+        {
+            const char *watch = getenv("IT_NAND_WATCH");
+            if (watch) {
+                char needle[32];
+                snprintf(needle, sizeof(needle), "%u/%u", bank, page);
+                if (strstr(watch, needle)) {
+                    fprintf(stderr, "[NAND-WATCH] guest read bank%u/%u "
+                            "(present=%d)\n", bank, page, present);
+                }
+            }
+        }
         /* Context-page transitions are the useful geometry diagnostic.  Keep
          * the opt-in trace sparse so it does not perturb guest startup timing. */
         if (s->page_spare_buffer[9] == 0x43 || s->last_spare_type == 0x43) {
