@@ -85,7 +85,55 @@ fully traverse for *newly inserted* files, so lockdownd's `fopen` of the injecte
 file fails ("Could not load data_ark"). Adding a new catalog entry via macOS is
 the unreliable operation.
 
-### SUCCESS: hacktivation via string-rename works (device → [Activated]); next gate is EverRegistered
+### RESOLVED THE RIGHT WAY: authentic data-ark injection (one source of truth, no per-binary patches)
+
+**The iPod's method, applied to M68AP.** N45AP renders because its NAND ships a
+populated lockdown **data ark**. Reconstructing N45AP's volume (via
+`ipod-nand-restore-dns.py`'s page mapping) and reading
+`/var/root/Library/Lockdown/data_ark.plist` shows the authoritative format and
+keys — notably `com.apple.mobile.lockdown_cache-ActivationState => "Activated"`
+(the cached state lockdownd's `_load_cached_activation_state` serves) and
+`-SBLockdownEverRegisteredKey => 0`. It is a **binary** plist.
+
+**Verified working (clean, UNpatched root FS):** inject a binary
+`data_ark.plist` carrying those keys into the M68AP /var (`--data-hfs`) and boot
+→ `SpringBoard[15]: lockdown says the device is: [Activated], state is 2` AND
+`lockdown says we've previously registered: [0]` — BOTH the activation and the
+EverRegistered gates clear, from one file, for every consumer. No binary
+patches. A **minimal from-scratch** ark (7 keys, 269 bytes, NO Apple certs —
+`hacktivate-m68ap.py build-dataark`) is sufficient; N45AP's real ark is not
+committed (Apple activation tokens).
+
+**Dead ends / corrected hypotheses along the way (so nobody re-walks them):**
+- *Injected XML data ark → "Could not load".* First blamed on HFS-write
+  visibility (macOS catalog not traversed by the 2007 iOS driver). **WRONG** —
+  the guest reads macOS-written HFS files fine (the DNS restore proves it). The
+  real cause was **format**: the data ark must be a **binary** plist; XML fails
+  to parse.
+- *Ownership.* Suspected lockdownd rejects a non-root data ark. **Not
+  required** — it runs as root and read a uid-501 file (Activated). Ownership
+  only matters for consumers like launchctl; `inject-guest-file.py --root-owned`
+  covers that.
+- *Binary-patching lockdownd's "Unactivated" string.* It works (→ [Activated])
+  and the RE is documented below, but it is the **rabbit hole**: it only fixes
+  lockdownd's own report; SpringBoard's EverRegistered and other consumers still
+  read the empty ark. Superseded by the data ark. Kept as a fallback.
+
+**Reusable tooling built (repeatable, not LLM-driven):**
+- `scripts/inject-guest-file.py` — put any host file at any guest path inside an
+  HFS+ image, optional `--root-owned` (generalises the DNS-restore technique).
+- `scripts/hacktivate-m68ap.py build-dataark` — emit the minimal binary ark;
+  plus `analyse`/`disasm`/`patch` for the fallback string-rename.
+
+**Remaining (the deeper gate):** even Activated + registered, M68AP SpringBoard
+goes SILENT after the registration check — it never logs
+`Configuring SpringBoard for M68AP` (N45AP does) and programs no `0x0f400000`
+base. So there is a gate BELOW lockdown: SpringBoard's board/UI configuration
+does not proceed on M68AP. That is the next thing to chase (SpringBoard's
+`Configuring SpringBoard for %s` path / device capabilities), no longer an
+activation problem.
+
+### (superseded, kept for reference) hacktivation via lockdownd string-rename
 
 `scripts/hacktivate-m68ap.py` patches the root-HFS image bytes directly (never
 via a macOS HFS mount, so the write-visibility problem cannot bite). The robust,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hacktivate the M68AP (iPhone 2G) so SpringBoard renders the home screen.
+"""Hacktivate the M68AP (iPhone 2G) so SpringBoard gets past the activation gate.
 
 Why this exists
 ---------------
@@ -9,32 +9,41 @@ framebuffer base, so the panel stays black. N45AP (iPod Touch) ships a
 pre-activated NAND (devos50: "I copied activation records from an actual
 device ... modified the NAND filesystem to bypass various checks").
 
-DEAD END (do not retry): injecting `/var/root/Library/Lockdown/data_ark.plist`
-into the `--data-hfs` partition. Two cycles (journaled + fresh non-journaled)
-stayed `[Unactivated]`. Ruled out carriage (disk0s2 mounts), path, timing
-(/var mounts before lockdownd reads), and journaling. Root cause: macOS's
-modern HFS+ writer produces a catalog the 2007-era iOS HFS driver will not
-traverse for NEWLY-INSERTED files, so lockdownd's fopen fails.
+RECOMMENDED (authentic, single source of truth): the `build-dataark` command
+here emits a `data_ark.plist`; inject it into the guest /var with
+`scripts/inject-guest-file.py`, regenerate the NAND, boot. lockdownd then
+serves `Activated` (and EverRegistered, etc.) to EVERY consumer -- SpringBoard,
+CommCenter, Preferences, iTunes-sync -- exactly the way N45AP's pre-activated
+NAND does. This is how the iPod does it and avoids a rabbit hole of per-binary
+patches. Verified: with a clean, UNpatched root FS, this alone takes M68AP to
+`SpringBoard[15]: lockdown says the device is: [Activated], state is 2` and
+clears the EverRegistered gate too.
 
-ROBUST APPROACH (this script): byte-patch `/usr/libexec/lockdownd`
-in place -- overwrite bytes inside the EXISTING file, same length, so the
-HFS catalog and the file's extents are untouched and the guest reads the
-patched bytes. The patch forces lockdownd's activation-state determination
-to `Activated`. We locate lockdownd's Mach-O inside the raw root-HFS image by
-signature and patch its file bytes directly (never through a macOS mount), so
-the HFS-writer incompatibility above cannot bite.
+Two facts that cost cycles to learn:
+  * The data ark MUST be a **binary** plist. An earlier XML injection made
+    lockdownd log "Could not load" -- that was a format (parse) failure, NOT
+    the HFS-write-visibility problem first suspected. The guest reads
+    macOS-written HFS files fine (the DNS restore and this both prove it).
+  * root:wheel ownership is NOT required for the data ark (lockdownd runs as
+    root and reads a uid-501 file); it IS required for launchd plists. See
+    `inject-guest-file.py --root-owned`.
+
+FALLBACK / reference (a single in-binary patch, if you cannot rebuild the data
+partition): the `analyse`/`disasm`/`patch` commands byte-rename lockdownd's
+"Unactivated" CFString constant to "Activated" in the root-HFS image. It also
+reaches [Activated], but it only fixes lockdownd's own report -- other
+consumers (SpringBoard's EverRegistered, etc.) still read the empty data ark,
+so it leads to the per-binary rabbit hole. Prefer the data ark.
 
 Usage
 -----
-  # analyse only: find the patch site and print the disassembly
-  scripts/hacktivate-m68ap.py analyse --lockdownd <extracted lockdownd>
+  scripts/hacktivate-m68ap.py build-dataark --out /tmp/data_ark.plist
+  scripts/inject-guest-file.py --image <data.hfs> --src /tmp/data_ark.plist \
+      --dest /root/Library/Lockdown/data_ark.plist
+  scripts/build-m68ap-nand.py --hfs <root> --data-hfs <data.hfs> ...
 
-  # patch a copy of the root HFS image in place
-  scripts/hacktivate-m68ap.py patch \
-      --root-hfs m68ap-artifacts/stage/filesystem-m68ap-readonly.img \
-      --out /tmp/root-hacktivated.img
-
-Then regenerate the NAND with `build-m68ap-nand.py --hfs <out>` and boot.
+  # fallback binary patch:
+  scripts/hacktivate-m68ap.py patch --root-hfs <root.img> --out <patched.img>
 """
 from __future__ import annotations
 
@@ -200,11 +209,41 @@ def disasm(lockdownd: bytes, start_vm: int, length: int):
         print(f"  {ins.address:08x} {ins.mnemonic:7} {ins.op_str}{ann}")
 
 
+# Minimal lockdown data ark that clears the activation + registration gates.
+# Keys mirror the ones an activated device carries (observed on N45AP's real
+# data ark), but contain NO Apple certificates/tokens -- the *cached*
+# ActivationState string is what lockdownd's _load_cached_activation_state
+# serves, and it is sufficient for SpringBoard to proceed past [Activated] and
+# the EverRegistered check. Domain-qualified key form is "<domain>-<key>";
+# bare "-<key>" is the default domain.
+DATA_ARK = {
+    "com.apple.mobile.lockdown_cache-ActivationState": "Activated",
+    "-ActivationStateAcknowledged": 1,
+    "-SBLockdownEverRegisteredKey": 0,
+    "-BrickState": 0,
+    "-iTunesHasConnected": 1,
+    "-PasswordProtected": 0,
+    "-ProtocolVersion": "2",
+}
+
+
+def build_dataark(out: Path):
+    import plistlib
+    out.write_bytes(plistlib.dumps(DATA_ARK, fmt=plistlib.FMT_BINARY))
+    print(f"wrote binary data_ark.plist ({out.stat().st_size} bytes) -> {out}")
+    print("keys:", ", ".join(DATA_ARK))
+    print("next: inject-guest-file.py --image <data.hfs> --src", out,
+          "--dest /root/Library/Lockdown/data_ark.plist")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    a = sub.add_parser("analyse", help="locate the activation patch site")
+    da = sub.add_parser("build-dataark",
+                        help="emit a minimal binary lockdown data_ark.plist")
+    da.add_argument("--out", type=Path, required=True)
+    a = sub.add_parser("analyse", help="locate the activation patch site (fallback)")
     a.add_argument("--lockdownd", type=Path, required=True)
     dd = sub.add_parser("disasm", help="disassemble a vm range")
     dd.add_argument("--lockdownd", type=Path, required=True)
@@ -215,6 +254,9 @@ def main() -> int:
     p.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
+    if args.cmd == "build-dataark":
+        build_dataark(args.out)
+        return 0
     if args.cmd == "analyse":
         analyse(args.lockdownd.read_bytes())
         return 0
