@@ -21,13 +21,22 @@ TVOut swap-device field elsewhere, so its teardown never completed and
 SpringBoard waited forever after `attach(AppleH1TVOut)`. Full decode below (§6
 avenue 1) and in the 2026-07-25 session log of `IPHONE_2G_BRINGUP_HANDOFF.md`.
 
-**Remaining, and now a DIFFERENT problem:** the frame that paints is the iPhone
-**activation / "Searching…" / connect-to-iTunes** screen (emergency-call only),
-not the SpringBoard home screen. That is telephony, not rendering: this config
-runs `IT_M68AP_NO_BASEBAND=1`, so no network ever registers and 1.1.4 parks on
-the activation screen (the iPod has no telephony, so it goes straight to the
-home screen). Whether the H5 baseband stub registers far enough to reach the
-home screen is the open question — `m68ap-mbx-bb` variant, running.
+**Remaining, and now a DIFFERENT problem — TELEPHONY, not rendering.** The
+frame paints correctly; which frame depends on the baseband, and neither is the
+home screen yet:
+* **No baseband** (`IT_M68AP_NO_BASEBAND=1`): the **"Searching…" /
+  connect-to-iTunes / Solo emergenze** activation screen (~41% non-black).
+* **H5 baseband stub** (`IT_BASEBAND_H5=1`, `m68ap-mbx-bb`): advances to
+  **"No Service / Repair Needed — iPhone cannot make or receive calls" /
+  Appel d'urgence** (~52% non-black) — and now logs `Couldn't get IAP TV out
+  settings`, the same line N45AP emits just before its home screen.
+The iPhone OS 1.1.4 SpringBoard gates the home screen on a **healthy,
+registered** telephony stack (the iPod has no telephony, so it goes straight to
+the home screen). Getting from "Repair Needed" to a registered network is the
+baseband-registration work, previously **shelved as a stretch goal**
+(`2032b7995e`; see `WIFI_SDIO_NOTES.md` and [[baseband-lab-tooling]]). The
+WiFi→Safari acceptance is therefore now blocked on telephony, not the black
+screen. Both screens verified by `scripts/fb-snapshot.py` (PNG evidence).
 
 *Historical (pre-fix) framing kept for the record below.* M68AP boots iPhone
 OS 1.1.4 to **SpringBoard**, reports **`[Activated]`**, and used to settle into
