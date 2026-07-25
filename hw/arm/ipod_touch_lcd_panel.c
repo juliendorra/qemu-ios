@@ -1,7 +1,30 @@
 #include "hw/arm/ipod_touch_lcd_panel.h"
 #include "hw/arm/ipod_touch_lcd.h"
 
+/* Part of IT_FB_TRACE: the panel bytes are the other half of the display
+ * conversation (a driver stuck probing an unknown panel command would show
+ * up here, not in the CLCD MMIO). Low rate, no throttle needed. */
+static void it_fb_trace_panel(uint32_t value, uint32_t response)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("IT_FB_TRACE") != NULL;
+    }
+    if (cached) {
+        fprintf(stderr, "[FB] panel 0x%02x -> 0x%02x\n", value, response);
+    }
+}
+
+static uint32_t ipod_touch_lcd_panel_transfer_internal(SSIPeripheral *dev, uint32_t value);
+
 static uint32_t ipod_touch_lcd_panel_transfer(SSIPeripheral *dev, uint32_t value)
+{
+    uint32_t response = ipod_touch_lcd_panel_transfer_internal(dev, value);
+    it_fb_trace_panel(value, response);
+    return response;
+}
+
+static uint32_t ipod_touch_lcd_panel_transfer_internal(SSIPeripheral *dev, uint32_t value)
 {
     IPodTouchLCDPanelState *s = IPOD_TOUCH_LCD_PANEL(dev);
 

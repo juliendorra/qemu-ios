@@ -962,7 +962,10 @@ static void ipod_touch_machine_init(MachineState *machine)
     spi2_state->mt->gpio_state = gpio_state;
     spi2_state->mt->cpu = CPU(cpu);
     // the iPhone's touch controller runs the Zephyr1 firmware/protocol
-    spi2_state->mt->zephyr1 = (nms->board_id == BOARD_ID_M68AP);
+    // (IT_FORCE_MT_Z2=1 is a lab knob: answer in Zephyr2 semantics instead,
+    // to probe whether SpringBoard's render wait involves the Z1 dialogue)
+    spi2_state->mt->zephyr1 = (nms->board_id == BOARD_ID_M68AP) &&
+                              !getenv("IT_FORCE_MT_Z2");
     nms->spi2_state = spi2_state;
 
     ipod_touch_memory_setup(machine, sysmem, nsas);

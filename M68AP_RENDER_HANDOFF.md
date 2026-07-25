@@ -90,6 +90,8 @@ M68AP. Judge by **LCD bases** and **framebuffer content**, not by that phase.
 | Empty `/var` (no `/var/mobile` for SpringBoard's `mobile` uid 501) | **not the blocker** | minimal skeleton boots identically (launchd 13 / configd 45 / SpringBoard 2) and still does not render; configd still says `no preferences` because it wants preference *files* (`f5a9c414dc`) |
 | Display model is board-specific | **no** | LCD/CoreSurface code is shared; N45AP renders through the same path |
 | Full `/var` skeleton would help | **harmful** | 56 dirs + `chmod 1777` → launchd never starts at all (0/0/0 lines at a 700 s cap) |
+| Zephyr1 multitouch never signals "ready" | **not the blocker** | `IT_MT_TRACE` (2026-07-25): the Z1 bootloader + raw main-firmware upload completes and verifies on M68AP — `firmware_loaded=1` on both boards. Control: `IT_FORCE_MT_Z2=1` (model answers Z2 semantics) breaks boot far *earlier* (phase=kernel, 0 SpringBoard lines), confirming the guest really speaks Z1 |
+| Kernel display-controller programming diverges | **no** | `IT_FB_TRACE` (2026-07-25): both boards write the *identical* CLCD register set (only the gamma-ramp values differ, iPhone vs iPod panel calibration). The divergence is in userland compositing, not the kernel LCD driver |
 
 ## 5. Tools built this session (all committed, all reusable)
 

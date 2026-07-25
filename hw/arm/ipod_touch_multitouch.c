@@ -7,6 +7,47 @@ static void ipod_touch_multitouch_inform_frame_ready(
 static void ipod_touch_multitouch_consume_frame(
     IPodTouchMultitouchState *s);
 
+/* IT_MT_TRACE=1: log the guest<->controller conversation (command starts and
+ * the firmware-upload state transitions). The render investigation needs to
+ * know whether the guest driver talks to the controller at all and how far
+ * the dialogue gets, on both the Z1 (iPhone) and Z2 (iPod) paths. */
+static bool it_mt_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("IT_MT_TRACE") != NULL;
+    }
+    return cached;
+}
+
+#define MT_TRACE(...) do { \
+    if (it_mt_trace_enabled()) { \
+        fprintf(stderr, "[MT] " __VA_ARGS__); \
+    } \
+} while (0)
+
+/* Consecutive repeats of the same command (frame polls) collapse: the first
+ * few print, then every 256th with its count. */
+static void mt_trace_cmd(const char *proto, uint8_t cmd)
+{
+    static uint8_t last_cmd;
+    static uint32_t repeat;
+
+    if (!it_mt_trace_enabled()) {
+        return;
+    }
+    if (cmd == last_cmd) {
+        repeat++;
+        if (repeat > 8 && (repeat & 0xFF) != 0) {
+            return;
+        }
+    } else {
+        last_cmd = cmd;
+        repeat = 1;
+    }
+    fprintf(stderr, "[MT] %s cmd 0x%02x (n=%u)\n", proto, cmd, repeat);
+}
+
 static void prepare_interface_version_response(IPodTouchMultitouchState *s) {
     memset(s->out_buffer + 1, 0, 15);
 
@@ -242,6 +283,8 @@ static uint32_t z1_raw_upload_transfer(IPodTouchMultitouchState *s, uint8_t valu
             s->z1_raw_upload = false;
             s->z1_verify_matched = 0;
             s->firmware_loaded = true;
+            MT_TRACE("Z1 main-firmware upload verified (cksum 0x%04x) -> "
+                     "firmware_loaded=1\n", s->z1_upload_cksum);
         }
         return ret;
     }
@@ -282,6 +325,7 @@ static uint32_t z1_transfer(IPodTouchMultitouchState *s, uint32_t value)
     if(s->cur_cmd == 0) {
         // start a new command
         s->cur_cmd = value;
+        mt_trace_cmd("Z1", (uint8_t)value);
         free(s->out_buffer);
         free(s->in_buffer);
         s->out_buffer = malloc(MT_Z1_MAX_PACKET_SIZE + 0x10);
@@ -384,9 +428,11 @@ static uint32_t z1_transfer(IPodTouchMultitouchState *s, uint32_t value)
         }
     }
     else if(s->cur_cmd == MT_Z1_CMD_REPORT_INFO && s->in_buffer_ind == 2) {
+        MT_TRACE("Z1 report-info for report 0x%02x\n", s->in_buffer[1]);
         z1_prepare_report_info_response(s, s->in_buffer[1]);
     }
     else if(s->cur_cmd == MT_Z1_CMD_GET_REPORT && s->in_buffer_ind == 2) {
+        MT_TRACE("Z1 get-report 0x%02x\n", s->in_buffer[1]);
         z1_prepare_report_response(s, s->in_buffer[1]);
     }
 
@@ -404,12 +450,15 @@ static uint32_t z1_transfer(IPodTouchMultitouchState *s, uint32_t value)
                 }
                 s->z1_upload_cksum = checksum & 0xFFFF;
                 s->firmware_transfer_seen = true;
+                MT_TRACE("Z1 bootloader data packet done (cksum 0x%04x)\n",
+                         s->z1_upload_cksum);
             }
             else {
                 // a blank packet announces the raw main-firmware stream
                 s->z1_raw_upload = true;
                 s->z1_raw_sum = 0;
                 s->z1_verify_matched = 0;
+                MT_TRACE("Z1 raw main-firmware upload begins\n");
             }
         }
         else if(s->cur_cmd == MT_Z1_CMD_FRAME_READ && s->next_frame &&
@@ -460,6 +509,7 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
     else if(s->cur_cmd == 0) {
         // we're currently not in a command - start a new command
         s->cur_cmd = value;
+        mt_trace_cmd("Z2", (uint8_t)value);
         free(s->out_buffer);
         free(s->in_buffer);
         s->out_buffer = malloc(0x100);
@@ -632,8 +682,11 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
         if (s->cur_cmd == MT_CMD_HBPP_DATA_PACKET) {
             if (s->buf_size > 0x1000) {
                 s->firmware_transfer_seen = true;
+                MT_TRACE("Z2 HBPP firmware transfer seen (%u bytes)\n",
+                         s->buf_size);
             } else if (s->firmware_transfer_seen) {
                 s->firmware_loaded = true;
+                MT_TRACE("Z2 calibration after firmware -> firmware_loaded=1\n");
             }
         }
         //printf("Finished command 0x%02x\n", s->cur_cmd);
@@ -744,6 +797,8 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
 static void ipod_touch_multitouch_inform_frame_ready(IPodTouchMultitouchState *s) {
     int grp = s->zephyr1 ? MT_ATN_INT_GROUP_Z1 : MT_ATN_INT_GROUP_Z2;
     int bit = s->zephyr1 ? MT_ATN_INT_BIT_Z1 : MT_ATN_INT_BIT_Z2;
+
+    MT_TRACE("ATN edge (group %d bit %d)\n", grp, bit);
 
     s->sysic->gpio_int_status[grp] |= (1 << bit);
     /* The AP reset can leave QEMU's qemu_irq level high even after the VIC
@@ -877,6 +932,7 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
 {
     IPodTouchMultitouchState *s = IPOD_TOUCH_MULTITOUCH(dev);
 
+    MT_TRACE("controller reset (zephyr1=%d)\n", s->zephyr1);
     timer_del(s->touch_timer);
     timer_del(s->touch_end_timer);
 

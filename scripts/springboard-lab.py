@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -68,7 +69,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lab_workspace import (NAND_TREE_BYTES, ROOT_HFS_BYTES, DATA_HFS_BYTES,
-                           Workspace, human, prune_runs, require_free_bytes)
+                           Workspace, attached, human, prune_runs,
+                           require_free_bytes)
 
 REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get("IPOD_APP", "/Applications/iPod Touch.app/Contents"))
@@ -114,6 +116,37 @@ PHASES = [
     ("configuring", rb"Configuring SpringBoard"),
 ]
 
+# --- launch-daemon pruning ------------------------------------------------
+# N45AP's devos50 NAND ships only SEVEN LaunchDaemons (AddressBook, CommCenter,
+# SpringBoard, configd, mDNSResponder, lockdown, notifyd) and RENDERS, so
+# SpringBoard's render path needs at most that set. M68AP's stock 1.1.4 root
+# runs all twenty; these are the thirteen extras, removable per-variant to
+# test whether one of them wedges SpringBoard (BTServer opens the bluetooth
+# UART; iapd/usbptpd/coreaudiod touch hardware the emulator stubs).
+PRUNE_SETS = {
+    "all13": (
+        "com.apple.BTServer.plist", "com.apple.DumpPanic.plist",
+        "com.apple.SCHelper-embedded.plist", "com.apple.crashreporterd.plist",
+        "com.apple.daily.plist", "com.apple.iapd.plist",
+        "com.apple.mDNSResponderHelper.plist", "com.apple.mobile.lockbot.plist",
+        "com.apple.securityd.plist", "com.apple.syslogd.plist",
+        "com.apple.update.plist", "com.apple.usbptpd.plist",
+        "coreaudiod.plist",
+    ),
+    # bisection halves: hardware-facing daemons vs system-service daemons
+    "hw": (
+        "com.apple.BTServer.plist", "com.apple.iapd.plist",
+        "com.apple.usbptpd.plist", "coreaudiod.plist",
+    ),
+    "svc": (
+        "com.apple.DumpPanic.plist", "com.apple.SCHelper-embedded.plist",
+        "com.apple.crashreporterd.plist", "com.apple.daily.plist",
+        "com.apple.mDNSResponderHelper.plist", "com.apple.mobile.lockbot.plist",
+        "com.apple.securityd.plist", "com.apple.syslogd.plist",
+        "com.apple.update.plist",
+    ),
+}
+
 # --- hypothesis matrix ----------------------------------------------------
 # board: n45ap | m68ap ; dataark/patch: M68AP artifact knobs ; env: extra env.
 VARIANTS = {
@@ -145,6 +178,33 @@ VARIANTS = {
     "m68ap-varmin": dict(board="m68ap", dataark=True, patch=True,
                          var_skeleton="minimal",
                          env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # --- multitouch protocol: the QEMU model answers in Zephyr2 (iPod)
+    # semantics even though the board is M68AP. The guest's Z1 driver will
+    # see a broken dialogue; where the [MT] trace then stalls (vs m68ap-full)
+    # localises how far SpringBoard's render path depends on the touch stack.
+    "m68ap-z2": dict(board="m68ap", dataark=True, patch=True,
+                     env={"IT_M68AP_NO_BASEBAND": "1", "IT_FORCE_MT_Z2": "1"}),
+    # --- SpringBoard environment: N45AP's devos50 image (which RENDERS) sets
+    # LK_ENABLE_MBX2D=0 in com.apple.SpringBoard.plist, forcing LayerKit to
+    # software rendering; M68AP's stock plist does not, so its SpringBoard
+    # composites via the PowerVR MBX -- which this emulator only stubs (a
+    # do-nothing MMIO region). A SpringBoard blocked on a stubbed GPU is
+    # exactly the observed quiet wait. This knob replicates the iPod's data
+    # fix on the iPhone root.
+    "m68ap-mbx": dict(board="m68ap", dataark=True, patch=True, sb_env="mbx2d",
+                      env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # same, plus drop UserName=mobile so SpringBoard runs as root like N45AP
+    "m68ap-mbx-root": dict(board="m68ap", dataark=True, patch=True,
+                           sb_env="mbx2d-root",
+                           env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # --- launch-daemon pruning: reduce M68AP to N45AP's known-rendering set
+    "m68ap-prune": dict(board="m68ap", dataark=True, patch=True, prune="all13",
+                        env={"IT_M68AP_NO_BASEBAND": "1"}),
+    "m68ap-prune-hw": dict(board="m68ap", dataark=True, patch=True, prune="hw",
+                           env={"IT_M68AP_NO_BASEBAND": "1"}),
+    "m68ap-prune-svc": dict(board="m68ap", dataark=True, patch=True,
+                            prune="svc",
+                            env={"IT_M68AP_NO_BASEBAND": "1"}),
     # --- activation DURABILITY matrix (can the binary patch be dropped?) ---
     # All of these are data-ark-only (patch=False). The question each answers:
     # does [Activated] SURVIVE determine_activation_state's boot re-validation
@@ -210,7 +270,9 @@ class QMP:
 
 def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
                      ark_profile: str = "minimal",
-                     var_skeleton: bool = False) -> Path:
+                     var_skeleton: bool = False,
+                     prune: str = None,
+                     sb_env: str = None) -> Path:
     """Build (and cache) an M68AP NAND for a given artifact recipe."""
     if out.exists() and (out / "bank0").exists():
         return out
@@ -221,6 +283,38 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
         if not root.exists():
             run([sys.executable, str(REPO / "scripts" / "hacktivate-m68ap.py"),
                  "patch", "--root-hfs", str(M68_ROOT_HFS), "--out", str(root)])
+    if prune:
+        pruned = work / f"root-prune-{prune}.img"
+        if not pruned.exists():
+            # keep the .img suffix: hdiutil types raw images by extension
+            tmp = work / f"root-prune-{prune}.tmp.img"
+            shutil.copy2(root, tmp)
+            with attached(tmp, readonly=False) as mnt:
+                for name in PRUNE_SETS[prune]:
+                    victim = mnt / "System" / "Library" / "LaunchDaemons" / name
+                    if not victim.exists():
+                        raise RuntimeError(f"prune target missing: {victim}")
+                    victim.unlink()
+            tmp.rename(pruned)
+        root = pruned
+    if sb_env:
+        mutated = work / f"root-sbenv-{sb_env}.img"
+        if not mutated.exists():
+            # keep the .img suffix: hdiutil types raw images by extension
+            tmp = work / f"root-sbenv-{sb_env}.tmp.img"
+            shutil.copy2(root, tmp)
+            with attached(tmp, readonly=False) as mnt:
+                plist = (mnt / "System" / "Library" / "LaunchDaemons" /
+                         "com.apple.SpringBoard.plist")
+                job = plistlib.loads(plist.read_bytes())
+                job.setdefault("EnvironmentVariables",
+                               {})["LK_ENABLE_MBX2D"] = "0"
+                if sb_env == "mbx2d-root":
+                    job.pop("UserName", None)
+                plist.write_bytes(plistlib.dumps(job,
+                                                 fmt=plistlib.FMT_BINARY))
+            tmp.rename(mutated)
+        root = mutated
     data = M68_DATA_DMG
     if var_skeleton:
         # A populated /var: the generated NAND otherwise ships an EMPTY data
@@ -282,7 +376,9 @@ class Instance:
         profile = self.spec.get("ark_profile", "minimal")
         return (f"m68ap-ark{int(self.spec.get('dataark', False))}"
                 f"-{profile}-patch{int(self.spec.get('patch', False))}"
-                f"-var{self.spec.get('var_skeleton', False)}")
+                f"-var{self.spec.get('var_skeleton', False)}"
+                f"-prune{self.spec.get('prune') or 'none'}"
+                f"-sbenv{self.spec.get('sb_env') or 'none'}")
 
     def prepare(self):
         """Build this variant's NAND recipe into the shared cache.
@@ -306,7 +402,9 @@ class Instance:
         build_m68ap_nand(nand, self.spec.get("dataark", False),
                          self.spec.get("patch", False), shared,
                          self.spec.get("ark_profile", "minimal"),
-                         self.spec.get("var_skeleton", False))
+                         self.spec.get("var_skeleton", False),
+                         self.spec.get("prune"),
+                         self.spec.get("sb_env"))
 
     def stage(self):
         board = self.spec["board"]
@@ -340,6 +438,8 @@ class Instance:
                "-qmp", f"unix:{self.qmp_path},server,nowait"]
         env = dict(os.environ)
         env["IT_LCD_TRACE"] = "1"
+        env["IT_FB_TRACE"] = "1"   # full LCD MMIO + panel conversation
+        env["IT_MT_TRACE"] = "1"   # multitouch dialogue + firmware state
         env.update(self.spec.get("env", {}))
         (self.dir / "command.txt").write_text(
             " ".join(cmd) + "\n# env: " +
@@ -360,6 +460,45 @@ class Instance:
             return []
         blob = self.stderr.read_text(errors="replace")
         return sorted(set(re.findall(r"base <- (0x0[0-9a-f]{7})", blob)))
+
+    def trace_summary(self):
+        """Condense the [MT]/[FB] stderr traces into comparable evidence:
+        which LCD registers the guest wrote (with last value), how the
+        multitouch dialogue ended, and whether the touch firmware loaded."""
+        if not self.stderr.exists():
+            return {}
+        fb_writes = {}
+        mt_lines = []
+        panel_cmds = []
+        for line in self.stderr.read_text(errors="replace").splitlines():
+            m = re.match(r"\[FB\] wr (0x[0-9a-f]+) = (0x[0-9a-f]+)", line)
+            if m:
+                fb_writes[m.group(1)] = m.group(2)
+                continue
+            if line.startswith("[MT] "):
+                mt_lines.append(re.sub(r" \(n=\d+\)", "", line[5:]))
+                continue
+            m = re.match(r"\[FB\] panel (0x[0-9a-f]+)", line)
+            if m:
+                panel_cmds.append(m.group(1))
+        # collapse consecutive repeats but keep order
+        def dedupe(seq):
+            out = []
+            for x in seq:
+                if not out or out[-1] != x:
+                    out.append(x)
+            return out
+        mt_lines = dedupe(mt_lines)
+        return {
+            "fb_regs_written": {k: fb_writes[k] for k in sorted(fb_writes)},
+            "mt_firmware_loaded": any("firmware_loaded=1" in l
+                                      for l in mt_lines),
+            "mt_dialogue": mt_lines[:40] + (["..."] if len(mt_lines) > 80
+                                            else []) +
+                           (mt_lines[-40:] if len(mt_lines) > 80 else
+                            mt_lines[40:]),
+            "panel_cmds": dedupe(panel_cmds)[:30],
+        }
 
     def rendered(self):
         for b in self.lcd_bases():
@@ -435,6 +574,7 @@ class Instance:
             "framebuffers": self.framebuffers(),
             "springboard_lines": sb[-6:],
             "driver_tail": drivers[-12:],
+            "trace": self.trace_summary(),
         })
         return self.result
 
@@ -563,10 +703,13 @@ def main() -> int:
     # distinct M68AP recipe costs a NAND tree (+ a patched root / data image
     # when those knobs are set); N45AP stages a CoW clone of the app's NAND.
     recipes = {(v, VARIANTS[v].get("dataark"), VARIANTS[v].get("patch"),
-                VARIANTS[v].get("ark_profile", "minimal"))
+                VARIANTS[v].get("ark_profile", "minimal"),
+                VARIANTS[v].get("prune"), VARIANTS[v].get("sb_env"))
                for v in args.variants if VARIANTS[v]["board"] == "m68ap"}
     need = len(recipes) * NAND_TREE_BYTES
     need += sum(ROOT_HFS_BYTES for r in recipes if r[2])
+    need += sum(ROOT_HFS_BYTES for r in recipes if r[4])
+    need += sum(ROOT_HFS_BYTES for r in recipes if r[5])
     need += sum(DATA_HFS_BYTES for r in recipes if r[1])
     if need:
         require_free_bytes(args.logs, need,
@@ -621,10 +764,32 @@ def main() -> int:
               f"{','.join(r.get('lcd_bases',[])) or '-'}")
 
     report = {"results": [r for r in results if r], "diffs": {}}
+    by_name = {r["name"]: r for r in results if r}
     for spec in args.diff:
         if "=" not in spec:
             continue
         a, b = spec.split("=", 1)
+        ta = by_name.get(a, {}).get("trace", {})
+        tb = by_name.get(b, {}).get("trace", {})
+        if ta or tb:
+            ra, rb = ta.get("fb_regs_written", {}), tb.get("fb_regs_written", {})
+            print(f"\n=== TRACE DIFF {a} vs {b} ===")
+            print(f"  mt_firmware_loaded: {a}={ta.get('mt_firmware_loaded')} "
+                  f"{b}={tb.get('mt_firmware_loaded')}")
+            only_a = {k: ra[k] for k in ra if k not in rb}
+            only_b = {k: rb[k] for k in rb if k not in ra}
+            differ = {k: (ra[k], rb[k]) for k in ra
+                      if k in rb and ra[k] != rb[k]}
+            # the per-board gamma/palette ramp at 0x400..0xffc differs in
+            # VALUES on every boot pair; only its presence is signal
+            gamma = [k for k in differ if 0x400 <= int(k, 16) <= 0xffc]
+            for k in gamma:
+                del differ[k]
+            print(f"  LCD regs only in {a}: {only_a or '(none)'}")
+            print(f"  LCD regs only in {b}: {only_b or '(none)'}")
+            print(f"  LCD regs differing: {differ or '(none)'}"
+                  + (f" (+{len(gamma)} gamma-ramp regs, values only)"
+                     if gamma else ""))
         d = diff_serial(args.logs / a, args.logs / b)
         report["diffs"][spec] = d
         print(f"\n=== DIFF {a} vs {b} (normalised, from SpringBoard on) ===")

@@ -19,10 +19,54 @@ static void it_lcd_trace_base(const char *win, uint32_t base)
             win, base, lcd_visible_sample_count(base));
 }
 
+/* IT_FB_TRACE=1: log every LCD MMIO access. The render investigation needs
+ * the whole display-controller conversation, not just window-base programs:
+ * a driver that never writes vidcon/wndcon, or polls a status register
+ * forever, is invisible to IT_LCD_TRACE. Per-register throttling keeps the
+ * 60 Hz vblank-ack chatter bounded: the first 8 accesses of each register
+ * print, then every 4096th with its running count. */
+static bool it_fb_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("IT_FB_TRACE") != NULL;
+    }
+    return cached;
+}
+
+static void it_fb_trace_mmio(const char *dir, hwaddr addr, uint64_t val)
+{
+    static uint32_t counts[0x240 / 4];
+    uint32_t idx = addr / 4;
+
+    if (!it_fb_trace_enabled()) {
+        return;
+    }
+    if (idx < ARRAY_SIZE(counts)) {
+        uint32_t n = ++counts[idx];
+        if (n > 8 && (n & 0xFFF) != 0) {
+            return;
+        }
+        fprintf(stderr, "[FB] %s 0x%03x = 0x%08x (n=%u)\n",
+                dir, (uint32_t)addr, (uint32_t)val, n);
+    } else {
+        /* an out-of-map register is exactly what we want to see */
+        fprintf(stderr, "[FB] %s 0x%03x = 0x%08x (unmapped)\n",
+                dir, (uint32_t)addr, (uint32_t)val);
+    }
+}
+
+static uint64_t s5l8900_lcd_read_internal(void *opaque, hwaddr addr, unsigned size);
+
 static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
 {
-    //fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
+    uint64_t val = s5l8900_lcd_read_internal(opaque, addr, size);
+    it_fb_trace_mmio("rd", addr, val);
+    return val;
+}
 
+static uint64_t s5l8900_lcd_read_internal(void *opaque, hwaddr addr, unsigned size)
+{
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
     switch(addr)
     {
@@ -90,7 +134,7 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
     uint32_t old_framebuffer_base = s->w1_framebuffer_base;
-    //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, (uint32_t)val, addr);
+    it_fb_trace_mmio("wr", addr, val);
 
     switch(addr) {
         case 0x4:
