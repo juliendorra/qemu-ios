@@ -251,7 +251,55 @@ ARK_PROFILES = {
     # ("YES"/"1" are the two plausible spellings; measure, don't guess.)
     "everreg-yes": {"-SBLockdownEverRegisteredKey": "YES"},
     "everreg-1": {"-SBLockdownEverRegisteredKey": "1"},
+    # THE REFERENCE SHAPE. Read off the iPod's own shipped data ark -- a real
+    # device that reaches the home screen -- via
+    #   extract-hfs-from-nand.py <ipod nand> root.img   (single-partition NAND,
+    #   so /private/var/root/Library/Lockdown/data_ark.plist is in the ROOT)
+    # Only key NAMES, TYPES and generic values are mirrored; no Apple-signed
+    # material is copied (the reference's activation record and its
+    # StoreIdentityCookie stay on the reference).
+    #
+    # Two classes of difference from the ark we had been writing:
+    #  1. TYPES: the reference stores CFBooleans where we wrote CFNumbers
+    #     (0/1). A binary plist keeps that distinction, and SpringBoard's
+    #     "wasn't a string" complaint fires for our CFNumber *and* for a
+    #     CFString -- consistent with it wanting the boolean the real device
+    #     has, with a misleading message.
+    #  2. MISSING KEYS: the reference carries international settings, SIM
+    #     status, timezone and iTunes/registration flags. M68AP logs
+    #     "lockdown: _load_international_settings: Could not load languages
+    #     list / Could not load the locale" -- a device with no language has
+    #     never been set up, which is exactly the screen we are stuck on.
+    "reference": {
+        "-ActivationStateAcknowledged": True,
+        "-BrickState": False,
+        "-DeviceName": "iPhone",
+        "-FirmwareVersion": "iBoot-204.3.14",   # M68AP's own iBoot BUILD_TAG
+        "-PasswordProtected": False,
+        "-ProtocolVersion": "2",
+        "-SBLockdownEverRegisteredKey": False,
+        "-SIMStatus": "kCTSIMSupportSIMStatusReady",
+        "-SomebodySetTimeZone": True,
+        "-TimeZone": "Europe/Paris",
+        "-Uses24HourClock": False,
+        "-iTunesHasConnected": True,
+        "com.apple.international-HostKeyboard": "en_US",
+        "com.apple.international-Keyboard": "en_US",
+        "com.apple.international-Language": "en",
+        "com.apple.international-Locale": "en_US",
+        "com.apple.mobile.restriction-ProhibitAppInstall": False,
+        "com.apple.mobile.lockdown_cache-ActivationState": "Activated",
+    },
 }
+# The reference is an iPod: it has never registered on a network, so its
+# EverRegistered is False and the iPod's SpringBoard build never asks. On the
+# iPhone build the key IS consulted -- with the reference ark it is finally
+# ACCEPTED ("lockdown says we've previously registered: [0], state is 0"),
+# which also settles the type question: the consumer wants a CFBoolean, and
+# the "wasn't a string" complaint is a misleading message. A phone that has
+# registered would say True.
+ARK_PROFILES["reference-reg"] = dict(ARK_PROFILES["reference"])
+ARK_PROFILES["reference-reg"]["-SBLockdownEverRegisteredKey"] = True
 
 
 def build_dataark(out: Path, profile: str = "minimal"):

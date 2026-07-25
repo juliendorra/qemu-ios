@@ -104,6 +104,50 @@ edit/fork ruleset  ->  baseband-lab.py --rules <candidates> none builtin
 
 Minutes per cycle, no rebuilds, no manual watching.
 
+## Seven rules added by the M68AP home-screen case (2026-07-25)
+
+Full narrative in `M68AP_HOMESCREEN_CASE_STUDY.md`. These are the generalisable
+parts — three stacked faults, and about half the effort spent on hypotheses
+that were wrong for interesting reasons.
+
+1. **Every shortcut that depends on a build-specific address must announce
+   when it is not being used.** The 2022 TVOut workaround was a magic physical
+   address correct for one kernel; on a second board it silently punched a
+   zero-reading hole in the kernel heap and hung elsewhere. No error, no log —
+   which is why it cost an entire investigation. A one-line "this window was
+   never read" warning would have ended it in minutes. **Silence is the bug,
+   not the shortcut.**
+2. **Prefer a value the guest announces over a value you hard-code.** The
+   kernel *prints* the object address the workaround needs
+   (`AppleMBX: Added swap device: … id: c09c8400`). Deriving it at runtime (see
+   the console tap, `include/hw/arm/ipod_touch_console_tap.h`) removed the
+   per-board table and works on kernels nobody has booted yet.
+3. **A negative result is only valid for the state the system was in.** Three
+   correct measurements (`m68ap-mbx`, `m68ap-mbx-root`, `m68ap-prune`) became
+   void conclusions, because an earlier fault stopped execution before their
+   variable could matter. **When a blocker falls, re-run the negatives taken
+   under it** — and mark them as provisional when you record them.
+4. **Judge the property you actually care about, not its proxy.** "Non-black
+   %" answered "did anything render" but could not answer "which screen" — the
+   activation screen is *more* lit (41%) than the home screen (29%). Progress
+   only became measurable once the lab classified the screen
+   (`classify_screen()`; home = 10.7% colorful / 81% dock vs 1.8% for setup
+   screens). Ask what verdict would change your next action, then measure that.
+5. **Read the working reference before theorising about your own artifacts.**
+   Every correct answer came from N45AP: the SpringBoard plist diff, the board
+   capability table, and finally its real `data_ark.plist` — 19 keys where ours
+   had 7, CFBooleans where we wrote CFNumbers. Reaching it needed one small
+   tool change (`extract-hfs-from-nand.py --partition`), which is a much better
+   investment than another round of guesses.
+6. **Error messages are evidence, not truth.** SpringBoard's
+   `"...but it wasn't a string"` fires for a CFNumber *and* for a genuine
+   CFString; it actually wants a CFBoolean. Two experiments were spent
+   trusting the wording. Believe accepted-vs-rejected behaviour.
+7. **Expect stacked faults.** Fault 1 masked fault 2 masked fault 3, so early
+   experiments legitimately produced "no change". If a well-founded hypothesis
+   shows no effect, ask whether the system even reaches the code it concerns
+   before discarding it.
+
 ## Retrospective: where this would have saved time
 
 - **WiFi SDIO** (the proof case, pre-tooling): every hypothesis was a C

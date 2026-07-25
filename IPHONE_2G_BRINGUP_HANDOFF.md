@@ -13,6 +13,55 @@ the live bring-up state.
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
 
+## Session log — 2026-07-25 (HOME SCREEN reached; the reference ark settles activation)
+
+M68AP now boots iPhone OS 1.1.4 to the **SpringBoard home screen** (dock with
+Phone/Mail/Safari/iPod, app icons, first-run tip). Three fixes, each hiding the
+next; the last one came from the *reference device*, not from guessing.
+
+1. **TVOut window** (see the session log below) — per-board, now derived at
+   runtime.
+2. **`LK_ENABLE_MBX2D=0`** in `com.apple.SpringBoard.plist`, exactly as
+   devos50's iPod image ships it: LayerKit otherwise composites through the
+   MBX, which we only stub.
+3. **The data ark had the wrong SHAPE.** The decisive move was reading the
+   reference instead of theorising: the iPod's shipped NAND declares ONE
+   partition (`extract-hfs-from-nand.py` now parses the GPT), so its
+   `/private/var/root/Library/Lockdown/data_ark.plist` is inside the ROOT
+   image. That real, activated device's ark has **19 keys**, and ours had 7 —
+   with the wrong *types*:
+   * it stores **CFBooleans** where we wrote CFNumbers (`0`/`1`);
+   * it carries keys we never wrote at all: `com.apple.international-{Language,
+     Locale,Keyboard,HostKeyboard}` (M68AP had been logging `lockdown:
+     _load_international_settings: Could not load languages list / the locale`
+     the whole time — a device with no language has never been set up),
+     `-SIMStatus`, `-TimeZone`, `-SomebodySetTimeZone`, `-Uses24HourClock`,
+     `-DeviceName`, `-FirmwareVersion`, `-iTunesHasConnected`,
+     `-ActivationStateAcknowledged`, `-BrickState`, `-PasswordProtected`,
+     `com.apple.mobile.restriction-ProhibitAppInstall`.
+   With the reference shape (`--profile reference`) SpringBoard finally
+   ACCEPTS the value: `lockdown says we've previously registered: [0], state
+   is 0`. With `-SBLockdownEverRegisteredKey = True` (`reference-reg`) it goes
+   to the **home screen**. Only key names/types/generic values are mirrored —
+   no Apple-signed material is copied; the reference's activation record and
+   StoreIdentityCookie stay on the reference.
+
+   **Type lesson worth remembering:** SpringBoard's `"...but it wasn't a
+   string"` message is misleading. It fires for our CFNumber *and* for a
+   genuine CFString; what it actually wants is a CFBoolean. Two experiments
+   were spent on that message before the reference settled it.
+
+Eliminated on the way (do not re-chase): telephony capability (it supplies the
+carrier chrome and the "Repair Needed" alert, not the gate — dropping it via
+the board profile removes all phone UI and still leaves connect-to-iTunes); a
+minimal `/var`; EverRegistered-as-string.
+
+Tooling added: `classify_screen()` in the lab (judges home vs setup from raw
+pixels — non-black %% cannot, since the activation screen is *more* lit than
+the home screen), `caps` knob (board capability profile), `--partition
+{boot,data}` in the NAND extractor, ark profiles `reference` / `reference-reg`,
+and a self-locating TVOut workaround (below).
+
 ## Session log — 2026-07-25 (render blocker DECODED: the TVOut workaround is iPod-specific)
 
 Method: everything ran through `scripts/springboard-lab.py` matrices with the

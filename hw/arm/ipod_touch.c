@@ -14,6 +14,7 @@
 #include "hw/block/flash.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/arm/ipod_touch.h"
+#include "hw/arm/ipod_touch_console_tap.h"
 #include "hw/arm/exynos4210.h"
 #include "hw/dma/pl080.h"
 #include "chardev/char.h"
@@ -89,15 +90,49 @@ void ipod_touch_prepare_retained_wake(void)
     }
 }
 
+/*
+ * --- TVOut swap-device workaround ---------------------------------------
+ *
+ * SpringBoard attaches the AppleH1TVOut framebuffer, then waits for the
+ * TVOut swap device to tear down before it re-attaches AppleH1CLCD and
+ * paints. AppleMBX's teardown polls one field of the swap-device object and
+ * never sees it clear, because our MBX is a do-nothing stub that completes no
+ * swaps. Upstream "got past TVOut" (f59f20f60e) by overlaying a 4-byte
+ * always-zero window on that field.
+ *
+ * THIS IS A SHORTCUT, and the shortcut's original form was the expensive kind:
+ * a magic physical address baked in for ONE kernel build. When the address is
+ * wrong nothing complains -- you just get four bytes of kernel heap that read
+ * as zero, and a hang somewhere unrelated. That silence cost this project the
+ * entire M68AP render investigation, because the iPod's constant does not
+ * match the iPhone kernel's heap.
+ *
+ * So the window is now DERIVED, not declared: the kernel itself prints the
+ * object's address ("AppleMBX: Added swap device: AppleH1TVOut  id: c09c8400")
+ * and the console tap moves the window there, on any board and any kernel
+ * build. The per-board constants remain only as a pre-announcement placement,
+ * and a mismatch is reported rather than hidden. If the window is never read
+ * by the time SpringBoard starts, we say so loudly.
+ *
+ * THE CLEAN FIX, still to do: model the MBX swap completion (and/or the TVOut
+ * SDO IRQ, which the machine already wires) so the guest driver clears that
+ * field itself and no window is needed at all. Tracked in
+ * M68AP_RENDER_HANDOFF.md.
+ */
+#define TVOUT_WA_FIELD_OFFSET 0x160     /* field within the swap-device object */
+#define KERNEL_VA_BASE        0xC0000000
+
+static MemoryRegion *tvout_wa_region;
+static hwaddr tvout_wa_addr;
+static uint64_t tvout_wa_reads;
+static bool tvout_wa_derived;
+
 static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
 {
-    /* Rides on IT_FB_TRACE: this always-zero window inside guest RAM is the
-     * upstream hack that lets the iPod kernel's TVOut teardown proceed. If
-     * only N45AP ever touches it, the M68AP kernel's equivalent flag lives
-     * at a different heap address and its TVOut interaction never
-     * completes -- which is what the render investigation observes. */
+    tvout_wa_reads++;
     if (getenv("IT_FB_TRACE")) {
-        fprintf(stderr, "[TVOUT-WA] rd +0x%x\n", (uint32_t)addr);
+        fprintf(stderr, "[TVOUT-WA] rd +0x%x (n=%" PRIu64 ")\n",
+                (uint32_t)addr, tvout_wa_reads);
     }
     return 0;
 }
@@ -115,6 +150,69 @@ static const MemoryRegionOps tvout_workaround_ops = {
     .write = tvout_workaround_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
+
+static void tvout_workaround_move(hwaddr pa)
+{
+    if (!tvout_wa_region || pa == tvout_wa_addr) {
+        return;
+    }
+    memory_region_del_subregion(get_system_memory(), tvout_wa_region);
+    memory_region_add_subregion_overlap(get_system_memory(), pa,
+                                        tvout_wa_region, 1);
+    fprintf(stderr, "[TVOUT-WA] window moved 0x%08x -> 0x%08x "
+            "(derived from the guest's own announcement)\n",
+            (uint32_t)tvout_wa_addr, (uint32_t)pa);
+    tvout_wa_addr = pa;
+}
+
+/*
+ * Console tap. Two jobs: derive the workaround address from the kernel's own
+ * "Added swap device" announcement, and refuse to fail silently.
+ */
+static void ipod_touch_console_line(const char *line)
+{
+    const char *p = strstr(line, "Added swap device: AppleH1TVOut");
+
+    if (p) {
+        p = strstr(p, "id:");
+        if (p) {
+            uint32_t va = (uint32_t)strtoul(p + 3, NULL, 16);
+            if (va >= KERNEL_VA_BASE) {
+                hwaddr pa = (va - KERNEL_VA_BASE) + RAM_MEM_BASE +
+                            TVOUT_WA_FIELD_OFFSET;
+                tvout_wa_derived = true;
+                if (pa != tvout_wa_addr) {
+                    fprintf(stderr, "[TVOUT-WA] board default 0x%08x is WRONG "
+                            "for this kernel (swap device at VA 0x%08x)\n",
+                            (uint32_t)tvout_wa_addr, va);
+                } else {
+                    fprintf(stderr, "[TVOUT-WA] derived 0x%08x from the guest "
+                            "(swap device VA 0x%08x + 0x%x) - matches the "
+                            "board default\n", (uint32_t)pa, va,
+                            TVOUT_WA_FIELD_OFFSET);
+                }
+                tvout_workaround_move(pa);
+            }
+        }
+        return;
+    }
+    /* SpringBoard is the consumer that hangs when the window is misplaced, so
+     * its start is the moment to check that the window is real. */
+    if (!tvout_wa_reads && strstr(line, "SpringBoard[")) {
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr,
+                    "[TVOUT-WA] WARNING: window at 0x%08x has never been read "
+                    "(%s). If the display now hangs after "
+                    "IOMobileFramebufferUserClient::attach(AppleH1TVOut), this "
+                    "is why: the swap-device object is elsewhere in this "
+                    "kernel build.\n", (uint32_t)tvout_wa_addr,
+                    tvout_wa_derived ? "address was derived"
+                                     : "no 'Added swap device' line seen");
+        }
+    }
+}
 
 static MemoryRegion *allocate_ram(MemoryRegion *top, const char *name,
                                   uint32_t addr, uint32_t size)
@@ -1143,15 +1241,18 @@ static void ipod_touch_machine_init(MachineState *machine)
     nms->tvout3_state = tvout_state;
     memory_region_add_subregion(sysmem, TVOUT3_MEM_BASE, &tvout_state->iomem);
 
-    // setup workaround for TVOut (per-board: the zeroed swap-device field
-    // sits at a different deterministic heap address in each 1.1.4 kernel
-    // build -- see the TVOUT_WORKAROUND_*_MEM_BASE comment in ipod_touch.h)
+    // setup workaround for TVOut. The per-board constant is only the initial
+    // placement, used until the kernel announces the real object address; the
+    // console tap then moves the window and reports any mismatch (see the
+    // block comment above tvout_workaround_read).
     iomem = g_new(MemoryRegion, 1);
     memory_region_init_io(iomem, OBJECT(nms), &tvout_workaround_ops, NULL, "tvoutworkaround", 0x4);
-    memory_region_add_subregion(sysmem,
-                                (nms->board_id == BOARD_ID_M68AP) ?
-                                TVOUT_WORKAROUND_M68AP_MEM_BASE :
-                                TVOUT_WORKAROUND_MEM_BASE, iomem);
+    tvout_wa_region = iomem;
+    tvout_wa_addr = (nms->board_id == BOARD_ID_M68AP) ?
+                    TVOUT_WORKAROUND_M68AP_MEM_BASE :
+                    TVOUT_WORKAROUND_MEM_BASE;
+    memory_region_add_subregion_overlap(sysmem, tvout_wa_addr, iomem, 1);
+    ipod_touch_console_tap_install(ipod_touch_console_line);
 
     qemu_register_reset(ipod_touch_cpu_reset, nms);
 

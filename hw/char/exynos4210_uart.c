@@ -30,6 +30,39 @@
 #include "chardev/char-serial.h"
 
 #include "hw/arm/exynos4210.h"
+#include "hw/arm/ipod_touch_console_tap.h"
+
+/*
+ * Read-only console tap (see ipod_touch_console_tap.h). It lives here, with
+ * the UART, so it is linked wherever the UART is; it is inert until a machine
+ * installs a callback, and never alters the byte stream.
+ */
+#define TAP_LINE_MAX 512
+static void (*tap_fn)(const char *line);
+static char tap_line[TAP_LINE_MAX];
+static unsigned tap_len;
+
+void ipod_touch_console_tap_install(void (*fn)(const char *line))
+{
+    tap_fn = fn;
+    tap_len = 0;
+}
+
+void ipod_touch_console_tap_byte(uint8_t ch)
+{
+    if (!tap_fn) {
+        return;
+    }
+    if (ch == '\n' || ch == '\r' || tap_len == TAP_LINE_MAX - 1) {
+        if (tap_len) {
+            tap_line[tap_len] = '\0';
+            tap_fn(tap_line);
+            tap_len = 0;
+        }
+        return;
+    }
+    tap_line[tap_len++] = (char)ch;
+}
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -534,6 +567,9 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
             /* XXX this blocks entire thread. Rewrite to use
              * qemu_chr_fe_write and background I/O callbacks */
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
+            /* read-only tap: lets the machine react to what the guest
+             * announces about itself (see ipod_touch_console_tap.h) */
+            ipod_touch_console_tap_byte(ch);
             trace_exynos_uart_tx(s->channel, ch);
             s->reg[I_(UTRSTAT)] |= UTRSTAT_TRANSMITTER_EMPTY |
                     UTRSTAT_Tx_BUFFER_EMPTY;

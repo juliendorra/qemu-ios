@@ -276,6 +276,23 @@ VARIANTS = {
     "m68ap-everreg-1": dict(board="m68ap", dataark=True, patch=True,
                             sb_env="mbx2d", ark_profile="everreg-1",
                             env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # THE REFERENCE ARK: key names/types read off the iPod's own shipped ark
+    # (a device that reaches the home screen) -- booleans where we wrote
+    # numbers, plus the international/SIM/timezone keys we never wrote at all.
+    "m68ap-ref": dict(board="m68ap", dataark=True, patch=True,
+                      sb_env="mbx2d", ark_profile="reference",
+                      env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # same, with the phone chrome off as well
+    "m68ap-ref-notel": dict(board="m68ap", dataark=True, patch=True,
+                            sb_env="mbx2d", ark_profile="reference",
+                            caps="notel",
+                            env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # reference ark but EverRegistered TRUE: the reference is an iPod that
+    # never registered; a phone that HAS registered says so, and this is the
+    # value SpringBoard's telephony path is actually looking for.
+    "m68ap-refreg": dict(board="m68ap", dataark=True, patch=True,
+                         sb_env="mbx2d", ark_profile="reference-reg",
+                         env={"IT_M68AP_NO_BASEBAND": "1"}),
     # same, plus drop UserName=mobile so SpringBoard runs as root like N45AP
     "m68ap-mbx-root": dict(board="m68ap", dataark=True, patch=True,
                            sb_env="mbx2d-root",

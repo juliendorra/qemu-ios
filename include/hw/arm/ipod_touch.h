@@ -136,11 +136,13 @@ const int S5L8900_GPIO_IRQS[7] = { S5L8900_GPIO_G0_IRQ, S5L8900_GPIO_G1_IRQ, S5L
 // without reverse engineering the entire TVOut protocol: a 4-byte always-zero
 // window over one field of the AppleH1TVOut swap-device object that AppleMBX
 // registers ("AppleMBX: Added swap device: AppleH1TVOut id: <kernel VA>").
-// The field is at object+0x160; phys = VA - 0xc0000000 + 0x08000000. The
-// object address is deterministic per kernel build (verified stable across
-// boots and root-image variants), but differs between the iPod and iPhone
-// 1.1.4 kernels, so each board gets its own window. The clean fix would be
-// an MBX/TVOut model that completes swaps for real.
+// The field is at object+0x160; phys = VA - 0xc0000000 + 0x08000000.
+//
+// These constants are only the INITIAL placement. At runtime the console tap
+// derives the address from the kernel's own announcement and moves the window
+// (see the block comment in ipod_touch.c), so a kernel that allocates the
+// object elsewhere is handled -- and reported -- instead of silently hanging.
+// The clean fix is an MBX/TVOut model that completes swaps for real.
 #define TVOUT_WORKAROUND_MEM_BASE       0x8a25960   // N45AP: id c0a25800 + 0x160
 #define TVOUT_WORKAROUND_M68AP_MEM_BASE 0x89c8560   // M68AP: id c09c8400 + 0x160
 

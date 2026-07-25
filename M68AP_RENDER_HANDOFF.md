@@ -1,74 +1,78 @@
-# M68AP (iPhone 2G) — session handoff: the render blocker
+# M68AP (iPhone 2G) — session handoff: render SOLVED, home screen reached
 
-**Date:** 2026-07-25 · **Branch:** `ipod_touch_1g` · **Head at handoff:** `f5a9c414dc`
+**Date:** 2026-07-25 · **Branch:** `ipod_touch_1g` · **Head at handoff:** `d863470867`+
 
-This is a focused handoff for the *current* wall. `IPHONE_2G_BRINGUP_HANDOFF.md`
+This is a focused handoff. The wall it was written for (the black screen) is
+SOLVED; §0 carries the engineering tasks that remain. `IPHONE_2G_BRINGUP_HANDOFF.md`
 remains the long-form working log (every run, every trace); this file is the
 short path back into the problem: what is true, what is ruled out, what tools
 exist, and what to try next.
 
 ---
 
+## 0. OPEN ENGINEERING TASKS (carried forward — do not lose these)
+
+| # | Task | Why it matters | State |
+|---|---|---|---|
+| T1 | **Model MBX swap completion / the TVOut SDO IRQ** so the guest driver clears the swap-device field itself, and delete the workaround window entirely. The machine already wires `S5L8900_TVOUT_SDO_IRQ`; the MBX region is currently a do-nothing stub with **no IRQ connected at all**. | Removes the last address-dependent hack in the display path, on both boards. | **TODO** — the honest fix |
+| T2 | **Model MBX 2D** so `LK_ENABLE_MBX2D=0` is no longer needed. LayerKit otherwise tight-polls `c03b9698` (register-read accessor in `com.apple.driver.AppleMBX`). | Today we force software compositing via a guest plist edit — a shortcut, and the iPod ships the same one. | **TODO** |
+| T3 | ~~Make the TVOut workaround self-locating and self-verifying~~ | A build-specific magic address that failed **silently** cost this project the entire render investigation. | **DONE** (2026-07-25) — derived from the guest's own `AppleMBX: Added swap device` line, with a mismatch report and a "window never read" warning at SpringBoard start |
+| T4 | Re-run any experiment whose verdict predates the screen classifier | Everything before 2026-07-25 was judged by logs on a black screen; several conclusions were only about *rendering*, not about *which screen*. | partially done |
+
 ## 1. Status in one paragraph
 
-**RESOLVED 2026-07-25 — M68AP RENDERS.** The black screen is gone: with the
-per-board TVOut workaround window plus `LK_ENABLE_MBX2D=0` in the SpringBoard
-plist, M68AP programs the kernel framebuffers `0x0f400000` + `0x0f496000` and
-paints ~41% non-black (a real iPhone OS 1.1.4 UI — see the delivered
-screenshot). The blocker was the upstream "Got past TVOut" hack being
-hard-coded to the iPod kernel's heap address; the iPhone kernel puts the same
-TVOut swap-device field elsewhere, so its teardown never completed and
-SpringBoard waited forever after `attach(AppleH1TVOut)`. Full decode below (§6
-avenue 1) and in the 2026-07-25 session log of `IPHONE_2G_BRINGUP_HANDOFF.md`.
+**RESOLVED 2026-07-25 — M68AP REACHES THE HOME SCREEN.** iPhone OS 1.1.4 boots
+to the SpringBoard **home screen** on `-M iPhone-2G`: Phone/Mail/Safari/iPod
+dock, app icons, first-run "Edit Home Screen" tip. Three independent fixes were
+needed, and each hid the next:
 
-**Remaining — the SETUP/ACTIVATION screen. (Corrects an earlier claim in this
-file: I first wrote that the home screen was gated on *telephony registration*.
-Measurement says otherwise — telephony only supplied the carrier chrome and the
-"Repair Needed" alert on top of an underlying activation/setup gate.)**
+1. **Render** — the TVOut swap-device workaround window was hard-coded to the
+   *iPod's* kernel heap address; the iPhone kernel puts the object elsewhere,
+   so SpringBoard waited forever after `attach(AppleH1TVOut)`. Now derived at
+   runtime from the kernel's own announcement (§6.1, task T3).
+2. **Compositing** — LayerKit drives the MBX 2D path against our do-nothing
+   MBX stub, so SpringBoard has to run with `LK_ENABLE_MBX2D=0`, exactly as
+   devos50's iPod image does (task T2).
+3. **Setup** — the synthesised data ark was the wrong SHAPE. Read off the
+   iPod's real ark (`extract-hfs-from-nand.py`, single-partition NAND → the
+   ark is in the ROOT image): the real device stores **CFBooleans** where we
+   wrote CFNumbers, and carries keys we never wrote at all (international
+   language/locale, SIM status, timezone, iTunes/registration flags). With the
+   reference shape SpringBoard finally *accepts* EverRegistered
+   (`previously registered: [0], state is 0`), and with it **True** the device
+   goes to the home screen. Profile: `hacktivate-m68ap.py --profile
+   reference-reg`; lab variant `m68ap-refreg`.
 
-What the board capability profile proved (2026-07-25, `m68ap-notel`):
-`GraphicsServices` owns the capability table (it exports `GSSystemGetCapability`
-and knows `telephony`/`unifiedIPod`/`camera`/…), sourced from
-`SpringBoard.app/<board>.plist`. **Both** firmwares ship **both** profiles —
-the iPod's own 1.1.4 image contains `M68AP.plist` with `telephony: True` — so
-this is Apple's runtime board table, not a per-device build, and editing
-M68AP's profile is the vendor's own "this is not a phone" switch. Dropping the
-`telephony` key works exactly as designed: all phone chrome disappears (no
-carrier label, no lock glyph, no emergency slider) and SpringBoard's
-telephony-gated EverRegistered check stops running. **But the device still sits
-on the connect-to-iTunes screen**, and its SpringBoard log becomes
-line-for-line identical to the *rendering* iPod's:
-`lockdown says the device is: [Activated], state is 2` + `Couldn't get IAP TV
-out settings`. So the residual gate is activation/setup, not telephony.
-Also measured: a minimal `/var` changes nothing (`m68ap-notel-var`, identical
-8.0%), and the iPod control at the same boot age (200 s) really is on the
-**home screen** — so this is not a timing artifact.
+Note the type lesson: SpringBoard's `"...but it wasn't a string"` complaint is
+**misleading** — it fires for a CFNumber *and* for a real CFString; what it
+wants is a CFBoolean.
 
-Live hypothesis: SpringBoard reads `EverRegistered` as a **CFString** and our
-synthesized ark writes an **integer** (`lockdown had a value for EverRegistered
-but it wasn't a string: <CFNumber 0>`), so it discards the value and treats the
-device as never registered. New ark profiles `everreg-yes` / `everreg-1` supply
-a string; matrix running.
+### How the setup gate was found (superseded steps, kept as method)
 
-Historical detail — which frame paints depends on the baseband, and neither is
-the home screen:
-* **No baseband** (`IT_M68AP_NO_BASEBAND=1`): the **"Searching…" /
-  connect-to-iTunes / Solo emergenze** activation screen (~41% non-black).
-* **H5 baseband stub** (`IT_BASEBAND_H5=1`, `m68ap-mbx-bb`): advances to
-  **"No Service / Repair Needed — iPhone cannot make or receive calls" /
-  Appel d'urgence** (~52% non-black) — and now logs `Couldn't get IAP TV out
-  settings`, the same line N45AP emits just before its home screen.
-The iPhone OS 1.1.4 SpringBoard gates the home screen on a **healthy,
-registered** telephony stack (the iPod has no telephony, so it goes straight to
-the home screen). Getting from "Repair Needed" to a registered network is the
-baseband-registration work, previously **shelved as a stretch goal**
-(`2032b7995e`; see `WIFI_SDIO_NOTES.md` and [[baseband-lab-tooling]]). The
-WiFi→Safari acceptance is therefore now blocked on telephony, not the black
-screen. Both screens verified by `scripts/fb-snapshot.py` (PNG evidence).
+Three hypotheses were tested and eliminated before the reference told us the
+answer — each is worth *not* re-chasing:
 
-*Historical (pre-fix) framing kept for the record below.* M68AP boots iPhone
-OS 1.1.4 to **SpringBoard**, reports **`[Activated]`**, and used to settle into
-the kernel idle loop with a black screen; N45AP rendered on the same paths.
+* **Telephony was chrome, not the gate.** `GraphicsServices` owns the
+  capability table (exports `GSSystemGetCapability`; knows
+  `telephony`/`unifiedIPod`/`camera`/…), sourced from
+  `SpringBoard.app/<board>.plist`. **Both** firmwares ship **both** board
+  profiles — the iPod's own 1.1.4 image contains `M68AP.plist` with
+  `telephony: True` — so it is Apple's runtime board table, not a per-device
+  build. Dropping the key (`caps=notel`) removes every bit of phone UI
+  (carrier label, lock glyph, emergency slider) and stops the telephony-gated
+  EverRegistered check — **and the device still sat on connect-to-iTunes**,
+  with a SpringBoard log line-for-line identical to the rendering iPod's.
+* **`/var` is not the gate** — a minimal skeleton changed nothing
+  (`m68ap-notel-var`, identical 8.0% non-black).
+* **EverRegistered's type is not "string"** — supplying a real CFString still
+  produced `wasn't a string: <CFString>{contents = "YES"}`. The message lies;
+  the consumer wants a CFBoolean, which only the reference revealed.
+
+Which frame paints also depends on the baseband, all pre-home states:
+`IT_M68AP_NO_BASEBAND=1` → "Searching…"/connect-to-iTunes (~41% non-black);
+`IT_BASEBAND_H5=1` → "No Service / Repair Needed" (~52%); with the reference
+ark → **home screen** (~70%, `colorful 8.6 / dock 100`). Baseband registration
+remains shelved (`2032b7995e`) and is now decoupled from reaching the UI.
 
 ## 2. What is verified working
 
@@ -347,6 +351,10 @@ f5a9c414dc  /var hypothesis tested and DISPROVED
 ```
 
 ## 9. Related documents
+
+* `M68AP_HOMESCREEN_CASE_STUDY.md` — **how this was actually solved**: the
+  three stacked faults, all eight dead ends with the measurement that killed
+  each, the lessons, and the tool inventory.
 
 * `IPHONE_2G_BRINGUP_HANDOFF.md` — long-form log: every run, trace and dead end.
 * `WIFI_SDIO_NOTES.md` — WiFi milestones A–I (N45AP proven) + M68AP parity note.
