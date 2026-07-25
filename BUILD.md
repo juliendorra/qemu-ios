@@ -434,3 +434,117 @@ covers and why the lock-phase steps exist):
 python3 scripts/ipod-acceptance-test.py --timed
 IPOD_QEMU=/path/to/build/qemu-system-arm python3 scripts/ipod-acceptance-test.py
 ```
+
+---
+
+## Part 3 — Building the iPhone 2G (M68AP) app bundle
+
+The same engine/launcher serve both boards; the bundle differs only in its
+**profile**, its **firmware directory**, and one M68AP-specific runtime rule
+(a fresh NAND per launch). Verified working: the resulting app boots M68AP to
+SpringBoard through its own launcher.
+
+### 1. Create the bundle
+
+Either install the engine into a new bundle with the sanctioned script (it
+copies the launcher + helpers, bundles every Homebrew dylib, rewrites their
+paths to `@executable_path/../Frameworks`, and signs):
+
+```bash
+scripts/install-ipod-app-engine.sh \
+    build-ipod11/qemu-system-arm \
+    "/Applications/iPhone 2G.app" \
+    iphone-2g
+```
+
+…or clone a working `iPod Touch.app` and switch its profile — the launcher is
+shared, so only the profile file decides the board:
+
+```bash
+cp -R "/Applications/iPod Touch.app" "/Applications/iPhone 2G.app"
+printf 'iphone-2g\n' > "/Applications/iPhone 2G.app/Contents/Resources/s5l8900-profile"
+```
+
+If you clone, and you replace the QEMU binary with a fresh local build, you
+**must** rewrite its dylib references — a repo build links Homebrew absolute
+paths (`/opt/homebrew/...`) and will not run on another machine:
+
+```bash
+APP="/Applications/iPhone 2G.app"; BIN="$APP/Contents/MacOS/qemu-system-arm"
+cp build-ipod11/qemu-system-arm "$BIN"
+for dep in $(otool -L "$BIN" | awk '/\/opt\/homebrew/{print $1}'); do
+    install_name_tool -change "$dep" \
+        "@executable_path/../Frameworks/$(basename "$dep")" "$BIN"
+done
+codesign --remove-signature "$APP" 2>/dev/null; codesign --force --deep --sign - "$APP"
+```
+
+Check with `otool -L "$BIN" | grep -c /opt/homebrew` → must be **0**. (Each
+bundled dylib keeps its own Homebrew *install-ID* on line 2 of `otool -L`; that
+is cosmetic and also true of the shipped iPod bundle. What matters is that
+nothing *depends* on a Homebrew path.)
+
+### 2. Install the M68AP firmware
+
+```bash
+python3 scripts/install-iphone-firmware.py --app "/Applications/iPhone 2G.app"
+```
+
+This fills `Contents/Resources/iphone_files/` with the names the launcher
+expects: `bootrom_s5l8900`, `iboot_204_m68ap.bin`, `nor_m68ap.bin`, `nand/`.
+
+**Important:** the iBoot the launcher loads must be the **secure-boot-patched**
+build, installed under the plain name:
+
+```bash
+cp m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin \
+   "/Applications/iPhone 2G.app/Contents/Resources/iphone_files/iboot_204_m68ap.bin"
+cp m68ap-artifacts/appdbg/bootrom_s5l8900 \
+   "/Applications/iPhone 2G.app/Contents/Resources/iphone_files/bootrom_s5l8900"
+```
+
+and the NAND must be a **generated** tree (`build-m68ap-nand.py`, e.g.
+`m68ap-artifacts/stage/nand-m68ap-fresh`), not an N45AP dump.
+
+### 3. Fresh NAND per launch (M68AP only)
+
+The M68AP kernel completes `FTL_Open` only against a **clean** NAND, and the
+guest writes to NOR as well, so the bundle's `Resources` copies must stay
+pristine. `scripts/ipod-app-launcher.sh` therefore clones the NAND and NOR into
+a temp dir for every launch of the `iphone-2g` profile and deletes them on
+exit (`cp -Rc` clones on APFS, so this is cheap). Set `S5L8900_STAGE_NAND=0` to
+opt out. N45AP keeps the historical in-place behaviour.
+
+If you cloned an older bundle, reinstall the launcher so it carries this rule:
+
+```bash
+cp scripts/ipod-app-launcher.sh "/Applications/iPhone 2G.app/Contents/MacOS/iPod Touch"
+codesign --force --deep --sign - "/Applications/iPhone 2G.app"
+```
+
+(The launcher filename stays `iPod Touch` — it is the bundle's
+`CFBundleExecutable`. Optionally set the display identity:
+`CFBundleName`/`CFBundleDisplayName`/`CFBundleIdentifier` via PlistBuddy, then
+re-sign.)
+
+### 4. Run and verify
+
+```bash
+open "/Applications/iPhone 2G.app"
+# or, with serial output for debugging:
+S5L8900_DEBUG=1 "/Applications/iPhone 2G.app/Contents/MacOS/iPod Touch" -display none \
+    -serial "file:/tmp/i2g.log"
+grep -c "SpringBoard\[" /tmp/i2g.log     # >0 == reached SpringBoard
+```
+
+### Known limitations
+
+* **The screen is currently black.** M68AP reaches SpringBoard and reports
+  `[Activated]`, but never programs a kernel framebuffer base — the open
+  render blocker (see `M68AP_RENDER_HANDOFF.md`). The app runs; it does not
+  yet display a home screen.
+* Activation requires the patched root filesystem + lockdown data ark; a plain
+  IPSW-derived NAND boots `[Unactivated]`.
+* The bundle is **arm64-only** and **ad-hoc signed**: on another Mac Gatekeeper
+  will report an unidentified developer (right-click → Open). It is otherwise
+  self-contained — no Homebrew required on the target machine.

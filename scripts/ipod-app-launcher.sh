@@ -68,6 +68,21 @@ if [[ ! -d "$NAND" ]]; then
     exit 1
 fi
 
+# The M68AP kernel only completes FTL_Open against a *clean* NAND (guest writes
+# never persist correctly on the generated tree), and it also writes to NOR. The
+# bundle's Resources copy must therefore stay pristine: stage a fresh writable
+# clone per launch and throw it away on exit. `cp -Rc` clones on APFS, so this
+# is cheap. N45AP keeps the historical in-place behaviour, which its real
+# device-dump NAND tolerates.
+STAGE_DIR=""
+if [[ "$PROFILE" == "iphone-2g" && "${S5L8900_STAGE_NAND:-1}" != "0" ]]; then
+    STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s5l8900-nand.XXXXXX")"
+    cp -Rc "$NAND" "$STAGE_DIR/nand" 2>/dev/null || cp -R "$NAND" "$STAGE_DIR/nand"
+    cp "$NOR" "$STAGE_DIR/nor.bin"
+    NAND="$STAGE_DIR/nand"
+    NOR="$STAGE_DIR/nor.bin"
+fi
+
 BRIDGE_PID=""
 HTTPS_PID=""
 BRIDGE_PORT="${S5L8900_HTTP_BRIDGE_PORT:-18080}"
@@ -120,6 +135,9 @@ cleanup() {
     if [[ -n "$HTTPS_PID" ]]; then
         kill "$HTTPS_PID" 2>/dev/null || true
         wait "$HTTPS_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]]; then
+        rm -rf "$STAGE_DIR" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
