@@ -28,6 +28,35 @@ static void set_bank(ITNandState *s, uint32_t activate_bank) {
     }
 }
 
+/*
+ * IT_NAND_WRITABLE=1 makes guest writes VISIBLE to subsequent reads.
+ *
+ * By default this model is write-ONLY: writes land in "<page>_new.page" and
+ * the read path never opens those files, so from the guest's point of view
+ * storage silently discards everything. That is safe for a NAND shipped
+ * read-only inside an app bundle, but it makes any daemon that must CREATE
+ * state spin forever. Measured on M68AP: com.apple.AddressBook creates its
+ * SQLite database, reads it back, finds "no such table: ABPerson", and
+ * retries ~250 times a second -- pegging the emulated CPU at 98% while the
+ * iPod idles at 11%.
+ *
+ * With this flag, writes go to "<page>.page" and the read path prefers an
+ * on-disk page over the immutable pack, so a write is read back within the
+ * session. Only enable it when the NAND directory is a THROWAWAY COPY: the
+ * iPhone bundle stages a fresh clone per launch (see ipod-app-launcher.sh),
+ * which is exactly that. Never point it at a pristine bundle NAND.
+ */
+static bool nand_writable(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *v = getenv("IT_NAND_WRITABLE");
+        cached = (v && *v && strcmp(v, "0") != 0);
+    }
+    return cached;
+}
+
 static void nand_open_pack(ITNandState *s)
 {
     char filename[PATH_MAX];
@@ -135,8 +164,10 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
         bool present = true;
         sprintf(filename, "%s/bank%d/%d.page", s->nand_path, bank, page);
         struct stat st = {0};
-        if (nand_read_packed_page(s, bank, page)) {
-            /* The immutable base pack replaces the per-page open/read path. */
+        if (!(nand_writable() && stat(filename, &st) == 0) &&
+            nand_read_packed_page(s, bank, page)) {
+            /* The immutable base pack replaces the per-page open/read path.
+             * When writable, a page the guest has written shadows the pack. */
         }
         else if (stat(filename, &st) == -1) {
             // page storage does not exist - initialize an empty buffer
@@ -295,7 +326,9 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 qemu_mutex_unlock(&s->lock);
                 {
                     char filename[200];
-                    sprintf(filename, "%s/bank%d/%d_new.page", s->nand_path, s->buffered_bank, s->buffered_page);
+                    sprintf(filename, "%s/bank%d/%d%s.page", s->nand_path,
+                            s->buffered_bank, s->buffered_page,
+                            nand_writable() ? "" : "_new");
                     FILE *f = fopen(filename, "wb");
                     if (f == NULL) { hw_error("Unable to read file!"); }
                     fwrite(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);

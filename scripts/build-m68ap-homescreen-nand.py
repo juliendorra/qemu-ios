@@ -88,28 +88,68 @@ def with_software_compositing(root: Path, work: Path) -> Path:
     return out
 
 
-def data_partition(work: Path) -> Path:
-    out = work / "data-ark.img"
+def without_addressbook(root: Path, work: Path, keep: bool) -> Path:
+    """SHORTCUT: drop com.apple.AddressBook, which spins forever here.
+
+    AddressBook creates its SQLite database on first run. On a GENERATED NAND
+    the guest's writes never take effect -- the FTL cannot write to the tree we
+    construct (measured: /private/var is mounted read-WRITE and the kernel
+    still lands zero pages in the NAND model). So the daemon creates its
+    tables, reads them back, finds "no such table: ABPerson", and retries about
+    250 times a second FOREVER. That is what pegs the emulated CPU at ~98%
+    while the iPod idles at 11-15%.
+
+    The iPod is unaffected because its NAND is a real device dump whose /var
+    already contains what daemons expect.
+
+    THE REAL FIX is writable storage on the generated NAND (task T6); this is
+    a stopgap that costs Contacts and nothing else. --keep-addressbook opts
+    out for anyone working on T6.
+    """
+    if keep:
+        return root
+    out = work / "root-noab.img"
     if out.exists():
         return out
-    print(f"[3/4] data partition with the {ARK_PROFILE!r} ark")
+    print("[2b/4] removing com.apple.AddressBook (SHORTCUT -- see T6)")
+    tmp = work / "root-noab.tmp.img"
+    shutil.copy2(root, tmp)
+    with attached(tmp, readonly=False) as mnt:
+        victim = (Path(mnt) / "System" / "Library" / "LaunchDaemons" /
+                  "com.apple.AddressBook.plist")
+        if victim.exists():
+            victim.unlink()
+        else:
+            print("      (already absent)")
+    tmp.rename(out)
+    root.unlink(missing_ok=True)
+    return out
+
+
+def data_partition(work: Path) -> Path:
+    """/var: the minimal directory skeleton PLUS the activation data ark.
+
+    The skeleton is not cosmetic. A /var without `/var/mobile/Library` sends
+    com.apple.AddressBook into an endless SQLite retry loop -- it can neither
+    open nor create its database ("no such table: ABPerson", "error 5 creating
+    properties table: database is locked") -- which pegs the emulated CPU at
+    ~98% forever. The iPod does not have this problem, and NOT because it
+    ships a database: its /var/mobile/Library simply EXISTS and is writable,
+    so the daemon creates the file once and goes quiet. (Reference checked:
+    the iPod's own /var has no AddressBook database either.)
+
+    Use --minimal, never --full: 56 dirs + chmod 1777 stops launchd starting
+    at all (measured; see build-m68ap-var.py).
+    """
+    out = work / "data-var.img"
+    if out.exists():
+        return out
+    print(f"[3/4] data partition: minimal /var skeleton + {ARK_PROFILE!r} ark")
     ark = work / "data_ark.plist"
     run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "build-dataark",
          "--out", ark, "--profile", ARK_PROFILE])
-    dmg = work / "data.dmg"
-    dmg.unlink(missing_ok=True)
-    run(["hdiutil", "create", "-sectors", str(DATA_DMG.stat().st_size // 512),
-         "-fs", "Case-sensitive HFS+", "-volname", "var", "-layout", "NONE",
-         "-o", dmg], stdout=subprocess.DEVNULL)
-    run([sys.executable, SCRIPTS / "inject-guest-file.py",
-         "--image", dmg, "--src", ark,
-         "--dest", "/root/Library/Lockdown/data_ark.plist"],
-        stdout=subprocess.DEVNULL)
-    raw = work / "data-raw"
-    run(["hdiutil", "convert", dmg, "-format", "UDTO", "-o", raw],
-        stdout=subprocess.DEVNULL)
-    shutil.move(str(work / "data-raw.cdr"), str(out))
-    dmg.unlink(missing_ok=True)
+    run([sys.executable, SCRIPTS / "build-m68ap-var.py",
+         "--out", out, "--data-ark", ark])
     return out
 
 
@@ -122,6 +162,9 @@ def main() -> int:
     ap.add_argument("--work", type=Path,
                     help="scratch dir (default: <out>.work, removed on success)")
     ap.add_argument("--keep-work", action="store_true")
+    ap.add_argument("--keep-addressbook", action="store_true",
+                    help="keep com.apple.AddressBook (it spins at ~98%% CPU "
+                         "until the generated NAND accepts writes -- task T6)")
     args = ap.parse_args()
 
     for needed in (ROOT_HFS, DATA_DMG):
@@ -139,6 +182,7 @@ def main() -> int:
                        "the M68AP home-screen NAND")
 
     root = with_software_compositing(patched_root(work), work)
+    root = without_addressbook(root, work, args.keep_addressbook)
     data = data_partition(work)
 
     print("[4/4] building the NAND tree")
