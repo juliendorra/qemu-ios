@@ -21,9 +21,37 @@ TVOut swap-device field elsewhere, so its teardown never completed and
 SpringBoard waited forever after `attach(AppleH1TVOut)`. Full decode below (§6
 avenue 1) and in the 2026-07-25 session log of `IPHONE_2G_BRINGUP_HANDOFF.md`.
 
-**Remaining, and now a DIFFERENT problem — TELEPHONY, not rendering.** The
-frame paints correctly; which frame depends on the baseband, and neither is the
-home screen yet:
+**Remaining — the SETUP/ACTIVATION screen. (Corrects an earlier claim in this
+file: I first wrote that the home screen was gated on *telephony registration*.
+Measurement says otherwise — telephony only supplied the carrier chrome and the
+"Repair Needed" alert on top of an underlying activation/setup gate.)**
+
+What the board capability profile proved (2026-07-25, `m68ap-notel`):
+`GraphicsServices` owns the capability table (it exports `GSSystemGetCapability`
+and knows `telephony`/`unifiedIPod`/`camera`/…), sourced from
+`SpringBoard.app/<board>.plist`. **Both** firmwares ship **both** profiles —
+the iPod's own 1.1.4 image contains `M68AP.plist` with `telephony: True` — so
+this is Apple's runtime board table, not a per-device build, and editing
+M68AP's profile is the vendor's own "this is not a phone" switch. Dropping the
+`telephony` key works exactly as designed: all phone chrome disappears (no
+carrier label, no lock glyph, no emergency slider) and SpringBoard's
+telephony-gated EverRegistered check stops running. **But the device still sits
+on the connect-to-iTunes screen**, and its SpringBoard log becomes
+line-for-line identical to the *rendering* iPod's:
+`lockdown says the device is: [Activated], state is 2` + `Couldn't get IAP TV
+out settings`. So the residual gate is activation/setup, not telephony.
+Also measured: a minimal `/var` changes nothing (`m68ap-notel-var`, identical
+8.0%), and the iPod control at the same boot age (200 s) really is on the
+**home screen** — so this is not a timing artifact.
+
+Live hypothesis: SpringBoard reads `EverRegistered` as a **CFString** and our
+synthesized ark writes an **integer** (`lockdown had a value for EverRegistered
+but it wasn't a string: <CFNumber 0>`), so it discards the value and treats the
+device as never registered. New ark profiles `everreg-yes` / `everreg-1` supply
+a string; matrix running.
+
+Historical detail — which frame paints depends on the baseband, and neither is
+the home screen:
 * **No baseband** (`IT_M68AP_NO_BASEBAND=1`): the **"Searching…" /
   connect-to-iTunes / Solo emergenze** activation screen (~41% non-black).
 * **H5 baseband stub** (`IT_BASEBAND_H5=1`, `m68ap-mbx-bb`): advances to

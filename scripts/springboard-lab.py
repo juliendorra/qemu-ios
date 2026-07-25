@@ -90,6 +90,51 @@ FB_BASES = {"iboot_0x0fe00000": 0x0FE00000,
 # The kernel idle loop (wait-for-interrupt); PCs here mean "nothing to run".
 IDLE_PCS = {"c005a9cc", "c005a9c4", "c005a9c8", "c005a9d0"}
 
+FB_W, FB_H = 320, 480
+
+
+def classify_screen(d: bytes) -> dict:
+    """Tell a HOME screen from a SETUP/activation screen, from raw BGRA pixels.
+
+    Rendering is no longer the question -- WHICH screen renders is. Non-black
+    %% cannot answer it (the activation screen with carrier chrome is *more*
+    lit than the home screen). Two features separate them cleanly, calibrated
+    on four measured frames:
+
+        frame                      colorful%%   dock%%
+        N45AP home screen             10.7      81.2
+        M68AP setup (no telephony)     1.8       3.8
+        M68AP activation (telephony)   1.8      53.4
+
+    App icons are saturated; the setup screens are white/grey artwork on
+    black. So `colorful` (max-min channel > 60) is the discriminator, and the
+    dock band is a corroborating signal.
+    """
+    def band(y0, y1):
+        nb = col = tot = 0
+        for y in range(y0, min(y1, FB_H)):
+            row = (y * FB_W) * 4
+            for x in range(0, FB_W, 2):
+                i = row + x * 4
+                b, g, r = d[i], d[i + 1], d[i + 2]
+                tot += 1
+                if r > 16 or g > 16 or b > 16:
+                    nb += 1
+                if max(r, g, b) - min(r, g, b) > 60:
+                    col += 1
+        return (100.0 * nb / tot, 100.0 * col / tot) if tot else (0.0, 0.0)
+
+    all_nb, all_col = band(0, FB_H)
+    dock_nb, _ = band(400, 470)
+    if all_col >= 5.0 and dock_nb >= 60.0:
+        kind = "home"
+    elif all_nb >= 2.0:
+        kind = "setup"          # activation / connect-to-iTunes / alert
+    else:
+        kind = "blank"
+    return {"kind": kind, "colorful_pct": round(all_col, 1),
+            "dock_pct": round(dock_nb, 1), "nonblack_pct": round(all_nb, 1)}
+
 MARKERS = {
     "panic": rb"panic\(cpu",
     "springboard": rb"SpringBoard\[",
@@ -202,6 +247,35 @@ VARIANTS = {
     # the "Searching..."/emergency activation screen onto the home screen?
     "m68ap-mbx-bb": dict(board="m68ap", dataark=True, patch=True,
                          sb_env="mbx2d", env={"IT_BASEBAND_H5": "1"}),
+    # --- TELEPHONY GATE, data-only: drop `telephony` from M68AP's board
+    # capability profile so GraphicsServices reports a non-phone device to
+    # every consumer (see the `caps` block in build_m68ap_nand).
+    "m68ap-notel": dict(board="m68ap", dataark=True, patch=True,
+                        sb_env="mbx2d", caps="notel",
+                        env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # same, but the key stays present and false (consumer may test presence)
+    "m68ap-notel-false": dict(board="m68ap", dataark=True, patch=True,
+                              sb_env="mbx2d", caps="notel-false",
+                              env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # telephony dropped AND a /var that SpringBoard can write its setup state
+    # into: with the phone chrome gone the remaining screen is the
+    # activation/"connect to iTunes" SETUP screen, and the iPod's device-dump
+    # NAND has a populated /var (mobile's home + preferences) where ours is
+    # empty. This pairs the two data fixes.
+    "m68ap-notel-var": dict(board="m68ap", dataark=True, patch=True,
+                            sb_env="mbx2d", caps="notel",
+                            var_skeleton="minimal",
+                            env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # --- SETUP gate: SpringBoard reads EverRegistered as a CFString and
+    # rejects the integer our ark writes ("wasn't a string: <CFNumber 0>"),
+    # so it treats the device as never registered -> connect-to-iTunes.
+    # Supply a string; two plausible spellings, measured not guessed.
+    "m68ap-everreg-yes": dict(board="m68ap", dataark=True, patch=True,
+                              sb_env="mbx2d", ark_profile="everreg-yes",
+                              env={"IT_M68AP_NO_BASEBAND": "1"}),
+    "m68ap-everreg-1": dict(board="m68ap", dataark=True, patch=True,
+                            sb_env="mbx2d", ark_profile="everreg-1",
+                            env={"IT_M68AP_NO_BASEBAND": "1"}),
     # same, plus drop UserName=mobile so SpringBoard runs as root like N45AP
     "m68ap-mbx-root": dict(board="m68ap", dataark=True, patch=True,
                            sb_env="mbx2d-root",
@@ -288,7 +362,8 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
                      ark_profile: str = "minimal",
                      var_skeleton: bool = False,
                      prune: str = None,
-                     sb_env: str = None) -> Path:
+                     sb_env: str = None,
+                     caps: str = None) -> Path:
     """Build (and cache) an M68AP NAND for a given artifact recipe."""
     if out.exists() and (out / "bank0").exists():
         return out
@@ -315,6 +390,41 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
         if root != M68_ROOT_HFS:
             root.unlink(missing_ok=True)
         root = pruned
+    if caps:
+        # The BOARD CAPABILITY PROFILE. GraphicsServices owns the capability
+        # table (it exports GSSystemGetCapability and knows the key names
+        # telephony/unifiedIPod/camera/...); its data source is
+        # SpringBoard.app/<board>.plist. BOTH firmwares ship BOTH profiles --
+        # the iPod's own 1.1.4 image contains M68AP.plist with telephony=true
+        # -- so this is Apple's board table, selected at runtime, not a
+        # per-device build. Editing M68AP's profile is therefore the vendor's
+        # own mechanism for "this device is not a phone", applied at ONE
+        # authority that every consumer reads, with no binary patched.
+        #   notel       -- drop the telephony key (N45AP's profile shape)
+        #   notel-false -- keep the key, set it false (in case a consumer
+        #                  tests presence rather than truth)
+        mutated = work / f"root-caps-{caps}.img"
+        if not mutated.exists():
+            tmp = work / f"root-caps-{caps}.tmp.img"
+            shutil.copy2(root, tmp)
+            with attached(tmp, readonly=False) as mnt:
+                plist = (mnt / "System" / "Library" / "CoreServices" /
+                         "SpringBoard.app" / "M68AP.plist")
+                prof = plistlib.loads(plist.read_bytes())
+                if caps == "notel":
+                    prof["capabilities"].pop("telephony", None)
+                elif caps == "notel-false":
+                    prof["capabilities"]["telephony"] = False
+                else:
+                    raise RuntimeError(f"unknown caps profile {caps!r}")
+                # the shipped file is a BINARY plist; keep the format (a
+                # format change is exactly what broke the data ark once)
+                plist.write_bytes(plistlib.dumps(prof,
+                                                 fmt=plistlib.FMT_BINARY))
+            tmp.rename(mutated)
+        if root != M68_ROOT_HFS:
+            root.unlink(missing_ok=True)
+        root = mutated
     if sb_env:
         mutated = work / f"root-sbenv-{sb_env}.img"
         if not mutated.exists():
@@ -398,6 +508,8 @@ class Instance:
         self.stderr = self.dir / "stderr.log"
         self.qmp_path = Path(f"/tmp/sblab-{os.getpid()}-{name}.qmp")
         self.proc = None
+        self._best_fb_label = None
+        self.screen = None
         self.result = {"name": name, "spec": {k: v for k, v in spec.items()
                                               if k != "env"}}
 
@@ -407,7 +519,8 @@ class Instance:
                 f"-{profile}-patch{int(self.spec.get('patch', False))}"
                 f"-var{self.spec.get('var_skeleton', False)}"
                 f"-prune{self.spec.get('prune') or 'none'}"
-                f"-sbenv{self.spec.get('sb_env') or 'none'}")
+                f"-sbenv{self.spec.get('sb_env') or 'none'}"
+                f"-caps{self.spec.get('caps') or 'none'}")
 
     def prepare(self):
         """Build this variant's NAND recipe into the shared cache.
@@ -433,7 +546,8 @@ class Instance:
                          self.spec.get("ark_profile", "minimal"),
                          self.spec.get("var_skeleton", False),
                          self.spec.get("prune"),
-                         self.spec.get("sb_env"))
+                         self.spec.get("sb_env"),
+                         self.spec.get("caps"))
 
     def stage(self):
         board = self.spec["board"]
@@ -569,6 +683,10 @@ class Instance:
                 nb = sum(1 for i in range(0, len(d), 4)
                          if d[i] > 16 or d[i + 1] > 16 or d[i + 2] > 16)
                 out[label] = round(100 * nb / (len(d) // 4), 1)
+                if out[label] >= (out.get(self._best_fb_label, 0)
+                                  if self._best_fb_label else -1):
+                    self._best_fb_label = label
+                    self.screen = classify_screen(d)
                 raw.unlink(missing_ok=True)
         except Exception:
             pass
@@ -601,6 +719,7 @@ class Instance:
             "pc_histogram": Counter(pcs).most_common(6),
             "pcs_all_idle": bool(pcs) and all(p in IDLE_PCS for p in pcs),
             "framebuffers": self.framebuffers(),
+            "screen": self.screen,
             "springboard_lines": sb[-6:],
             "driver_tail": drivers[-12:],
             "trace": self.trace_summary(),
@@ -733,13 +852,14 @@ def main() -> int:
     # when those knobs are set); N45AP stages a CoW clone of the app's NAND.
     recipes = {(v, VARIANTS[v].get("dataark"), VARIANTS[v].get("patch"),
                 VARIANTS[v].get("ark_profile", "minimal"),
-                VARIANTS[v].get("prune"), VARIANTS[v].get("sb_env"))
+                VARIANTS[v].get("prune"), VARIANTS[v].get("sb_env"),
+                VARIANTS[v].get("caps"))
                for v in args.variants if VARIANTS[v]["board"] == "m68ap"}
     need = len(recipes) * NAND_TREE_BYTES
     # root/data images are intermediates deleted as soon as consumed
     # (prepare runs serially), so the transient peak is two roots + one data
     # image regardless of how many recipes mutate the root
-    if any(r[2] or r[4] or r[5] for r in recipes):
+    if any(r[2] or r[4] or r[5] or r[6] for r in recipes):
         need += 2 * ROOT_HFS_BYTES
     if any(r[1] for r in recipes):
         need += DATA_HFS_BYTES
@@ -784,14 +904,15 @@ def main() -> int:
         raise
 
     print("\n=== MATRIX ===")
-    print(f"{'instance':16} {'verdict':10} {'phase':22} {'idle':5} "
+    print(f"{'instance':18} {'verdict':10} {'screen':7} {'phase':20} "
           f"{'sb':3} {'bases'}")
     print("-" * 92)
     for r in results:
         if not r:
             continue
-        print(f"{r['name']:16} {r.get('verdict',''):10} "
-              f"{r.get('phase',''):22} {str(r.get('pcs_all_idle','')):5} "
+        scr = (r.get('screen') or {}).get('kind', '-')
+        print(f"{r['name']:18} {r.get('verdict',''):10} {scr:7} "
+              f"{r.get('phase',''):20} "
               f"{r.get('markers',{}).get('springboard',0):<3} "
               f"{','.join(r.get('lcd_bases',[])) or '-'}")
 

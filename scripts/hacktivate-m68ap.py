@@ -243,6 +243,14 @@ ARK_PROFILES = {
     "all": {"-FactoryActivated": True, "-ActivationState": "Activated",
             "-AllowUnactivatedService": True,
             "com.apple.mobile.lockdown-ActivationState": "Activated"},
+    # TYPE, not value: SpringBoard reads EverRegistered as a CFString and
+    # logs "lockdown had a value for EverRegistered but it wasn't a string:
+    # <CFNumber 0>" for the integer the minimal ark writes -- so it discards
+    # the value and treats the device as never registered, which is a
+    # "set me up with iTunes" state. These profiles supply a STRING instead.
+    # ("YES"/"1" are the two plausible spellings; measure, don't guess.)
+    "everreg-yes": {"-SBLockdownEverRegisteredKey": "YES"},
+    "everreg-1": {"-SBLockdownEverRegisteredKey": "1"},
 }
 
 
