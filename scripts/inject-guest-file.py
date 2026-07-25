@@ -43,12 +43,17 @@ data partition (disk0s2 = /private/var) use `/root/...` to land at
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import shutil
 import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lab_workspace import attached
 
 
 def run(cmd, **kw):
@@ -146,11 +151,12 @@ def main() -> int:
         shutil.copy2(args.image, args.out)
 
     dest = args.dest.lstrip("/")
-    mnt = Path(f"/tmp/inject-guest-{int(time.time())}")
+    mnt = Path(f"/tmp/inject-guest-{os.getpid()}-{int(time.time())}")
     mnt.mkdir(exist_ok=True)
-    dev = attach_rw(target, mnt)
     created = []
-    try:
+    # `attached()` guarantees the detach even on failure: a leaked mount pins
+    # its backing image's space and is a real disk-filler (lab_workspace.py).
+    with attached(target, mountpoint=mnt, readonly=False):
         full = mnt / dest
         for parent in list(full.parents)[:-1]:
             if mnt in parent.parents and not parent.exists():
@@ -160,13 +166,8 @@ def main() -> int:
         created.append(full.name)
         subprocess.run(["sync"])
         print(f"injected {args.src} -> /{dest}")
-    finally:
-        for _ in range(10):
-            r = subprocess.run(["hdiutil", "detach", str(mnt)],
-                               capture_output=True, text=True)
-            if r.returncode == 0:
-                break
-            time.sleep(0.5)
+    with contextlib.suppress(OSError):
+        mnt.rmdir()
 
     if args.root_owned:
         n = rewrite_owner_records(target, sorted(set(created)))

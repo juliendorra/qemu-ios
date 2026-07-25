@@ -53,6 +53,9 @@ import time
 from collections import Counter
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lab_workspace import Workspace, prune_runs, require_free_bytes, NAND_TREE_BYTES
+
 REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get("IPOD_APP", "/Applications/iPod Touch.app/Contents"))
 DEFAULT_QEMU = REPO / "build-ipod11" / "qemu-system-arm"
@@ -335,6 +338,14 @@ class Instance:
             return {**self.result, "verdict": "lab_error", "error": repr(e)}
         finally:
             self.kill()
+            # Staged NAND/NOR are reproducible; evidence (serial, traces,
+            # modem logs, timeline) is not and is never registered here.
+            # See scripts/lab_workspace.py -- a session of un-pruned runs
+            # once filled the disk outright.
+            ws = Workspace(self.logs, keep=getattr(self.args, "keep_artifacts",
+                                                   False), label=self.name)
+            ws.disposable(self.logs / "stage")
+            ws.cleanup(verbose=False)
 
 
 def main() -> int:
@@ -368,6 +379,12 @@ def main() -> int:
                     "IOIpodUSBDevice::start panic; staggering keeps at most "
                     "one instance in that window at a time. 0 = simultaneous "
                     "(only safe for 1-2 instances).")
+    ap.add_argument("--keep-artifacts", action="store_true",
+                    help="keep staged NAND/NOR per instance (debugging); "
+                         "default deletes them, evidence is always kept")
+    ap.add_argument("--keep-runs", type=int, default=3,
+                    help="previous run dirs to keep alongside --logs "
+                         "(0 = keep all)")
     ap.add_argument("--poll-secs", type=float, default=2.0)
     ap.add_argument("--pc-samples", type=int, default=8)
     ap.add_argument("--tail-lines", type=int, default=40)
@@ -398,6 +415,13 @@ def main() -> int:
         instances.append(Instance(name, ruleset, args))
 
     args.logs.mkdir(parents=True, exist_ok=True)
+
+    # Each instance stages its own NAND clone; refuse up front rather than
+    # fill the disk half-way through a matrix (see scripts/lab_workspace.py).
+    require_free_bytes(args.logs, len(instances) * NAND_TREE_BYTES,
+                       f"{len(instances)} staged NAND tree(s)")
+    if getattr(args, "keep_runs", 3):
+        prune_runs(args.logs.parent, args.keep_runs, f"{args.logs.name}*")
     results: list[dict] = [None] * len(instances)  # type: ignore
 
     def worker(i: int) -> None:

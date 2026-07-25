@@ -66,6 +66,10 @@ import time
 from collections import Counter
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lab_workspace import (NAND_TREE_BYTES, ROOT_HFS_BYTES, DATA_HFS_BYTES,
+                           Workspace, human, prune_runs, require_free_bytes)
+
 REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get("IPOD_APP", "/Applications/iPod Touch.app/Contents"))
 IPOD_FILES = APP / "Resources" / "ipod_files"
@@ -248,6 +252,34 @@ class Instance:
         self.result = {"name": name, "spec": {k: v for k, v in spec.items()
                                               if k != "env"}}
 
+    def recipe(self):
+        profile = self.spec.get("ark_profile", "minimal")
+        return (f"m68ap-ark{int(self.spec.get('dataark', False))}"
+                f"-{profile}-patch{int(self.spec.get('patch', False))}")
+
+    def prepare(self):
+        """Build this variant's NAND recipe into the shared cache.
+
+        Called SERIALLY from main before any instance boots: concurrent NAND
+        builds (148k page writes each) plus concurrent hdiutil create/attach
+        starve the host badly enough to error some builds and stall the boots
+        that do start (observed: two errors + two timeouts at kernel/launchd).
+        Preparation is the expensive, I/O-bound part; only the boots need to
+        run in parallel.
+        """
+        if self.spec["board"] != "m68ap":
+            return
+        shared = self.cache / self.recipe()
+        nand = shared / "nand"
+        if nand.exists() and not (nand / "bank0").exists():
+            shutil.rmtree(nand)          # scrub a half-built cache entry
+        if not nand.exists():
+            print(f"[{self.name}] building NAND recipe {self.recipe()}",
+                  flush=True)
+        build_m68ap_nand(nand, self.spec.get("dataark", False),
+                         self.spec.get("patch", False), shared,
+                         self.spec.get("ark_profile", "minimal"))
+
     def stage(self):
         board = self.spec["board"]
         stage = self.dir / "stage"
@@ -260,12 +292,8 @@ class Instance:
             shutil.copy2(IPOD_FILES / "nor_n45ap.bin", nor)
             return (M68_BOOTROM, IPOD_FILES / "iboot_204_n45ap.bin", nand, nor,
                     "iPod-Touch")
-        profile = self.spec.get("ark_profile", "minimal")
-        recipe = f"m68ap-ark{int(self.spec.get('dataark', False))}" \
-                 f"-{profile}-patch{int(self.spec.get('patch', False))}"
-        shared = self.cache / recipe
-        build_m68ap_nand(shared / "nand", self.spec.get("dataark", False),
-                         self.spec.get("patch", False), shared, profile)
+        shared = self.cache / self.recipe()
+        self.prepare()                    # no-op if already cached
         nand = stage / "nand"
         if nand.exists():
             shutil.rmtree(nand)
@@ -418,6 +446,13 @@ class Instance:
             return self.collect(verdict, time.monotonic() - started)
         finally:
             self.kill()
+            # The staged NAND clone + NOR are reproducible from the cache;
+            # the evidence (serial.log, stderr.log, command.txt) is not, and
+            # is never registered as disposable.
+            ws = Workspace(self.dir, keep=self.args.keep_artifacts,
+                           label=self.name)
+            ws.disposable(self.dir / "stage")
+            ws.cleanup(verbose=False)
 
 
 def diff_instances(results, a_name, b_name):
@@ -453,6 +488,12 @@ def main() -> int:
     ap.add_argument("--poll-secs", type=float, default=3)
     ap.add_argument("--pc-samples", type=int, default=8)
     ap.add_argument("--stagger-secs", type=float, default=30)
+    ap.add_argument("--keep-artifacts", action="store_true",
+                    help="keep staged NANDs and the recipe cache (debugging); "
+                         "default deletes them, evidence is always kept")
+    ap.add_argument("--keep-runs", type=int, default=3,
+                    help="how many previous run dirs to keep under the logs "
+                         "parent (0 = keep all)")
     args = ap.parse_args()
 
     for v in args.variants:
@@ -462,8 +503,30 @@ def main() -> int:
     cache = args.logs / "_cache"
     cache.mkdir(exist_ok=True)
 
+    # Pre-flight: refuse to start rather than fill the disk half-way. Each
+    # distinct M68AP recipe costs a NAND tree (+ a patched root / data image
+    # when those knobs are set); N45AP stages a CoW clone of the app's NAND.
+    recipes = {(v, VARIANTS[v].get("dataark"), VARIANTS[v].get("patch"),
+                VARIANTS[v].get("ark_profile", "minimal"))
+               for v in args.variants if VARIANTS[v]["board"] == "m68ap"}
+    need = len(recipes) * NAND_TREE_BYTES
+    need += sum(ROOT_HFS_BYTES for r in recipes if r[2])
+    need += sum(DATA_HFS_BYTES for r in recipes if r[1])
+    if need:
+        require_free_bytes(args.logs, need,
+                           f"{len(recipes)} NAND recipe(s)")
+    if args.keep_runs:
+        prune_runs(args.logs.parent, args.keep_runs, f"{args.logs.name}*")
+
     instances = [Instance(v, VARIANTS[v], args, cache) for v in args.variants]
     results = [None] * len(instances)
+
+    # Build every NAND recipe SERIALLY before any boot (see Instance.prepare).
+    for inst in instances:
+        try:
+            inst.prepare()
+        except Exception as e:
+            print(f"[{inst.name}] PREPARE FAILED: {e}", flush=True)
 
     def worker(i):
         time.sleep(i * args.stagger_secs)
@@ -516,6 +579,12 @@ def main() -> int:
     path = args.logs / "matrix.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"\nreport: {path}")
+
+    # The recipe cache is large and fully reproducible; drop it unless the
+    # caller wants to re-run quickly. Evidence stays either way.
+    cache_ws = Workspace(args.logs, keep=args.keep_artifacts, label="cache")
+    cache_ws.disposable(cache)
+    cache_ws.cleanup()
     return 0
 
 
