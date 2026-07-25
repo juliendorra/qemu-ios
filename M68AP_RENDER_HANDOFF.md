@@ -11,14 +11,27 @@ exist, and what to try next.
 
 ## 1. Status in one paragraph
 
-M68AP boots iPhone OS 1.1.4 all the way to **SpringBoard**, with the **baseband
-attached** and the **WiFi driver up**, and the device reports **`[Activated]`**.
-It still shows a **black screen**: SpringBoard runs, logs its two lockdown
-lines, and then never programs a kernel framebuffer base — the guest settles
-into the kernel idle loop. N45AP (iPod Touch), booted from the same emulator on
-the same code paths, renders normally. **The render blocker is not activation,
-not the baseband, and not the empty `/var`** — all three were tested and
-eliminated. It is currently unidentified.
+**RESOLVED 2026-07-25 — M68AP RENDERS.** The black screen is gone: with the
+per-board TVOut workaround window plus `LK_ENABLE_MBX2D=0` in the SpringBoard
+plist, M68AP programs the kernel framebuffers `0x0f400000` + `0x0f496000` and
+paints ~41% non-black (a real iPhone OS 1.1.4 UI — see the delivered
+screenshot). The blocker was the upstream "Got past TVOut" hack being
+hard-coded to the iPod kernel's heap address; the iPhone kernel puts the same
+TVOut swap-device field elsewhere, so its teardown never completed and
+SpringBoard waited forever after `attach(AppleH1TVOut)`. Full decode below (§6
+avenue 1) and in the 2026-07-25 session log of `IPHONE_2G_BRINGUP_HANDOFF.md`.
+
+**Remaining, and now a DIFFERENT problem:** the frame that paints is the iPhone
+**activation / "Searching…" / connect-to-iTunes** screen (emergency-call only),
+not the SpringBoard home screen. That is telephony, not rendering: this config
+runs `IT_M68AP_NO_BASEBAND=1`, so no network ever registers and 1.1.4 parks on
+the activation screen (the iPod has no telephony, so it goes straight to the
+home screen). Whether the H5 baseband stub registers far enough to reach the
+home screen is the open question — `m68ap-mbx-bb` variant, running.
+
+*Historical (pre-fix) framing kept for the record below.* M68AP boots iPhone
+OS 1.1.4 to **SpringBoard**, reports **`[Activated]`**, and used to settle into
+the kernel idle loop with a black screen; N45AP rendered on the same paths.
 
 ## 2. What is verified working
 

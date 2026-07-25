@@ -197,6 +197,11 @@ VARIANTS = {
     # fix on the iPhone root.
     "m68ap-mbx": dict(board="m68ap", dataark=True, patch=True, sb_env="mbx2d",
                       env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # the render fix (TVOut window) + software compositing, WITH the H5
+    # baseband stub attached: does a registered network get SpringBoard past
+    # the "Searching..."/emergency activation screen onto the home screen?
+    "m68ap-mbx-bb": dict(board="m68ap", dataark=True, patch=True,
+                         sb_env="mbx2d", env={"IT_BASEBAND_H5": "1"}),
     # same, plus drop UserName=mobile so SpringBoard runs as root like N45AP
     "m68ap-mbx-root": dict(board="m68ap", dataark=True, patch=True,
                            sb_env="mbx2d-root",
