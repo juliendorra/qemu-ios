@@ -8,6 +8,59 @@ the live bring-up state.
 
 ---
 
+## FINDING + DECISION (2026-07-25): the M68AP black screen is the ACTIVATION gate — hacktivate
+
+**What the iPod (N45AP) taught us, and the original author's own words.** devos50
+(the upstream author, `github.com/devos50/qemu-ios`) writes in his Part I article:
+*"I also had to copy activation records from an actual device to bypass device
+activation"* and *"the NAND filesystem was heavily modified to bypass various
+checks."* So N45AP renders a home screen because its **shipped NAND is
+pre-activated** (a real activation record baked into the FS). iPod Touch
+activation is trivial/local. Our M68AP NAND, generated fresh from the 4A102
+IPSW, has none → `[Unactivated]`.
+
+**Proven blocker (not a display bug).** With `IT_LCD_TRACE=1`, an M68AP boot
+programs the LCD window base to **only `0x0fe00000`** (iBoot's boot-logo base,
+black) and **never** to SpringBoard's `0x0f400000`/`0x0f496000`. So SpringBoard
+runs but **never reaches the rendering stage** — it is stuck at the activation
+gate (`SpringBoard[15]: lockdown says the device is: [Unactivated]`), so nothing
+paints. The display/scanout pipeline itself is fine (same LCD model as N45AP,
+which renders 47%). This is purely activation.
+
+**Mechanism (from lockdownd strings, `/usr/libexec/lockdownd`).** Activation
+state lives in a "data ark" at **`/var/root/Library/Lockdown/data_ark.plist`**
+(serial: `data_ark_load: Could not load …/data_ark.plist`, `No cached activation
+state`). Keys: `ActivationState`, `FactoryActivated`, `ActivationStateAcknowledged`,
+`AllowUnactivatedService`. lockdownd has a *factory-activated* path
+(`"The device was factory activated"`) and an `AllowUnactivatedService` lever,
+both of which can bypass the carrier activation the iPhone shipped requiring.
+Caveat: it validates records (`"No activation randomness in the data ark"`,
+`"activation record did not contain a device certificate"`), so a naive injected
+plist may be rejected — binary-patching lockdownd's state getter is the robust
+fallback.
+
+**DECISION: hacktivation, not the baseband.** It is what devos50 effectively did
+(patch the FS to bypass checks), what this repo's feasibility doc planned
+("activation stub"), local (no user-supplied activated iPhone dump needed), and
+~10× less work than the telephony stack for the same visual result.
+
+**Execution plan (task #17).**
+1. Injection point: the data HFS (`--data-hfs`) that becomes disk0s2 (`/private/var`),
+   currently a blank /var. Modify a writable copy, then regenerate the NAND:
+   `scripts/build-m68ap-nand.py --out <nand> --signature m68ap --active-banks 4
+   --bbt production --hfs <root_hfs> --data-hfs <data_hfs_hacked>` (root =
+   `m68ap-artifacts/stage/filesystem-m68ap-readonly.img`).
+2. **Best lead for the exact format: extract N45AP's WORKING `data_ark.plist`**
+   (its NAND is activated) and adapt it — the schema/validation is what lockdownd
+   already accepts. Failing that, binary-patch lockdownd's activation-state getter
+   to return Activated (same RE approach used for H5 — the kext/binary is on the
+   root FS, unencrypted).
+3. Boot, confirm SpringBoard programs `0x0f400000` (LCD trace) and the FB is
+   non-black, then re-run `scripts/ipod-https-acceptance.py --select-wifi` for the
+   WiFi→Safari proof.
+
+---
+
 ## DECISION (2026-07-24): baseband telephony/activation is SHELVED as a stretch goal
 
 **Status: M68AP boots to SpringBoard with the baseband attached, and has
