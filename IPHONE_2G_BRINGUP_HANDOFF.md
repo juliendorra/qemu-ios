@@ -59,6 +59,45 @@ fallback.
    non-black, then re-run `scripts/ipod-https-acceptance.py --select-wifi` for the
    WiFi→Safari proof.
 
+### Execution log — data-ark injection FAILED (2 cycles); pivot to in-place lockdownd patch
+
+Attempted the data-ark route twice: built a writable /var HFS containing
+`/root/Library/Lockdown/data_ark.plist` (keys `ActivationState=Activated`,
+`FactoryActivated`, `ActivationStateAcknowledged`, `AllowUnactivatedService`),
+regenerated the NAND (`build-m68ap-nand.py --data-hfs …`), booted. **Both cycles
+stayed `[Unactivated]`, no render (LCD base still only `0x0fe00000`).** Ruled out,
+in order:
+- **File carriage**: the NAND *does* write the data partition (12288 pages) and
+  the guest mounts it (`/dev/disk0s2 on /private/var`); the file is confirmed in
+  the host-side image.
+- **Path/filename**: correct — lockdownd's only activation-state file is
+  `<home>/Library/Lockdown/data_ark.plist` = `/var/root/Library/Lockdown/
+  data_ark.plist` (no separate cached-state file; `_load_cached_activation_state`
+  reads the data ark).
+- **Timing**: ruled out — disk0s2 mounts (serial line 1595) *before* lockdownd's
+  read (line 1659).
+- **Journaling**: rebuilt the /var image fresh, non-journaled (`hdiutil create
+  -layout NONE`), same exact size — no change.
+
+Remaining cause: **HFS-write compatibility.** macOS's modern HFS+ writer produces
+a catalog B-tree that the 2007-era iPhone OS 1.x HFS driver mounts but does not
+fully traverse for *newly inserted* files, so lockdownd's `fopen` of the injected
+file fails ("Could not load data_ark"). Adding a new catalog entry via macOS is
+the unreliable operation.
+
+**Pivot (robust): in-place byte-patch of lockdownd on the ROOT FS.** The root FS
+is devos50's original, guest-readable HFS. Overwriting bytes *inside an existing
+file, same size* changes only data blocks — the catalog entry and extents are
+untouched, so the guest reads the patched bytes (far more reliable than inserting
+a new file). Steps: (1) disassemble `/usr/libexec/lockdownd` (ARM, unencrypted on
+the root FS) to find the activation-state getter behind `_load_cached_activation_state`
+/ the `ActivationState` computation; (2) patch it to return `Activated`
+(same-length patch, e.g. force the return/branch); (3) write the patched lockdownd
+into a writable copy of `filesystem-m68ap-readonly.img` *in place* (same size);
+(4) regen the NAND with `--hfs <patched_root>`; (5) boot, confirm LCD `0x0f400000`.
+Same RE toolchain as the H5 work (capstone ARM). This is the next concrete step
+for task #17.
+
 ---
 
 ## DECISION (2026-07-24): baseband telephony/activation is SHELVED as a stretch goal
