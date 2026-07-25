@@ -134,6 +134,17 @@ VARIANTS = {
     # patch only (no data ark)
     "m68ap-patch": dict(board="m68ap", dataark=False, patch=True,
                         env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # --- /var skeleton: does a populated data partition let SpringBoard render?
+    "m68ap-var": dict(board="m68ap", dataark=True, patch=True,
+                      var_skeleton="full",
+                      env={"IT_M68AP_NO_BASEBAND": "1"}),
+    "m68ap-var-nopatch": dict(board="m68ap", dataark=True, patch=False,
+                              var_skeleton="minimal",
+                              env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # only the strictly-needed dirs, to isolate what the full skeleton breaks
+    "m68ap-varmin": dict(board="m68ap", dataark=True, patch=True,
+                         var_skeleton="minimal",
+                         env={"IT_M68AP_NO_BASEBAND": "1"}),
     # --- activation DURABILITY matrix (can the binary patch be dropped?) ---
     # All of these are data-ark-only (patch=False). The question each answers:
     # does [Activated] SURVIVE determine_activation_state's boot re-validation
@@ -198,7 +209,8 @@ class QMP:
 
 
 def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
-                     ark_profile: str = "minimal") -> Path:
+                     ark_profile: str = "minimal",
+                     var_skeleton: bool = False) -> Path:
     """Build (and cache) an M68AP NAND for a given artifact recipe."""
     if out.exists() and (out / "bank0").exists():
         return out
@@ -210,7 +222,21 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
             run([sys.executable, str(REPO / "scripts" / "hacktivate-m68ap.py"),
                  "patch", "--root-hfs", str(M68_ROOT_HFS), "--out", str(root)])
     data = M68_DATA_DMG
-    if dataark:
+    if var_skeleton:
+        # A populated /var: the generated NAND otherwise ships an EMPTY data
+        # partition (no /var/mobile for SpringBoard's `mobile` user, no
+        # preferences for configd), which N45AP's device-dump NAND has.
+        data = work / "data-var.img"
+        if not data.exists():
+            ark = work / "data_ark.plist"
+            run([sys.executable, str(REPO / "scripts" / "hacktivate-m68ap.py"),
+                 "build-dataark", "--out", str(ark), "--profile", ark_profile])
+            cmd = [sys.executable, str(REPO / "scripts" / "build-m68ap-var.py"),
+                   "--out", str(data), "--data-ark", str(ark)]
+            if var_skeleton == "full":
+                cmd.append("--full")
+            run(cmd)
+    elif dataark:
         data = work / "data-ark.img"
         if not data.exists():
             ark = work / "data_ark.plist"
@@ -255,7 +281,8 @@ class Instance:
     def recipe(self):
         profile = self.spec.get("ark_profile", "minimal")
         return (f"m68ap-ark{int(self.spec.get('dataark', False))}"
-                f"-{profile}-patch{int(self.spec.get('patch', False))}")
+                f"-{profile}-patch{int(self.spec.get('patch', False))}"
+                f"-var{self.spec.get('var_skeleton', False)}")
 
     def prepare(self):
         """Build this variant's NAND recipe into the shared cache.
@@ -278,7 +305,8 @@ class Instance:
                   flush=True)
         build_m68ap_nand(nand, self.spec.get("dataark", False),
                          self.spec.get("patch", False), shared,
-                         self.spec.get("ark_profile", "minimal"))
+                         self.spec.get("ark_profile", "minimal"),
+                         self.spec.get("var_skeleton", False))
 
     def stage(self):
         board = self.spec["board"]
@@ -455,20 +483,48 @@ class Instance:
             ws.cleanup(verbose=False)
 
 
-def diff_instances(results, a_name, b_name):
-    """Tokens in A's post-SpringBoard driver lines that are absent from B's."""
-    by = {r["name"]: r for r in results if r}
-    if a_name not in by or b_name not in by:
-        return None
-    def tokens(r):
-        toks = set()
-        for line in r.get("driver_tail", []):
-            for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{4,}", line):
-                toks.add(t)
-        return toks
-    ta, tb = tokens(by[a_name]), tokens(by[b_name])
-    return {"only_in_" + a_name: sorted(ta - tb),
-            "only_in_" + b_name: sorted(tb - ta)}
+def _normalise(line: str) -> str:
+    """Strip everything that differs between two boots but carries no meaning:
+    syslog timestamps, pointers/handles, pids, and the board name itself."""
+    s = re.sub(r"^\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+", "", line)   # syslog stamp
+    s = re.sub(r"0x[0-9a-fA-F]+", "0xX", s)
+    s = re.sub(r"\b[0-9a-f]{6,8}\b", "HEX", s)
+    s = re.sub(r"\[\d+\]", "[P]", s)
+    s = re.sub(r"\b(N45AP|M68AP|iPod touch|iPhone)\b", "BOARD", s)
+    s = re.sub(r"\bc0[0-9a-f]{6}\b", "KADDR", s)
+    return s.strip()
+
+
+def diff_serial(a_dir: Path, b_dir: Path, marker: str = r"SpringBoard\["):
+    """Normalised set-diff of the two serial logs from the SpringBoard phase on.
+
+    This is the differential that matters for the render wall: one board paints
+    and one does not, so whatever the renderer needs shows up as lines present
+    in the working boot and missing from the wedged one. Driver/service lines
+    are reported separately because they are the actionable subset.
+    """
+    def phase_lines(d: Path):
+        p = d / "serial.log"
+        if not p.exists():
+            return []
+        lines = p.read_bytes().decode("latin1", "replace").splitlines()
+        for i, l in enumerate(lines):
+            if re.search(marker, l):
+                return [_normalise(x) for x in lines[i:]]
+        return [_normalise(x) for x in lines[-200:]]     # never reached it
+    a, b = set(phase_lines(a_dir)), set(phase_lines(b_dir))
+    def service_like(xs):
+        return sorted(x for x in xs
+                      if re.search(r"::(attach|start|probe)|Registering:|"
+                                   r"config\(|matching|UserClient", x))
+    return {
+        "only_in_a_services": service_like(a - b)[:40],
+        "only_in_b_services": service_like(b - a)[:40],
+        "only_in_a_other": sorted(x for x in (a - b) if x not in
+                                  set(service_like(a - b)))[:25],
+        "only_in_b_other": sorted(x for x in (b - a) if x not in
+                                  set(service_like(b - a)))[:25],
+    }
 
 
 def main() -> int:
@@ -569,12 +625,18 @@ def main() -> int:
         if "=" not in spec:
             continue
         a, b = spec.split("=", 1)
-        d = diff_instances(results, a, b)
-        if d:
-            report["diffs"][spec] = d
-            print(f"\n=== DIFF {a} vs {b} (driver/service tokens) ===")
-            for k, v in d.items():
-                print(f"  {k}: {', '.join(v[:25]) or '(none)'}")
+        d = diff_serial(args.logs / a, args.logs / b)
+        report["diffs"][spec] = d
+        print(f"\n=== DIFF {a} vs {b} (normalised, from SpringBoard on) ===")
+        for key, label in (("only_in_b_services", f"services only in {b}"),
+                           ("only_in_a_services", f"services only in {a}"),
+                           ("only_in_b_other", f"other only in {b}"),
+                           ("only_in_a_other", f"other only in {a}")):
+            print(f"  -- {label}:")
+            for line in d[key][:20]:
+                print(f"       {line[:110]}")
+            if not d[key]:
+                print("       (none)")
 
     path = args.logs / "matrix.json"
     path.write_text(json.dumps(report, indent=2) + "\n")

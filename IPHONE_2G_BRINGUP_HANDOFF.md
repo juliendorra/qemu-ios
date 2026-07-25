@@ -228,6 +228,40 @@ nothing. The real evidence is that no kernel FB base is ever programmed and all
 framebuffers stay black. Also note m68ap-full/-bb sampled `idle=False` on the
 second sampling pass (some thread still runs) while m68ap-plain was fully idle.
 
+### /var hypothesis TESTED and DISPROVED (2026-07-25)
+
+Observation that motivated it: the normalised post-SpringBoard log diff
+(`springboard-lab.py --diff`) showed N45AP's configd doing real work
+(`Setup:/Network/Interface/en0/AirPort`, `New network configuration saved`,
+`created directory for .../NetworkInterfaces.plist`, `setting hostname`) while
+M68AP's configd only says `updateConfiguration(): no preferences.`. And the
+M68AP data partition really is EMPTY (verified) -- we generate the NAND and
+skip Apple's restore, which is what lays /var down on real hardware -- so
+SpringBoard's user `mobile` (uid 501, `/etc/master.passwd`) has no home
+(`/var/mobile`).
+
+Result (`scripts/build-m68ap-var.py` + lab variants `m68ap-varmin`/`m68ap-var`):
+| variant | /var contents | launchd | configd | SpringBoard | renders |
+|---|---|---|---|---|---|
+| (baseline) | empty | yes | 45 | 2 lines | no |
+| `m68ap-varmin` | 8 dirs, no chmod | 13 | 45 | 2 lines | **no** |
+| `m68ap-var` | full 56 dirs + chmod | **0** | **0** | **0** | no (breaks) |
+
+Two conclusions:
+1. **An empty /var is NOT the render blocker.** With `/var/mobile/Library/
+   Preferences` and `/var/root/Library/Preferences/SystemConfiguration`
+   present, SpringBoard still stops after the same two lockdown lines, and
+   configd still reports `no preferences` -- it wants preference *files*, not
+   just directories. Creating the home directory changes nothing.
+2. **The full skeleton is actively harmful**: launchd never starts at all
+   (0 launchd/configd/SpringBoard lines even at a 700 s cap). Something in the
+   extra entries or the `chmod 1777` through an owner-less hdiutil mount breaks
+   early userland. `build-m68ap-var.py` therefore defaults to the minimal set;
+   `--full` is opt-in and flagged, pending a bisect.
+
+So the render blocker is still unidentified: it is not activation, not the
+baseband, and not an empty /var.
+
 **Conclusion: the render blocker is SEPARATE from activation** — a SpringBoard
 event-wait (kernel idle), most likely in the display bring-up
 (`IOCoreSurfaceRoot`/`IOMobileFramebuffer` was the last thing attached before
