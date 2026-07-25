@@ -27,6 +27,9 @@ case "$PROFILE" in
         DEFAULT_FIRMWARE_DIR="$RESOURCES/ipod_files"
         DEFAULT_IBOOT="iboot_204_n45ap.bin"
         DEFAULT_NOR="nor_n45ap.bin"
+        DEFAULT_HTTP_BRIDGE_PORT=18080
+        DEFAULT_HTTPS_PORT=18443
+        DEFAULT_HTTPS_CONTROL_PORT=18442
         ;;
     iphone-2g)
         DEFAULT_MACHINE="iPhone-2G"
@@ -34,6 +37,17 @@ case "$PROFILE" in
         DEFAULT_FIRMWARE_DIR="$RESOURCES/iphone_files"
         DEFAULT_IBOOT="iboot_204_m68ap.bin"
         DEFAULT_NOR="nor_m68ap.bin"
+        # Distinct bridge ports so the two bundles are ISOLATED. They used to
+        # share 18080/18443/18442, and since the launcher exits when the HTTPS
+        # bridge cannot bind ("ports may already be in use"), opening one app
+        # made the other refuse to start. The iPod keeps the historical ports
+        # so existing state and guest configuration stay valid.
+        DEFAULT_HTTP_BRIDGE_PORT=18090
+        # The proxy binds a RANGE (one port per TLS slot, ~65), so the iPod's
+        # 18443 default actually occupies 18443..18507. The iPhone therefore
+        # starts a clear 100 above it, not the +10 that would land inside.
+        DEFAULT_HTTPS_PORT=18543
+        DEFAULT_HTTPS_CONTROL_PORT=18542
         ;;
     *)
         echo "Unsupported S5L8900 profile: $PROFILE" >&2
@@ -93,7 +107,28 @@ fi
 
 BRIDGE_PID=""
 HTTPS_PID=""
-BRIDGE_PORT="${S5L8900_HTTP_BRIDGE_PORT:-18080}"
+
+cleanup() {
+    if [[ -n "$BRIDGE_PID" ]]; then
+        kill "$BRIDGE_PID" 2>/dev/null || true
+        wait "$BRIDGE_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$HTTPS_PID" ]]; then
+        kill "$HTTPS_PID" 2>/dev/null || true
+        wait "$HTTPS_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]]; then
+        rm -rf "$STAGE_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# The trap is installed BEFORE any helper starts. It used to be armed only
+# after the HTTPS bridge came up, so the `exit 1` on a bind failure orphaned
+# the already-running HTTP bridge -- which then held ITS port and made the
+# next launch fail too.
+
+BRIDGE_PORT="${S5L8900_HTTP_BRIDGE_PORT:-$DEFAULT_HTTP_BRIDGE_PORT}"
 if [[ "${S5L8900_HTTP_BRIDGE:-1}" != "0" ]] &&
         command -v python3 >/dev/null 2>&1 &&
         [[ -f "$RESOURCES/ipod-http-bridge.py" ]]; then
@@ -102,8 +137,8 @@ if [[ "${S5L8900_HTTP_BRIDGE:-1}" != "0" ]] &&
     BRIDGE_PID=$!
 fi
 
-HTTPS_PORT="${S5L8900_HTTPS_PROXY_PORT:-18443}"
-HTTPS_CONTROL_PORT="${S5L8900_HTTPS_PROXY_CONTROL_PORT:-18442}"
+HTTPS_PORT="${S5L8900_HTTPS_PROXY_PORT:-$DEFAULT_HTTPS_PORT}"
+HTTPS_CONTROL_PORT="${S5L8900_HTTPS_PROXY_CONTROL_PORT:-$DEFAULT_HTTPS_CONTROL_PORT}"
 HTTPS_STATE_DIR="${S5L8900_HTTPS_STATE_DIR:-$HOME/Library/Application Support/S5L8900 HTTPS Bridge/$PROFILE}"
 HTTPS_PROOF_LOG="${S5L8900_HTTPS_PROOF_LOG:-$HTTPS_STATE_DIR/https-proof.jsonl}"
 if [[ "${S5L8900_HTTPS_BRIDGE:-1}" != "0" ]]; then
@@ -121,34 +156,39 @@ if [[ "${S5L8900_HTTPS_BRIDGE:-1}" != "0" ]]; then
     chmod 700 "$HTTPS_STATE_DIR"
     echo "Starting local HTTPS compatibility bridge; TLS metadata only is logged." >&2
     echo "Do not enter credentials into sites you do not intend to intercept." >&2
-    python3 "$RESOURCES/ipod-https-proxy.py" \
-        --port "$HTTPS_PORT" --control-port "$HTTPS_CONTROL_PORT" \
-        --state "$HTTPS_STATE_DIR" --proof-log "$HTTPS_PROOF_LOG" &
-    HTTPS_PID=$!
-    sleep 1
-    if ! kill -0 "$HTTPS_PID" 2>/dev/null; then
-        wait "$HTTPS_PID" || true
-        echo "HTTPS bridge failed to start (ports may already be in use)" >&2
-        exit 1
+    # Try a few port pairs, then boot WITHOUT the bridge rather than refusing
+    # to start. The emulator is the product; the HTTPS bridge is an optional
+    # convenience for browsing, and a busy port (a second copy of this bundle,
+    # or a leaked helper from an earlier crash) must not cost the user their
+    # device. Losing it only means Safari cannot use the local TLS bridge.
+    for attempt in 0 1 2; do
+        try_port=$((HTTPS_PORT + attempt * 100))
+        try_control=$((HTTPS_CONTROL_PORT + attempt * 100))
+        python3 "$RESOURCES/ipod-https-proxy.py" \
+            --port "$try_port" --control-port "$try_control" \
+            --state "$HTTPS_STATE_DIR" --proof-log "$HTTPS_PROOF_LOG" &
+        HTTPS_PID=$!
+        sleep 1
+        if kill -0 "$HTTPS_PID" 2>/dev/null; then
+            HTTPS_PORT="$try_port"
+            HTTPS_CONTROL_PORT="$try_control"
+            export IPOD_HTTPS_PROXY_PORT="$HTTPS_PORT"
+            export IPOD_HTTPS_PROXY_CONTROL_PORT="$HTTPS_CONTROL_PORT"
+            [[ "$attempt" -gt 0 ]] && \
+                echo "HTTPS bridge moved to port $HTTPS_PORT/$HTTPS_CONTROL_PORT" >&2
+            break
+        fi
+        wait "$HTTPS_PID" 2>/dev/null || true
+        HTTPS_PID=""
+    done
+    if [[ -z "$HTTPS_PID" ]]; then
+        echo "WARNING: the HTTPS bridge could not bind a port; starting the" >&2
+        echo "device WITHOUT it. Safari will still browse, but HTTPS sites that" >&2
+        echo "need the local TLS bridge will not work. Close any other copy of" >&2
+        echo "this bundle, or set S5L8900_HTTPS_PROXY_PORT, to get it back." >&2
     fi
-    export IPOD_HTTPS_PROXY_PORT="$HTTPS_PORT"
-    export IPOD_HTTPS_PROXY_CONTROL_PORT="$HTTPS_CONTROL_PORT"
 fi
 
-cleanup() {
-    if [[ -n "$BRIDGE_PID" ]]; then
-        kill "$BRIDGE_PID" 2>/dev/null || true
-        wait "$BRIDGE_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$HTTPS_PID" ]]; then
-        kill "$HTTPS_PID" 2>/dev/null || true
-        wait "$HTTPS_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]]; then
-        rm -rf "$STAGE_DIR" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
 
 QEMU_DIAGNOSTICS=(-serial null)
 DEBUG="${S5L8900_DEBUG:-${IPOD_TOUCH_DEBUG:-0}}"
