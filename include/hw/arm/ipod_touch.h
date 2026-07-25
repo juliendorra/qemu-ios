@@ -132,7 +132,17 @@ const int S5L8900_GPIO_IRQS[7] = { S5L8900_GPIO_G0_IRQ, S5L8900_GPIO_G1_IRQ, S5L
 #define MPVD_MEM_BASE 0x39600000
 #define H264BPD_MEM_BASE 0x39800000
 
-#define TVOUT_WORKAROUND_MEM_BASE 0x8a25960  // workaround for TV Out, to make sure that it can be correctly deallocated without reverse engineering the entire TVOut protocol
+// Workaround for TV Out, to make sure that it can be correctly deallocated
+// without reverse engineering the entire TVOut protocol: a 4-byte always-zero
+// window over one field of the AppleH1TVOut swap-device object that AppleMBX
+// registers ("AppleMBX: Added swap device: AppleH1TVOut id: <kernel VA>").
+// The field is at object+0x160; phys = VA - 0xc0000000 + 0x08000000. The
+// object address is deterministic per kernel build (verified stable across
+// boots and root-image variants), but differs between the iPod and iPhone
+// 1.1.4 kernels, so each board gets its own window. The clean fix would be
+// an MBX/TVOut model that completes swaps for real.
+#define TVOUT_WORKAROUND_MEM_BASE       0x8a25960   // N45AP: id c0a25800 + 0x160
+#define TVOUT_WORKAROUND_M68AP_MEM_BASE 0x89c8560   // M68AP: id c09c8400 + 0x160
 
 typedef struct {
     MachineClass parent;

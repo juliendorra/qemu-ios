@@ -91,12 +91,23 @@ void ipod_touch_prepare_retained_wake(void)
 
 static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
 {
+    /* Rides on IT_FB_TRACE: this always-zero window inside guest RAM is the
+     * upstream hack that lets the iPod kernel's TVOut teardown proceed. If
+     * only N45AP ever touches it, the M68AP kernel's equivalent flag lives
+     * at a different heap address and its TVOut interaction never
+     * completes -- which is what the render investigation observes. */
+    if (getenv("IT_FB_TRACE")) {
+        fprintf(stderr, "[TVOUT-WA] rd +0x%x\n", (uint32_t)addr);
+    }
     return 0;
 }
 
 static void tvout_workaround_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
-
+    if (getenv("IT_FB_TRACE")) {
+        fprintf(stderr, "[TVOUT-WA] wr +0x%x = 0x%08x\n",
+                (uint32_t)addr, (uint32_t)value);
+    }
 }
 
 static const MemoryRegionOps tvout_workaround_ops = {
@@ -1132,10 +1143,15 @@ static void ipod_touch_machine_init(MachineState *machine)
     nms->tvout3_state = tvout_state;
     memory_region_add_subregion(sysmem, TVOUT3_MEM_BASE, &tvout_state->iomem);
 
-    // setup workaround for TVOut
+    // setup workaround for TVOut (per-board: the zeroed swap-device field
+    // sits at a different deterministic heap address in each 1.1.4 kernel
+    // build -- see the TVOUT_WORKAROUND_*_MEM_BASE comment in ipod_touch.h)
     iomem = g_new(MemoryRegion, 1);
     memory_region_init_io(iomem, OBJECT(nms), &tvout_workaround_ops, NULL, "tvoutworkaround", 0x4);
-    memory_region_add_subregion(sysmem, TVOUT_WORKAROUND_MEM_BASE, iomem);
+    memory_region_add_subregion(sysmem,
+                                (nms->board_id == BOARD_ID_M68AP) ?
+                                TVOUT_WORKAROUND_M68AP_MEM_BASE :
+                                TVOUT_WORKAROUND_MEM_BASE, iomem);
 
     qemu_register_reset(ipod_touch_cpu_reset, nms);
 

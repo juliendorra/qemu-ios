@@ -1,23 +1,48 @@
 #include "hw/arm/ipod_touch_tvout.h"
 #include "qapi/error.h"
 
+/* Part of IT_FB_TRACE (see ipod_touch_lcd.c): the TVOut register traffic.
+ * M68AP's SpringBoard attaches the AppleH1TVOut framebuffer and never
+ * detaches it (N45AP's does within two log lines); what the driver programs
+ * here before its silent wait identifies the completion it expects from
+ * this otherwise RAM-backed stub. */
+static bool it_tvout_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("IT_FB_TRACE") != NULL;
+    }
+    return cached;
+}
+
+static void it_tvout_trace(IPodTouchTVOutState *s, const char *dir,
+                           hwaddr offset, uint64_t value)
+{
+    static uint32_t n;
+
+    if (!it_tvout_trace_enabled()) {
+        return;
+    }
+    n++;
+    if (n <= 256 || (n & 0x3FF) == 0) {
+        fprintf(stderr, "[TVOUT%d] %s 0x%03x = 0x%08x (n=%u)\n",
+                s->index, dir, (uint32_t)offset, (uint32_t)value, n);
+    }
+}
+
 static uint64_t ipod_touch_tvout_read(void *opaque, hwaddr offset, unsigned size)
 {
     IPodTouchTVOutState *s = (IPodTouchTVOutState *)opaque;
 
-    //fprintf(stderr, "%s (%d): offset = 0x%08x\n", __func__, s->index, offset);
-
-    // switch(offset) {
-    //     case SDO_IRQ:
-    //         return s->sdo_irq_reg;
-    // }
-
+    it_tvout_trace(s, "rd", offset, s->data[offset]);
     return s->data[offset];
 }
 
 static void ipod_touch_tvout_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
     IPodTouchTVOutState *s = (IPodTouchTVOutState *)opaque;
+
+    it_tvout_trace(s, "wr", offset, value);
 
     //fprintf(stderr, "%s (%d): writing 0x%08x to 0x%08x\n", __func__, s->index, value, offset);
     s->data[offset] = value;

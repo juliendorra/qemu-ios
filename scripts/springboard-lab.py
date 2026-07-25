@@ -145,6 +145,10 @@ PRUNE_SETS = {
         "com.apple.securityd.plist", "com.apple.syslogd.plist",
         "com.apple.update.plist",
     ),
+    # SpringBoard's first post-lockdown act is an IAP query ("Couldn't get
+    # IAP TV out settings" fails fast on N45AP, which has NO iapd); M68AP has
+    # iapd + the accessory stack, so the query may block instead of failing
+    "iap": ("com.apple.iapd.plist",),
 }
 
 # --- hypothesis matrix ----------------------------------------------------
@@ -197,6 +201,10 @@ VARIANTS = {
     "m68ap-mbx-root": dict(board="m68ap", dataark=True, patch=True,
                            sb_env="mbx2d-root",
                            env={"IT_M68AP_NO_BASEBAND": "1"}),
+    # isolation: ONLY drop UserName=mobile (no MBX env) — if mbx-root renders
+    # and this does too, the whole story is the user, not the GPU
+    "m68ap-root": dict(board="m68ap", dataark=True, patch=True, sb_env="root",
+                       env={"IT_M68AP_NO_BASEBAND": "1"}),
     # --- launch-daemon pruning: reduce M68AP to N45AP's known-rendering set
     "m68ap-prune": dict(board="m68ap", dataark=True, patch=True, prune="all13",
                         env={"IT_M68AP_NO_BASEBAND": "1"}),
@@ -204,6 +212,9 @@ VARIANTS = {
                            env={"IT_M68AP_NO_BASEBAND": "1"}),
     "m68ap-prune-svc": dict(board="m68ap", dataark=True, patch=True,
                             prune="svc",
+                            env={"IT_M68AP_NO_BASEBAND": "1"}),
+    "m68ap-prune-iap": dict(board="m68ap", dataark=True, patch=True,
+                            prune="iap",
                             env={"IT_M68AP_NO_BASEBAND": "1"}),
     # --- activation DURABILITY matrix (can the binary patch be dropped?) ---
     # All of these are data-ark-only (patch=False). The question each answers:
@@ -296,6 +307,8 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
                         raise RuntimeError(f"prune target missing: {victim}")
                     victim.unlink()
             tmp.rename(pruned)
+        if root != M68_ROOT_HFS:
+            root.unlink(missing_ok=True)
         root = pruned
     if sb_env:
         mutated = work / f"root-sbenv-{sb_env}.img"
@@ -307,13 +320,18 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
                 plist = (mnt / "System" / "Library" / "LaunchDaemons" /
                          "com.apple.SpringBoard.plist")
                 job = plistlib.loads(plist.read_bytes())
-                job.setdefault("EnvironmentVariables",
-                               {})["LK_ENABLE_MBX2D"] = "0"
-                if sb_env == "mbx2d-root":
+                if sb_env in ("mbx2d", "mbx2d-root"):
+                    job.setdefault("EnvironmentVariables",
+                                   {})["LK_ENABLE_MBX2D"] = "0"
+                if sb_env in ("mbx2d-root", "root"):
                     job.pop("UserName", None)
                 plist.write_bytes(plistlib.dumps(job,
                                                  fmt=plistlib.FMT_BINARY))
             tmp.rename(mutated)
+        # the chained-from root is an intermediate; disk is the scarce
+        # resource here (a filled volume once killed a whole session)
+        if root != M68_ROOT_HFS:
+            root.unlink(missing_ok=True)
         root = mutated
     data = M68_DATA_DMG
     if var_skeleton:
@@ -354,6 +372,12 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
          "--out", str(out), "--signature", "m68ap", "--active-banks", "4",
          "--bbt", "production", "--hfs", str(root), "--data-hfs", str(data),
          "--device", "iPhone1,1", "--ipsw-build", "4A102"])
+    # the NAND embeds both filesystems; drop the intermediate images so a
+    # multi-recipe matrix peaks at one root image, not one per recipe
+    if root != M68_ROOT_HFS:
+        root.unlink(missing_ok=True)
+    if data != M68_DATA_DMG:
+        data.unlink(missing_ok=True)
     return out
 
 
@@ -707,10 +731,13 @@ def main() -> int:
                 VARIANTS[v].get("prune"), VARIANTS[v].get("sb_env"))
                for v in args.variants if VARIANTS[v]["board"] == "m68ap"}
     need = len(recipes) * NAND_TREE_BYTES
-    need += sum(ROOT_HFS_BYTES for r in recipes if r[2])
-    need += sum(ROOT_HFS_BYTES for r in recipes if r[4])
-    need += sum(ROOT_HFS_BYTES for r in recipes if r[5])
-    need += sum(DATA_HFS_BYTES for r in recipes if r[1])
+    # root/data images are intermediates deleted as soon as consumed
+    # (prepare runs serially), so the transient peak is two roots + one data
+    # image regardless of how many recipes mutate the root
+    if any(r[2] or r[4] or r[5] for r in recipes):
+        need += 2 * ROOT_HFS_BYTES
+    if any(r[1] for r in recipes):
+        need += DATA_HFS_BYTES
     if need:
         require_free_bytes(args.logs, need,
                            f"{len(recipes)} NAND recipe(s)")

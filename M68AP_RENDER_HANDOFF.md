@@ -104,6 +104,17 @@ python3 scripts/springboard-lab.py --logs /tmp/sblab \
 #   evidence: PC histogram, LCD bases, FB non-black %, phase, SpringBoard lines, driver tail
 #   --diff A=B: normalised full-log set-diff from the SpringBoard phase on
 
+# Emulator-side display/touch tracing (2026-07-25; the lab sets all three):
+#   IT_FB_TRACE=1    every LCD MMIO access (throttled) + panel SPI bytes
+#   IT_MT_TRACE=1    multitouch dialogue + firmware-upload transitions
+#   IT_FORCE_MT_Z2=1 answer an M68AP guest in Zephyr2 semantics (breaks boot;
+#                    that breakage is itself the proof the guest speaks Z1)
+# Evidence lands in matrix.json under "trace" and in the TRACE DIFF section.
+# New variants: m68ap-z2, m68ap-mbx (LK_ENABLE_MBX2D=0 in the SpringBoard
+# plist, replicating the fix devos50's N45AP image ships), m68ap-mbx-root
+# (same + drop UserName=mobile), m68ap-prune[-hw|-svc] (launch-daemon set
+# reduced toward N45AP's 7-daemon rendering set).
+
 # Baseband matrix (same shape, uart1 rulesets)
 python3 scripts/baseband-lab.py --logs /tmp/bblab --rules <rules...> none builtin
 
@@ -143,34 +154,90 @@ iboot=m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin,nand=/tmp/nand" \
 
 Or just: `python3 scripts/springboard-lab.py --logs /tmp/x --variants m68ap-full`.
 
-## 6. Next investigation avenues (ranked)
+## 6. Next investigation avenues (ranked; updated 2026-07-25)
 
-1. **Find what SpringBoard blocks on.** The system is idle, so this is a
-   *wait*, not a crash. Options, cheapest first:
-   * Instrument the emulator rather than the guest: log every
-     `IOMobileFramebuffer`/`CoreSurface` MMIO and IPC-ish touch after
-     SpringBoard starts (an `IT_FB_TRACE` in the LCD/CoreSurface path), and
-     compare N45AP vs M68AP. The two boards diverge somewhere in that
-     conversation; the emulator sees both sides.
-   * Diff the **launchd job set** between the two firmwares
-     (`/System/Library/LaunchDaemons` in each root FS). N45AP's NAND was pruned
-     by devos50 and restored selectively (see `ipod-nand-restore-dns.py`); the
-     1.1.4 root FS may expect a daemon that never runs here (e.g. an accessory,
-     mediaserver or notification-relay job SpringBoard waits for).
-   * Disassemble SpringBoard's startup after the EverRegistered check
-     (`_hasEverRegistered` at `0xb3ec4` / `0xbdcc4`; log string `0xa392c`) to
-     see what it calls next and which service it expects to answer.
-2. **Multitouch (Zephyr) difference** — `ipod_touch.c` sets
-   `mt->zephyr1 = (board_id == BOARD_ID_M68AP)`; M68AP uses the Zephyr1
-   protocol path. If SpringBoard waits for a touchscreen "ready" event that the
-   Z1 path never delivers, this would look exactly like the observed wait.
-   Cheap test: force `zephyr1 = false` for M68AP and boot.
-3. **Preference *files*, not directories** — configd wants files. Seeding a
+1. **The MBX/LayerKit lead (current best).** Measured 2026-07-25:
+   * `com.apple.SpringBoard.plist` differs between the firmwares. N45AP (the
+     devos50 image that RENDERS) carries `EnvironmentVariables:
+     LK_ENABLE_MBX2D = "0"` — LayerKit's PowerVR-MBX 2D compositing OFF, i.e.
+     software rendering. M68AP's stock 1.1.4 plist has no such override (and
+     runs SpringBoard as `UserName mobile`, where N45AP runs it as root).
+   * Only N45AP ever logs `AppleMBXUserClient::attach(AppleMBXDevice)`.
+   * The emulator's MBX is a do-nothing MMIO stub (`s5l8900_mbx_read/write` in
+     `hw/arm/ipod_touch.c`) — an MBX-compositing SpringBoard blocks silently
+     on a GPU that never completes anything. This matches the wedge exactly,
+     and explains why the shared LCD path renders for one board only.
+   * **Measured — `m68ap-mbx` (env var alone) does NOT render.** Same wedge
+     signature (phase=coresurface, only the iBoot base, all PCs idle). The
+     mutation itself is verified end-to-end: a replayed edit reads back
+     `EnvironmentVariables = {LK_ENABLE_MBX2D: "0"}` from a fresh mount, and
+     M68AP's LayerKit *does* contain the `LK_ENABLE_MBX2D` getenv string (and
+     "Failed to initialized MBX2D driver"), so the knob is honored by the
+     iPhone build. Interpretation shift: N45AP's `AppleMBXUserClient::attach`
+     is probably a *consequence* of SpringBoard getting further, not the
+     cause; the block is likely BEFORE LayerKit compositing begins.
+   * **Measured — `m68ap-mbx-root` and `m68ap-prune` do NOT render either.**
+     Same signature both times (phase=coresurface, iBoot base only, idle).
+     So the SpringBoard plist env, the `mobile`-vs-root user AND the
+     thirteen extra launch daemons are all eliminated.
+   * **The live thread — the TV-Out user client.** Serial ordering
+     (first-matrix evidence, `/tmp/sblab-mt`): N45AP's SpringBoard does
+     `attach(AppleH1TVOut)` → `attach(IOCoreSurfaceRoot)` →
+     **`detach(AppleH1TVOut)`** → `attach(AppleH1CLCD)` → renders, and only
+     *later* logs `Couldn't get IAP TV out settings`. M68AP's SpringBoard
+     does `attach(AppleH1TVOut)` → `attach(IOCoreSurfaceRoot)` → **silence
+     forever** (no TVOut detach, no second CLCD attach, no IAP line). The
+     kernel side is identical on both boards (AppleMBX registers both
+     CLCD+TVOut swap devices; AppleH1TVOut::start completes in ~0.5 s). So
+     the iPhone SpringBoard build blocks inside its TVOut framebuffer
+     interaction — and the emulator's TVOut is a RAM-backed stub
+     (`hw/arm/ipod_touch_tvout.c`) whose `SDO_IRQ` never fires. TVOut MMIO
+     tracing now rides on `IT_FB_TRACE` (`[TVOUT{1,2}]` lines) to show what
+     the driver programs before the silent wait.
+   * **DECODED — the upstream "TVOut workaround" is the mechanism, and it is
+     iPod-specific.** devos50 hit this same hang on the iPod and "got past
+     TVOut" (`f59f20f60e`, 2022) by overlaying a **4-byte always-zero MMIO
+     window at phys `0x8a25960`** — which decodes as kernel VA `0xc0a25960`
+     = N45AP's `AppleMBX: Added swap device: AppleH1TVOut id: c0a25800`
+     **+ 0x160**: one field of the TVOut swap-device object, force-read-as-
+     zero so the teardown proceeds. The M68AP kernel build allocates that
+     object at `c09c8400` (verified byte-stable across four boots and
+     different root-image variants), so its field sits at phys `0x89c8560`
+     and the iPod's window misses it. **Fix VERIFIED**: with the per-board
+     window (`TVOUT_WORKAROUND_M68AP_MEM_BASE 0x89c8560`, board-gated in
+     `ipod_touch.c`), M68AP's kernel polls the new window (20 `[TVOUT-WA]`
+     reads) and the healthy sequence appears for the first time —
+     `detach(AppleH1TVOut)` → re-`attach(AppleH1CLCD)`, SpringBoard advances
+     (8 log lines: BT session retries, then LayerKit activity). Clean
+     version, recorded: model MBX swap completion / the TVOut SDO IRQ
+     instead of zeroing a heap field.
+   * **The NEXT wall after TVOut, measured:** SpringBoard's LayerKit then
+     drives the **MBX 2D path** and the kernel ends in a tight poll —
+     all 8 PC samples at `c03b9698`, which disassembles to the register-read
+     accessor (`ldr r0,[r0,r1]; bx lr`) inside **com.apple.driver.AppleMBX**
+     (kext identified by walking `__PRELINK` back to its Mach-O header). Our
+     MBX is a do-nothing stub, so the polled status never flips; serial dies
+     with user-client terminate storms and two `LKLayer ... bogus layer size
+     (0.0, 0.0)` lines. This is exactly why devos50's iPod image carries
+     BOTH fixes: the TVOut window AND `LK_ENABLE_MBX2D=0`. The earlier
+     `m68ap-mbx` negative is VOID — it wedged at TVOut before the MBX could
+     matter. Decisive combo (TVOut window + `sb_env=mbx2d`) running at
+     update time.
+2. **Launch-daemon set** — measured: M68AP's root runs the full stock twenty
+   daemons; N45AP renders with only seven (AddressBook, CommCenter,
+   SpringBoard, configd, mDNSResponder, lockdown, notifyd). If `m68ap-mbx`
+   does not render, `m68ap-prune[-hw|-svc]` bisects the thirteen extras
+   (BTServer, iapd, usbptpd, coreaudiod touch stubbed hardware).
+3. **Disassemble SpringBoard's startup** after the EverRegistered check
+   (`_hasEverRegistered` at `0xb3ec4` / `0xbdcc4`; log string `0xa392c`) to
+   see what it calls next — now specifically to confirm the LayerKit/MBX
+   surface-creation path and the `LK_ENABLE_MBX2D` getenv.
+4. **Preference *files*, not directories** — configd wants files. Seeding a
    minimal `com.apple.SystemConfiguration.plist` / language + locale
    preferences might unstick the userland chain (`lockdown:
    _load_international_settings: Could not load languages list` is still
    present). Use `inject-guest-file.py`; this is unproven but cheap.
-4. **Bisect the harmful full `/var` skeleton** (`--full`) — understanding *why*
+5. **Bisect the harmful full `/var` skeleton** (`--full`) — understanding *why*
    launchd dies with 56 dirs + `chmod` may itself explain what early userland
    is sensitive to.
 
@@ -195,6 +262,13 @@ Or just: `python3 scripts/springboard-lab.py --logs /tmp/x --variants m68ap-full
   "dubious" non-root plists). lockdownd read a uid-501 data ark happily.
   `inject-guest-file.py --root-owned` covers the strict cases.
 * **`Configuring SpringBoard` is an iPod-only string** — see §3.
+* **hdiutil types raw images by their extension.** A working copy named
+  `root.img.tmp` fails to attach with "image not recognized"; name temp
+  copies `*.tmp.img`. This silently killed the first `sb_env` lab seat.
+* **The disk is contended by parallel sessions.** Another session working in
+  `/Applications` consumed ~3 GB mid-run here. The lab now deletes each
+  intermediate root image as soon as the next stage has consumed it (peak one
+  root image per matrix, not one per recipe), but keep an eye on `df` anyway.
 
 ## 8. Commit trail (this session, oldest → newest)
 

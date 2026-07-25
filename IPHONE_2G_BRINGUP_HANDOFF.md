@@ -13,6 +13,47 @@ the live bring-up state.
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
 
+## Session log — 2026-07-25 (render blocker DECODED: the TVOut workaround is iPod-specific)
+
+Method: everything ran through `scripts/springboard-lab.py` matrices with the
+`n45ap-control` seat in every run; emulator-side tracing added first
+(`IT_FB_TRACE` = all LCD MMIO + panel SPI + TVOut MMIO + TVOut-workaround
+window, `IT_MT_TRACE` = multitouch dialogue, `IT_FORCE_MT_Z2` = protocol
+falsifier). Chronology:
+
+1. **Multitouch ruled out** (matrix: n45ap-control / m68ap-full / m68ap-z2).
+   The Z1 bootloader + raw-firmware upload completes (`firmware_loaded=1` on
+   both boards); `IT_FORCE_MT_Z2` breaks boot at phase=kernel, proving the
+   guest really speaks Z1. The kernel CLCD register programming is identical
+   on both boards (gamma values only) — divergence is in userland.
+2. **SpringBoard plist deltas ruled out.** M68AP's stock
+   `com.apple.SpringBoard.plist` lacks N45AP's `LK_ENABLE_MBX2D=0` env and
+   runs as `UserName mobile`; M68AP's LayerKit does contain the
+   `LK_ENABLE_MBX2D` getenv. Variants `m68ap-mbx` (env), `m68ap-mbx-root`
+   (env+root): both wedge identically (mutation verified end-to-end by plist
+   readback from a fresh mount).
+3. **Launch-daemon set ruled out.** M68AP runs the stock 20 daemons; N45AP
+   renders with 7. `m68ap-prune` (exactly N45AP's set): wedges identically.
+4. **The tell** (serial ordering): N45AP SpringBoard: attach(AppleH1TVOut) →
+   attach(IOCoreSurfaceRoot) → detach(AppleH1TVOut) → attach(AppleH1CLCD) →
+   renders. M68AP: attach(AppleH1TVOut) → attach(IOCoreSurfaceRoot) →
+   silence forever. Kernel side identical (both boards: `AppleMBX: Added
+   swap device` for CLCD and TVOut, TVOut::start ~0.5 s).
+5. **Decoded the 2022 "Got past TVOut" hack** (`f59f20f60e`): the always-zero
+   4-byte window at phys `0x8a25960` is kernel VA `0xc0a25960` = N45AP's
+   TVOut swap-device object `c0a25800` **+ 0x160**. The M68AP kernel
+   allocates that object at `c09c8400` (byte-stable across 4 boots and
+   root-image variants) → its field is at phys `0x89c8560`, outside the
+   iPod's window → TVOut teardown never completes → SpringBoard never
+   proceeds to the CLCD. Fix: per-board workaround window
+   (`TVOUT_WORKAROUND_M68AP_MEM_BASE`), decisive matrix running at
+   log-writing time; verdict recorded below.
+6. Traps hit: `hdiutil` types raw disk images by file extension (a `*.img.tmp`
+   working copy fails to attach); the volume is contended by parallel
+   sessions (~3 GB vanished mid-run) — the lab now deletes intermediate root
+   images as soon as the next stage consumed them and the space guard models
+   that.
+
 ## FINDING + DECISION (2026-07-25): the M68AP black screen is the ACTIVATION gate — hacktivate
 
 **What the iPod (N45AP) taught us, and the original author's own words.** devos50
