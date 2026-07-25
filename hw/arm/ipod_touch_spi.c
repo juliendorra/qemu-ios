@@ -129,9 +129,24 @@ static void apple_spi_run(S5L8900SPIState *s)
         REG(s, R_STATUS) |= R_STATUS_COMPLETE;
         REG(s, R_CTRL) &= ~R_CTRL_RUN;
     }
-    /* A receive transaction that has delivered every byte the driver asked
-     * for is over; tell the peripheral so it does not stay mid-command. */
-    if (rxcnt_in > 0 && REG(s, R_RXCNT) == 0) {
+    /*
+     * Transaction framing, OFF BY DEFAULT (IT_SPI_FRAMING=1 to enable).
+     *
+     * R_RXCNT reaching 0 ends a transfer, so a half-consumed command can be
+     * dropped there -- and doing so made the headless regression test pass
+     * 4/4 (scripts/lock-unlock-probe.py). But in the packaged app, with a
+     * display attached and a human gesture, it made things WORSE: even the
+     * FIRST slide-to-unlock stopped responding, where before the first one
+     * worked. So this boundary is NOT equivalent to "the driver abandoned
+     * that command" -- some legitimate multi-transfer sequence is being reset
+     * mid-way.
+     *
+     * Kept behind a flag rather than deleted, because the desync it targets
+     * is real and measured (T7). Do not enable it by default again without a
+     * test that reproduces the APP's conditions -- a display client driving
+     * gfx_update -- which the headless probe demonstrably does not.
+     */
+    if (rxcnt_in > 0 && REG(s, R_RXCNT) == 0 && getenv("IT_SPI_FRAMING")) {
         ipod_touch_multitouch_transaction_end(s->mt);
     }
 
