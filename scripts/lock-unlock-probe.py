@@ -248,6 +248,13 @@ def main() -> int:
     ap.add_argument("--settle", type=float, default=8,
                     help="seconds to wait after each input before grabbing")
     ap.add_argument("--qemu", type=Path, default=QEMU)
+    ap.add_argument("--app", type=Path,
+                    help="test a PACKAGED bundle instead of the repo build: "
+                         "runs the bundle's own launcher (its engine copy, its "
+                         "firmware, its bridges, its per-launch NAND staging) "
+                         "and appends -qmp/-vnc, which the launcher forwards "
+                         "to QEMU. Closes the gap between 'my test passed' and "
+                         "'the app works'.")
     ap.add_argument("--no-display-client", action="store_true",
                     help="do NOT attach the VNC refresh client. Headless runs "
                          "skip gfx_update entirely, so the touch-readiness "
@@ -284,13 +291,22 @@ def main() -> int:
         if not (iboot and nand and nor):
             ap.error("--iboot/--nand/--nor are required for m68ap")
 
-    cmd = [str(args.qemu),
-           "-M", f"{machine},bootrom={M68_BOOTROM},iboot={iboot},nand={nand}",
-           "-m", "1G", "-pflash", str(nor), "-L", str(PC_BIOS),
-           "-serial", f"file:{serial}",
-           "-qmp", f"unix:{qmp_path},server,nowait"]
+    if args.app:
+        launcher = args.app / "Contents" / "MacOS" / "iPod Touch"
+        if not launcher.exists():
+            ap.error(f"no launcher in bundle: {launcher}")
+        # the launcher builds its own -M/-pflash/-L and forwards "$@"
+        cmd = [str(launcher),
+               "-qmp", f"unix:{qmp_path},server,nowait"]
+    else:
+        cmd = [str(args.qemu),
+               "-M", f"{machine},bootrom={M68_BOOTROM},iboot={iboot},nand={nand}",
+               "-m", "1G", "-pflash", str(nor), "-L", str(PC_BIOS),
+               "-serial", f"file:{serial}",
+               "-qmp", f"unix:{qmp_path},server,nowait"]
     if args.no_display_client:
-        cmd += ["-display", "none"]
+        if not args.app:
+            cmd += ["-display", "none"]
     else:
         # a display BACKEND that a client can attach to, so gfx_update runs
         cmd += ["-vnc", f"127.0.0.1:{args.vnc_port - 5900}"]
