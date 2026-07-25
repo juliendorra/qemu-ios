@@ -125,13 +125,35 @@ committed (Apple activation tokens).
 - `scripts/hacktivate-m68ap.py build-dataark` — emit the minimal binary ark;
   plus `analyse`/`disasm`/`patch` for the fallback string-rename.
 
-**Remaining (the deeper gate):** even Activated + registered, M68AP SpringBoard
-goes SILENT after the registration check — it never logs
-`Configuring SpringBoard for M68AP` (N45AP does) and programs no `0x0f400000`
-base. So there is a gate BELOW lockdown: SpringBoard's board/UI configuration
-does not proceed on M68AP. That is the next thing to chase (SpringBoard's
-`Configuring SpringBoard for %s` path / device capabilities), no longer an
-activation problem.
+**Activation is now fully solved — but it was NOT the render blocker.**
+Two further facts nailed this down:
+
+1. *The cached ActivationState is not authoritative.* `determine_activation_state`
+   re-validates at boot and, finding no valid (Apple-signed) activation RECORD
+   — only the cache string — logs `Setting the activation state to Unactivated`,
+   flipping the device back. The baseband's SIM status just makes it happen
+   sooner (`lookup_baseband_info: We now have SIM status` → activation check);
+   it still flips even with `IT_M68AP_NO_BASEBAND=1`. A forged record is
+   impossible (Apple-signed certs). So the ONE justified binary patch is
+   lockdownd's `Unactivated`→`Activated` string rename (the single activation
+   *authority*), combined with the data ark for the other values — NOT a
+   per-consumer rabbit hole.
+2. *Even held Activated, SpringBoard still does not render.* With the lockdownd
+   patch (0 Unactivated flips, verified) + data ark (EverRegistered cleared) +
+   no baseband, the device stays `[Activated], state 2` — and SpringBoard STILL
+   wedges: only 2 SpringBoard log lines, no `0x0f400000` base, and the guest PC
+   sits 8/8 samples at the kernel WFI-idle loop (`0xc005a9cc`: `mcr p15,…,c7,c0,4`
+   = wait-for-interrupt). So the whole system is quiescent — **SpringBoard's
+   thread is blocked waiting for an event/interrupt that never arrives.**
+
+**Conclusion: the render blocker is SEPARATE from activation** — a SpringBoard
+event-wait (kernel idle), most likely in the display bring-up
+(`IOCoreSurfaceRoot`/`IOMobileFramebuffer` was the last thing attached before
+the wedge) or a service checkin. Chasing it needs syscall/mach-message tracing
+of SpringBoard, or RE of what it blocks on after the lockdown checks — a new,
+deep frontier distinct from everything solved so far. Activation, EverRegistered,
+the data ark, and the reusable tooling are done; the home screen still does not
+paint because of this separate wait.
 
 ### (superseded, kept for reference) hacktivation via lockdownd string-rename
 
