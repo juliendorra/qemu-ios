@@ -44,6 +44,7 @@ import os
 import signal
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -59,6 +60,80 @@ FB_W, FB_H, FB_BYTES = 320, 480, 320 * 480 * 4
 # The unlock slider sits low on the panel; drag left-to-right across it.
 SLIDE_Y = 430
 SLIDE_X0, SLIDE_X1 = 45, 280
+
+
+class DisplayClient(threading.Thread):
+    """A minimal VNC/RFB client whose only job is to make QEMU refresh.
+
+    WHY THIS EXISTS. Headless (`-display none`) QEMU never calls gfx_update,
+    so the LCD model's touch-readiness logic never runs and every touch is
+    refused -- a harness artifact that once "proved" a false regression, and
+    worse, tempted a model change to work around it. With a client attached,
+    QEMU's VNC server refreshes on its own timer, driving gfx_update at ~30 Hz
+    exactly like the packaged app. The pixels are thrown away; only the
+    side effect matters.
+    """
+
+    daemon = True
+
+    def __init__(self, port: int):
+        super().__init__(daemon=True)
+        self.port = port
+        self.ok = False
+        self._stop = threading.Event()
+
+    def run(self):
+        # QEMU opens the VNC socket well after exec (it loads the NAND pack
+        # first), so retry rather than assuming it is listening.
+        sock = None
+        deadline = time.time() + 60
+        while sock is None and time.time() < deadline and not self._stop.is_set():
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port),
+                                                timeout=5)
+            except OSError:
+                time.sleep(1)
+        if sock is None:
+            print("display client: could not connect (is -vnc set?)", flush=True)
+            return
+        sock.settimeout(10)
+        try:
+            ver = sock.recv(12)                       # "RFB 003.00x\n"
+            if not ver.startswith(b"RFB"):
+                return
+            sock.sendall(b"RFB 003.008\n")
+            n = sock.recv(1)[0]                        # security types
+            types = sock.recv(n)
+            if 1 not in types:                         # 1 = None
+                return
+            sock.sendall(bytes([1]))
+            if int.from_bytes(sock.recv(4), "big") != 0:
+                return                                 # SecurityResult
+            sock.sendall(bytes([1]))                   # ClientInit: shared
+            hdr = sock.recv(24)                        # ServerInit
+            name_len = int.from_bytes(hdr[20:24], "big")
+            while name_len > 0:
+                name_len -= len(sock.recv(min(name_len, 4096)))
+            w = int.from_bytes(hdr[0:2], "big")
+            h = int.from_bytes(hdr[2:4], "big")
+            self.ok = True
+            req = (b"\x03\x01" + (0).to_bytes(2, "big") + (0).to_bytes(2, "big")
+                   + w.to_bytes(2, "big") + h.to_bytes(2, "big"))
+            while not self._stop.is_set():
+                sock.sendall(req)                      # FramebufferUpdateRequest
+                try:
+                    if not sock.recv(65536):
+                        break
+                except socket.timeout:
+                    pass
+                time.sleep(0.05)
+        except (OSError, IndexError) as e:
+            print(f"display client error: {type(e).__name__}: {e}", flush=True)
+        finally:
+            sock.close()
+
+    def stop(self):
+        self._stop.set()
 
 
 def _classifier():
@@ -122,11 +197,12 @@ def _abs(q: QMP, px: int, py: int):
                                  "value": int(py / FB_H * 32768)}}]})
 
 
-def slide(q: QMP, steps: int = 12, dwell: float = 0.06):
+def slide(q: QMP, steps: int = 12, dwell: float = 0.06, hold: float = 0.0):
     """Drag across the unlock slider, with motion the guest can track."""
     _abs(q, SLIDE_X0, SLIDE_Y)
     q.cmd("input-send-event", {"events": [
         {"type": "btn", "data": {"down": True, "button": "left"}}]})
+    time.sleep(hold)          # a finger rests before it moves
     for i in range(1, steps + 1):
         _abs(q, SLIDE_X0 + (SLIDE_X1 - SLIDE_X0) * i // steps, SLIDE_Y)
         time.sleep(dwell)
@@ -172,6 +248,18 @@ def main() -> int:
     ap.add_argument("--settle", type=float, default=8,
                     help="seconds to wait after each input before grabbing")
     ap.add_argument("--qemu", type=Path, default=QEMU)
+    ap.add_argument("--no-display-client", action="store_true",
+                    help="do NOT attach the VNC refresh client. Headless runs "
+                         "skip gfx_update entirely, so the touch-readiness "
+                         "logic never executes -- results do not reflect the "
+                         "packaged app. Kept only for A/B against old runs.")
+    ap.add_argument("--vnc-port", type=int, default=5999)
+    # A human slide is slower and produces far more motion frames than the
+    # original 12-step/0.7 s default; this bug is timing-sensitive, so the
+    # gesture must be sweepable.
+    ap.add_argument("--slide-steps", type=int, default=12)
+    ap.add_argument("--slide-dwell", type=float, default=0.06)
+    ap.add_argument("--slide-hold", type=float, default=0.0)
     ap.add_argument("--warmup", type=int, default=0,
                     help="issue N screendumps before touching. Builds that "
                          "evaluate touch readiness inside gfx_update (i.e. "
@@ -199,15 +287,28 @@ def main() -> int:
     cmd = [str(args.qemu),
            "-M", f"{machine},bootrom={M68_BOOTROM},iboot={iboot},nand={nand}",
            "-m", "1G", "-pflash", str(nor), "-L", str(PC_BIOS),
-           "-display", "none", "-serial", f"file:{serial}",
+           "-serial", f"file:{serial}",
            "-qmp", f"unix:{qmp_path},server,nowait"]
+    if args.no_display_client:
+        cmd += ["-display", "none"]
+    else:
+        # a display BACKEND that a client can attach to, so gfx_update runs
+        cmd += ["-vnc", f"127.0.0.1:{args.vnc_port - 5900}"]
     env = dict(os.environ)
     env.setdefault("IT_M68AP_NO_BASEBAND", "1")
     proc = subprocess.Popen(cmd, env=env, stdout=stderr.open("wb"),
                             stderr=subprocess.STDOUT)
     report = {"board": args.board, "cycles": []}
     try:
+        client = None
+        if not args.no_display_client:
+            client = DisplayClient(args.vnc_port)
+            client.start()
+            time.sleep(2)
         time.sleep(args.boot_wait)
+        if client is not None:
+            print(f"display client attached: {client.ok}")
+            report["display_client"] = client.ok
         q = QMP(qmp_path)
         if args.warmup:
             shot = args.logs / "warmup.ppm"
@@ -229,7 +330,7 @@ def main() -> int:
             time.sleep(args.settle)
             d, locked = grab(q, args.logs, classify)
             png(d, args.logs / f"{n:02d}-woken.png")
-            slide(q)
+            slide(q, args.slide_steps, args.slide_dwell, args.slide_hold)
             time.sleep(args.settle)
             d, after = grab(q, args.logs, classify)
             png(d, args.logs / f"{n:02d}-after-slide.png")
@@ -245,12 +346,19 @@ def main() -> int:
             tail = stderr.read_bytes()[mark:].decode("latin1", "replace")
             lcd = [l for l in tail.splitlines()
                    if "[LCD]" in l or "[TOUCH]" in l][:8]
+            # The pixel verdict cannot tell "the slide worked" from "the lock
+            # screen went away"; this can. Requires IT_MT_TRACE>=1.
+            consumed = tail.count("frame consumed")
+            delivered = tail.count("[TOUCH] mouse DOWN")
             report["cycles"].append({"cycle": n, "verdict": verdict,
                                      "slept": slept, "woken": locked,
-                                     "after_slide": after, "model_lines": lcd})
+                                     "after_slide": after, "model_lines": lcd,
+                                     "touches_delivered": delivered,
+                                     "frames_consumed_by_guest": consumed})
             print(f"cycle {n}: {verdict:12} "
                   f"(slept {slept['nonblack_pct']}%, woken "
-                  f"{locked['nonblack_pct']}%, after {after['nonblack_pct']}%)")
+                  f"{locked['nonblack_pct']}%, after {after['nonblack_pct']}%"
+                  f", frames consumed {consumed})")
             for l in lcd:
                 print(f"    {l}")
         q.close()

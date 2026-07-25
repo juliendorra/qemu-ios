@@ -924,6 +924,11 @@ static void ipod_touch_multitouch_consume_frame(IPodTouchMultitouchState *s)
 {
     uint8_t event = s->next_frame->finger_data.event;
 
+    /* The definitive "the guest actually took this touch" signal: anything
+     * else (ATN raised, bytes clocked, screen changed) can be true while the
+     * driver still drops the frame. Tests assert on this. */
+    MT_TRACE("frame consumed (event %u)\n", event);
+
     free(s->next_frame);
     s->next_frame = s->deferred_frame;
     s->deferred_frame = NULL;

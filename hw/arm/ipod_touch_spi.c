@@ -130,24 +130,33 @@ static void apple_spi_run(S5L8900SPIState *s)
         REG(s, R_CTRL) &= ~R_CTRL_RUN;
     }
     /*
-     * Transaction framing, OFF BY DEFAULT (IT_SPI_FRAMING=1 to enable).
+     * SPI transaction framing. ON by default; IT_SPI_FRAMING=0 disables it.
      *
-     * R_RXCNT reaching 0 ends a transfer, so a half-consumed command can be
-     * dropped there -- and doing so made the headless regression test pass
-     * 4/4 (scripts/lock-unlock-probe.py). But in the packaged app, with a
-     * display attached and a human gesture, it made things WORSE: even the
-     * FIRST slide-to-unlock stopped responding, where before the first one
-     * worked. So this boundary is NOT equivalent to "the driver abandoned
-     * that command" -- some legitimate multi-transfer sequence is being reset
-     * mid-way.
+     * R_RXCNT is the number of bytes the driver asked for, so reaching 0 ends
+     * the transfer and any half-consumed command must be dropped. Without
+     * this the multitouch model has NO framing at all: a driver that asks for
+     * fewer bytes than our reply is long -- a short status poll, or a 0xEB
+     * frame poll abandoned once the length reads zero -- leaves the device
+     * stuck mid-command forever, and slide-to-unlock works exactly once per
+     * boot (T7).
      *
-     * Kept behind a flag rather than deleted, because the desync it targets
-     * is real and measured (T7). Do not enable it by default again without a
-     * test that reproduces the APP's conditions -- a display client driving
-     * gfx_update -- which the headless probe demonstrably does not.
+     * History worth keeping: this was briefly disabled because the first
+     * attempt appeared to regress the packaged app. The harness that had
+     * "passed" it was headless, where QEMU never calls gfx_update, so it was
+     * not testing what the app runs. With a display client attached
+     * (scripts/lock-unlock-probe.py, default) the measurements are
+     * unambiguous, at both a 0.7 s and a 4 s gesture:
+     *     framing off -> cycle 1 unlocks, cycles 2+ fail with ZERO frames
+     *                    consumed by the guest
+     *     framing on  -> 3/3 cycles unlock, 46-233 frames consumed each
+     * The env switch exists so the app can be A/B tested in place:
+     *     IT_SPI_FRAMING=0 "/Applications/iPod Touch.app/Contents/MacOS/iPod Touch"
      */
-    if (rxcnt_in > 0 && REG(s, R_RXCNT) == 0 && getenv("IT_SPI_FRAMING")) {
-        ipod_touch_multitouch_transaction_end(s->mt);
+    if (rxcnt_in > 0 && REG(s, R_RXCNT) == 0) {
+        const char *off = getenv("IT_SPI_FRAMING");
+        if (!off || strcmp(off, "0") != 0) {
+            ipod_touch_multitouch_transaction_end(s->mt);
+        }
     }
 
     /* IT_SPI_BURST_TRACE=1: is one "run" one SPI transaction? R_RXCNT is the
