@@ -134,6 +134,26 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                 uint8_t bank;
                 uint32_t cmd = adm_read_u32(
                     s, s->data2_sec_addr + 0x1104 + 0x24);
+                /* IT_NAND_TRACE=1: which NAND operations the guest actually
+                 * issues. 0x200/0x300 are reads, 0x500 is a page WRITE. If a
+                 * board never emits 0x500 its storage is read-only in
+                 * practice, whatever the mount flags say. */
+                if (getenv("IT_NAND_TRACE")) {
+                    static uint32_t seen[8], counts[8], nseen;
+                    uint32_t i;
+                    for (i = 0; i < nseen && seen[i] != cmd; i++) {
+                    }
+                    if (i == nseen && nseen < 8) {
+                        seen[nseen++] = cmd;
+                    }
+                    if (i < 8) {
+                        counts[i]++;
+                        if (counts[i] <= 3 || counts[i] % 512 == 0) {
+                            fprintf(stderr, "[ADM] nand cmd 0x%x n=%u\n",
+                                    cmd, counts[i]);
+                        }
+                    }
+                }
                 // printf("Setting command: 0x%08x\n", cmd);
                 // for(int i = 0; i < 20; i++) {
                 //     printf("0x%08x ", buf[i]);

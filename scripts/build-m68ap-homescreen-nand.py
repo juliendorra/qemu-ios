@@ -88,8 +88,12 @@ def with_software_compositing(root: Path, work: Path) -> Path:
     return out
 
 
-def without_addressbook(root: Path, work: Path, keep: bool) -> Path:
-    """SHORTCUT: drop com.apple.AddressBook, which spins forever here.
+def without_addressbook(root: Path, work: Path, drop: bool) -> Path:
+    """OPT-IN ONLY (--drop-addressbook): remove com.apple.AddressBook.
+
+    Not the default: removing a daemon degrades the device (no Contacts), and
+    the packaged image should be complete. It exists because the daemon costs
+    ~90% of a host core until task T6 lands -- pick your trade-off knowingly.
 
     AddressBook creates its SQLite database on first run. On a GENERATED NAND
     the guest's writes never take effect -- the FTL cannot write to the tree we
@@ -106,7 +110,7 @@ def without_addressbook(root: Path, work: Path, keep: bool) -> Path:
     a stopgap that costs Contacts and nothing else. --keep-addressbook opts
     out for anyone working on T6.
     """
-    if keep:
+    if not keep:
         return root
     out = work / "root-noab.img"
     if out.exists():
@@ -148,8 +152,18 @@ def data_partition(work: Path) -> Path:
     ark = work / "data_ark.plist"
     run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "build-dataark",
          "--out", ark, "--profile", ARK_PROFILE])
+    # The databases the first boot after a restore would have created. Our
+    # guest cannot create them (writes do not reach the generated NAND), and
+    # without them com.apple.AddressBook retries ~250x/s forever. Schema comes
+    # from the firmware's own SQL -- see seed-guest-databases.py. They are
+    # handed to the /var builder so they are written WHILE the volume is
+    # constructed: a file added to a finished image is not reliably traversed
+    # by the 2007 HFS driver.
+    seed = work / "seed"
+    run([sys.executable, SCRIPTS / "seed-guest-databases.py",
+         "--root-hfs", ROOT_HFS, "--out", seed])
     run([sys.executable, SCRIPTS / "build-m68ap-var.py",
-         "--out", out, "--data-ark", ark])
+         "--out", out, "--data-ark", ark, "--seed-dir", seed])
     return out
 
 
@@ -162,9 +176,9 @@ def main() -> int:
     ap.add_argument("--work", type=Path,
                     help="scratch dir (default: <out>.work, removed on success)")
     ap.add_argument("--keep-work", action="store_true")
-    ap.add_argument("--keep-addressbook", action="store_true",
-                    help="keep com.apple.AddressBook (it spins at ~98%% CPU "
-                         "until the generated NAND accepts writes -- task T6)")
+    ap.add_argument("--drop-addressbook", action="store_true",
+                    help="remove com.apple.AddressBook instead of seeding its "
+                         "database (last-resort fallback; costs Contacts)")
     args = ap.parse_args()
 
     for needed in (ROOT_HFS, DATA_DMG):
@@ -182,7 +196,7 @@ def main() -> int:
                        "the M68AP home-screen NAND")
 
     root = with_software_compositing(patched_root(work), work)
-    root = without_addressbook(root, work, args.keep_addressbook)
+    root = without_addressbook(root, work, args.drop_addressbook)
     data = data_partition(work)
 
     print("[4/4] building the NAND tree")

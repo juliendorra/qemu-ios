@@ -151,6 +151,14 @@ def main() -> int:
                     help="output raw HFS image for --data-hfs")
     ap.add_argument("--size-from", type=Path, default=DEFAULT_SIZE_FROM,
                     help="take the image size from this file")
+    ap.add_argument("--seed-dir", type=Path,
+                    help="copy every *.sqlitedb here into "
+                         "mobile/Library/AddressBook/ WHILE the volume is "
+                         "being built. Files added to an already-built image "
+                         "are not always traversed by the 2007 HFS driver, so "
+                         "seeded databases must be written during construction "
+                         "-- the same reason the data ark is copied here and "
+                         "not injected afterwards.")
     ap.add_argument("--data-ark", type=Path,
                     help="also inject this binary plist at "
                          "root/Library/Lockdown/data_ark.plist")
@@ -189,6 +197,12 @@ def main() -> int:
         if args.full:
             for rel in ("tmp", "run"):
                 (mnt / rel).chmod(0o1777)
+        if args.seed_dir:
+            target = mnt / "mobile/Library/AddressBook"
+            target.mkdir(parents=True, exist_ok=True)
+            for db in sorted(args.seed_dir.glob("*.sqlitedb")):
+                shutil.copy(db, target / db.name)
+                made.append(f"mobile/Library/AddressBook/{db.name}")
         if args.data_ark:
             dest = mnt / "root/Library/Lockdown/data_ark.plist"
             dest.parent.mkdir(parents=True, exist_ok=True)
