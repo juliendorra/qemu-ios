@@ -85,6 +85,47 @@ fully traverse for *newly inserted* files, so lockdownd's `fopen` of the injecte
 file fails ("Could not load data_ark"). Adding a new catalog entry via macOS is
 the unreliable operation.
 
+### HOW OUR ACTIVATION DIFFERS FROM THE iPod'S — and why we cannot simply copy it
+
+**What the iPod (N45AP) actually has.** Its shipped NAND is activated the
+legitimate way: alongside the data ark there is a **genuine, Apple-signed
+activation record** at `/var/root/Library/Lockdown/activation_records/
+pod_record.plist`, containing `AccountToken`, `AccountTokenCertificate`,
+`AccountTokenSignature`, `DeviceCertificate` and `FairPlayKeyData`. That is
+exactly what the upstream author describes: *"I also had to copy activation
+records from an actual device to bypass device activation"* (devos50, Part I).
+The iPod is therefore **activated with a real record**, not with a bypass.
+
+**Why we cannot reproduce that for M68AP.**
+- The record is **Apple-signed** (certificate + signature) and **device-bound**
+  (it carries a device certificate). It cannot be synthesised or forged, and
+  the iPod's own record will not transfer to an iPhone.
+- Obtaining one legitimately requires a **physically owned iPhone 1,1** to dump
+  it from — hardware the project does not assume — and the repo's artifact
+  policy forbids committing/redistributing activation material anyway
+  (`IPHONE_2G_OS_1_FEASIBILITY.md`: no activated NAND in the repo; a demo must
+  use a *local, documented provisioning path* and must not depend on the
+  long-retired carrier activation service).
+- The original iTunes/AT&T activation service is dead, so there is no way to
+  obtain a fresh record for an emulated device.
+
+**Hence the rationale for a different route.** We reproduce the *effect* of an
+activation record with the least invasive mechanism that is fully local and
+carries no Apple material:
+1. **Data ark first** (preferred, iPod-shaped): one binary `data_ark.plist`
+   that lockdownd serves to every consumer. Universal — no per-binary patching.
+2. **Only if the ark cannot survive re-validation**, a single byte patch in
+   **lockdownd**, the sole activation *authority*, rather than patching each
+   consumer (SpringBoard, CommCenter, Preferences…). That keeps the hack at one
+   well-understood point instead of spreading it.
+
+The open question — whether step 2 can be dropped entirely — is being measured
+by the `ark-minimal|factory|unactsvc|all` variants in
+`scripts/springboard-lab.py` (does `[Activated]` survive
+`determine_activation_state`'s boot re-validation using only lockdownd's
+data-driven levers `FactoryActivated` / `AllowUnactivatedService`?). If one
+holds, hacktivation becomes **pure data**, and the binary patch is deleted.
+
 ### RESOLVED THE RIGHT WAY: authentic data-ark injection (one source of truth, no per-binary patches)
 
 **The iPod's method, applied to M68AP.** N45AP renders because its NAND ships a
@@ -145,6 +186,34 @@ Two further facts nailed this down:
    sits 8/8 samples at the kernel WFI-idle loop (`0xc005a9cc`: `mcr p15,…,c7,c0,4`
    = wait-for-interrupt). So the whole system is quiescent — **SpringBoard's
    thread is blocked waiting for an event/interrupt that never arrives.**
+
+**Parallel discovery harness (`scripts/springboard-lab.py`).** Same shape as the
+baseband lab: boots N variants concurrently (staggered, to dodge the USB-start
+contention race), self-judges each — `rendered` (a kernel FB base was
+programmed) / `wedged` (serial static AND every PC sample in the kernel idle
+loop) / `crawling` (static but PCs spread) / `panicked` / `timeout` — and
+collects PC histogram, LCD bases, FB non-black %, last boot phase, SpringBoard
+lines and the driver tail. `--diff A=B` prints driver/service tokens present in
+one instance and absent in the other. Hypotheses live in a `VARIANTS` table, so
+adding one is a data edit.
+
+First matrix (n45ap-control, m68ap-full, m68ap-full-bb, m68ap-plain):
+
+| instance | verdict | phase | bases |
+|---|---|---|---|
+| n45ap-control | **rendered** | configuring | 0x0f400000, 0x0f496000, 0x0fe00000 |
+| m68ap-full (ark+patch, no bb) | wedged | coresurface | 0x0fe00000 |
+| m68ap-full-bb (ark+patch, bb) | wedged | coresurface | 0x0fe00000 |
+| m68ap-plain (untouched) | wedged | coresurface | 0x0fe00000 |
+
+Reading it: every M68AP config stops at the same place regardless of activation
+state or baseband — so the render blocker is **insensitive to both**. CAVEAT on
+the `phase` column: `Configuring SpringBoard` does **not exist as a string in
+M68AP's 1.1.4 SpringBoard binary**, so `configuring` is unreachable on M68AP by
+construction; `coresurface` is its ceiling and the phase difference alone proves
+nothing. The real evidence is that no kernel FB base is ever programmed and all
+framebuffers stay black. Also note m68ap-full/-bb sampled `idle=False` on the
+second sampling pass (some thread still runs) while m68ap-plain was fully idle.
 
 **Conclusion: the render blocker is SEPARATE from activation** — a SpringBoard
 event-wait (kernel idle), most likely in the display bring-up

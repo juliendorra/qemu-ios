@@ -226,12 +226,37 @@ DATA_ARK = {
     "-ProtocolVersion": "2",
 }
 
+# Profiles for the activation-DURABILITY question: the `minimal` ark above sets
+# only the *cached* state, which `determine_activation_state` re-validates at
+# boot and overrides back to Unactivated (no Apple-signed activation record
+# exists). lockdownd carries two data-driven levers that may satisfy that
+# re-validation WITHOUT any binary patch -- if either holds, hacktivation
+# becomes pure data, like the iPod's populated ark:
+#   * FactoryActivated        -> lockdownd logs "The device was factory
+#                                activated" on a path that skips ticket checks
+#   * AllowUnactivatedService -> lets the device serve while unactivated
+# `all` sets both plus a non-cache ActivationState in the default domain.
+ARK_PROFILES = {
+    "minimal": {},
+    "factory": {"-FactoryActivated": True, "-ActivationState": "FactoryActivated"},
+    "unactsvc": {"-AllowUnactivatedService": True},
+    "all": {"-FactoryActivated": True, "-ActivationState": "Activated",
+            "-AllowUnactivatedService": True,
+            "com.apple.mobile.lockdown-ActivationState": "Activated"},
+}
 
-def build_dataark(out: Path):
+
+def build_dataark(out: Path, profile: str = "minimal"):
     import plistlib
-    out.write_bytes(plistlib.dumps(DATA_ARK, fmt=plistlib.FMT_BINARY))
-    print(f"wrote binary data_ark.plist ({out.stat().st_size} bytes) -> {out}")
-    print("keys:", ", ".join(DATA_ARK))
+    if profile not in ARK_PROFILES:
+        raise SystemExit(f"unknown profile {profile!r}; "
+                         f"known: {', '.join(ARK_PROFILES)}")
+    ark = dict(DATA_ARK)
+    ark.update(ARK_PROFILES[profile])
+    out.write_bytes(plistlib.dumps(ark, fmt=plistlib.FMT_BINARY))
+    print(f"wrote binary data_ark.plist [{profile}] "
+          f"({out.stat().st_size} bytes) -> {out}")
+    print("keys:", ", ".join(sorted(ark)))
     print("next: inject-guest-file.py --image <data.hfs> --src", out,
           "--dest /root/Library/Lockdown/data_ark.plist")
 
@@ -243,6 +268,10 @@ def main() -> int:
     da = sub.add_parser("build-dataark",
                         help="emit a minimal binary lockdown data_ark.plist")
     da.add_argument("--out", type=Path, required=True)
+    da.add_argument("--profile", default="minimal",
+                    choices=sorted(ARK_PROFILES),
+                    help="extra activation levers to include (default: "
+                         "minimal = cached ActivationState only)")
     a = sub.add_parser("analyse", help="locate the activation patch site (fallback)")
     a.add_argument("--lockdownd", type=Path, required=True)
     dd = sub.add_parser("disasm", help="disassemble a vm range")
@@ -255,7 +284,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.cmd == "build-dataark":
-        build_dataark(args.out)
+        build_dataark(args.out, args.profile)
         return 0
     if args.cmd == "analyse":
         analyse(args.lockdownd.read_bytes())
