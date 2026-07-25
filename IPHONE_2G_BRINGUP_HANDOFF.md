@@ -85,7 +85,33 @@ fully traverse for *newly inserted* files, so lockdownd's `fopen` of the injecte
 file fails ("Could not load data_ark"). Adding a new catalog entry via macOS is
 the unreliable operation.
 
-**Pivot (robust): in-place byte-patch of lockdownd on the ROOT FS.** The root FS
+### SUCCESS: hacktivation via string-rename works (device → [Activated]); next gate is EverRegistered
+
+`scripts/hacktivate-m68ap.py` patches the root-HFS image bytes directly (never
+via a macOS HFS mount, so the write-visibility problem cannot bite). The robust,
+code-path-independent patch: **rename lockdownd's "Unactivated" CFString constant
+to "Activated"** — two same-length raw edits (the C string `Unactivated\0` →
+`Activated\0\0\0`, plus the CFString length word 11→9 in the two constants that
+point at it). Whatever activation state lockdownd computes, it now reports the
+string "Activated", and SpringBoard's exact-string compare passes.
+
+Result (verified): `SpringBoard[15]: lockdown says the device is: [Activated],
+state is 2` — the activation gate is CLEARED. lockdownd RE that pinned this:
+determine_activation_state (~vm 0xe000) is a large path-dependent function; the
+plain "Unactivated" constant (0x109cf8) is only used on the IMEI-mismatch path
+(0xe1a8) which an empty-record device skips, so a pool redirect there does NOT
+help — renaming the string does, regardless of path.
+
+**BUT a second gate appeared.** SpringBoard's very next (and last) log line is
+`lockdown didn't have a EverRegistered value set`, then it goes silent and still
+programs no framebuffer base (0x0f400000 stays 0%). So after activation,
+SpringBoard blocks on **EverRegistered** (was the device ever registered/synced
+with iTunes). This is the same class of lockdown-value gate; clear it next
+(make lockdownd report EverRegistered=true, or patch SpringBoard's check).
+
+---
+
+### (superseded) earlier pivot note — in-place byte-patch of lockdownd on the ROOT FS The root FS
 is devos50's original, guest-readable HFS. Overwriting bytes *inside an existing
 file, same size* changes only data blocks — the catalog entry and extents are
 untouched, so the guest reads the patched bytes (far more reliable than inserting
