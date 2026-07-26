@@ -1,6 +1,10 @@
 # How M68AP got to the home screen — the full path, including the wrong turns
 
-**Date:** 2026-07-25 · **Branch:** `ipod_touch_1g`
+**Date:** 2026-07-25, extended 2026-07-26 · **Branch:** `ipod_touch_1g`
+
+Cases in this file: **1** the black screen (render/compositing/activation),
+**2** slide-to-unlock dying after a sleep/wake (T7), **3** the iPhone app
+pegging a host core (T6), **4** the iPhone not waking from Home (T7b).
 
 The iPhone 2G (M68AP) went from *"boots to SpringBoard, black screen forever"*
 to *"iPhone OS 1.1.4 home screen"* in one session. Three separate faults were
@@ -308,3 +312,157 @@ of the ladder actually proves:
 Rule of thumb this session earned: **if the harness cannot observe the thing
 under test without changing it, the harness is wrong** — do not change the
 model to make the test work.
+
+
+# Case 3 — the iPhone app pegged a host core (T6)
+
+**Reported:** `iPhone 2G.app` burns ~98% of a host core sitting on its home
+screen; `iPod Touch.app` idles at 11–15%. **Fixed 2026-07-26.** Root cause:
+the `/var` partition we generate was missing the directory skeleton the OS
+expects — a skeleton the root filesystem itself ships as a template.
+
+## The real bug, in one paragraph
+
+`com.apple.AddressBook` (`ABDatabaseDoctor`) found no tables in its database,
+tried to create them, and `CREATE TABLE` returned **SQLITE_BUSY** — "error 5
+creating properties table: database is locked" — about 250 times a second,
+forever. The daemon is not the bug. Our `/var` (disk0s2, an HFS partition we
+build ourselves because we do not run Apple's restore) contained a
+**hand-written 8-directory list**. A real device's `/var` is laid down by the
+restore ramdisk from a template the root filesystem carries at
+`/private/var`: 73 entries with their real modes — `tmp` (1777), `run`,
+`preferences`, `logs`, `log`, `db/{dyld,timezone}`, `Keychains`, `vm`, `msgs`,
+`empty`, `mobile/{Library,Media}`, `root/Library`. Nothing that needed to
+write to /var could.
+
+## The fix
+
+`build-m68ap-var.py --template-from <root image>` copies that template in with
+`ditto` (modes survive; a `mkdir` loop does not preserve 1777), and the product
+recipe passes the root image. One line of configuration, but it had to be
+*found*.
+
+Measured on the app's own artifacts, before → after:
+
+| | before | after |
+|---|---|---|
+| idle CPU | ~98% | **6–10%** (iPod: 11–15%) |
+| `database is locked` in the guest log | 2 057 in the first 90 s | **0** |
+| `no such table` | 15 592 AddressBook lines/boot | **0** |
+| home screen | renders | renders (69.6% non-black) |
+| guest clock | `Jan 1 00:00` | real date — `/var/db/timezone` exists now |
+
+## Dead ends and false paths, in order
+
+1. **"The guest's writes never reach the NAND."** The inherited diagnosis, and
+   already half-corrected by the previous session: writes DO happen. Pursuing
+   it further with `IT_NAND_WRITABLE=1` + `IT_NAND_RB=1` produced **zero
+   read-back hits**, which looks damning and means nothing — a page just
+   written sits in the guest's buffer cache, so it is never re-read. *A
+   measurement that cannot distinguish its hypothesis from the null case.*
+2. **"Then the written pages land at the wrong addresses."** 131 of 132 page
+   writes landed in the boot partition's *physical* range rather than /var's.
+   Also meaningless: the FTL allocates fresh physical pages from its own free
+   pool and remaps, so physical addresses say nothing about which logical
+   partition was written. Dropped.
+3. **"The seeded database never made it into the shipped image."** It did —
+   118 784 bytes, page size 4096, schema format 1, 20 tables including
+   `ABPerson` and `_SqliteDatabaseProperties`, `integrity_check` ok. Getting
+   at it required fixing `extract-hfs-from-nand.py` twice (below).
+4. **"The guest cannot READ the seeded database."** Killed decisively: the
+   file's SQLite magic was corrupted **through a NAND page override** (2 KB
+   written into `bank3/60532.page`) and SpringBoard immediately reported
+   `SQLITE_CORRUPT encountered while accessing
+   /var/mobile/Library/AddressBook/AddressBook.sqlitedb, exiting`. The bytes
+   reach SQLite; the daemon was never failing to read.
+5. **"Two `ABDatabaseDoctor`s are locking each other out"** (the job is
+   `OnDemand` with a `MachService`, so it is plausible). Every AddressBook
+   line in the log carries the same pid — `16/com.apple.AddressBook`. One
+   instance.
+6. **"It is looking under the wrong `$HOME`."** Strong-looking evidence: the
+   *real iPod device dump* keeps its AddressBook under `/var/root`, not
+   `/var/mobile`. But that iPod runs 1.1, whose daemon plist has no
+   `UserName` (so, root); the 1.1.4 plist says `UserName=mobile`. A second
+   copy placed at `/var/root/Library/AddressBook/` changed nothing.
+7. **"The volume is case-sensitive and the real device's is not."** Both are
+   HFSX. Dead.
+8. **"SQLite 3.1.3 cannot read a page-size-4096 database."** The guest really
+   does ship SQLite 3.1.3 (2005), so this was worth a look — but the *real
+   device's own* AddressBook database is page size 4096 too. Dead without
+   spending a single boot on it.
+
+The turn came from asking a different question: not "why does SQLite fail?"
+but **"what does a real device's /var contain?"** — and the answer was sitting
+inside the root filesystem we already ship.
+
+## Tools this produced
+
+| Tool | Use |
+|---|---|
+| `scripts/overlay-hfs-into-nand.py` | **The loop that made T6 tractable.** Drops an HFS partition image into a NAND tree as `bank<N>/<page>.page` overrides, spare copied from the pack so FTL metadata is byte-identical. Editing `/var` and booting went from a full NAND rebuild (minutes, ~900 MB of scratch on a disk that is always ~98% full) to about a second. Every hypothesis above was tested through it. |
+| `scripts/extract-hfs-from-nand.py` (2 fixes) | It addressed pack entries as if `active_banks` were always 8 — true for the iPod's real dump, false for the generated 4-bank M68AP NAND, where it read the wrong pages and died with "invalid HFS volume signature". It also refused any pack with holes, which every generated (sparse) NAND has. Holes now read as zeros, exactly as the model reads them. |
+| `S5L8900_DEBUG=1` | Serial on stdout from either bundle. The cheapest window into the guest, and where every count above came from. |
+| `IT_NAND_WATCH=<bank>/<page>` | "Did the guest ever read this file?" — used to place, then discard, hypothesis 4. |
+
+## Lessons
+
+* **When a working reference exists, read it before theorising.** Two full
+  hypotheses (`$HOME`, page size) were settled in minutes by looking at the
+  real device's own files, and the *fix itself* came from the root filesystem's
+  own template.
+* **Build the fast loop first.** Four of the eight dead ends were each one boot
+  away from being killed; they only got chased because a boot used to cost a
+  NAND rebuild.
+* **A measurement that cannot fail is not evidence.** "No read-back hits" and
+  "writes land in the wrong physical range" both looked like findings and were
+  compatible with a perfectly healthy system.
+* **A daemon spinning on an error is usually right about its environment.**
+
+
+# Case 4 — the iPhone would not wake: P slept it, H did nothing (T7b)
+
+**Reported:** on `iPhone 2G.app`, Power sleeps the device and Home does
+nothing; the iPod wakes from the same keys. **Fixed 2026-07-26.**
+
+## The real bug, in one paragraph
+
+`ipod_touch_key_event()` used `GPIO_BUTTON_HOME` (0x1606) and
+`GPIO_BUTTON_HOME_IRQ` (0x2E) for **both** boards. Those are the *iPod's*
+values. M68AP's device tree (`buttons` node, compatible `buttons,m68`) puts
+`button_menu` on **0x1600**, and 0x2E is not in its interrupt list at all.
+Power (`hold`, 0x1605) is shared between the boards — which is exactly why
+one key kept working and the other did not.
+
+## The fix, and the honest part of it
+
+Home is now board-aware (`ipod_touch_home_pin()` / `ipod_touch_home_irq()`).
+The **pin is certain** (it is in the device tree). The **IRQ is a derivation**:
+N45AP fixes the rule `IRQ = 0x28 + (pin & 0xf)` (0x1605→0x2D, 0x1606→0x2E),
+and applying it to M68AP's five button pins reproduces its device tree's
+interrupt SET exactly — `0x2d 0x28 0x29 0x2a 0x2b`, with 0x2C absent precisely
+because pin 0x1604 is unused. That is strong, but it is inference from a set,
+not a measured pairing, so `IT_M68AP_HOME_IRQ=<n>` overrides it without a
+rebuild.
+
+## The A/B that proves it
+
+Same NAND, same fixed `/var`, only the engine differing — the pre-fix engine
+is the one still inside the shipped bundle, so no rebuild was needed to get a
+baseline:
+
+| | cycle 1 | cycle 2 |
+|---|---|---|
+| pre-fix engine | no `[LCD] Merlot panel woke from sleep` at all; screen frozen at its pre-sleep 63.5% (the pixel classifier called this "unlocked" — a false pass) | `stuck-locked` at 42.2% |
+| post-fix engine | wakes: 69.1% home → sleep → H → 42.2% lock screen → slide → 69.1% home | same, 2/2 `unlocked` |
+
+Recorded as a limitation: neither run counted touch frames at the model
+boundary, because `lock-unlock-probe.py` only reports them when the **caller**
+sets `IT_MT_TRACE=1`. The wake claim rests on the panel's own wake trace and
+on the lock screen actually appearing, not on pixels alone.
+
+## Lesson
+
+**Shared hardware hides board divergence.** Power sits on the same pin on both
+boards, so the button path looked "tested" for as long as anyone only pressed
+P. The device tree for each board is the specification — read it per board,
+not once.
