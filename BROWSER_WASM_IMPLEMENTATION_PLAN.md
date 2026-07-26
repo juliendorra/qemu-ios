@@ -1,14 +1,27 @@
-# Browser/WebAssembly iPod touch Emulator Plan
+# Browser/WebAssembly Emulator Plan
 
 > **Historical provenance:** Carried forward on 2026-07-21 from
-> `ipod_touch_1g-qemu6-legacy` at `4221943495`. This remains a planning record;
-> status and branch references inside it should be read as dated context.
-
+> `ipod_touch_1g-qemu6-legacy` at `4221943495`.
+>
+> **Revised 2026-07-26.** The original text assumed a QEMU 6.2.50 tree with no
+> Emscripten support and a NAND stored as ~133,000 individual page files. Both
+> assumptions are obsolete: the tree is QEMU 11.0.2 with upstream Emscripten
+> support, and the packed NAND exists and ships in the packaged apps. The
+> sections below have been rewritten accordingly. Live, dated state lives in
+> [`BROWSER_WASM_STATUS.md`](BROWSER_WASM_STATUS.md); this file is the design of
+> record.
 
 ## Status and decision
 
-This document is the implementation plan for running the existing first-generation
-iPod touch emulator entirely in a web browser.
+This document is the implementation plan for running the existing S5L8900
+emulator entirely in a web browser.
+
+**Primary target: iPhone 2G (M68AP) running iPhone OS 1.1.4.** That software
+stack reaches the home screen on the native emulator and is the build the
+browser port must reproduce. The iPod touch (N45AP) remains a supported asset
+set — the machine, the tooling, and the frontend are board-agnostic and select a
+board from the asset manifest — but it is no longer the thing being aimed at
+first.
 
 The project will produce two deployment flavors from one codebase:
 
@@ -22,13 +35,18 @@ Both flavors execute QEMU and the guest locally. There is no remote emulator and
 no server-side VM. A server is needed only to serve static files with the HTTP
 headers required for threaded WebAssembly.
 
-The browser port must be based on a modern QEMU tree with Emscripten host support.
-The iPod device model should be forward-ported to that tree. Backporting the Wasm
-runtime and TCG changes into this QEMU 6.2.50 fork is not the planned approach.
+The browser port must be based on a modern QEMU tree with Emscripten host
+support. **This has happened.** The tree is QEMU 11.0.2 (`QEMU_11_PORT.md`), the
+machines are forward-ported, and 11.0.2 carries Emscripten host support
+upstream: `host_os == 'emscripten'`, `--cpu=wasm64`, `util/coroutine-wasm.c`,
+`os-wasm.c`, `configs/meson/emscripten.txt`, and a cross-build container recipe
+at `tests/docker/dockerfiles/emsdk-wasm64-cross.docker`. No out-of-tree patch
+set is required to build for the browser.
 
 ## Goals
 
-- Boot the same N45AP/iPod1,1 software stack as the native emulator.
+- Boot the same M68AP/iPhone1,1 iPhone OS 1.1.4 stack as the native emulator,
+  and keep N45AP/iPod1,1 bootable from the same build.
 - Reach a usable SpringBoard with display, touch, Home, Power, sleep, and wake.
 - Run all guest code on the student's computer inside the browser sandbox.
 - Ship a fast classroom deployment that needs no student interaction before boot.
@@ -36,7 +54,8 @@ runtime and TCG changes into this QEMU 6.2.50 fork is not the planned approach.
   artifacts and caches them after the first run.
 - Use one frontend, one QEMU/Wasm build, one asset schema, and one test suite for
   both deployment flavors.
-- Preserve a working native build as a reference during the forward port.
+- Keep the native build (`build-ipod11/`) working as the correctness oracle the
+  browser build is measured against.
 - Make asset identity, integrity, cache state, and emulator version visible and
   diagnosable.
 - Allow the prepared application to work offline after its assets have been
@@ -62,38 +81,37 @@ The existing machine is a good browser target:
 - The display is 320 by 480 pixels at 32 bits per pixel.
 - The LCD refresh timer currently runs at 10 Hz.
 - Touch is already represented as normalized absolute pointer input.
-- The iPod-specific implementation is contained in roughly 43 files and 7,400
-  lines under `hw/arm`, `hw/i2c`, and `include/hw`.
+- One machine file serves both boards: `-M iPhone-2G` and `-M iPod-Touch` differ
+  by board ID, and per-board facts (PMU I²C bus, NAND bank count, button pin,
+  security epoch, TV-out workaround address) branch inside it.
+- The device implementation is contained in roughly 43 files under `hw/arm`,
+  `hw/i2c`, and `include/hw`.
 
-The present NAND representation is the main browser-specific obstacle:
+### The NAND base pack already exists
 
-Before sharing this backend with a browser port, the native cleanup audit in
-`SLEEP_WAKE_INVESTIGATION.md` Phase 17 must be resolved or explicitly carried
-forward. In particular, the current synchronous page-per-file reads and
-`*_new.page` writes are both a native performance issue and an incomplete
-persistence contract. Browser work must not preserve that behavior merely for
-source compatibility: the packed immutable base plus copy-on-write overlay
-below is also the intended clean semantic boundary for a future native
-backend.
+The original obstacle here — a NAND stored as ~133,000 individual `.page` files,
+opened synchronously during emulation — has been solved natively and does not
+need solving again for the browser:
 
-The native implementation now has the first half of that boundary: an optional
-indexed, read-only `nand.pack` maps canonical base pages without per-page file
-opens, while retaining the legacy directory fallback. A three-pair M2 cold-boot
-benchmark reduced median time to SpringBoard from 9.292 to 5.687 seconds. The
-writable half is intentionally not implemented yet. Testing proved that the
-old `*_new.page` files are incomplete program captures: giving them read
-precedence makes iBoot see an HFS signature of zero and enter recovery. Browser
-and native overlays must therefore share a newly specified program/erase and
-spare-metadata contract rather than importing those files.
+- `scripts/pack-ipod-nand.py` builds a deterministic immutable base pack
+  (`IPODNAND` v1: 20-byte header, sorted fixed-width index, 2,112-byte payloads).
+- `hw/arm/ipod_touch_nand.c` maps it with `g_mapped_file`, binary-searches the
+  index, validates magic/version/size/sort order, and keeps the legacy
+  per-page directory as a fallback the browser never ships.
+- A three-pair M2 cold-boot benchmark reduced median time to SpringBoard from
+  9.292 to 5.687 seconds.
+- The packaged apps already ship a single `nand.pack` (~300 MiB for M68AP 1.1.4)
+  instead of a page tree, so the browser's asset set is a straight copy.
 
-- Approximately 133,000 individual `.page` files are used.
-- Each page contains 2,048 data bytes and 64 spare bytes.
-- The unpacked tree consumes roughly 521 MiB because of per-file allocation.
-- The actual page payload is roughly 269 MiB.
-- The existing compressed archive is roughly 162 MiB.
-- The current device opens individual page files synchronously during emulation.
+What remains unimplemented is the **writable half**: the copy-on-write overlay
+specified below. Testing proved the old `*_new.page` files are incomplete
+program captures — giving them read precedence makes iBoot see an HFS signature
+of zero and enter recovery — so browser and native overlays must share a newly
+specified program/erase and spare-metadata contract rather than importing those
+files.
 
-The browser build must not reproduce that directory tree in MEMFS or IndexedDB.
+The browser build must not reproduce the per-page directory tree in MEMFS or
+IndexedDB; it consumes the pack directly.
 
 ## High-level architecture
 
@@ -108,8 +126,8 @@ Browser page
           v
 Dedicated worker
   |-- QEMU compiled to WebAssembly
-  |-- ARM TCI plus hybrid Wasm JIT when available
-  |-- N45AP machine and S5L8900 device models
+  |-- ARM TCI (a hybrid Wasm JIT only if measurement demands it)
+  |-- M68AP/N45AP machines and S5L8900 device models
   |-- QEMU display-to-canvas bridge
   |-- browser-input-to-QEMU bridge
   `-- packed NAND base plus copy-on-write overlay
@@ -139,17 +157,22 @@ dist/classroom/
   index.html
   manifest.webmanifest
   service-worker.js
-  emulator.js
-  emulator.wasm
-  emulator.worker.js
-  asset-manifest.json
+  emulator/
+    qemu-system-arm.js        # Emscripten ES module loader
+    qemu-system-arm.wasm
   assets/
-    n45ap-v1/
+    m68ap-114-v1/
+      asset-manifest.json
       bootrom_s5l8900
-      iboot_204_n45ap.bin
-      nor_n45ap.bin
+      iboot.bin
+      nor.bin
       nand.pack
 ```
+
+Artifact names inside an asset set are normalized (`iboot.bin`, `nor.bin`)
+rather than board-specific, because the manifest already names the board; this
+keeps the frontend from having to know per-board filenames. The set directory
+and layout are produced by `scripts/wasm/stage-assets.py`.
 
 The firmware is **bundled with the deployment**, but it is not linked into
 `emulator.wasm` or encoded into JavaScript. Separate files provide:
@@ -183,8 +206,10 @@ URLs. It performs this first-run flow:
 7. Start QEMU only after the complete asset set has been committed atomically.
 8. On later visits, validate cache metadata and boot without downloading again.
 
-The default source set may point at the N45AP release already named in `BUILD.md`,
-but every URL must pass a browser deployment preflight. A URL being downloadable
+The source-loaded flavor is realistic for N45AP, whose artifacts have a named
+release in `BUILD.md`. It is not yet realistic for M68AP, whose NAND is
+generated from a retail IPSW rather than downloaded (see above). Every URL must
+pass a browser deployment preflight. A URL being downloadable
 in a desktop browser does not prove that `fetch()` can use it from a
 cross-origin-isolated web application.
 
@@ -194,44 +219,54 @@ not the primary experience.
 
 ## Asset manifest
 
-Both builds consume the same versioned schema. A representative classroom
-manifest is:
+Both builds consume the same versioned schema. This is the classroom manifest
+`scripts/wasm/stage-assets.py` writes, with digests filled in from the staged
+bytes:
 
 ```json
 {
   "schemaVersion": 1,
-  "assetSet": "n45ap-v1",
-  "board": "N45AP",
-  "productType": "iPod1,1",
+  "assetSet": "m68ap-114-v1",
+  "board": "M68AP",
+  "machine": "iPhone-2G",
+  "productType": "iPhone1,1",
+  "description": "iPhone 2G (M68AP), S5L8900, iPhone OS 1.1.4",
+  "firmware": "1.1.4",
   "delivery": "bundled",
+  "machineOptions": [],
   "assets": {
     "bootrom": {
-      "url": "./assets/n45ap-v1/bootrom_s5l8900",
+      "url": "./bootrom_s5l8900",
       "size": 65536,
-      "sha256": "REQUIRED_AT_BUILD_TIME",
+      "sha256": "FILLED_AT_STAGING_TIME",
       "format": "raw"
     },
     "iboot": {
-      "url": "./assets/n45ap-v1/iboot_204_n45ap.bin",
+      "url": "./iboot.bin",
       "size": 139264,
-      "sha256": "REQUIRED_AT_BUILD_TIME",
+      "sha256": "FILLED_AT_STAGING_TIME",
       "format": "raw"
     },
     "nor": {
-      "url": "./assets/n45ap-v1/nor_n45ap.bin",
+      "url": "./nor.bin",
       "size": 1048576,
-      "sha256": "REQUIRED_AT_BUILD_TIME",
+      "sha256": "FILLED_AT_STAGING_TIME",
       "format": "raw"
     },
     "nand": {
-      "url": "./assets/n45ap-v1/nand.pack",
-      "size": "REQUIRED_AT_BUILD_TIME",
-      "sha256": "REQUIRED_AT_BUILD_TIME",
+      "url": "./nand.pack",
+      "size": 314886212,
+      "sha256": "FILLED_AT_STAGING_TIME",
       "format": "ipod-nand-pack-v1"
     }
   }
 }
 ```
+
+`machine` and `machineOptions` exist so the frontend builds QEMU's argv from the
+manifest rather than carrying board knowledge in JavaScript: an asset set is
+self-describing, and adding the N45AP set requires no frontend change. Asset
+URLs are relative to the manifest, so a set can be moved or mirrored whole.
 
 The source-loaded manifest uses the same asset keys but may describe source
 archives and their conversion:
@@ -239,10 +274,13 @@ archives and their conversion:
 ```json
 {
   "schemaVersion": 1,
-  "assetSet": "n45ap-v1-source",
-  "board": "N45AP",
-  "productType": "iPod1,1",
+  "assetSet": "m68ap-114-v1-source",
+  "board": "M68AP",
+  "machine": "iPhone-2G",
+  "productType": "iPhone1,1",
+  "firmware": "1.1.4",
   "delivery": "remote-source",
+  "machineOptions": [],
   "assets": {
     "bootrom": {
       "url": "https://configured-source.example/bootrom_s5l8900",
@@ -251,27 +289,34 @@ archives and their conversion:
       "format": "raw"
     },
     "iboot": {
-      "url": "https://configured-source.example/iboot_204_n45ap.bin",
+      "url": "https://configured-source.example/iboot_204_m68ap.bin",
       "size": 139264,
       "sha256": "REQUIRED",
       "format": "raw"
     },
     "nor": {
-      "url": "https://configured-source.example/nor_n45ap.bin",
+      "url": "https://configured-source.example/nor_m68ap.bin",
       "size": 1048576,
       "sha256": "REQUIRED",
       "format": "raw"
     },
     "nand": {
-      "url": "https://configured-source.example/nand_n45ap.zip",
+      "url": "https://configured-source.example/nand_m68ap.zip",
       "size": "REQUIRED",
       "sha256": "REQUIRED",
-      "format": "n45ap-page-tree-zip",
+      "format": "page-tree-zip",
       "convertTo": "ipod-nand-pack-v1"
     }
   }
 }
 ```
+
+The M68AP NAND has no public single-file source: it is *constructed* from a
+retail IPSW by `scripts/build-m68ap-nand.py` and friends (a decrypted root
+filesystem laid into a generated FTL/VFL layout). A source-loaded M68AP flavor
+therefore needs either a prepared pack mirror or an in-browser port of that
+generator — a materially larger job than unzipping a page tree, and the reason
+the classroom flavor is the primary path for this board.
 
 Manifest rules:
 
@@ -339,33 +384,47 @@ The browser-native NAND representation must:
 - reject duplicate, truncated, malformed, and out-of-range pages;
 - allow future chunking or compression without changing QEMU's NAND semantics.
 
-### Proposed `ipod-nand-pack-v1`
+### `ipod-nand-pack-v1`, as built
 
-The first format consists of a small header, a fixed-width sorted index, and a
-payload region:
+The format is implemented and in production use natively. The description below
+is the as-built layout, not a proposal: the writer is
+`scripts/pack-ipod-nand.py` and the reader is `nand_open_pack()` /
+`nand_read_packed_page()` in `hw/arm/ipod_touch_nand.c`.
 
-- Magic and format version
-- Page data size: 2,048
-- Spare data size: 64
-- Bank count: 8
-- Record count
-- Index offset and payload offset
-- Source asset digest
-- Converter version
-- One 16-byte index entry per present page
-- One 2,112-byte payload per present page
+All integers are little-endian.
 
-An index entry contains:
+```text
+offset  size          field
+0       8             magic "IPODNAND"
+8       4             version = 1
+12      4             page stride = 2112 (2048 data + 64 spare)
+16      4             record count N
+20      4 * N         index: sorted u32 virtual page numbers
+20+4N   2112 * N      payloads, in index order
+```
 
-- bank number;
-- flags/reserved fields;
-- page number;
-- payload offset.
+The index is a bare sorted array of keys, not a table of offsets: because every
+payload is the same 2,112 bytes, a record's payload address is
+`payload_base + slot * 2112`, so the slot found by binary search *is* the
+offset. That keeps the index at 4 bytes per page instead of 16.
 
-Entries are sorted by `(bank, page)` and duplicate keys are forbidden. Integer
-serialization is explicitly little-endian. The final exact header layout must be
-captured in a format specification and golden test vectors before the converter
-is considered stable.
+The key is a single virtual page number, `page * bank_count + bank`, which
+orders pages by page-then-bank and lets one `uint32` express the `(bank, page)`
+pair. The reader validates magic, version, stride, total length, and strictly
+increasing keys, which rejects truncated, malformed, and duplicate-keyed packs
+on open. Pages absent from the index read back as erased.
+
+Two known deviations from the original proposal, both deliberate:
+
+- **The bank count is not in the header.** Both sides use a fixed 8
+  (`NAND_NUM_BANKS`, and `NUM_BANKS` in the packer) to compute the key, which is
+  why the key stays valid on M68AP even though that board's device only
+  addresses 4 banks. Writer and reader therefore agree by convention rather than
+  by declaration; putting the count in the header is a candidate for v2.
+- **No source digest or converter version is embedded.** Provenance lives
+  outside the pack, in the asset manifest and in `nand-provenance.json`.
+
+Golden test vectors for the pack are still owed.
 
 The initial implementation should favor a simple uncompressed, memory-mappable
 or Blob-backed pack. Compression and HTTP range loading add complexity to a
@@ -411,54 +470,61 @@ and restart persistence tests.
 
 ## QEMU and WebAssembly strategy
 
-### Base selection
+### Base selection: settled
 
-Before implementation begins, pin a specific upstream QEMU commit that:
+The base is this tree: **QEMU 11.0.2**, branch `ipod_touch_1g`. The forward port
+from 6.2.50 is complete and the machines boot natively (`QEMU_11_PORT.md`,
+`build-ipod11/`). Nothing needs pinning to a different upstream commit.
 
-- builds a 32-bit guest system emulator with Emscripten;
-- contains the upstream 32-bit TCI host support introduced in QEMU 10.1 or later;
-- can accept the current hybrid WebAssembly TCG/JIT patch set if that patch set
-  is not yet upstream;
-- has a reproducible Emscripten SDK and dependency container.
+The toolchain is pinned in `scripts/wasm/toolchain.env`: Emscripten 4.0.10,
+glib 2.84.0, pixman 0.44.2, libffi 3.5.2, zlib 1.3.1 — the same versions QEMU's
+own `emsdk-wasm64-cross` container uses. Changing a value there is a toolchain
+change that must be re-measured.
 
-Record the QEMU commit, Wasm TCG patch revision, Emscripten version, dependency
-digests, and container image digest in the repository. Do not follow moving
-branches in release builds.
+### Build configuration
 
-### Forward-port sequence
+```sh
+configure --static --cpu=wasm64 --wasm64-32bit-address-limit \
+          --target-list=arm-softmmu --enable-tcg-interpreter \
+          --disable-tools --disable-docs
+```
 
-1. Preserve a scripted native baseline from the current branch.
-2. Create a clean branch based on the selected modern QEMU commit.
-3. Port the iPod Kconfig and Meson entries.
-4. Port the S5L8900 machine, CPU setup, memory map, and interrupt controllers.
-5. Port bootrom, iBoot, NOR, and NAND loading.
-6. Port timers, clock, GPIO, I2C, SPI, PMU, LCD, and multitouch.
-7. Port AES, SHA, DMA/ADM, USB, SDIO, TV-out, chip ID, and remaining stubs.
-8. Resolve modern QEMU reset, input, block, display, and ARM CPU APIs.
-9. Build and boot the forward-ported machine natively first.
-10. Compare native serial output, first frame, touch, Home, Power, sleep, and wake
-    against the preserved baseline.
-11. Only then build the same machine for Emscripten.
+- `--cpu=wasm64` is what QEMU 11.0.2 supports for Emscripten; `MEMORY64` is
+  required by the port, not chosen by us.
+- `--wasm64-32bit-address-limit` keeps the address space at 32 bits, which the
+  128 MiB guest never approaches and which is kinder to browser memory limits.
+- `--enable-tcg-interpreter` is mandatory: `meson.build` errors out on a
+  WebAssembly host without it.
 
-Small, subsystem-oriented commits are required. Avoid one commit that combines
-the QEMU forward port, browser bridge, NAND redesign, and frontend.
+**Docker is not required.** The upstream container exists to pin the SDK and
+cross-compile four static dependencies, all of which build natively on macOS.
+`scripts/wasm/setup-toolchain.sh` + `build-deps.sh` are the default path;
+`build-toolchain.sh` keeps the container for reproducible/CI builds. Two
+host-specific corrections the container never needs are recorded in
+`BROWSER_WASM_STATUS.md`.
 
 ### CPU execution and performance
 
-Pure TCI is the correctness fallback. The hybrid Wasm TCG/JIT is the expected
-performance path: cold translation blocks are interpreted and hot blocks are
-compiled as WebAssembly modules through browser APIs.
+**QEMU 11.0.2 has no in-tree WebAssembly TCG backend** — `tcg/` contains no
+wasm target, and the emscripten host path routes through TCI. So TCI is not a
+"correctness fallback" here; it is the only thing this base can do, and the
+first measurement.
+
+If TCI cannot reach an acceptable time to a usable SpringBoard, the hybrid
+WebAssembly TCG/JIT from the out-of-tree [qemu-wasm](https://github.com/ktock/qemu-wasm)
+tree becomes a **requirement**, and carrying that patch set on 11.0.2 becomes a
+scoped project of its own. Measure before deciding; do not adopt the patch set
+speculatively.
 
 The first performance gate compares:
 
-- current native QEMU 6.2.50;
-- forward-ported native QEMU;
-- browser pure TCI;
-- browser hybrid Wasm JIT.
+- native QEMU 11.0.2 (the `build-ipod11/` reference);
+- browser TCI;
+- browser hybrid Wasm JIT, only if TCI fails the gate.
 
 Measure time to iBoot output, Apple logo, first SpringBoard frame, and usable
 input. Also record host CPU utilization, Wasm heap high-water mark, total browser
-memory, translation-block compilation count, and long-task duration.
+memory, and long-task duration.
 
 ## Display bridge
 
@@ -578,59 +644,57 @@ quota failures explicitly.
 
 ## Proposed repository layout
 
-The exact frontend toolchain will be selected during the first spike, but the
-target organization is:
+What exists today (2026-07-26):
+
+```text
+scripts/
+  pack-ipod-nand.py            # the base-pack writer, shared with native
+  wasm/
+    README.md
+    toolchain.env              # every pinned version
+    setup-toolchain.sh         # standalone python (if needed) + emsdk + meson
+    build-deps.sh              # wasm64 zlib, libffi, pixman, glib
+    build-toolchain.sh         # the container alternative
+    build-qemu.sh              # arm-softmmu -> build-wasm/
+    stage-assets.py            # asset set + hashed asset-manifest.json
+    serve.py                   # COOP/COEP dev server, --check
+web/
+  index.html
+  .gitignore                   # public/assets/ and emulator/ are never committed
+  src/
+    app/       main.js, shell.css
+    emulator/  loader.js       # fetch, verify, cache
+    workers/   emulator-worker.js
+```
+
+Still planned, not written:
 
 ```text
 web/
-  README.md
-  package.json
-  src/
-    app/
-    emulator/
-    assets/
-    storage/
-    workers/
-  public/
-  manifests/
-    classroom.template.json
-    source.template.json
+  src/storage/                 # overlay persistence
   tests/
-scripts/
-  wasm/
-    build-toolchain.sh
-    build-qemu.sh
-    build-web.sh
-    check-source-assets.py
-    generate-asset-manifest.py
-    pack-nand.py
-    verify-release.py
-containers/
-  wasm-builder/
-docs/
-  browser/
-    deployment.md
-    nand-pack-v1.md
-    troubleshooting.md
+  manifests/{classroom,source}.template.json
+docs/browser/{deployment,nand-pack-v1,troubleshooting}.md
+scripts/wasm/{build-web.sh,check-source-assets.py,verify-release.py}
 ```
 
-These files do not exist yet. They are planned outputs, not commands that work in
-the current repository.
-
-Planned developer entry points are:
+Working developer entry points:
 
 ```sh
-npm run build:classroom
-npm run build:source
-npm run test
-./scripts/wasm/build-qemu.sh
-./scripts/wasm/pack-nand.py --input build/ipod_files/nand --output nand.pack
-./scripts/wasm/verify-release.py dist/classroom
+scripts/wasm/setup-toolchain.sh
+scripts/wasm/build-deps.sh
+scripts/wasm/build-qemu.sh
+scripts/wasm/stage-assets.py --from-app "/Applications/iPhone 2G.app" \
+    --board m68ap --firmware 1.1.4
+scripts/wasm/serve.py
 ```
 
-Build scripts must fail clearly when classroom source assets are absent. Firmware
-paths are supplied through ignored local configuration or environment variables;
-they are not silently discovered from arbitrary directories.
+There is no Node.js toolchain and no bundler: the frontend is ES modules served
+directly. That stays true until something actually requires a build step.
+
+Build scripts must fail clearly when classroom source assets are absent.
+Firmware paths are supplied explicitly (`--from-app` or per-artifact paths);
+they are never silently discovered from arbitrary directories.
 
 ## Release artifacts
 
@@ -655,13 +719,14 @@ controlled release job that does:
 
 ### Public CI
 
-- build the modern native QEMU iPod target;
-- build the Emscripten target from the pinned container;
+- build the native QEMU target (`build-ipod11/`);
+- build the Emscripten target from the pinned container (CI uses the container
+  path, not the native toolchain, so builds stay reproducible);
 - run C/unit tests for the NAND pack and overlay;
 - generate and validate synthetic asset packs;
 - build the source-loaded frontend;
 - run browser tests with synthetic/non-Apple fixtures;
-- verify required deployment headers in a local test server;
+- verify required deployment headers (`scripts/wasm/serve.py --check`);
 - ensure no firmware or generated classroom asset appears in tracked files or
   public artifacts.
 
@@ -684,7 +749,9 @@ frontend artifacts where the toolchain permits.
 
 ### Native regression tests
 
-Before the forward port, capture:
+The forward port is finished, so these are no longer a pre-port baseline; they
+are the **oracle the browser build is compared against**, and they are still
+owed. Capture from native QEMU 11.0.2 (`build-ipod11/`), per board:
 
 - serial output landmarks and timestamps;
 - first Apple-logo screenshot;
@@ -695,7 +762,10 @@ Before the forward port, capture:
 - NAND page read/write behavior;
 - emulator exit status and diagnostic log.
 
-Run the same sequence after each forward-port milestone.
+Existing tooling covers part of this already — `scripts/fb-snapshot.py` for
+framebuffer capture, `scripts/iphone-nand-acceptance.py` for the NAND — so the
+work is automation and a stored baseline, not new instrumentation. Run the same
+sequence after each browser milestone.
 
 ### NAND tests
 
@@ -785,52 +855,64 @@ Initial targets, subject to measurement during the spike:
 - pointer-to-visible-response latency remains below 100 ms during normal UI use;
 - no recurring main-thread task exceeds 50 ms during steady-state emulation;
 - browser memory stays safely below practical per-tab limits on an 8 GiB machine;
-- hybrid Wasm JIT reaches SpringBoard within three times the forward-ported native
-  boot time, or a documented classroom-acceptable absolute time.
+- the browser reaches SpringBoard within three times the native QEMU 11.0.2 boot
+  time, or a documented classroom-acceptable absolute time.
 
-If pure TCI is too slow but hybrid JIT meets these gates, hybrid JIT becomes a
-release requirement rather than an optional optimization.
+If TCI cannot meet that and a hybrid JIT can, the JIT becomes a release
+requirement rather than an optional optimization.
 
 ## Milestones
 
-### Phase 0: Baseline and spike (1-2 weeks)
+### Phase 0: Baseline and spike — mostly done
 
+- ~~Select and pin modern QEMU, Emscripten, and Wasm TCG revisions.~~ Done:
+  QEMU 11.0.2 in-tree, Emscripten 4.0.10 and the dependency set pinned in
+  `scripts/wasm/toolchain.env`. No Wasm TCG revision to pin — there is none in
+  this base.
+- ~~Verify cross-origin isolation.~~ Done: `scripts/wasm/serve.py --check`.
+- Prove a minimal `arm-softmmu` browser build. **In progress** — the toolchain
+  and three of four dependencies build; see `BROWSER_WASM_STATUS.md`.
 - Script the native reference boot and interaction sequence.
-- Select and pin modern QEMU, Emscripten, and Wasm TCG revisions.
-- Prove a minimal `arm-softmmu` browser build with synthetic firmware.
-- Verify worker threads, cross-origin isolation, display bridge feasibility, and
-  browser storage quota on reference machines.
-- Preflight the intended public source URLs.
+- Verify worker threads, display bridge feasibility, and storage quota on
+  reference machines.
 
 Exit condition: no architectural blocker to ARM32 execution, static hosting,
 asset fetch, or required memory allocation.
 
-### Phase 1: Forward port (2-4 weeks)
+### Phase 1: Forward port — done
 
-- Port the N45AP machine and devices to modern QEMU.
-- Restore native boot parity.
-- Keep subsystem commits reviewable.
-- Add basic native regression automation.
-
-Exit condition: modern native QEMU reaches SpringBoard and passes touch,
-Home/Power, and sleep/wake smoke tests.
+The QEMU 6.2.50 → 11.0.2 forward port is complete and promoted; both the iPod
+touch and iPhone 2G machines boot to their home screens natively. See
+`QEMU_11_PORT.md`, `IPHONE_2G_BRINGUP_HANDOFF.md`, and
+`M68AP_HOMESCREEN_CASE_STUDY.md`. What this phase still owes the browser port is
+**native regression automation** — a scripted boot/serial/screenshot/interaction
+baseline to compare browser runs against.
 
 ### Phase 2: Browser boot and UI (2-3 weeks)
 
-- Build the forward-ported machine with Emscripten.
-- Add worker lifecycle and QEMU startup glue.
-- Add canvas display and browser input bridges.
-- Compare TCI and hybrid JIT performance.
+- Build the machine with Emscripten and get `main()` to run.
+- Resolve what the device code does to a browser filesystem: the machine takes
+  host paths and uses `fopen`/`g_mapped_file`, and mmap over a ~300 MiB pack in
+  MEMFS is the first memory question to measure.
+- Add worker lifecycle and QEMU startup glue (skeleton exists, instantiation is
+  provisional).
+- Add the canvas display bridge — nothing produces frames yet.
+- Add the input bridge into QEMU — the frontend emits events, the worker drops
+  them.
+- Measure TCI, and decide about a JIT on the evidence.
 
 Exit condition: browser SpringBoard is interactive and performance direction is
 known.
 
-### Phase 3: NAND and persistence (2-3 weeks)
+### Phase 3: NAND and persistence (1-2 weeks)
 
-- Specify `ipod-nand-pack-v1` and add golden fixtures.
-- Implement native and browser converters.
-- Replace per-page file access with pack lookup.
-- Implement the copy-on-write overlay and persistence.
+- ~~Specify `ipod-nand-pack-v1`.~~ Built and in production; documented above.
+- ~~Implement the native converter and replace per-page access with pack
+  lookup.~~ Done (`scripts/pack-ipod-nand.py`, `hw/arm/ipod_touch_nand.c`).
+- Add golden fixtures and round-trip tests for the pack. **Still owed.**
+- Implement the copy-on-write overlay and persistence. **The real remaining
+  work of this phase** — guest writes currently have nowhere to go in the
+  browser.
 - Select the browser storage/loading strategy from measurements.
 
 Exit condition: a warm browser boot uses the cached pack, and guest writes survive
@@ -857,18 +939,22 @@ delivery.
 
 Exit condition: all classroom release gates pass.
 
-The phases overlap where safe. The total estimate is approximately 6-12 weeks for
-an engineer already comfortable with QEMU, C, Emscripten, and browser storage.
-Performance or forward-port API changes may extend it.
+The phases overlap where safe. With the forward port and the base pack already
+done, the remaining estimate is approximately 4-8 weeks for an engineer
+comfortable with QEMU, C, Emscripten, and browser storage. A TCI performance
+failure that forces adopting the out-of-tree JIT would extend it substantially.
 
 ## Risk register
 
 | Risk | Impact | Mitigation | Go/no-go signal |
 | --- | --- | --- | --- |
-| Pure TCI is too slow | High | Use hybrid Wasm JIT; profile hot blocks | Hybrid JIT cannot reach acceptable boot/input targets |
-| Wasm JIT patch set remains out of tree | Medium | Pin a reviewed revision and isolate it from iPod changes | Patch set cannot be maintained on selected QEMU |
-| Forward port changes guest behavior | High | Native baseline, subsystem commits, serial/screenshot tests | Modern native build cannot match current behavior |
+| TCI is too slow (it is the only engine this base has) | High | Measure first; adopt the out-of-tree hybrid Wasm JIT only if needed | Neither TCI nor JIT reaches acceptable boot/input targets |
+| Wasm JIT patch set is out of tree and targets a different QEMU | Medium | Pin a reviewed revision, isolate it from device changes | Patch set cannot be carried on 11.0.2 |
+| ~~Forward port changes guest behavior~~ (retired: the port is done and promoted) | — | Native baseline tests still owed for browser comparison | — |
+| Device code assumes a real filesystem (`fopen`, `g_mapped_file`) | High | Measure MEMFS/mmap behavior early; add a pack access seam if needed | The 300 MiB pack cannot be mapped within browser memory |
 | NAND pack consumes too much memory | High | Blob/chunk access, bounded caches, storage benchmarks | Reference 8 GiB machine repeatedly crashes |
+| M68AP NAND has no public single-file source | High for source build | Classroom flavor first; mirror or port the generator later | No permitted delivery path for a prepared pack |
+| The build host runs out of disk | Medium | ~5 GiB free needed: deps, build tree, staged assets | Build cannot complete locally |
 | Public source blocks browser fetch | High for source build | Preflight, authorized mirror/proxy, manual fallback | No reliable permitted delivery path exists |
 | Browser storage is evicted | Medium | Request persistence, export support, clear UI | Required browsers cannot retain a warm asset set |
 | COOP/COEP deployment is misconfigured | High | Header test in CI and deployment verifier | `crossOriginIsolated` is false in production |
@@ -923,7 +1009,14 @@ contains metadata, timings, stable error codes, and filtered emulator logs.
 
 ## Decisions already made
 
-- Forward-port the iPod model to modern QEMU rather than backporting Wasm.
+- Forward-port the device model to modern QEMU rather than backporting Wasm.
+  *(Done: QEMU 11.0.2.)*
+- Target iPhone 2G / iPhone OS 1.1.4 first, with N45AP as a second asset set
+  from the same build.
+- Build with the native pinned Emscripten toolchain by default; keep the
+  container for reproducible and CI builds. Docker is not a requirement.
+- Ship wasm64 + TCI first and let measurement decide whether a JIT is required.
+- Keep board knowledge in the asset manifest, not in the frontend.
 - Produce one application with classroom and source-loaded manifests.
 - Make classroom delivery the primary optimized experience.
 - Bundle classroom firmware as separate same-origin assets, not inside Wasm.
@@ -937,10 +1030,21 @@ contains metadata, timings, stable error codes, and filtered emulator logs.
 
 ## Open decisions for the spike
 
-- Exact modern QEMU commit and Wasm TCG revision.
-- Exact Emscripten and dependency-container versions.
-- Frontend build tool and minimum Node.js version.
-- Blob, IndexedDB chunk, OPFS, or complete-memory base-pack access.
+Closed since the plan was written:
+
+- ~~Exact modern QEMU commit and Wasm TCG revision.~~ QEMU 11.0.2 in-tree; no
+  Wasm TCG in this base, so TCI until measured otherwise.
+- ~~Exact Emscripten and dependency versions.~~ Pinned in
+  `scripts/wasm/toolchain.env`.
+- ~~Frontend build tool and minimum Node.js version.~~ None: ES modules served
+  directly, revisited only if something requires a build step.
+
+Still open:
+
+- Whether TCI is fast enough, and therefore whether the out-of-tree JIT is
+  required. **This is the decisive one.**
+- How the pack is reached from the wasm heap: MEMFS + mmap, a Blob-backed
+  reader, IndexedDB/OPFS chunks, or complete-memory load.
 - Whether independent NAND chunk compression is needed after profiling.
 - Whether `OffscreenCanvas` is the default or an optimization.
 - Exact supported browser versions and institutional hardware baseline.
@@ -955,8 +1059,9 @@ evidence, not preference alone.
 
 The browser project is complete when:
 
-- one pinned QEMU/Wasm build runs the N45AP emulator in supported browsers;
-- modern native QEMU still passes the reference behavior tests;
+- one pinned QEMU/Wasm build runs the M68AP (iPhone OS 1.1.4) emulator in
+  supported browsers, and the N45AP asset set on the same build;
+- native QEMU 11.0.2 still passes the reference behavior tests;
 - the classroom deployment boots automatically from bundled assets;
 - the source-loaded deployment downloads, verifies, converts, caches, and boots
   automatically;
