@@ -66,6 +66,37 @@ from pathlib import Path
 ORIG = bytes.fromhex("0020")   # movs r0, #0  (reject: unsigned not allowed)
 PATCHED = bytes.fromhex("0120")  # movs r0, #1  (allow unsigned)
 
+# --- iBoot-159 only: the unsigned flash-image return value --------------------
+#
+# iBoot-159's flash-image loader tests IMG2 flags2 bit 1 ("signed") and, when it
+# is CLEAR, runs a path that hardcodes the return value to -1:
+#
+#     0x1800843e  ldr r3,[r4,#0x1c] / lsls r2,r3,#0x1e / bpl <unsigned path>
+#     0x180084a4  movs r4,#1
+#     0x180084a6  rsbs r4,r4,#0        ; r4 = -1  <- the failure
+#     0x180084b2  cmp r4,#0 / bge <return r4>
+#     0x180084b6  <security-config helper> ; consulted, but r4 is already -1
+#
+# Apple's own all_flash containers ship with bit 1 CLEAR (the IPSW dtre header
+# is 0x40000000), so every NOR image we build takes this path and iBoot returns
+# "load_macho_image: failed to load device tree" no matter what the security
+# config says -- which is why relaxing the config helper alone is not enough on
+# 1.0/1.0.x, and why forcing the image validator to report "trusted" does not
+# help either.
+#
+# One instruction: movs r4,#1 -> movs r4,#0. The following rsbs then computes
+# -0 == 0, cmp/bge returns 0, and the load succeeds. The destination address and
+# size were already stored by 0x1800842e, so nothing else is needed.
+#
+# Located by the 20 bytes starting 2 before the site; measured unique in both
+# iBoot-159 builds (1C28 and 1A543a, both at 0x84a4) and ABSENT from every
+# iBoot-204 image, so it is skipped automatically on 1.1.x.
+UNSIGNED_LOCATOR = bytes.fromhex("01e0" "0124" "6442" "19a8" "0021" "1022"
+                                 "0ff0" "98eb" "002c" "09da")
+UNSIGNED_SITE_OFF = 2
+UNSIGNED_ORIG = bytes.fromhex("0124")     # movs r4, #1  (-> -1, reject)
+UNSIGNED_PATCHED = bytes.fromhex("0024")  # movs r4, #0  (-> 0, accept)
+
 # The 32 bytes immediately PRECEDING the patch site, ending exactly at it.
 # Read from 4A102 at file 0x5970..0x5990 and confirmed byte-identical in 3A109a
 # and in 1A543a's iBoot-159. Contains the literal 0x18022fa0 (security-config
@@ -132,6 +163,29 @@ def main() -> int:
         print(f"{args.iboot}: already patched; copying through")
     else:
         buf[site:site + 2] = PATCHED
+
+    # iBoot-159 only; absent from iBoot-204, where it is silently skipped.
+    hits = []
+    start = 0
+    while True:
+        i = bytes(buf).find(UNSIGNED_LOCATOR, start)
+        if i < 0:
+            break
+        hits.append(i + UNSIGNED_SITE_OFF)
+        start = i + 1
+    if len(hits) > 1:
+        raise SystemExit(f"unsigned-image site found {len(hits)} times; "
+                         f"refusing to patch")
+    if hits:
+        at = hits[0]
+        if bytes(buf[at:at + 2]) == UNSIGNED_PATCHED:
+            print(f"  unsigned flash-image acceptance: already patched at "
+                  f"0x{at:x}")
+        else:
+            buf[at:at + 2] = UNSIGNED_PATCHED
+            print(f"  unsigned flash-image acceptance (iBoot-159) at 0x{at:x}: "
+                  f"{UNSIGNED_ORIG.hex()} -> {UNSIGNED_PATCHED.hex()}")
+
     args.out.write_bytes(buf)
     print(f"wrote {args.out} (secure-boot bypass at 0x{site:x}: "
           f"{ORIG.hex()} -> {PATCHED.hex()})")

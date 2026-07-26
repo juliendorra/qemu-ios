@@ -457,74 +457,71 @@ Gate 1 is passed and the real 1.0.2 kernelcache is read off the generated NAND
 through the HFS+ filesystem. Regression-clean: the iPod still renders at 47.2 %
 non-black and 1.1.1 still reaches `BSD root: disk0s1`.
 
-### Current wall: `load_macho_image: failed to load device tree`
+### SOLVED: `load_macho_image: failed to load device tree`
 
-The same message the 1.1.4 bring-up hit, but **not** the same cause. Everything
-that fixed it there is in place and verified by measurement, not assumption:
+**iBoot-159 hardcodes failure for unsigned flash images**, independently of the
+security config. Its loader tests IMG2 flags2 **bit 1** ("signed") and takes a
+path that sets the return value to −1 before it ever consults the config:
 
-- iBoot-159 gates on the same flag as iBoot-204 — `[img+0x1c]` bit 24, tested at
-  `0x18007f70`. The built NOR has `flags@+0x1c = 0x01000000`.
-- The header CRC matches: read at a breakpoint, computed `0x32c55ce2` == stored
-  `0x32c55ce2`, and equal to `zlib.crc32(header[:0x64])`.
-- The secure-boot relaxation is applied (site `0x5350`, verified).
+```
+0x1800843e  ldr r3,[r4,#0x1c] / lsls r2,r3,#0x1e / bpl -> unsigned path
+0x180084a4  movs r4,#1
+0x180084a6  rsbs r4,r4,#0          ; r4 = -1   <- the failure, unconditional
+0x180084b2  cmp r4,#0 / bge -> return r4
+0x180084b6  <security-config helper>   ; consulted, but r4 is already -1
+```
 
-Traced call chain, with the measured value at each step:
+Apple's own all_flash containers ship with bit 1 **clear** (the IPSW `dtre`
+header is `0x40000000`), so every NOR image we build takes this path. That is
+why relaxing the config helper was not enough, and why forcing the image
+validator to report "trusted" changed nothing — both act *after* `r4` is fixed
+at −1.
 
-| Where | What | Measured |
-|---|---|---|
-| `0x1800c714` | `find_image("dtre")` | **succeeds**, struct at `0x1802bd40` |
-| `0x1802bd40+0xc` | image kind tag | `0x22f5ef0e` (flash) — **accepted** |
-| `0x1800c726` | size vs 1 MiB cap | `0x896c` ≤ `0x100000` — **passes** |
-| `0x1800c73a` | `load_image()` | returns **−1** |
-| `0x18007e0e` | kind check inside `load_image` | passes (flash tag) |
-| `0x18008364` | flash-image loader | the rejection happens in here |
-| `0x18008060` | image validator exit | returns trust **4** (unverified) |
+Fix: one instruction, `movs r4,#1` → `movs r4,#0`, so the following `rsbs`
+computes −0 = 0 and the load succeeds. The destination address and size are
+already stored by `0x1800842e`, so nothing else is required. It is located by a
+20-byte pattern that is unique in **both** iBoot-159 builds (1C28 and 1A543a,
+both at `0x84a4`) and **absent from every iBoot-204 image**, so 1.1.x skips it
+automatically. `patch-m68ap-iboot.py` applies it; the 4A102 output is still
+byte-identical to the previously staged image.
 
-Forcing the validator to report trusted (`movs r5,#4` → `movs r5,#1` at file
-`0x7fec`) does change its return — confirmed r5 = 1 under the debugger — and
-`load_image` **still** returns −1. So the trust level is not the gate either.
+**Result: the iPhone OS 1.0.2 kernel boots.**
 
-The security-config helper at `0x18005344` is fully understood and our patch is
-correct for it: called with `r0 = 1` from `0x180083d6`, it tests bit 4 of the
-config word at `0x18022fa0`, and the patched `movs r0,#1` at `0x18005350` makes
-it answer "allowed". The caller's `cmp r0,#0 / beq <fail>` therefore passes.
+```
+gBootArgs.commandLine = [debug=0x8 kextlog=0xfff cpus=1 rd=disk0s1 serial=1 ...]
+Darwin Kernel Version 9.0.0d1: Fri Jun 22 00:38:56 PDT 2007;
+    root:xnu-933.0.1.178.obj~1/RELEASE_ARM_S5L8900XRB
+iBoot version: iBoot-159
+70 prelinked modules
+AppleARMPE::start(M68AP)
+```
 
-**Remaining candidates inside `0x18008364`**, in order:
+68 serial lines became 1329.
 
-1. `0x180083ba` — `bl 0x18007f34` (the validator) and `bge` on its result. A
-   negative return jumps straight to the failure exit at `0x180084ca`. The
-   validator returns −1 on a magic or header-CRC mismatch, and the header it is
-   handed here (`[[r5+0x10]+0xc]`) is **not** the one already verified at
-   `0x1802b910` — that is the most likely culprit and the first thing to check.
-2. `0x180083c4`–`0x180083cc` — compares `[sl+0x10]` against the validator's
-   out-parameter at `sp+0x74` and fails on mismatch.
-3. `0x180083d0`–`0x180083d4` — tests bit 2 of `[sl+0x18]`, which is what leads
-   to the security-config call.
+#### How it was found, after a false start
 
-Break at `0x180083be` and read `r0`, then at `0x180083ca` and compare `r2`/`r3`.
+Static Thumb disassembly had been producing fictional addresses (see the
+alignment note below). The fix was to stop guessing: run with
+`-d in_asm -D <file>`, which makes **QEMU** dump every translation block it
+decodes — real entry addresses and their exact bytes. Disassembling *those*
+byte ranges is guaranteed correctly aligned, and the set of blocks that appear
+is itself the executed path. The failing branch was obvious within one pass.
+**Use `-d in_asm` before hand-disassembling anything in this bootloader.**
 
-**Attempted, and it exposed a tooling problem rather than an answer.** With
-breakpoints on `0x180083be`, `0x180083ca`, `0x180083dc`, `0x180084c6` and
-`0x180084ca`, execution lands directly on the failure exit `0x180084ca` without
-hitting any of the earlier ones. Since `0x180084ca` is reachable from
-`0x180083c2` — immediately after `0x180083be` — that is impossible if all five
-addresses are real instruction boundaries.
+### Current wall: kernel stalls at `IOIpodUSBDevice`
 
-**They are probably not.** Every address in the table above came from linear
-Thumb disassembly started at an address I chose, and Thumb is variable-length:
-if the chosen start is not a real boundary the decode silently desynchronises
-and produces plausible-looking but fictional instructions. That also explains
-earlier breakpoints in this investigation that never fired (`0x1800c726`,
-`0x1800c73e` in one run) while neighbouring ones did.
+1.0.2 now runs 1329 serial lines and stops at:
 
-So the addresses in this section should be treated as **approximate** until
-re-derived from a known-good anchor — a function entry found via its `push
-{...}` prologue, or better, by disassembling forward from a PC value actually
-observed in a register dump rather than from a guess. The measured *facts*
-(find_image succeeds, the tag is accepted, the size passes, `load_image` returns
-−1, the header CRC matches, trust is 4 and forcing 1 does not help) are all from
-register and memory reads and remain valid; only the instruction addresses are
-suspect.
+```
+AppleS5L8900XUSBWrangler::doCoreInit core reset complete
+AppleS5L8900XIpodHAL::message
+IOIpodUSBDevice::gated_message cable is connected, starting stack
+```
+
+Unchanged at 300 s, so it is a stall rather than slowness. Notably this is the
+same service the 1.1.4 bring-up once panicked inside (`IPHONE_2G.md`, "the first
+production boundary is now the M68 USB service lookup/order"), so the history
+there is worth re-reading before treating it as new.
 
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
