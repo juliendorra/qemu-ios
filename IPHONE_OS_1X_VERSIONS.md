@@ -804,6 +804,68 @@ It does not fall back: IOKit retries `AppleS5L8900XADMFMC::start` forever
 each time). Removed. If this is revisited, the driver has to be made to *decline
 the match* rather than fail its start.
 
+### What the ADM actually is, and why only 1.0 needs new work
+
+The S5L8900's flash controller has a companion **DSP core** — a Samsung "Calm"
+RISC. `AppleS5L8900XADMFMC` uploads a firmware blob to it (the
+`Loading ADM/FMC firmware 'CalmADMFMCFirmware-NN'` line), programs section base
+addresses into the ADM registers (`0x50` code, `0x84`/`0x88`/`0x8c`
+data1/2/3), writes command descriptors into those buffers, and kicks the engine
+with `ADM_CTRL2 = 2`. The DSP then drives the NAND.
+
+So the command interface is **not a hardware register spec**. It is a private
+software ABI between two halves of Apple's own code — kernel driver and DSP
+firmware — that ship together in one OS release. `hw/arm/ipod_touch_adm.c` does
+not run the DSP at all; it *impersonates* it, reading the descriptors out of
+guest memory at the offsets one blob version uses and doing the NAND access
+itself.
+
+That is why the version matters and why the bootloader is unaffected:
+
+| | uses the ADM? | works here? |
+|---|---|---|
+| iBoot-159 (1.0/1.0.x) | **no** — drives the controller registers directly | yes, after the ECC-engine fix |
+| iBoot-204 (1.1.x) | no | yes |
+| kernel, 1.1.x | yes, blob **-17** | yes — the shim was written against it |
+| kernel, 1.0.x | yes, blob **-14** | **no** — different ABI revision |
+
+#### Provenance of the shim (asked 2026-07-26)
+
+There is no written specification, and none in this repo's history:
+`ipod_touch_adm.c` arrives whole with `697306b42c` ("Port the iPod Touch 1G
+machine to QEMU 11"), i.e. it is upstream devos50 code and the fork does not
+carry his history for it. His Part II post does not document the ADM at all.
+Part I documents the *method*, not the layout:
+
+- Ghidra on the bootloader/kernel images
+- openiboot's NAND driver as a reference for "the physical layout of the NAND
+  memory ... and the I/O interactions"
+- a leaked iBoot source containing NAND drivers
+- and, explicitly, that deciphering the FMC's I/O operations "took me several
+  weeks of trial and error"
+
+The shim's own comments corroborate the trial-and-error origin — "this seems to
+be the control register", "some kind of start-up command?", "dunno, write some
+bytes to data4_sec_addr". Note also that the leaked iBoot source would not help
+here even if consulted: iBoot drives the FMC **directly** and never speaks the
+kernel's ADM ABI.
+
+#### Is there a Calm DSP implementation for QEMU? No.
+
+Checked in this tree — `target/` holds alpha, arm, avr, hexagon, hppa, i386,
+loongarch, m68k, microblaze, mips, or1k, ppc, riscv, rx, s390x, sh4, sparc,
+tricore, xtensa. No CalmRISC, and no public QEMU port of one exists. The
+architecture is real and documented enough to be portable in principle —
+CalmRISC16 is a Harvard core with a 24-bit `CalmMAC24` coprocessor, has an eCos
+target and published papers — but that route means writing a **new QEMU CPU
+target from scratch**.
+
+Its one advantage is that it would be version-proof: run the uploaded blob for
+real and every firmware revision works, with no per-version shim. That is not a
+reasonable trade for one more boot. **Extending the shim to firmware-14 is the
+right call**; this is recorded only so the option is not re-discovered from
+scratch later.
+
 ### Round 3 (kernel bring-up) — what did NOT work
 
 - **Forcing the image validator to report "trusted".** `movs r5,#4` →
