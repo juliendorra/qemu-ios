@@ -99,9 +99,46 @@ static uint64_t ipod_touch_adm_read(void *opaque, hwaddr offset, unsigned size)
     return 0;
 }
 
+/*
+ * IT_ADM_TRACE=1: every ADM register access, unconditionally. IT_NAND_TRACE
+ * only reports the command word behind an ADM_CTRL2 == 0x2 write, so a
+ * bootloader that drives this block differently is invisible to it -- which is
+ * exactly the situation with iBoot-159 (iPhone OS 1.0/1.0.x), whose page reads
+ * produce no IT_NAND_TRACE output at all. Use this to find out what a new
+ * firmware actually writes before concluding anything about the NAND content.
+ */
+static void adm_trace_access(const char *dir, hwaddr offset, uint64_t value)
+{
+    static uint32_t seen_off[64], seen_val[64], counts[64], nseen;
+    uint32_t i;
+
+    if (!getenv("IT_ADM_TRACE")) {
+        return;
+    }
+    for (i = 0; i < nseen; i++) {
+        if (seen_off[i] == offset && seen_val[i] == (uint32_t)value) {
+            break;
+        }
+    }
+    if (i == nseen) {
+        if (nseen == ARRAY_SIZE(seen_off)) {
+            return;
+        }
+        seen_off[nseen] = offset;
+        seen_val[nseen] = (uint32_t)value;
+        nseen++;
+    }
+    if (++counts[i] <= 2 || counts[i] % 4096 == 0) {
+        fprintf(stderr, "[ADM] %s offset 0x%02x value 0x%08x n=%u\n",
+                dir, (unsigned)offset, (uint32_t)value, counts[i]);
+    }
+}
+
 static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
     IPodTouchADMState *s = (IPodTouchADMState *)opaque;
+
+    adm_trace_access("write", offset, value);
 
     switch(offset) {
         case ADM_CTRL:

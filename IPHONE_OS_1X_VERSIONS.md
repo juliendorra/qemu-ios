@@ -332,19 +332,58 @@ it then prints as `Apple NAND Driver (AND)`. The printf's two arguments are the
 production-format result and a signature-found flag; both come back 0, meaning
 the scan never found the word it was looking for.
 
-**The read path is the problem.** With `IT_NAND_TRACE=1`, a 1.1.1 boot issues
-thousands of ADM commands (`0x100`, `0x200`, `0x300`); a 1.0.2 boot issues
-**zero**, and `-d unimp` reports no unimplemented MMIO at all. Running iBoot-159
-against 1.1.1's NAND tree instead of its own changes nothing — still zero ADM
-commands, same error. So iBoot-159 reads pages through a controller path that
-`hw/arm/ipod_touch_adm.c` does not service, and no NAND content can fix it.
+**iBoot-159 does not use the ADM at all.** With `IT_ADM_TRACE=1` (which logs
+*every* ADM register access, not just the command behind an `ADM_CTRL2 == 0x2`
+write), a 1.1.1 boot shows the full DMA setup — `0x04`/`0x00` control writes,
+then the `0x50`/`0x84`/`0x88`/`0x8c` section addresses — and a 1.0.2 boot shows
+**nothing whatsoever**. `-d unimp` reports no unimplemented MMIO either. So the
+1.0 bootloader drives the NAND controller registers directly rather than through
+the DMA engine.
 
-**Next step for 1.0:** widen the ADM instrumentation to log every command word
-written (the current trace only fires for a specific `value == 0x2` sequence),
-identify the command iBoot-159 issues for a page read, and implement it. That is
-emulator work of unknown but bounded size, and it is the single thing standing
-between the 1.0 family and Gate 1 — everything else on the 1.0 path is already
-proven.
+> **CORRECTION.** An earlier revision of this document concluded from that fact
+> that "iBoot-159 reads pages through a path `ipod_touch_adm.c` does not service,
+> and no NAND content can fix it". **That conclusion was wrong.** Not using the
+> ADM does not mean the reads fail — the direct path is modelled, and it works.
+> The error was inferring a *second* fact (reads fail) from the *one* fact
+> measured (no ADM traffic). Committed as a finding before it was tested.
+
+**The direct reads work, and return the right bytes.** `IT_NAND_WATCH=0/0` shows
+1.0.2 really does read `bank0/0`, present. `IT_NAND_FIFO=1` then shows the word
+arithmetic on the way out:
+
+```
+[NAND-FIFO] page 0 fmdnum 2047 spare 0 -> word[0] = 0x43303030   (1.0.2)
+[NAND-FIFO] page 0 fmdnum 2047 spare 0 -> word[0] = 0x43303032   (1.1.1)
+```
+
+Each firmware receives exactly the signature it is looking for. 1.0.2 then keeps
+scanning — pages 0, 1, 2, 3 … of bank 0, data then spare for each — and still
+reports `no signature`. So the page is read, the correct word is delivered, and
+the scan rejects it anyway.
+
+**Also ruled out:** `FMCSTAT`. It returns bits 1–12 with bit 0 deliberately
+clear, which looked like a candidate for "the read reports failure". Overriding
+it (`IT_NAND_FMCSTAT=0x1fff`, `0xffffffff`) changes nothing; `0x3` only breaks
+the boot earlier.
+
+**Where that leaves it.** The acceptance condition is not the signature word
+itself. Remaining candidates, in order of cheapness to test:
+
+1. The page's **spare** bytes. Every data read is followed by a spare read, and
+   our `bank0/0.page` spare is all zeros (as is the real N45AP one — but the
+   real iPod NAND is only ever exercised by iBoot-204). A 1.0-era FIL may
+   require a valid spare/metadata mark before accepting the page.
+2. The scan may want the signature at a page other than 0, or on more than one
+   bank — it visits pages 0…N sequentially, which is not the behaviour of code
+   that has already found what it wants at page 0.
+3. The disassembled site at `0x18016060` may simply not be the code that emits
+   the message; a breakpoint there would settle it.
+
+**Next step:** break at `0x180160f8` (the comparison) and read `r3`/`r5`. A
+scripted GDB-remote client did not connect to QEMU's stub in this session and
+`lldb -b` hung against the bare stub; getting one of those working is the
+unblocking task, and it converts all three candidates above into a single
+measurement.
 
 ## Dead ends, false paths and wrong turns (2026-07-26)
 

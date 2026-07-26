@@ -303,21 +303,48 @@ static uint64_t itnand_read(void *opaque, hwaddr addr, unsigned size)
                 }
                 else {
                     uint32_t page = (s->fmaddr1 << 16) | (s->fmaddr0 >> 16);
+                    uint32_t idx;
                     nand_set_buffered_page(s, page);
                     //printf("Reading page %d\n", page);
 
                     if(s->reading_spare) {
-                        read_val = ((uint32_t *)s->page_spare_buffer)[(NAND_BYTES_PER_SPARE - s->fmdnum - 1) / 4];
+                        idx = (NAND_BYTES_PER_SPARE - s->fmdnum - 1) / 4;
+                        read_val = ((uint32_t *)s->page_spare_buffer)[idx];
                     } else {
-                        read_val = ((uint32_t *)s->page_buffer)[(NAND_BYTES_PER_PAGE - s->fmdnum - 1) / 4];
+                        idx = (NAND_BYTES_PER_PAGE - s->fmdnum - 1) / 4;
+                        read_val = ((uint32_t *)s->page_buffer)[idx];
+                    }
+                    /* IT_NAND_FIFO=1: the single-page FIFO index arithmetic.
+                     * The word index is derived from FMDNUM's ABSOLUTE value,
+                     * which assumes the guest primed FMDNUM with the full
+                     * transfer length. A firmware that asks for a short read
+                     * lands somewhere else in the page and silently gets
+                     * zeroes. */
+                    if (getenv("IT_NAND_FIFO")) {
+                        static unsigned n;
+                        if (idx == 0 && n++ < 64) {
+                            fprintf(stderr, "[NAND-FIFO] page %u fmdnum %u "
+                                    "spare %d -> word[%u] = 0x%08x\n",
+                                    page, s->fmdnum, s->reading_spare,
+                                    idx, read_val);
+                        }
                     }
                 }
                 s->fmdnum -= 4;
                 return read_val;
             }
 
-        case NAND_FMCSTAT:
-            return (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12); // this indicates that everything is ready, including our eight banks
+        case NAND_FMCSTAT: {
+            /* Bits 1..12 = "everything ready, including our eight banks".
+             * Bit 0 is deliberately NOT set here, which iBoot-204 tolerates.
+             * IT_NAND_FMCSTAT=<value> overrides it so a firmware that polls a
+             * different bit can be tested without a rebuild. */
+            const char *override = getenv("IT_NAND_FMCSTAT");
+            if (override) {
+                return (uint64_t)strtoul(override, NULL, 0);
+            }
+            return (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12);
+        }
         case NAND_RSCTRL:
             return s->rsctrl;
         default:

@@ -2877,12 +2877,15 @@ this as a regression invariant.
   the default epoch 3 yields zero serial bytes and an all-black framebuffer
   report, which looks exactly like "the OS ran but never rendered". A boot that
   fails late still logs. Check `serial.log` size before interpreting pixels.
-- **iBoot-159 (iPhone OS 1.0/1.0.x) does not use the ADM NAND path.** It reads
-  chip IDs and returns `[OK]` from `FIL_Init`/`BUF_Init`/`VFL_Init`/`FTL_Init`,
-  then fails the signature scan having issued **zero** ADM commands (1.1.x
-  issues thousands) with no unimplemented MMIO. Confirmed independent of NAND
-  content by feeding it the 1.1.1 tree. This is the one blocker for the 1.0
-  family.
+- **iBoot-159 (iPhone OS 1.0/1.0.x) does not use the ADM NAND path** — it drives
+  the controller registers directly, and `IT_ADM_TRACE=1` shows it making zero
+  ADM accesses where 1.1.x makes thousands. **Do not conclude from that that its
+  reads fail** — an earlier note here did, and it was wrong. `IT_NAND_FIFO=1`
+  shows 1.0.2 reading `bank0/0` and receiving `0x43303030` in word 0, exactly the
+  signature it wants, and rejecting it anyway while scanning on through pages
+  1, 2, 3 … FMCSTAT is ruled out too. The acceptance condition is something other
+  than the signature word; the spare bytes are the leading candidate. Settle it
+  with a breakpoint at `0x180160f8` rather than more static analysis.
 
 ## Artifacts
 
