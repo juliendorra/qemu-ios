@@ -48,6 +48,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import re
 import struct
 import sys
 from pathlib import Path
@@ -134,38 +135,87 @@ class MachO:
 
 PATCH_DESCRIPTION = 'rename lockdownd "Unactivated" activation string -> "Activated"'
 
-PATCHES = [
-    # (name, find_bytes, replace_bytes, expected) - expected occurrence count.
-    # Signatures carry enough surrounding context to be unique/scoped in the
-    # whole root-FS image (the bare "Unactivated\0" occurs 4x across the FS).
-    #  - The C string is patched once (unique 8-byte-prefixed signature).
-    #  - The length field lives in TWO CFString constants that both point at
-    #    the "Unactivated" string; both must become length 9 so SpringBoard's
-    #    exact-string compare sees "Activated" (not "Activated\0\0").
-    ("activation-string",
-     b"tate\x00\x00\x00\x00Unactivated\x00",       # ...brick sTATE\0\0\0\0 + str
-     b"tate\x00\x00\x00\x00Activated\x00\x00\x00", 1),
-    ("cfstring-length",
-     bytes.fromhex("b8f34f38" "c8070000" "a0d80900" "0b000000"),  # CFString const
-     bytes.fromhex("b8f34f38" "c8070000" "a0d80900" "09000000"), 2),  # len 11->9
-]
+# The edits are DERIVED from the image, not hardcoded, so the same code works on
+# every iPhone OS 1.x lockdownd. Hardcoding them to 1.1.4's literal pool values
+# (str-ptr 0x0009d8a0, isa 0x384ff3b8) meant a different build silently found
+# zero occurrences; 1.1.1's are 0x0007def0 / 0x384c73b8 with the identical
+# structure. What IS stable is the shape:
+#
+#   * lockdownd's __cstring holds "...state\0<padding>Unactivated\0" -- the only
+#     place in the whole root filesystem where "Unactivated" follows "state"
+#     across NUL padding (measured: exactly 1 match in both 1.1.1 and 1.1.4,
+#     out of 4 bare "Unactivated" occurrences filesystem-wide).
+#   * TWO __cfstring constants point at that string with length 11. Both must
+#     become 9, or SpringBoard's exact compare sees "Activated\0\0".
+#
+# lockdownd is stored contiguously in the HFS image (verified: the Mach-O header
+# sits exactly at str_offset - str_file_offset), so the binary can be parsed in
+# place and every address derived from its own load commands.
+UNACTIVATED_RE = re.compile(rb"state\x00+Unactivated\x00")
+NEW_STATE = b"Activated"
+OLD_LEN, NEW_LEN = 11, 9
+
+
+def derive_patches(image: bytes) -> list:
+    """Return [(name, offset, original, replacement)] derived from the image."""
+    matches = UNACTIVATED_RE.findall(image)
+    if len(matches) != 1:
+        raise SystemExit(
+            f"expected exactly 1 lockdownd 'state\\0+Unactivated' site, found "
+            f"{len(matches)}; refusing to patch")
+    m = UNACTIVATED_RE.search(image)
+    str_off = image.index(b"Unactivated\x00", m.start())
+
+    # Walk back to lockdownd's Mach-O header and parse it in place.
+    base = image.rfind(bytes.fromhex("cefaedfe"), 0, str_off)
+    if base < 0:
+        raise SystemExit("no Mach-O header precedes the activation string")
+    macho = MachO(image[base:str_off + 0x200000])
+    str_va = macho.fo_to_vm(str_off - base)
+    if str_va is None or macho.cstr(str_va) != "Unactivated":
+        raise SystemExit(
+            f"derived VA {str_va and hex(str_va)} does not resolve back to "
+            f"'Unactivated'; lockdownd may be fragmented in this image")
+
+    patches = [(
+        "activation-string", str_off,
+        b"Unactivated\x00",
+        NEW_STATE + b"\x00" * (len(b"Unactivated\x00") - len(NEW_STATE)),
+    )]
+
+    # __cfstring constants: <isa><flags><str ptr><length>. Find them by the
+    # pointer we just derived, and patch the length word that follows it.
+    needle = struct.pack("<I", str_va) + struct.pack("<I", OLD_LEN)
+    found = 0
+    start = base
+    while True:
+        i = image.find(needle, start, base + len(macho.d))
+        if i < 0:
+            break
+        patches.append(("cfstring-length", i + 4,
+                        struct.pack("<I", OLD_LEN),
+                        struct.pack("<I", NEW_LEN)))
+        found += 1
+        start = i + 1
+    if found != 2:
+        raise SystemExit(
+            f"expected 2 CFString constants of length {OLD_LEN} pointing at "
+            f"{str_va:#x}, found {found}; refusing to patch")
+    print(f"  derived: 'Unactivated' at image {str_off:#x} (VA {str_va:#x}), "
+          f"{found} CFString length words")
+    return patches
 
 
 def apply_patches(image: bytes) -> bytes:
     buf = bytearray(image)
-    for name, find, repl, expected in PATCHES:
-        assert len(find) == len(repl), name
-        n = image.count(find)
-        if n != expected:
+    for name, off, orig, repl in derive_patches(image):
+        assert len(orig) == len(repl), name
+        if bytes(buf[off:off + len(orig)]) != orig:
             raise SystemExit(
-                f"patch {name!r}: expected {expected} occurrence(s), found {n} "
-                f"(pattern {find!r})")
-        start = 0
-        for _ in range(n):
-            i = buf.find(find, start)
-            buf[i:i + len(repl)] = repl
-            print(f"  patched {name}: image offset {i:#x}")
-            start = i + len(repl)
+                f"patch {name!r} at {off:#x}: expected {orig!r}, found "
+                f"{bytes(buf[off:off + len(orig)])!r}")
+        buf[off:off + len(repl)] = repl
+        print(f"  patched {name}: image offset {off:#x}")
     return bytes(buf)
 
 
