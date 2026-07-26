@@ -26,3 +26,7 @@ GTAGS
 # iPhone 2G (M68AP) local artifacts: IPSW, decrypted Apple images, generated
 # NOR/NAND trees, provenance. Never commit (see AGENTS.md firmware policy).
 /m68ap-artifacts/
+
+# Browser/WebAssembly port toolchain (pinned emsdk, wasm64 sysroot)
+/.wasm-toolchain/
+/build-wasm/
