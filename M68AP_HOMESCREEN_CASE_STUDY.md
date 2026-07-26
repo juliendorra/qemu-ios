@@ -290,3 +290,21 @@ previously failed every time; M68AP still reaches its home screen.
   down invented protocol details.
 * **Check whether your test can even observe the thing you are testing.**
   Two of the six dead ends above were measurement artifacts, not behaviour.
+
+
+## Test fidelity ladder (added after the T7 false pass)
+
+A fix passed the harness and regressed the product, so record what each rung
+of the ladder actually proves:
+
+| configuration | what it exercises | verdict on T7's fix |
+|---|---|---|
+| repo binary, `-display none` | **not the product**: QEMU never calls `gfx_update`, so the LCD readiness path never runs | INVALID — this rung "passed" a change that broke the app |
+| repo binary + VNC refresh client | display refresh as in the app; synthetic input | reproduces the bug; fix verified |
+| **shipped bundle** (`--app`) + VNC | the bundle's own engine, firmware, bridges, launcher | fix verified 3/3 |
+| **shipped bundle + Cocoa display** | the real display path a user gets | fix verified 3/3, 234+ frames consumed |
+| shipped bundle + Cocoa + real mouse/keys | a human's event stream | requires desktop control |
+
+Rule of thumb this session earned: **if the harness cannot observe the thing
+under test without changing it, the harness is wrong** — do not change the
+model to make the test work.
