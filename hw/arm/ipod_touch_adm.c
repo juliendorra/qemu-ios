@@ -169,8 +169,26 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                 uint32_t page;
                 uint16_t num_pages;
                 uint8_t bank;
-                uint32_t cmd = adm_read_u32(
-                    s, s->data2_sec_addr + 0x1104 + 0x24);
+                /*
+                 * The command block's offset within data2 belongs to the
+                 * ADM/FMC firmware the kernel uploaded, not to the hardware:
+                 * 1.1.x ("CalmADMFMCFirmware-17") uses +0x1104, 1.0/1.0.x
+                 * ("CalmADMFMCFirmware-14") uses +0x0824. The two layouts are
+                 * otherwise identical -- IT_ADM_DIFF shows the same
+                 * 0x500/0x300/0x300/0x100 table at base+0x10 in both, which is
+                 * how the second base was derived. Pick whichever holds a
+                 * command.
+                 */
+                hwaddr cmdbase = s->data2_sec_addr + 0x1104;
+                uint32_t cmd = adm_read_u32(s, cmdbase + 0x24);
+                if (cmd == 0) {
+                    hwaddr alt = s->data2_sec_addr + 0x0824;
+                    uint32_t altcmd = adm_read_u32(s, alt + 0x24);
+                    if (altcmd != 0) {
+                        cmdbase = alt;
+                        cmd = altcmd;
+                    }
+                }
                 /* IT_NAND_TRACE=1: which NAND operations the guest actually
                  * issues. 0x200/0x300 are reads, 0x500 is a page WRITE. If a
                  * board never emits 0x500 its storage is read-only in
@@ -338,7 +356,7 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         // read multiple pages simultaneously from the same bank
                         s->nand_state->reading_multiple_pages = true;
                         num_pages = adm_read_be16(
-                            s, s->data2_sec_addr + 0x1104 + 0x28);
+                            s, cmdbase + 0x28);
                         if (num_pages > ARRAY_SIZE(
                                 s->nand_state->pages_to_read)) {
                             qemu_log_mask(LOG_GUEST_ERROR,
@@ -349,7 +367,7 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         //printf("Reading %d pages at once, ", num_pages);
 
                         page = adm_read_be32(
-                            s, s->data2_sec_addr + 0x1104 + 0x244);
+                            s, cmdbase + 0x244);
                         //printf("starting with page %d\n", page);
 
                         /*
@@ -380,7 +398,7 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         // seems to be the NAND read command, read the page(s) + bank and instruct the flash device
                         s->nand_state->reading_multiple_pages = false;
                         num_pages = adm_read_be16(
-                            s, s->data2_sec_addr + 0x1104 + 0x28);
+                            s, cmdbase + 0x28);
                         if (num_pages > ARRAY_SIZE(
                                 s->nand_state->pages_to_read)) {
                             qemu_log_mask(LOG_GUEST_ERROR,
@@ -391,10 +409,10 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         if(num_pages == 1) {
                             // TODO this can probably be refactored to re-use the logic to read multiple pages!
                             bank = adm_read_u8(
-                                s, s->data2_sec_addr + 0x1104 + 0x44);
+                                s, cmdbase + 0x44);
 
                             page = adm_read_be32(
-                                s, s->data2_sec_addr + 0x1104 + 0x244);
+                                s, cmdbase + 0x244);
                             if (page >= 25855 && page <= 25859) {
                                 trace_itadm_root_read(cmd, num_pages, 0, bank,
                                                      page);
@@ -418,10 +436,10 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                             s->nand_state->reading_multiple_pages = true;
                             for(int i = 0; i < num_pages; i++) {
                                 page = adm_read_be32(
-                                    s, s->data2_sec_addr + 0x1104 + 0x244 +
+                                    s, cmdbase + 0x244 +
                                     4 * i);
                                 bank = adm_read_u8(
-                                    s, s->data2_sec_addr + 0x1104 + 0x44 + i);
+                                    s, cmdbase + 0x44 + i);
                                 // printf("Page: %d, bank: %d\n", page, bank);
 
                                 s->nand_state->pages_to_read[i] = page;
@@ -441,9 +459,9 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                     case 0x500:
                         // writing a page
                         bank = adm_read_u8(
-                            s, s->data2_sec_addr + 0x1104 + 0x44);
+                            s, cmdbase + 0x44);
                         page = adm_read_be32(
-                            s, s->data2_sec_addr + 0x1104 + 0x244);
+                            s, cmdbase + 0x244);
 
                         // set the bank, page, and operation.
                         //printf("Activating bank for writing: %d, page: %d\n", bank, page);
