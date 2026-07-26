@@ -16,6 +16,7 @@ PACK_MAGIC = b"IPODNAND"
 PACK_VERSION = 1
 PACK_PAGE_SIZE = 2048 + 64
 DATA_SIZE = 2048
+NUM_BANKS = 8
 PAGES_PER_BLOCK = 128
 FTL_CXT_SECTION_START = 201
 BOOT_PARTITION_FIRST_PAGE = 3
@@ -30,8 +31,15 @@ def sha256_file(path: Path) -> str:
 
 
 class PackedPages:
-    def __init__(self, path: Path):
+    # A pack is keyed by PHYSICAL address (page * 8 + bank, see
+    # pack-ipod-nand.py and nand_read_packed_page in the model), while callers
+    # here address pages by LOGICAL vpn over `active_banks`. Those coincide
+    # only on a real 8-bank iPod dump; on a generated 4-bank M68AP NAND they
+    # do not, and the extractor read the wrong pages (all zeros -> "invalid
+    # HFS volume signature").
+    def __init__(self, path: Path, active_banks: int = NUM_BANKS):
         self.path = path
+        self.active_banks = active_banks
         self.file = path.open("rb")
         self.mapping = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
         magic, version, page_size, count = PACK_HEADER.unpack_from(self.mapping)
@@ -45,16 +53,23 @@ class PackedPages:
             raise SystemExit(f"truncated or extended NAND pack: {path}")
         self.data_offset = descriptor_end
         self.page_size = page_size
+        self.missing = 0
         self.index = {
             struct.unpack_from("<I", self.mapping, PACK_HEADER.size + i * 4)[0]: i
             for i in range(count)
         }
 
     def read_data(self, vpn: int) -> bytes:
-        try:
-            index = self.index[vpn]
-        except KeyError as error:
-            raise SystemExit(f"missing NAND virtual page {vpn}") from error
+        # A GENERATED NAND is sparse: the builder only writes pages that carry
+        # data, so the pack has holes. The QEMU model reads a hole as zeros
+        # (nand_set_buffered_page), so the extractor must too -- refusing
+        # made this tool unusable on every image the app actually ships.
+        bank = vpn % self.active_banks
+        page = vpn // self.active_banks
+        index = self.index.get(page * NUM_BANKS + bank)
+        if index is None:
+            self.missing += 1
+            return bytes(DATA_SIZE)
         offset = self.data_offset + index * self.page_size
         return self.mapping[offset:offset + DATA_SIZE]
 
@@ -221,11 +236,11 @@ def main() -> int:
         raise SystemExit(f"refusing to overwrite output: {output}")
     if source.is_dir():
         pack = source / "nand.pack"
-        reader = PackedPages(pack) if pack.is_file() else SparsePages(
-            source, args.active_banks)
+        reader = (PackedPages(pack, args.active_banks) if pack.is_file()
+                  else SparsePages(source, args.active_banks))
         source_artifact = pack if pack.is_file() else source
     elif source.is_file():
-        reader = PackedPages(source)
+        reader = PackedPages(source, args.active_banks)
         source_artifact = source
     else:
         raise SystemExit(f"NAND source not found: {source}")
