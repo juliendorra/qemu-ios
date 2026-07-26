@@ -6,7 +6,11 @@
 > **UPDATE 2026-07-26 — iPhone OS 1.1.1 (3A109a) REACHES THE HOME SCREEN.**
 > The profile work below was implemented and 1.1.1 booted to SpringBoard on the
 > first attempt with no new emulator code. See
-> [Result: 1.1.1 runs](#result-111-runs). The 1.0 family is still unattempted.
+> [Result: 1.1.1 runs](#result-111-runs). 1.0.2 was then attempted and is
+> blocked on ONE emulator gap — see
+> [Result: 1.0.2 blocked](#result-102-is-blocked-in-the-emulator-not-in-the-artifacts).
+> Section 3's "work required" list below is the ORIGINAL estimate, kept for the
+> record; the ✅/⛔ markers say what survived contact.
 
 Today `-M iPhone-2G` runs exactly one firmware: **iPhone OS 1.1.4 / 4A102**
 (see [`IPHONE_2G.md`](IPHONE_2G.md), [`M68AP_HOMESCREEN_CASE_STUDY.md`](M68AP_HOMESCREEN_CASE_STUDY.md)).
@@ -119,16 +123,17 @@ These already verify an anchor and refuse to act on a mismatch, so a wrong build
 produces a clean error rather than corruption — but each needs a new offset for
 each new firmware:
 
-- `scripts/patch-m68ap-iboot.py` — secure-boot bypass at file offset `0x5990`
-  with anchor `0x5984`, explicitly labelled "iBoot-204.3.14". iBoot-159 needs its
-  own offsets (it is a different bootloader, and its trust check is structured
-  differently — no epoch gate).
-- `scripts/hacktivate-m68ap.py` — lockdownd patterns embed 1.1.4 literal-pool
-  values (`b8f34f38`, `a0d80900`, CFString length 11→9).
-- `hw/arm/ipod_touch.c` iBoot charge-wait patch — absolute `IBOOT_BASE+0x21458`
-  and `+0x09980`, verified against expected words.
-- `scripts/build-m68ap-nor.py` `promote_loadable` — IMG2 flag normalisation
-  reverse-engineered from iBoot-204's validator at VA `0x18008478`.
+- ✅ **Wrong — no re-derivation needed.** `scripts/patch-m68ap-iboot.py` now
+  locates the helper by pattern; it is byte-identical in all three bootloaders
+  including iBoot-159.
+- ✅ **Wrong — no re-derivation needed.** `scripts/hacktivate-m68ap.py` now
+  derives the lockdownd constants by parsing the binary in place.
+- ✅ **Right, and worse than stated.** The `hw/arm/ipod_touch.c` charge-wait
+  patch was pinned to `+0x21458` and `+0x09980`; the second is an *N45AP*
+  address, so it had never applied on the iPhone at all. Both are now
+  pattern-located.
+- ✅ **Wrong — needed no work.** `scripts/build-m68ap-nor.py` `promote_loadable`
+  was accepted by iBoot-159 with zero trust or epoch rejections, unchanged.
 
 ### Breaks silently (no guard at all)
 
@@ -151,6 +156,10 @@ each new firmware:
   sufficient — verified in a scratchpad copy: it decompressed the 1.0
   kernelcache to a 5,888,896-byte ARM Mach-O on the first try.
 - **TSL2561 ambient-light model** for 1.0, alongside the existing ISL29003.
+  (Not yet reached — 1.0.2 stops before the kernel runs.)
+- ⛔ **The one that actually blocks 1.0, and was not on this list at all:**
+  iBoot-159's NAND page reads never reach `hw/arm/ipod_touch_adm.c`. See the
+  1.0.2 result section.
 - (Checked and *not* a difference: the kernelcache is `8900 → complzss` with no
   IMG2 wrapper in 1.0, 1.1.1 and 1.1.4 alike. `extract-kernelcache.py`'s
   docstring claims 1.1.x interposes an IMG2 layer; it does not.)
