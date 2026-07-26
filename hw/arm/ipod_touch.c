@@ -1337,6 +1337,16 @@ static void ipod_touch_machine_init(MachineState *machine)
         i2c_slave_create_simple(i2c_state->bus, "isl29003", 0x49);
     }
 
+    /*
+     * The PMU is on a DIFFERENT I2C controller per board. The M68AP device
+     * tree makes `pmu,pcf50635` a child of the i2c0 node; N45AP puts it on
+     * i2c1. Attaching it to i2c1 for both meant every M68AP PMU read returned
+     * 0xFF (an unanswered bus), which 1.1.x survives -- it just believes it is
+     * permanently on external power and disables idle sleep -- but which stalls
+     * the 1.0 kernel in IOIpodUSBDevice's power path.
+     */
+    I2CBus *pmu_bus = i2c_state->bus;
+
     dev = qdev_new("ipodtouch.i2c");
     i2c_state = IPOD_TOUCH_I2C(dev);
     nms->i2c1_state = i2c_state;
@@ -1344,8 +1354,12 @@ static void ipod_touch_machine_init(MachineState *machine)
     sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_I2C1_IRQ));
     memory_region_add_subregion(sysmem, I2C1_MEM_BASE, &i2c_state->iomem);
 
+    if (nms->board_id != BOARD_ID_M68AP) {
+        pmu_bus = i2c_state->bus;   /* N45AP: i2c1 */
+    }
+
     // init the PMU
-    I2CSlave *pmu = i2c_slave_create_simple(i2c_state->bus, "pcf50633", 0x73);
+    I2CSlave *pmu = i2c_slave_create_simple(pmu_bus, "pcf50633", 0x73);
     spi2_state->mt->pmu = PCF50633(pmu);
     // Wire PMU interrupt output to SYSIC (GPIO 0x55 = group 2, bit 21)
     PCF50633(pmu)->sysic = sysic_state;
