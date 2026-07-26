@@ -520,7 +520,7 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
                  "-o", str(cdr)])
             shutil.move(str(work / "data-raw.cdr"), str(data))
     run([sys.executable, str(REPO / "scripts" / "build-m68ap-nand.py"),
-         "--out", str(out), "--signature", "m68ap", "--active-banks", "4",
+         "--out", str(out), "--active-banks", "4",
          "--bbt", "production", "--hfs", str(root), "--data-hfs", str(data),
          "--device", "iPhone1,1", "--ipsw-build", "4A102"])
     # the NAND embeds both filesystems; drop the intermediate images so a

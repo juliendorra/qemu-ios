@@ -26,12 +26,28 @@ separately licensable effort.)
 
 The patch
 ---------
-One 2-byte Thumb edit at the unsigned-image decision helper (VA 0x18005984):
-its bit-4-clear return `movs r0, #0` (file 0x5990, bytes 00 20) becomes
+One 2-byte Thumb edit at the unsigned-image decision helper (VA 0x18005984 in
+4A102): its bit-4-clear return `movs r0, #0` (bytes 00 20) becomes
 `movs r0, #1` (01 20), so the helper reports "allowed" for unsigned images.
 Signed-image verification is untouched. Verified: with this patch (plus the
 NOR IMG2-validator normalisation in build-m68ap-nor.py), m68ap iBoot loads the
 device tree and proceeds through `gBootArgs.commandLine` to the kernel jump.
+
+Finding the site across builds
+------------------------------
+The site is LOCATED BY PATTERN, not by a hardcoded offset. The 32 bytes ending
+at the patch site contain the literal address of the security-config word
+(0x18022fa0) followed by its load/test/branch, which makes them a unique and
+stable fingerprint. Measured 2026-07-25, the identical 32-byte sequence occurs
+exactly once in every 1.x m68ap iBoot, merely relocated:
+
+    4A102  (1.1.4)  iBoot-204  site 0x5990
+    3A109a (1.1.1)  iBoot-204  site 0x5930
+    1A543a (1.0)    iBoot-159  site 0x5350
+
+So the helper is byte-identical across the whole iPhone OS 1.x line and this
+patch needs no per-build re-derivation -- only a unique match. If a future
+image matches zero or several times, the tool refuses rather than guessing.
 
 Policy: this rewrites Apple-derived firmware, so like the extracted images it is
 never committed -- only this patch *tool* is. Operate on a staged copy; never
@@ -47,20 +63,41 @@ import argparse
 import sys
 from pathlib import Path
 
-# VA 0x18005984 helper: bit-4-clear reject at VA 0x18005990 == file 0x5990.
-PATCH_OFF = 0x5990
 ORIG = bytes.fromhex("0020")   # movs r0, #0  (reject: unsigned not allowed)
 PATCHED = bytes.fromhex("0120")  # movs r0, #1  (allow unsigned)
 
-# Sanity anchor: VA 0x18005984 is `cmp r0, #1` (0x2801, file 0x5984).
-ANCHOR_OFF = 0x5984
-ANCHOR = bytes.fromhex("0128")
+# The 32 bytes immediately PRECEDING the patch site, ending exactly at it.
+# Read from 4A102 at file 0x5970..0x5990 and confirmed byte-identical in 3A109a
+# and in 1A543a's iBoot-159. Contains the literal 0x18022fa0 (security-config
+# address, stored little-endian as a0 2f 02 18) plus its load/test/branch, which
+# is what makes it unique.
+LOCATOR = bytes.fromhex(
+    "13402022134306602010bd"          # tail of the preceding function
+    "a02f0218"                        # &security_config == 0x18022fa0
+    "fffff3df01280bd1074a1368d90601d4"  # cmp r0,#1 / ldr / tst bit 4 / bmi
+)
 
 
-def classify(buf: bytes) -> str:
-    if buf[ANCHOR_OFF:ANCHOR_OFF + 2] != ANCHOR:
-        return "unknown"
-    win = buf[PATCH_OFF:PATCH_OFF + 2]
+def find_site(buf: bytes) -> int:
+    """Return the file offset of the 2-byte return value, or raise."""
+    hits = []
+    start = 0
+    while True:
+        i = buf.find(LOCATOR, start)
+        if i < 0:
+            break
+        hits.append(i + len(LOCATOR))
+        start = i + 1
+    if len(hits) != 1:
+        raise SystemExit(
+            f"secure-boot helper located {len(hits)} times (expected exactly "
+            f"1); this does not look like an m68ap iBoot 1.x image, so "
+            f"refusing to patch")
+    return hits[0]
+
+
+def classify(buf: bytes, site: int) -> str:
+    win = buf[site:site + 2]
     if win == ORIG:
         return "unpatched"
     if win == PATCHED:
@@ -70,32 +107,33 @@ def classify(buf: bytes) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("iboot", type=Path, help="extracted iboot_204_m68ap.bin")
+    ap.add_argument("iboot", type=Path, help="extracted raw m68ap iBoot")
     ap.add_argument("out", type=Path, nargs="?", help="output patched iBoot")
     ap.add_argument("--verify", action="store_true",
                     help="only report patch state, do not write")
     args = ap.parse_args()
 
     buf = bytearray(args.iboot.read_bytes())
-    state = classify(buf)
+    site = find_site(buf)
+    state = classify(buf, site)
     if state == "unknown":
         raise SystemExit(
-            f"{args.iboot}: not a recognised m68ap iBoot-204.3.14 "
-            f"(anchor/opcode mismatch at 0x{ANCHOR_OFF:x}/0x{PATCH_OFF:x}); "
-            f"refusing to patch")
+            f"{args.iboot}: secure-boot helper found at 0x{site:x} but its "
+            f"return is {buf[site:site+2].hex()} (expected {ORIG.hex()} or "
+            f"{PATCHED.hex()}); refusing to patch")
 
     if args.verify:
-        print(f"{args.iboot}: {state}")
-        return 0 if state in ("patched", "unpatched") else 1
+        print(f"{args.iboot}: {state} (site 0x{site:x})")
+        return 0
 
     if not args.out:
         raise SystemExit("output path required (or use --verify)")
     if state == "patched":
         print(f"{args.iboot}: already patched; copying through")
     else:
-        buf[PATCH_OFF:PATCH_OFF + 2] = PATCHED
+        buf[site:site + 2] = PATCHED
     args.out.write_bytes(buf)
-    print(f"wrote {args.out} (secure-boot bypass at 0x{PATCH_OFF:x}: "
+    print(f"wrote {args.out} (secure-boot bypass at 0x{site:x}: "
           f"{ORIG.hex()} -> {PATCHED.hex()})")
     return 0
 

@@ -92,24 +92,19 @@ def with_software_compositing(root: Path, work: Path) -> Path:
 def without_addressbook(root: Path, work: Path, drop: bool) -> Path:
     """OPT-IN ONLY (--drop-addressbook): remove com.apple.AddressBook.
 
-    Not the default: removing a daemon degrades the device (no Contacts), and
-    the packaged image should be complete. It exists because the daemon costs
-    ~90% of a host core until task T6 lands -- pick your trade-off knowingly.
+    OBSOLETE as a workaround (T6 is fixed -- see data_partition() below): the
+    daemon no longer spins, because /var now carries the root filesystem's own
+    template. Kept only as a bisecting tool, and never the default: removing a
+    daemon degrades the device (no Contacts).
 
-    AddressBook creates its SQLite database on first run. On a GENERATED NAND
-    the guest's writes never take effect -- the FTL cannot write to the tree we
-    construct (measured: /private/var is mounted read-WRITE and the kernel
-    still lands zero pages in the NAND model). So the daemon creates its
-    tables, reads them back, finds "no such table: ABPerson", and retries about
-    250 times a second FOREVER. That is what pegs the emulated CPU at ~98%
-    while the iPod idles at 11-15%.
-
-    The iPod is unaffected because its NAND is a real device dump whose /var
-    already contains what daemons expect.
-
-    THE REAL FIX is writable storage on the generated NAND (task T6); this is
-    a stopgap that costs Contacts and nothing else. --keep-addressbook opts
-    out for anyone working on T6.
+    Retained because the reasoning was wrong in an instructive way. The claim
+    here used to be "the guest's writes never take effect -- the FTL cannot
+    write to the tree we construct". That was false twice over: the guest does
+    issue page writes, AND writability was never the issue. AddressBook was
+    failing CREATE TABLE with SQLITE_BUSY because /var had none of the
+    directories the OS expects. Dropping the daemon took CPU from ~98% to ~9%
+    and thereby made a symptom disappear while the cause stayed put -- which is
+    exactly how a stopgap buys silence instead of understanding.
     """
     if not drop:
         return root
@@ -152,17 +147,18 @@ def data_partition(work: Path) -> Path:
     out = work / "data-var.img"
     if out.exists():
         return out
-    print(f"[3/4] data partition: minimal /var skeleton + {ARK_PROFILE!r} ark")
+    print(f"[3/4] data partition: /var from the root template + "
+          f"{ARK_PROFILE!r} ark")
     ark = work / "data_ark.plist"
     run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "build-dataark",
          "--out", ark, "--profile", ARK_PROFILE])
-    # The databases the first boot after a restore would have created. Our
-    # guest cannot create them (writes do not reach the generated NAND), and
-    # without them com.apple.AddressBook retries ~250x/s forever. Schema comes
-    # from the firmware's own SQL -- see seed-guest-databases.py. They are
-    # handed to the /var builder so they are written WHILE the volume is
-    # constructed: a file added to a finished image is not reliably traversed
-    # by the 2007 HFS driver.
+    # The databases the first boot after a restore would have created. Kept
+    # even though T6 turned out not to be about them -- the guest reads them
+    # fine (proved by corrupting the SQLite magic and watching SpringBoard
+    # report SQLITE_CORRUPT with the path), and a device that ships with its
+    # schema already present skips one first-run rebuild. Schema comes from the
+    # firmware's own SQL -- see seed-guest-databases.py. They are handed to the
+    # /var builder so they are written WHILE the volume is constructed.
     cmd = [sys.executable, SCRIPTS / "build-m68ap-var.py",
            "--out", out, "--data-ark", ark,
            "--template-from", ROOT_HFS]
@@ -216,7 +212,7 @@ def main() -> int:
 
     print("[4/4] building the NAND tree")
     run([sys.executable, SCRIPTS / "build-m68ap-nand.py",
-         "--out", args.out, "--signature", "m68ap", "--active-banks", "4",
+         "--out", args.out, "--active-banks", "4",
          "--bbt", "production", "--hfs", root, "--data-hfs", data,
          "--device", "iPhone1,1", "--ipsw-build", "4A102"])
 

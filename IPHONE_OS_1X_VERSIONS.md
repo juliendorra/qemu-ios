@@ -140,16 +140,17 @@ each new firmware:
 
 ### Missing capability (small, well-scoped)
 
-- **8900 format-4 support.** `scripts/extract-m68ap-images.py` and
-  `scripts/extract-kernelcache.py` decrypt unconditionally and therefore die on
-  every 1.0 image (`Data must be padded to 16 byte boundary`). A one-line guard
-  on the format byte (`dec = enc if d[7] == 4 else aes_cbc_decrypt(...)`) is
+- **8900 format-4 support in the kernelcache path.** `scripts/extract-m68ap-images.py`
+  already branches on the format byte (`0x03` encrypted / `0x04` plaintext), so
+  the boot images are fine. `scripts/extract-kernelcache.py` does **not**, and
+  dies on every 1.0 kernelcache (`Data must be padded to 16 byte boundary`). A
+  one-line guard (`dec = enc if d[7] == 4 else aes_cbc_decrypt(...)`) is
   sufficient — verified in a scratchpad copy: it decompressed the 1.0
   kernelcache to a 5,888,896-byte ARM Mach-O on the first try.
 - **TSL2561 ambient-light model** for 1.0, alongside the existing ISL29003.
-- Note the 1.0 kernelcache is `8900 → complzss` directly, with **no IMG2
-  wrapper**, unlike 1.1.x's `8900 → IMG2 → complzss`. Any parser assuming the
-  wrapper needs a branch.
+- (Checked and *not* a difference: the kernelcache is `8900 → complzss` with no
+  IMG2 wrapper in 1.0, 1.1.1 and 1.1.4 alike. `extract-kernelcache.py`'s
+  docstring claims 1.1.x interposes an IMG2 layer; it does not.)
 
 ### Structural (the real fix)
 

@@ -29,22 +29,33 @@ NOTE ON POLICY: this script is extraction/conversion tooling only. Do not commit
 the IPSW, the decrypted images, keys beyond the one already in the tree, or an
 activated NAND. Point it at a user-supplied IPSW at run time.
 
+Both 8900 formats are handled: 1.1.x images are AES-encrypted (format 0x03),
+1.0/1.0.x images are stored in the clear (format 0x04). Pass --build so the raw
+iBoot is named for its real bootloader (1.0 is iBoot-159, not iBoot-204) and so
+the container's security epoch is checked against the expected value; see
+scripts/firmware_profiles.py and IPHONE_OS_1X_VERSIONS.md.
+
 Usage:
-  python3 scripts/extract-m68ap-images.py \
+  python3 scripts/extract-m68ap-images.py [--build 4A102] \
       <path to .../all_flash.m68ap.production> <output dir>
 """
+import argparse
 import os
 import struct
 import subprocess
 import sys
 
-GID_KEY = "188458A6D15034DFE386F23B61D43774"  # S5L8900 key 0x837 (public)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import firmware_profiles
+
+GID_KEY = firmware_profiles.GID_KEY  # S5L8900 key 0x837 (public)
 IMG2_HEADER_LEN = 0x400
 CONTAINER_HEADER_LEN = 0x800
 
-# Source image -> (output name, whether to strip the IMG2 wrapper)
+# Source image -> (output name, whether to strip the IMG2 wrapper). The iBoot
+# output name is filled in per build (iboot_<version>_<board>.bin).
 IMAGES = {
-    "iBoot.m68ap.RELEASE.img2": ("iboot_204_m68ap.bin", True),
+    "iBoot.m68ap.RELEASE.img2": (None, True),
     "LLB.m68ap.RELEASE.img2":   ("LLB.m68ap.bin",        True),
     "DeviceTree.m68ap.img2":    ("DeviceTree.m68ap.bin", True),
 }
@@ -69,11 +80,14 @@ def decrypt_8900(data):
     if data[:4] != b"8900":
         raise ValueError("not an 8900 container")
     marker = data[7]
+    size = struct.unpack("<I", data[0x0c:0x10])[0]
     if marker == 0x04:
-        return data[CONTAINER_HEADER_LEN:]  # already plaintext
+        # Already plaintext (1.0 / 1.0.x). Still honour sizeOfData: what follows
+        # the payload is the Apple Secure Boot certificate footer, not image
+        # data, and feeding it to iboot= would append ~3 KB of garbage.
+        return data[CONTAINER_HEADER_LEN:CONTAINER_HEADER_LEN + size]
     if marker != 0x03:
         raise ValueError(f"unexpected 8900 enc marker {marker:#x}")
-    size = struct.unpack("<I", data[0x0c:0x10])[0]
     payload = data[CONTAINER_HEADER_LEN:CONTAINER_HEADER_LEN + (size - size % 16)]
     proc = subprocess.run(
         ["openssl", "enc", "-d", "-aes-128-cbc", "-nopad",
@@ -82,14 +96,22 @@ def decrypt_8900(data):
     return proc.stdout
 
 
-def main(src_dir, out_dir):
+def main(src_dir, out_dir, profile):
     os.makedirs(out_dir, exist_ok=True)
     for src, (out_name, strip_img2) in IMAGES.items():
         src_path = os.path.join(src_dir, src)
         if not os.path.exists(src_path):
             print(f"skip {src}: not found")
             continue
-        dec = decrypt_8900(open(src_path, "rb").read())
+        raw = open(src_path, "rb").read()
+        if raw[7] != profile.img_format:
+            raise ValueError(
+                f"{src}: 8900 format byte is {raw[7]:#x}, but build "
+                f"{profile.build} expects {profile.img_format:#x} -- wrong "
+                f"--build for these images?")
+        dec = decrypt_8900(raw)
+        if out_name is None:
+            out_name = profile.iboot_out_name
         if strip_img2:
             if dec[:4] != b"2gmI":
                 raise ValueError(f"{src}: decrypted payload is not IMG2 "
@@ -122,11 +144,19 @@ def main(src_dir, out_dir):
         out_path = os.path.join(container_dir, f"{stem}.img2c")
         open(out_path, "wb").write(container)
         epoch = struct.unpack("<H", dec[0xa:0xc])[0]
+        if epoch != profile.epoch:
+            raise ValueError(
+                f"{src}: security epoch {epoch}, but build {profile.build} "
+                f"expects {profile.epoch}")
         print(f"{src} -> {out_path} (type={img_type} epoch={epoch} "
               f"{len(container):#x} bytes)")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit(__doc__)
-    main(sys.argv[1], sys.argv[2])
+    ap = argparse.ArgumentParser(
+        description="Extract raw M68AP boot images from an IPSW's all_flash dir")
+    firmware_profiles.add_build_argument(ap)
+    ap.add_argument("src_dir", help="path to .../all_flash.m68ap.production")
+    ap.add_argument("out_dir", help="output directory")
+    args = ap.parse_args()
+    main(args.src_dir, args.out_dir, firmware_profiles.get(args.build))

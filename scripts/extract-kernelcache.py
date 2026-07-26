@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Decrypt + decompress an S5L8900 (iPhone 2G / iPod Touch 1G) kernelcache.
 
-The 1.1.x kernelcache ships as an 8900 container:
+The kernelcache ships as an 8900 container:
 
-    [0x800 header] AES-128-CBC(key=GID, iv=0) over sizeOfData bytes
+    [0x800 header] payload of sizeOfData bytes, either AES-128-CBC(key=GID,
+                   iv=0) or stored in the clear -- the format byte at header
+                   offset 0x07 says which (0x03 encrypted, 0x04 plaintext)
         -> 'complzss' header + Apple LZSS stream
             -> raw ARM Mach-O (MH_MAGIC, kernel + prelinked kexts)
+
+iPhone OS 1.0 / 1.0.x images are format 4 (plaintext); 1.1.x are format 3. There
+is no IMG2 wrapper on the kernelcache in any 1.x build -- verified on 1A543a,
+3A109a and 4A102. See IPHONE_OS_1X_VERSIONS.md.
 
 The S5L8900 GID key (188458A6D15034DFE386F23B61D43774) is public and is the
 same key already compiled into hw/arm/ipod_touch_8900_engine.h -- iPhone 2G
@@ -88,8 +94,17 @@ def extract(path: str) -> bytes:
         if d[:5] != b"89001":
             print("warning: no 8900 magic; attempting anyway", file=sys.stderr)
     size = struct.unpack("<I", d[0xC:0x10])[0]
-    enc = d[0x800 : 0x800 + size]
-    dec = aes_cbc_decrypt(enc, GID_KEY)
+    fmt = d[7]
+    if fmt == 0x04:
+        # 1.0 / 1.0.x: payload stored in the clear, no AES layer at all.
+        dec = d[0x800 : 0x800 + size]
+    elif fmt == 0x03:
+        # AES-CBC needs a whole number of blocks; the trailing bytes past the
+        # last full block are container padding.
+        enc = d[0x800 : 0x800 + size - size % 16]
+        dec = aes_cbc_decrypt(enc, GID_KEY)
+    else:
+        sys.exit(f"unexpected 8900 format byte {fmt:#x} (expected 0x03 or 0x04)")
     if dec[:8] != b"complzss":
         sys.exit("decrypt failed: no 'complzss' magic (wrong key/offset?)")
     declen = struct.unpack(">I", dec[12:16])[0]

@@ -64,8 +64,15 @@ The IRQ pairing is a **derivation, not a measurement**: N45AP fixes the rule
 `IRQ = 0x28 + (pin & 0xf)` (0x1605→0x2D, 0x1606→0x2E), and applying it to
 M68AP's five pins reproduces its device tree's interrupt SET exactly
 (`0x2d 0x28 0x29 0x2a 0x2b`, with 0x2C absent because pin 0x1604 is unused).
-So Home/menu = **0x1600 / IRQ 0x28**. `IT_M68AP_HOME_IRQ=<n>` overrides it
-without a rebuild if a measurement ever disagrees.
+So Home/menu = **0x1600 / IRQ 0x28**.
+
+Corroborated by a second field: `interrupts` is five `(irq, trigger)` pairs
+(`0x2d 7  0x28 7  0x29 5  0x2a 5  0x2b 7`), and under this pairing trigger 7
+falls on every pin whose GPIO flags are 0x100 and trigger 5 on every pin whose
+flags are 0x000 — a perfect split, whereas pairing by the DT's stored property
+order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
+`IT_M68AP_HOME_IRQ=<n>` overrides it without a rebuild, and
+`IT_GPIO_TRACE=stderr` during a Home press is how to settle it outright.
 
 ---
 

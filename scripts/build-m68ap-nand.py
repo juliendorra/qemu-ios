@@ -29,7 +29,11 @@ import hashlib
 import json
 import os
 import struct
+import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import firmware_profiles
 
 # --- S5L8900 NAND geometry -----------------------------------------------------
 BANKS = 8
@@ -306,8 +310,10 @@ def build(tree: NandTree, signature: int, hfs_path: Path | None,
     populated = {}
     if active_banks not in (M68AP_ACTIVE_BANKS, BANKS):
         raise SystemExit(f"unsupported active bank count: {active_banks}")
-    if signature == SIG_N45AP and active_banks != BANKS:
-        raise SystemExit("N45AP construction requires eight-bank interleave")
+    # NB: do NOT gate the bank count on the signature word. The signature is
+    # firmware-keyed and the interleave is board-keyed, and they cross: iPhone
+    # OS 1.1.1 on M68AP carries the iPod's 0x43303032 signature but still needs
+    # the four-bank M68AP interleave. main() enforces the board rule.
     pages_per_subblock = active_banks * PAGES_PER_BLOCK
 
     # 1. FIL signature (bank0/page0)
@@ -467,9 +473,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, required=True,
                         help="output NAND directory (bank0..bank7 created here)")
-    parser.add_argument("--signature", default="m68ap",
-                        help="'m68ap' (0x43303033), 'n45ap' (0x43303032), or a "
-                             "raw 0x-hex word")
+    parser.add_argument("--signature", default=None,
+                        help="override the FIL signature: 'm68ap' (0x43303033), "
+                             "'n45ap' (0x43303032), or a raw 0x-hex word. "
+                             "Default: taken from --ipsw-build's profile, which "
+                             "is the correct source -- the signature is keyed to "
+                             "the FIRMWARE, not the board (1.1.1 on M68AP uses "
+                             "the iPod's 0x43303032)")
     parser.add_argument("--hfs", type=Path, default=None,
                         help="decrypted root HFS+ image (optional; not needed to "
                              "pass WMR init)")
@@ -484,34 +494,48 @@ def main() -> None:
                              "verify and hard-link its immutable data pages")
     parser.add_argument("--ipsw-hash", default=None,
                         help="SHA-256 of the source IPSW, recorded in provenance")
-    parser.add_argument("--ipsw-build", default="4A102",
-                        help="IPSW build tag, recorded in provenance")
-    parser.add_argument("--device", default="iPhone1,1",
-                        help="source device, recorded in provenance")
+    parser.add_argument("--ipsw-build", default=firmware_profiles.DEFAULT_BUILD,
+                        help="IPSW build tag; selects the firmware profile that "
+                             "supplies the FIL signature, and is recorded in "
+                             "provenance")
+    parser.add_argument("--device", default=None,
+                        help="source device, recorded in provenance (default: "
+                             "from the build profile)")
     parser.add_argument("--bbt", choices=("production", "zero", "auto"),
                         default="auto",
                         help="BBT fill: 'production' (0xFF, needed by M68AP), "
                              "'zero' (it1g/N45AP byte-exact), or 'auto' (by "
-                             "--signature)")
+                             "the profile's board)")
     parser.add_argument("--pack", action="store_true",
                         help="also run pack-ipod-nand.py after the tree validates")
     args = parser.parse_args()
 
-    if args.signature == "m68ap":
+    profile = firmware_profiles.get(args.ipsw_build)
+
+    # The FIL signature belongs to the FIRMWARE (000C for 1.0/1.0.x, 200C for
+    # 1.1.1 and the iPod, 300C for 1.1.4); the bank topology and BBT style
+    # belong to the BOARD (M68AP: four active banks + production BBT; N45AP:
+    # eight banks + the it1g byte-exact zero BBT). Keying both off the
+    # signature word conflated them and made 1.1.1-on-M68AP unbuildable.
+    if args.signature is None:
+        signature = profile.fil_signature
+    elif args.signature == "m68ap":
         signature = SIG_M68AP
     elif args.signature == "n45ap":
         signature = SIG_N45AP
     else:
         signature = int(args.signature, 0)
 
+    is_n45ap = profile.board == "n45ap"
+
     if args.bbt == "auto":
-        production_bbt = signature != SIG_N45AP
+        production_bbt = not is_n45ap
     else:
         production_bbt = args.bbt == "production"
 
     active_banks = (args.active_banks if args.active_banks is not None else
-                    (M68AP_ACTIVE_BANKS if signature == SIG_M68AP else BANKS))
-    if signature == SIG_N45AP and active_banks != BANKS:
+                    (BANKS if is_n45ap else M68AP_ACTIVE_BANKS))
+    if is_n45ap and active_banks != BANKS:
         raise SystemExit("N45AP construction requires --active-banks 8")
 
     out = args.out.resolve()
@@ -548,7 +572,8 @@ def main() -> None:
         "populated_pages": populated,
         "page_count": count,
         "source": {
-            "kind": "ipsw", "device": args.device, "build": args.ipsw_build,
+            "kind": "ipsw", "device": args.device or profile.device,
+            "build": args.ipsw_build,
             "ipsw_sha256": args.ipsw_hash,
             "hfs_sha256": sha256_file(args.hfs) if args.hfs else None,
             "data_hfs_sha256": (

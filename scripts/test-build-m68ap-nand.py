@@ -49,10 +49,16 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# --signature sets only the FIL word; the board's bank interleave and BBT
+# style come from the build profile, so the fixtures name both.
+BUILD_FOR_SIG = {"n45ap": "n45ap", "m68ap": "4A102"}
+
+
 def generate(sig: str, bbt: str) -> Path:
     out = Path(tempfile.mkdtemp(prefix=f"nand-{sig}-")) / "nand"
     subprocess.run(
         [sys.executable, str(BUILDER), "--out", str(out),
+         "--ipsw-build", BUILD_FOR_SIG[sig],
          "--signature", sig, "--bbt", bbt],
         check=True, capture_output=True, text=True)
     return out
@@ -66,6 +72,7 @@ def generate_with_hfs(sig: str, pages: int,
     hfs.write_bytes(b"".join(bytes([index]) * PAGE for index in range(pages)))
     out = root / "nand"
     command = [sys.executable, str(BUILDER), "--out", str(out),
+               "--ipsw-build", BUILD_FOR_SIG[sig],
                "--signature", sig, "--bbt", "auto", "--hfs", str(hfs)]
     if data_pages:
         data_hfs = root / "data-fixture.img"
@@ -189,9 +196,12 @@ def test_m68ap_can_hardlink_verified_eight_bank_pages() -> None:
     hfs.write_bytes(b"".join(bytes([index]) * PAGE for index in range(16)))
     source = root / "source"
     target = root / "target"
+    # The source must be a genuine eight-bank N45AP tree, so select it by
+    # build profile: --signature only sets the FIL word, it no longer implies
+    # the board's bank interleave (1.1.1 on M68AP shares N45AP's signature).
     subprocess.run(
         [sys.executable, str(BUILDER), "--out", str(source),
-         "--signature", "n45ap", "--bbt", "auto", "--hfs", str(hfs)],
+         "--ipsw-build", "n45ap", "--bbt", "auto", "--hfs", str(hfs)],
         check=True, capture_output=True, text=True)
     subprocess.run(
         [sys.executable, str(BUILDER), "--out", str(target),

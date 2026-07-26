@@ -440,9 +440,32 @@ The **pin is certain** (it is in the device tree). The **IRQ is a derivation**:
 N45AP fixes the rule `IRQ = 0x28 + (pin & 0xf)` (0x1605→0x2D, 0x1606→0x2E),
 and applying it to M68AP's five button pins reproduces its device tree's
 interrupt SET exactly — `0x2d 0x28 0x29 0x2a 0x2b`, with 0x2C absent precisely
-because pin 0x1604 is unused. That is strong, but it is inference from a set,
-not a measured pairing, so `IT_M68AP_HOME_IRQ=<n>` overrides it without a
-rebuild.
+because pin 0x1604 is unused.
+
+What the device tree does *not* do is state the pairing — and its properties
+are not stored in pin order either (the binary holds ringerab, hold, voldown,
+menu, volup), so position cannot supply it. But a **second, independent field
+in the same node** does corroborate the rule. `interrupts` is five
+`(irq, trigger)` pairs, and the trigger tracks the GPIO polarity flag exactly
+under this pairing:
+
+| IRQ | pairs with | GPIO flags | trigger |
+|---|---|---|---|
+| 0x2d | hold | 0x100 | 7 |
+| 0x28 | **menu** | 0x100 | 7 |
+| 0x29 | volup | 0x000 | 5 |
+| 0x2a | voldown | 0x000 | 5 |
+| 0x2b | ringerab | 0x100 | 7 |
+
+Every `0x100` pin gets 7, every `0x000` pin gets 5. And this **refutes** the
+obvious competing hypothesis: pairing by stored property order would require
+triggers `7,7,5,7,5`, while the list is `7,7,5,5,7`.
+
+It remains inference (a set plus a correlation), not an observed acknowledge,
+so `IT_M68AP_HOME_IRQ=<n>` overrides it without a rebuild. To settle it
+outright: press Home under `IT_GPIO_TRACE=stderr` and check which
+status/mask bit the driver actually acknowledges. A wrong IRQ fails **silently**
+— the pin toggles and nothing happens, which is exactly the original bug.
 
 ## The A/B that proves it
 

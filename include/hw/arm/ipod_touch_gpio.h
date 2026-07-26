@@ -46,10 +46,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchGPIOState, IPOD_TOUCH_GPIO)
  * N45AP fixes the rule: pin 0x1605 -> IRQ 0x2D and pin 0x1606 -> IRQ 0x2E,
  * i.e. IRQ = 0x28 + (pin & 0xf). Applying it to M68AP's five pins yields
  * {menu 0x28, volup 0x29, voldown 0x2A, ringerab 0x2B, hold 0x2D} -- exactly
- * the set its device tree lists for the `buttons` node (0x2d, 0x28, 0x29,
- * 0x2a, 0x2b), with 0x2C absent because pin 0x1604 is unused. The DT does not
- * state the pairing, so the SET is evidence and the rule is a derivation;
- * IT_M68AP_HOME_IRQ overrides it without a rebuild if a measurement disagrees.
+ * the set its device tree lists for the `buttons` node, with 0x2C absent
+ * because pin 0x1604 is unused. The DT never states the pairing, and its
+ * properties are not even stored in pin order (the binary holds ringerab,
+ * hold, voldown, menu, volup), so position cannot supply it either.
+ *
+ * A SECOND, INDEPENDENT field in the same node corroborates the rule. The
+ * interrupts property is five (irq, trigger) pairs:
+ *
+ *   0x2d 7   0x28 7   0x29 5   0x2a 5   0x2b 7
+ *
+ * Under this pairing every trigger 7 lands on a pin whose GPIO flags are 0x100
+ * (hold, menu, ringerab) and every trigger 5 on a pin whose flags are 0x000
+ * (volup, voldown) -- a perfect split. Pairing the interrupts against the
+ * stored property order instead would demand triggers 7,7,5,7,5, and the list
+ * is 7,7,5,5,7, so that reading is REFUTED.
+ *
+ * It is still inference (set + correlation), not an observed acknowledge, so
+ * IT_M68AP_HOME_IRQ overrides it without a rebuild. To settle it: press Home
+ * under IT_GPIO_TRACE=stderr and check which status/mask bit the driver acks.
  *
  * Until 2026-07-26 the key handler used N45AP's home pin/IRQ (0x1606/0x2E) on
  * BOTH boards. 0x2E is not in M68AP's list at all, which is why Power (0x1605,
