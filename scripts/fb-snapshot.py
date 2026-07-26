@@ -115,6 +115,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--board", choices=("m68ap", "n45ap"), required=True)
+    ap.add_argument("--epoch", type=int, default=None,
+                    help="SYSIC security epoch override (per FIRMWARE: 1.1.4=3, "
+                         "1.1.1=2, 1.0=0). Default: the board's own.")
     ap.add_argument("--qemu", type=Path, default=DEFAULT_QEMU)
     ap.add_argument("--bootrom", type=Path, default=DEFAULT_BOOTROM)
     ap.add_argument("--iboot-n45ap", type=Path,
@@ -171,6 +174,11 @@ def main() -> int:
     serial.write_bytes(b"")
     machine = (f"{machine_type},bootrom={args.bootrom},"
                f"iboot={iboot},nand={staged_nand}")
+    if args.epoch is not None:
+        # The security epoch is firmware-keyed, not board-keyed: M68AP defaults
+        # to 3 (1.1.4), but 1.1.1's images carry 2 and 1.0's carry 0. Booting
+        # them without this wedges in iBoot with an empty serial log.
+        machine += f",epoch={args.epoch}"
     cmd = [str(args.qemu), "-M", machine, "-m", "1G",
            "-pflash", str(staged_nor),
            "-L", str(APP / "Resources" / "pc-bios"),
