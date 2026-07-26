@@ -571,6 +571,28 @@ rather than a single command. Decoding it is the next task, and it is a real
 piece of work rather than a constant: the model needs a per-firmware ADM layout,
 selected by which blob the guest uploaded.
 
+#### Attempted and reverted: "same layout, different base"
+
+The obvious first guess was that firmware-14 uses firmware-17's field layout at
+a shifted base — if the command word is at `data2 + 0x840` rather than
+`data2 + 0x1104 + 0x24`, then base = `data2 + 0x81c`. Implemented as a fallback
+(use `+0x81c` when `+0x1104` holds no command) and measured:
+
+- Commands **do** start decoding: `0x700`, then `0x500` repeatedly.
+- The boot gets further — 1216 → 1835 serial lines.
+- But the data is wrong: WMR reads `nSig 0x5f005043` where it wants
+  `0x43303030`, reports `Unit NAND format info 0x5F005043 0x32327324`, and then
+  `NAND format invalid (corrupt, read error or blank NAND device)` followed by a
+  panic into the remote debugger.
+
+So the page/bank fields are **not** at the same relative offsets, and 0x500
+(a write code in the 17 layout) appearing hundreds of times during a read-only
+boot is a further sign the fields are being misread. Reverted: a guess that
+turns a clean wait into a panic on corrupt data is worse than the wait, and it
+would mask the real layout. Firmware-14's descriptor format needs to be read
+properly — most cheaply from the uploaded blob itself, which the guest hands us
+at `ADM_CODE_SEC_ADDR`.
+
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
 The process, not just the findings — so the next attempt does not repeat them.
