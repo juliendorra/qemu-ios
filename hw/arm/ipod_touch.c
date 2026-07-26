@@ -604,6 +604,24 @@ static void ipod_touch_memory_setup(MachineState *machine, MemoryRegion *sysmem,
     MemoryRegion *main_ram = allocate_ram(sysmem, "ram", RAM_MEM_BASE,
                                           0x8000000);
 
+    /*
+     * Uncached SDRAM alias at 0x98000000 (= RAM_MEM_BASE + 0x90000000).
+     *
+     * iBoot-204 never uses it, so its absence went unnoticed for years. The
+     * iPhone OS 1.0/1.0.x bootloader (iBoot-159) puts its NAND read buffer
+     * there: with the window unmapped, every store the FIL made to the buffer
+     * was dropped and every load returned zero, so the WMR signature scan
+     * compared 0x00000000 against the 0x43303030 it had just been handed by the
+     * FIFO and concluded "no signature or no production format" -- on a NAND
+     * that was correct all along. Caught with a breakpoint at the comparison
+     * (r3 = 0, r5 = 0x43303030, buffer at 0x98031258 reading back as unmapped).
+     */
+    MemoryRegion *ram_uncached_alias = g_new(MemoryRegion, 1);
+    memory_region_init_alias(ram_uncached_alias, OBJECT(machine),
+                             "ram-uncached-alias", main_ram, 0, 0x8000000);
+    memory_region_add_subregion(sysmem, RAM_UNCACHED_MEM_BASE,
+                                ram_uncached_alias);
+
     // load the bootrom (vrom)
     uint8_t *file_data = NULL;
     unsigned long fsize;

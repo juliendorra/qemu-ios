@@ -379,11 +379,40 @@ itself. Remaining candidates, in order of cheapness to test:
 3. The disassembled site at `0x18016060` may simply not be the code that emits
    the message; a breakpoint there would settle it.
 
-**Next step:** break at `0x180160f8` (the comparison) and read `r3`/`r5`. A
-scripted GDB-remote client did not connect to QEMU's stub in this session and
-`lldb -b` hung against the bare stub; getting one of those working is the
-unblocking task, and it converts all three candidates above into a single
-measurement.
+**The breakpoint was taken, and it narrowed things sharply.** QEMU's stub needs
+`-S` (a client attaching to a free-running guest never stops it); with that, a
+scripted GDB-remote client breaks at `0x180160f8` and reports:
+
+```
+r3 (value read) = 0x00000000      r5 (signature wanted) = 0x43303030
+buffer at 0x98031258 = 00 00 00 00 …  (all zero, every iteration)
+```
+
+The comparison is reached only when the read call returns success, so **the read
+reports success and leaves its buffer empty.** The signature word is fine; the
+data never arrives in the buffer being compared.
+
+**One real gap found on the way, now fixed:** the buffer lives at `0x98031258`,
+in a window the machine never mapped. QEMU returns zero for unassigned reads
+without faulting, so the guest silently read zeros rather than crashing. That
+window is a legitimate uncached alias of SDRAM (`RAM_MEM_BASE + 0x90000000`) —
+both iBoot-159 *and* iBoot-204 carry ~120 constants pointing into it, so it is
+not a 1.0 peculiarity, merely something 1.1.x's hot paths never needed. It is
+now mapped (`RAM_UNCACHED_MEM_BASE`), verified to alias correctly, and
+regression-clean: the iPod still renders at 47.2 % non-black and 1.1.1 still
+reaches `BSD root: disk0s1`.
+
+**It did not unblock 1.0.** With the window mapped the buffer is still all zero,
+so the missing write is elsewhere. What is now known: the sequential page reads
+seen via `IT_NAND_FIFO` (pages 0, 1, 2 … with correct data) are *not* landing in
+this scan's buffer, which means either they belong to an earlier phase entirely,
+or the FIL read path writes through a mechanism the model does not implement and
+still reports success.
+
+**Next step:** single-step from the read call at `0x180160ec` into `fp->[0x14]`
+and find where it intends to deposit the page — that is now a bounded question
+with the debugger working. The GDB-remote client is in the session scratchpad;
+it needs `-S` on the QEMU command line.
 
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
