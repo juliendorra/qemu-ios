@@ -147,6 +147,14 @@ Required m68ap firmware files (not in this repo):
 | NOR | `nor_m68ap.bin` — build it with `scripts/build-m68ap-nor.py` from the extracted M68AP IMG2 containers plus a real N45AP NOR (for SysCfg); accepted by m68ap iBoot with 0 epoch mismatches |
 | NAND | Generated M68AP sparse page tree from the IPSW root filesystem using `scripts/build-m68ap-nand.py`; a physical iPhone1,1 dump is optional validation input, not a required artifact. |
 
+## Other iPhone OS 1.x builds
+
+The machine currently runs **only** 1.1.4 / 4A102, and there is no firmware-version
+axis in the code — "M68AP" is used throughout as a synonym for that one build.
+[`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md) evaluates what running
+1.0 / 1.0.x / 1.1.x would cost, with the per-build container format, security
+epoch, iBoot version and NAND signature measured from the real IPSWs.
+
 ## Historical NAND provenance and route decision
 
 The original qemu-ios ports establish a simpler route than emulating a full
