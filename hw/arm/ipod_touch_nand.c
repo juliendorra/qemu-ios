@@ -46,6 +46,40 @@ static void set_bank(ITNandState *s, uint32_t activate_bank) {
  * iPhone bundle stages a fresh clone per launch (see ipod-app-launcher.sh),
  * which is exactly that. Never point it at a pristine bundle NAND.
  */
+/* IT_NAND_RB=1: does the guest ever READ BACK a page it wrote? If writes
+ * persist but are never read again, the write path is addressing different
+ * pages than the read path -- a mapping bug, not a storage bug (T6). */
+static GHashTable *nand_written_pages;
+
+static void nand_note_write(uint32_t bank, uint32_t page)
+{
+    if (!getenv("IT_NAND_RB")) {
+        return;
+    }
+    if (!nand_written_pages) {
+        nand_written_pages = g_hash_table_new(NULL, NULL);
+    }
+    g_hash_table_add(nand_written_pages, GUINT_TO_POINTER((bank << 24) | page));
+}
+
+static void nand_note_read(uint32_t bank, uint32_t page)
+{
+    static unsigned hits, misses;
+
+    if (!getenv("IT_NAND_RB") || !nand_written_pages) {
+        return;
+    }
+    if (g_hash_table_contains(nand_written_pages,
+                              GUINT_TO_POINTER((bank << 24) | page))) {
+        if (++hits <= 20 || hits % 100 == 0) {
+            fprintf(stderr, "[NAND-RB] read-back HIT bank%u/%u (hits=%u "
+                    "misses=%u)\n", bank, page, hits, misses);
+        }
+    } else {
+        misses++;
+    }
+}
+
 static bool nand_writable(void)
 {
     static int cached = -1;
@@ -186,6 +220,7 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
 
         s->buffered_page = page;
         s->buffered_bank = bank;
+        nand_note_read(bank, page);
         /* IT_NAND_WATCH=<bank>/<page>[,...]: report when the guest reads
          * specific physical pages. Used to tell "the guest never looked at
          * this file" from "the guest read it and rejected it" -- the two
@@ -351,6 +386,7 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                             nand_writable() ? "" : "_new");
                     FILE *f = fopen(filename, "wb");
                     if (f == NULL) { hw_error("Unable to read file!"); }
+                    nand_note_write(s->buffered_bank, s->buffered_page);
                     fwrite(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
                     fwrite(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
                     fclose(f);

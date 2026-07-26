@@ -275,6 +275,23 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         //printf("Activating bank for writing: %d, page: %d\n", bank, page);
                         set_bank(s->nand_state, bank);
                         nand_set_buffered_page(s->nand_state, page);
+                        /*
+                         * Take the SPARE from the guest, exactly where the
+                         * read path hands it back (data3). Without this the
+                         * page was written with whatever spare the previous
+                         * READ had left in the buffer, i.e. every guest write
+                         * carried stale FTL metadata -- the logical page
+                         * number, status and version belong to a different
+                         * page, so the FTL cannot find its own data again.
+                         * Measured consequence: SQLite's journal pages reach
+                         * the NAND, yet the database it just wrote reads back
+                         * as empty ("no such table"), and daemons that create
+                         * state retry forever (T6).
+                         */
+                        address_space_rw(&s->downstream_as, s->data3_sec_addr,
+                                         MEMTXATTRS_UNSPECIFIED,
+                                         (uint8_t *)s->nand_state->page_spare_buffer,
+                                         NAND_BYTES_PER_SPARE, 0);
                         s->nand_state->fmdnum = NAND_BYTES_PER_PAGE;
                         s->nand_state->is_writing = true;
                         break;

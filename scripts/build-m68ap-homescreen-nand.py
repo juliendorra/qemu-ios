@@ -52,6 +52,7 @@ ROOT_HFS = STAGE / "filesystem-m68ap-readonly.img"
 DATA_DMG = STAGE / "data-m68ap.dmg"
 
 ARK_PROFILE = "reference-reg"
+SEED_DATABASES = [True]
 SB_PLIST = "System/Library/LaunchDaemons/com.apple.SpringBoard.plist"
 
 
@@ -110,7 +111,7 @@ def without_addressbook(root: Path, work: Path, drop: bool) -> Path:
     a stopgap that costs Contacts and nothing else. --keep-addressbook opts
     out for anyone working on T6.
     """
-    if not keep:
+    if not drop:
         return root
     out = work / "root-noab.img"
     if out.exists():
@@ -159,11 +160,16 @@ def data_partition(work: Path) -> Path:
     # handed to the /var builder so they are written WHILE the volume is
     # constructed: a file added to a finished image is not reliably traversed
     # by the 2007 HFS driver.
-    seed = work / "seed"
-    run([sys.executable, SCRIPTS / "seed-guest-databases.py",
-         "--root-hfs", ROOT_HFS, "--out", seed])
-    run([sys.executable, SCRIPTS / "build-m68ap-var.py",
-         "--out", out, "--data-ark", ark, "--seed-dir", seed])
+    cmd = [sys.executable, SCRIPTS / "build-m68ap-var.py",
+           "--out", out, "--data-ark", ark]
+    if not SEED_DATABASES[0]:
+        print("      (databases NOT seeded: --no-seed-databases)")
+    else:
+        seed = work / "seed"
+        run([sys.executable, SCRIPTS / "seed-guest-databases.py",
+             "--root-hfs", ROOT_HFS, "--out", seed])
+        cmd += ["--seed-dir", seed]
+    run(cmd)
     return out
 
 
@@ -176,6 +182,10 @@ def main() -> int:
     ap.add_argument("--work", type=Path,
                     help="scratch dir (default: <out>.work, removed on success)")
     ap.add_argument("--keep-work", action="store_true")
+    ap.add_argument("--no-seed-databases", action="store_true",
+                    help="do NOT pre-create the AddressBook databases. With "
+                         "writable storage the daemon should create its own; "
+                         "this exists to test that (T6).")
     ap.add_argument("--drop-addressbook", action="store_true",
                     help="remove com.apple.AddressBook instead of seeding its "
                          "database (last-resort fallback; costs Contacts)")
@@ -195,6 +205,7 @@ def main() -> int:
                        NAND_TREE_BYTES + 2 * ROOT_HFS_BYTES + DATA_HFS_BYTES,
                        "the M68AP home-screen NAND")
 
+    SEED_DATABASES[0] = not args.no_seed_databases
     root = with_software_compositing(patched_root(work), work)
     root = without_addressbook(root, work, args.drop_addressbook)
     data = data_partition(work)
