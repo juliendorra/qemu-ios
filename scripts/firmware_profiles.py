@@ -96,6 +96,12 @@ PROFILES: Dict[str, FirmwareProfile] = {
         img_format=FORMAT_PLAINTEXT, epoch=0, iboot="iBoot-159",
         fil_signature=0x43303030,
         root_dmg="694-5298-5.dmg",
+        # Not from a wiki: recovered from the IPSW itself. For every pre-3.0
+        # firmware the VFDecrypt key is stored in the clear inside the restore
+        # ramdisk's /usr/sbin/asr, so it can be found by unwrapping the ramdisk
+        # (itself an 8900 container) and scanning asr for a 72-hex-char string.
+        vfdecrypt_key=("7d5962d0b582ec2557c2cade50de90f4353a1c1d"
+                       "e07b74212513fef9cc71fb890574bfe5"),
         ipsw_sha1="7f5c0ff1f84a0202b75a55c3fcb362e415334d1e",
         notes=("same bootloader generation as 1.0",),
     ),

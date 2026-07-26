@@ -288,19 +288,69 @@ python3 scripts/iphone-firmware-acceptance.py --all-known m68ap-artifacts/unpack
 python3 scripts/fb-snapshot.py --board m68ap --epoch 2 --iboot-m68ap m68ap-artifacts/stage-1.1.1/iboot_204_m68ap_sbpatch.bin --nor-m68ap m68ap-artifacts/stage-1.1.1/nor_m68ap.bin --nand-m68ap m68ap-artifacts/stage-1.1.1/nand --boot-wait 300 --logs /tmp/fbsnap-1.1.1
 ```
 
+## Result: 1.0.2 is blocked in the emulator, not in the artifacts
+
+Attempted 2026-07-26. Everything up to storage works; the wall is a real
+emulator gap, and it is now precisely located.
+
+**What passes.** Gate 0 (format 4, epoch 0, iBoot-159, signature `000C`); the
+secure-boot patch applies at `0x5350` with no change to the tool; the synthetic
+NOR is accepted by iBoot-159 with **no** trust or epoch rejection; iBoot-159
+runs to its banner; the NAND generator emits the `000C` tree; and the root
+filesystem decrypts.
+
+The VFDecrypt key did not need a wiki. For every pre-3.0 firmware the key is
+stored in the clear inside the restore ramdisk's `/usr/sbin/asr`, so unwrapping
+the ramdisk (itself an 8900 container) and scanning `asr` for a 72-hex-char
+string recovers it. 1C28's key was recovered that way and verified by decrypting
+the DMG; it is now in the profile.
+
+**What fails.** iBoot-159 identifies the chips (`Bank 0..3 - id 0xa514d3ad`),
+reports the right geometry, and returns `[OK]` from `FIL_Init`, `BUF_Init`,
+`VFL_Init` and `FTL_Init` — then:
+
+```
+[WMR:ERR] read only version (0, 0)
+[WMR:ERR] no signature or no production format
+sphwNandReadCapacity failed
+root filesystem mount failed
+```
+
+**The signature is not the problem.** Disassembling iBoot-159 at the failing
+check (`0x18016060`) shows the expected word loaded literally at `0x1801606c`:
+`r5 = 0x43303030` — exactly the `000C` the generator writes, and the same value
+it then prints as `Apple NAND Driver (AND)`. The printf's two arguments are the
+production-format result and a signature-found flag; both come back 0, meaning
+the scan never found the word it was looking for.
+
+**The read path is the problem.** With `IT_NAND_TRACE=1`, a 1.1.1 boot issues
+thousands of ADM commands (`0x100`, `0x200`, `0x300`); a 1.0.2 boot issues
+**zero**, and `-d unimp` reports no unimplemented MMIO at all. Running iBoot-159
+against 1.1.1's NAND tree instead of its own changes nothing — still zero ADM
+commands, same error. So iBoot-159 reads pages through a controller path that
+`hw/arm/ipod_touch_adm.c` does not service, and no NAND content can fix it.
+
+**Next step for 1.0:** widen the ADM instrumentation to log every command word
+written (the current trace only fires for a specific `value == 0x2` sequence),
+identify the command iBoot-159 issues for a page read, and implement it. That is
+emulator work of unknown but bounded size, and it is the single thing standing
+between the 1.0 family and Gate 1 — everything else on the 1.0 path is already
+proven.
+
 ## 6. Recommended order
 
 1. ~~**Add the firmware-profile dimension first**~~ ✅ **Done** —
    `scripts/firmware_profiles.py`, the format-4 guard, and
    `scripts/iphone-firmware-acceptance.py`.
 2. ~~**1.1.1 / 3A109a**~~ ✅ **Done, home screen reached.** See above.
-3. **1.0.2 / 1C28** before 1.0 — same bootloader generation as 1.0 but the more
-   widely-used shipping build, so it is the better-documented target for
-   activation behaviour.
-4. **1.0 / 1A543a** last, as the museum-accurate original. Its cost is dominated
-   by iBoot-159: new secure-boot bypass offsets, a re-derived NOR image
-   validator, and a new hacktivation pattern. Its bonus is the absent TVOut
-   device.
+3. **1.0.2 / 1C28** — attempted; blocked in the emulator's NAND read path, see
+   above. Its cost is *not* what this document first guessed: the secure-boot
+   bypass and the NOR validator needed no work at all, and the VFDecrypt key was
+   recoverable from the IPSW. What it needs is one ADM command implemented.
+4. **1.0 / 1A543a** last, as the museum-accurate original. It shares iBoot-159
+   with 1.0.2, so it should follow immediately once the read path works. Its
+   bonuses are the absent TVOut device and, still outstanding, its TSL2561
+   ambient-light sensor in place of the ISL29003.
 
 Rough shape of the remaining effort: the 1.0 family is still a genuine second
 bring-up (different bootloader generation, plaintext images, epoch 0, a third
