@@ -719,6 +719,34 @@ the next hypothesis.
   debugger that r5 becomes 1, and the device tree still does not load. Trust
   level is not the device-tree gate.
 
+#### What the section scans actually found (so the next attempt can skip them)
+
+Three windows were scanned live, with `IT_ADM_DUMP=1` and `IT_ADM_FIELDS=1`:
+
+- **`data2 + 0x840`** — the block that made firmware-14 look decodable. It is
+  **byte-identical across every command** (checked over 10 consecutive
+  commands), so it is a static configuration table, not a command block. Its
+  contents support that reading: `0x500, 0x300, 0x300, 0x100, 0, 0x400`
+  (the command codes the firmware supports), then `00 01 02 03` — a four-entry
+  bank map, matching M68AP's four active banks — then `0x1a00`.
+- **`data2 + 0x1104`** — firmware-17's command block. All zeroes under
+  firmware-14.
+- **`data1`** — a dense table of big-endian pointers (`0x000802aa`,
+  `0x000802b2`, `0x000802ba`, …) into the `0x0008xxxx` range: the uploaded
+  blob's own jump/function table, not a command interface.
+
+So firmware-14's per-command block is in none of the obvious places, and the
+layout is defined by the CalmRISC code the kernel uploads at
+`ADM_CODE_SEC_ADDR`. Two ways forward, cheapest first:
+
+1. **Watch the writes, not the memory.** Log every guest write into the data
+   sections between one `ADM_CTRL2 == 2` and the next; whatever the kernel
+   stores immediately before kicking the engine *is* the command block, wherever
+   it lives. This needs no understanding of the blob at all and is the
+   recommended next step.
+2. Disassemble the uploaded blob. It is a Calm/CalmRISC DSP image, not ARM, so
+   this is a project in its own right — treat it as the fallback.
+
 ### Round 3 (kernel bring-up) — what did NOT work
 
 - **Forcing the image validator to report "trusted".** `movs r5,#4` →

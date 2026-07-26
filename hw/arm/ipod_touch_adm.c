@@ -229,6 +229,42 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         }
                     }
                 }
+                /*
+                 * IT_ADM_FIELDS=1: dump the firmware-14 command window across
+                 * consecutive commands so the varying words (page, bank, count)
+                 * can be identified by diffing, instead of decoding the
+                 * uploaded CalmRISC blob.
+                 */
+                if (getenv("IT_ADM_FIELDS")) {
+                    static unsigned n;
+                    if (n++ < 10) {
+                        uint8_t w[0x40];
+                        struct { const char *nm; hwaddr base; } secs[] = {
+                            { "data1", s->data1_sec_addr },
+                            { "data3", s->data3_sec_addr },
+                        };
+                        fprintf(stderr, "[ADM-F] #%u\n", n);
+                        for (unsigned si = 0; si < ARRAY_SIZE(secs); si++) {
+                            for (hwaddr off = 0; off < 0x1000; off += 0x20) {
+                                bool nz = false;
+                                address_space_read(&s->downstream_as,
+                                                   secs[si].base + off,
+                                                   MEMTXATTRS_UNSPECIFIED, w,
+                                                   0x20);
+                                for (int k = 0; k < 0x20; k++) {
+                                    if (w[k]) { nz = true; break; }
+                                }
+                                if (!nz) { continue; }
+                                fprintf(stderr, "   %s+%04x:", secs[si].nm,
+                                        (unsigned)off);
+                                for (int k = 0; k < 0x20; k++) {
+                                    fprintf(stderr, " %02x", w[k]);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                }
                 // printf("Setting command: 0x%08x\n", cmd);
                 // for(int i = 0; i < 20; i++) {
                 //     printf("0x%08x ", buf[i]);
