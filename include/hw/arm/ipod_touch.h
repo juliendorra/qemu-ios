@@ -108,9 +108,10 @@ const int S5L8900_GPIO_IRQS[7] = { S5L8900_GPIO_G0_IRQ, S5L8900_GPIO_G1_IRQ, S5L
 #define DISPLAY_MEM_BASE 0x38900000
 #define CHIPID_MEM_BASE 0x3e500000
 #define RAM_MEM_BASE 0x8000000
-/* Uncached view of the same SDRAM; iBoot-159 (iPhone OS 1.0/1.0.x) uses it for
- * NAND DMA buffers. iBoot-204 does not, which is why it was never mapped. */
-#define RAM_UNCACHED_MEM_BASE 0x98000000
+/* Bit 31 of a physical address selects the UNCACHED view of the same memory.
+ * iBoot-159 (iPhone OS 1.0/1.0.x) hands such addresses to the NAND ECC/DMA
+ * engine; iBoot-204 does not, which is why these aliases were never mapped. */
+#define UNCACHED_MEM_BIT 0x80000000
 #define SHA1_MEM_BASE 0x38000000
 #define AES_MEM_BASE 0x38C00000
 #define VROM_MEM_BASE 0x20000000

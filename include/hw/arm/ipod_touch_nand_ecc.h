@@ -4,6 +4,7 @@
 #include "qemu/osdep.h"
 #include "hw/core/platform-bus.h"
 #include "hw/core/irq.h"
+#include "hw/arm/ipod_touch_nand.h"
 
 #define NANDECC_DATA 0x4
 #define NANDECC_ECC 0x8
@@ -22,6 +23,7 @@ typedef struct ITNandECCState {
     uint32_t ecc_addr;
     uint32_t status;
     uint32_t setup;
+    ITNandState *nand_state;
     qemu_irq irq;
 } ITNandECCState;
 

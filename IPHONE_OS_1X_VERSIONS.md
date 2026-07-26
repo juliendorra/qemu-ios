@@ -414,6 +414,71 @@ and find where it intends to deposit the page — that is now a bounded question
 with the debugger working. The GDB-remote client is in the session scratchpad;
 it needs `-S` on the QEMU command line.
 
+## 1.0 bring-up round 2: the ECC engine was hollow
+
+The blocker was never the NAND image. **The S5L8900 has two ways to move a NAND
+page into memory, and the emulator only implemented one of them.** iPhone OS
+1.1.x moves pages with the ADM DMA engine; iPhone OS 1.0 uses the NAND *ECC*
+engine at `0x38F00000`, which this tree modelled as a stub that raised an
+interrupt and copied nothing. Same silicon, different subset — and the unused
+subset was empty.
+
+Two defects, fixed together in `hw/arm/ipod_touch_nand_ecc.c`:
+
+1. **No data path at all.** The block stored neither `NANDECC_DATA` nor
+   `NANDECC_ECC` and never wrote to guest memory, so every destination buffer
+   stayed zero.
+2. **No region selector.** Once it copied *something*, it copied the main page
+   for every transfer. The firmware issues **two** transfers per page and
+   distinguishes them by `NANDECC_SETUP` bits [1:0] = (sector count − 1), a
+   sector being 512 bytes:
+
+   | setup & 3 | sectors | region |
+   |---|---|---|
+   | 3 | 4 | the 2048-byte main page |
+   | 0 | 1 | the 64-byte spare / metadata |
+
+   `_LoadVFLCxt` identifies its context page by `spare[8] == 0 && spare[9] ==
+   0x80` (disassembled at `0x18015d28`–`0x18015d34`). With the spare transfer
+   delivering page data instead, those bytes were always zero, so it scanned
+   every block on bank 0 and rejected all of them.
+
+Result on 1.0.2, from `no signature or no production format` to:
+
+```
+[FTL:MSG] VFL_Open   [OK]
+[FTL:MSG] FTL_Open   [OK]
+HFSInitPartition: 0x18030898
+Loading kernel cache at 0xb000000...data starts at 0xb000180
+done
+```
+
+Gate 1 is passed and the real 1.0.2 kernelcache is read off the generated NAND
+through the HFS+ filesystem. Regression-clean: the iPod still renders at 47.2 %
+non-black and 1.1.1 still reaches `BSD root: disk0s1`.
+
+### Current wall: `load_macho_image: failed to load device tree`
+
+The same wall the 1.1.4 bring-up hit, but *not* the same cause — the fixes that
+cleared it there are already in place and verified:
+
+- iBoot-159 checks the same flag as iBoot-204: `[img+0x1c]` bit 24, tested at
+  `0x18007f70` (`lsls r2, r3, #7` / `bmi`). `build-m68ap-nor.py promote_loadable`
+  already sets it; the built NOR has `flags@+0x1c = 0x01000000`, and the CRC at
+  `+0x64` is recomputed.
+- The secure-boot relaxation is applied (`site 0x5350`, verified).
+
+Measured with the debugger: the image validator at `0x18007f36` runs to its exit
+at `0x18008060` repeatedly and returns trust level **4** (unverified, hash
+compare at `0x18007fc6` fails as expected for images we cannot re-sign). Forcing
+it to report **1** (trusted) by patching `movs r5, #4` → `movs r5, #1` at file
+`0x7fec` changes the returned level — confirmed r5 = 1 under the debugger — and
+the device tree **still** fails to load. So the trust level is not the gate.
+
+The load call at `0x1800c6f8` (from `0x1800d790`, `lr = 0x1800d795`) is entered
+repeatedly and, in a 30-stop window, never reaches its return check at
+`0x1800d794`. That is where the next session should start.
+
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
 The process, not just the findings — so the next attempt does not repeat them.
@@ -505,6 +570,45 @@ the next hypothesis.
 - **Get the key from the artifact.** The VFDecrypt key for 1.0.2 was recovered
   from the IPSW's own restore ramdisk rather than a wiki, and verified by
   actually decrypting the image.
+
+### Round 2 (the 1.0 NAND push) — what did NOT work
+
+- **"iBoot-159 does not use the ADM, therefore its reads fail."** Corrected
+  above. It does not use the ADM *and* its reads work; those are two facts and
+  only one was measured.
+- **`FMCSTAT` bit 0.** The model returns bits 1–12 with bit 0 clear, which
+  looked like "the read reports not-ready". Swept `0x1fff`, `0xffffffff`
+  (identical behaviour) and `0x3` (fails earlier). Not the cause. The
+  `IT_NAND_FMCSTAT` override that made this a one-run experiment is worth
+  keeping.
+- **Spare bytes on the signature page.** Tried `spare[0xA] = 0xFF`, an all-`0xFF`
+  spare, and `spare[9] = 0x80`; all three still failed. The spare *was* the
+  problem, but on a different page (the VFL context) and for a different reason
+  (it was never delivered at all).
+- **VFL context `dwVersion` / extra signature-page words.** Both killed by
+  reading the **real** N45AP NAND out of the shipping iPod bundle: it has zeros
+  in exactly those fields and boots fine.
+- **Mapping `0x98000000` to SDRAM.** Right idea (bit 31 selects the uncached
+  view), wrong target: the buffer at `0x98031258` is the uncached alias of
+  `0x18031258`, inside the **iBoot RAM** window, not SDRAM. Mapping the wrong
+  region changed nothing, which is exactly why it looked like a dead end rather
+  than a half-fix. Both aliases are now mapped via `UNCACHED_MEM_BIT`.
+- **Forcing the image validator to report "trusted".** Verified under the
+  debugger that r5 becomes 1, and the device tree still does not load. Trust
+  level is not the device-tree gate.
+
+### Debugger notes (this is the tool that broke the deadlock)
+
+- **QEMU's gdbstub needs `-S`.** A client attaching to a free-running guest
+  never stops it, so `Z0` + `c` silently does nothing and the guest boots to
+  completion. Two runs were lost to this before it was noticed; a third was lost
+  to `lldb -b`, which hangs against the bare stub.
+- A ~60-line GDB-remote client in Python (packet framing, `Z0`, `c`, `g`, `m`)
+  works fine and is far more predictable here than a full debugger. Reading
+  registers *and* dereferencing guest pointers at a breakpoint is what turned
+  "the scan rejects our page" into "the spare buffer is never written".
+- Breakpoint at the *comparison* rather than at the failure message. The message
+  is many frames away from the decision; the `cmp` is the decision.
 
 ## 6. Recommended order
 

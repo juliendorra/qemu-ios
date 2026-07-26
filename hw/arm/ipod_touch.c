@@ -605,21 +605,14 @@ static void ipod_touch_memory_setup(MachineState *machine, MemoryRegion *sysmem,
                                           0x8000000);
 
     /*
-     * Uncached SDRAM alias at 0x98000000 (= RAM_MEM_BASE + 0x90000000).
-     *
-     * iBoot-204 never uses it, so its absence went unnoticed for years. The
-     * iPhone OS 1.0/1.0.x bootloader (iBoot-159) puts its NAND read buffer
-     * there: with the window unmapped, every store the FIL made to the buffer
-     * was dropped and every load returned zero, so the WMR signature scan
-     * compared 0x00000000 against the 0x43303030 it had just been handed by the
-     * FIFO and concluded "no signature or no production format" -- on a NAND
-     * that was correct all along. Caught with a breakpoint at the comparison
-     * (r3 = 0, r5 = 0x43303030, buffer at 0x98031258 reading back as unmapped).
+     * Uncached alias of SDRAM: bit 31 of the address selects the uncached view
+     * (0x88000000 == 0x08000000 | 0x80000000). iBoot-159 hands such addresses
+     * to the NAND ECC/DMA engine, which is why they must be backed.
      */
     MemoryRegion *ram_uncached_alias = g_new(MemoryRegion, 1);
     memory_region_init_alias(ram_uncached_alias, OBJECT(machine),
                              "ram-uncached-alias", main_ram, 0, 0x8000000);
-    memory_region_add_subregion(sysmem, RAM_UNCACHED_MEM_BASE,
+    memory_region_add_subregion(sysmem, RAM_MEM_BASE | UNCACHED_MEM_BIT,
                                 ram_uncached_alias);
 
     // load the bootrom (vrom)
@@ -671,7 +664,23 @@ static void ipod_touch_memory_setup(MachineState *machine, MemoryRegion *sysmem,
     // load iBoot
     file_data = NULL;
     if (g_file_get_contents(nms->iboot_path, (char **)&file_data, &fsize, NULL)) {
-        allocate_ram(sysmem, "iboot", IBOOT_BASE, 0x400000);
+        MemoryRegion *iboot_ram = allocate_ram(sysmem, "iboot", IBOOT_BASE,
+                                               0x400000);
+        /*
+         * ...and the same uncached view of the iBoot RAM window, which is where
+         * iBoot-159's heap lives: its NAND read buffer at 0x98031258 is the
+         * uncached alias of 0x18031258, just past the 0x22000-byte image. With
+         * this unmapped the ECC engine's DMA had nowhere to land, so the WMR
+         * signature scan compared zeroes against the 0x43303030 it expected and
+         * reported "no signature or no production format" -- on a NAND that was
+         * correct all along.
+         */
+        MemoryRegion *iboot_uncached = g_new(MemoryRegion, 1);
+        memory_region_init_alias(iboot_uncached, OBJECT(machine),
+                                 "iboot-uncached-alias", iboot_ram, 0,
+                                 0x400000);
+        memory_region_add_subregion(sysmem, IBOOT_BASE | UNCACHED_MEM_BIT,
+                                    iboot_uncached);
         address_space_rw(nsas, IBOOT_BASE, MEMTXATTRS_UNSPECIFIED, (uint8_t *)file_data, fsize, 1);
      }
 
@@ -1267,6 +1276,7 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("itnand_ecc");
     ITNandECCState *nand_ecc_state = ITNANDECC(dev);
     nms->nand_ecc_state = nand_ecc_state;
+    nand_ecc_state->nand_state = nand_state;
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_NAND_ECC_IRQ));
     memory_region_add_subregion(sysmem, NAND_ECC_MEM_BASE, &nand_ecc_state->iomem);

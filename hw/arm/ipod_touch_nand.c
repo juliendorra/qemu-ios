@@ -320,9 +320,15 @@ static uint64_t itnand_read(void *opaque, hwaddr addr, unsigned size)
                      * transfer length. A firmware that asks for a short read
                      * lands somewhere else in the page and silently gets
                      * zeroes. */
-                    if (getenv("IT_NAND_FIFO")) {
+                    {
+                        const char *fifo_trace = getenv("IT_NAND_FIFO");
                         static unsigned n;
-                        if (idx == 0 && n++ < 64) {
+                        unsigned limit = fifo_trace ?
+                            (unsigned)strtoul(fifo_trace, NULL, 0) : 0;
+                        if (limit <= 1) {
+                            limit = 64;
+                        }
+                        if (fifo_trace && idx == 0 && n++ < limit) {
                             fprintf(stderr, "[NAND-FIFO] page %u fmdnum %u "
                                     "spare %d -> word[%u] = 0x%08x\n",
                                     page, s->fmdnum, s->reading_spare,
