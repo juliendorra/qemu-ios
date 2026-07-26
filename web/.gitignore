@@ -1,0 +1,9 @@
+# Firmware and emulator binaries are never committed. Both are produced by
+# scripts/wasm/: stage-assets.py fills public/assets/, build-qemu.sh fills
+# emulator/.
+# Anchored: an unanchored "emulator/" would also swallow src/emulator/, which is
+# frontend source and must be committed.
+/public/assets/
+/emulator/
+node_modules/
+/dist/

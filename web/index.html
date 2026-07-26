@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>iPhone 2G — iPhone OS 1.1.4</title>
+<link rel="stylesheet" href="./src/app/shell.css">
+</head>
+<body>
+<main class="stage">
+  <div class="device" id="device">
+    <canvas id="screen" width="320" height="480"></canvas>
+    <button class="home" id="home" type="button" aria-label="Home"></button>
+  </div>
+  <aside class="panel">
+    <h1>iPhone 2G</h1>
+    <p class="state" id="state">idle</p>
+    <div class="progress"><div class="bar" id="bar"></div></div>
+    <button id="power" type="button">Power</button>
+    <details id="diagnostics">
+      <summary>Diagnostics</summary>
+      <dl id="diagnostics-body"></dl>
+    </details>
+  </aside>
+</main>
+<script type="module" src="./src/app/main.js"></script>
+</body>
+</html>
