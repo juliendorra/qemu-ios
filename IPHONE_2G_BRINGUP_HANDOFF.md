@@ -2862,6 +2862,28 @@ this as a regression invariant.
 - **Bound every boot test with a hard timeout** (an untimed boot wait once wedged
   a session for two hours — see the note in `IPHONE_2G.md`).
 
+- **A second firmware build is mostly a *tooling* problem, not an emulator one.**
+  iPhone OS 1.1.1 reached the home screen with no C changes at all. What blocked
+  it was fixed-offset patches, a NAND signature keyed to the board instead of
+  the firmware, and a snapshot tool that could not pass the security epoch. See
+  `IPHONE_OS_1X_VERSIONS.md`, which also records this session's dead ends in
+  full.
+- **The signature and the epoch belong to the FIRMWARE; the bank topology and
+  BBT belong to the BOARD.** They cross: 1.1.1 on M68AP needs the iPod's `200C`
+  signature *and* the four-bank M68AP interleave. `build-m68ap-nand.py` used to
+  infer the bank count from the signature word, which made that combination
+  unbuildable. Select with `--ipsw-build`.
+- **An empty serial log means it never started.** Booting epoch-2 images under
+  the default epoch 3 yields zero serial bytes and an all-black framebuffer
+  report, which looks exactly like "the OS ran but never rendered". A boot that
+  fails late still logs. Check `serial.log` size before interpreting pixels.
+- **iBoot-159 (iPhone OS 1.0/1.0.x) does not use the ADM NAND path.** It reads
+  chip IDs and returns `[OK]` from `FIL_Init`/`BUF_Init`/`VFL_Init`/`FTL_Init`,
+  then fails the signature scan having issued **zero** ADM commands (1.1.x
+  issues thousands) with no unimplemented MMIO. Confirmed independent of NAND
+  content by feeding it the 1.1.1 tree. This is the one blocker for the 1.0
+  family.
+
 ## Artifacts
 
 - `scripts/extract-m68ap-images.py` — committed, reproducible decryptor.

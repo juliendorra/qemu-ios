@@ -346,6 +346,98 @@ emulator work of unknown but bounded size, and it is the single thing standing
 between the 1.0 family and Gate 1 — everything else on the 1.0 path is already
 proven.
 
+## Dead ends, false paths and wrong turns (2026-07-26)
+
+The process, not just the findings — so the next attempt does not repeat them.
+Roughly chronological.
+
+### Claims I made that were wrong, and how they were caught
+
+- **"Both extractors die on 1.0 images."** False.
+  `scripts/extract-m68ap-images.py` already branched on the 8900 format byte;
+  only `scripts/extract-kernelcache.py` did not. Caught by reading the file
+  before editing it. The lesson is narrow but real: the evaluation asserted a
+  code fact from a *symptom* (a traceback from one tool) rather than from the
+  source.
+- **"1.1.x wraps the kernelcache 8900 → IMG2 → complzss, 1.0 does not."**
+  False, and the claim came from `extract-kernelcache.py`'s own docstring. No
+  1.x kernelcache has an IMG2 wrapper — verified by decrypting 1A543a, 3A109a
+  and 4A102 and looking at the first 8 bytes of each (all `complzss`). A
+  `kernelcache_has_img2` field had already been added to the profile before this
+  was checked; it was removed rather than left encoding a difference that does
+  not exist. **Docstrings are not measurements.**
+- **"The 1.0 NAND signature might be wrong."** This was the natural hypothesis
+  when 1.0.2's WMR rejected the tree, and it was wrong. Disassembly showed
+  iBoot-159 loading the expected word literally at VA `0x1801606c` as
+  `0x43303030` — precisely what the generator writes. Two boots were spent
+  around this before disassembling; disassembling first would have been cheaper.
+
+### Hypotheses tested and killed (for the 1.0 WMR failure)
+
+- **"`read only version (0, 0)` means the VFL context's `dwVersion` is unset."**
+  Plausible — our generator leaves it zero. Killed by reading the same field out
+  of the **real** N45AP NAND from the shipping iPod bundle: it is zero there
+  too, on a NAND that boots. Not the cause.
+- **"The 1.0-era signature page carries extra words (a version pair) after
+  word0."** Killed by dumping `bank0/0.page` from the real iPod NAND: word0 then
+  2044 zero bytes. Not the cause.
+- **"Some other `?00C`-shaped constant is the real signature."** The shape scan
+  found `900C` in both kernels alongside the expected word; it is unrelated.
+
+The thing that actually settled it was a **discriminating experiment, not more
+analysis**: run iBoot-159 against *1.1.1's* NAND tree. If the tree were at
+fault, the failure would change. It did not — same error, and still zero ADM
+commands — which rules out NAND content entirely and points at the read path.
+Reach for the experiment that can distinguish two hypotheses before reaching for
+the next hypothesis.
+
+### Tooling traps
+
+- **`fb-snapshot.py` had no way to pass the security epoch.** Booting 1.1.1's
+  epoch-2 images under the M68AP default of 3 produced an **empty serial log and
+  a fully black framebuffer report** — which reads exactly like "SpringBoard
+  never rendered", and was very nearly recorded as a 1.1.1 result. It was
+  actually iBoot refusing every NOR image before printing a line. The tell was
+  `serial.log` being *zero bytes*, not merely short: a real boot that fails late
+  still logs. Fixed by adding `--epoch`; **treat an empty serial log as "it
+  never started", never as "it ran and did nothing"**.
+- **`hdiutil attach -owners on` makes root-owned guest files unwritable.** The
+  repo's own `lab_workspace.attached()` deliberately omits it, so the mounting
+  user owns everything and the SpringBoard plist can be edited. Adding `-owners
+  on` "for correctness" cost a `PermissionError`. When a helper exists, its
+  omissions are usually deliberate.
+- **`timeout(1)` does not exist on macOS.** Every ad-hoc boot needs the
+  background-and-kill watchdog pattern instead. The repo's rule that no boot may
+  be run untimed still stands (an untimed wait once wedged a session for two
+  hours).
+- **A hand-typed byte pattern is a liability.** The first version of the iBoot
+  locator had a transposed byte and matched **zero** times in all three images.
+  That failed safe, but the lesson is to build such constants from the bytes
+  themselves (slice them out of a real image and print the hex) rather than
+  retyping them from a hexdump.
+- **A short N45AP boot looks like a regression when it is not.** After changing
+  the charge-wait patch, a 120-second iPod boot stopped at `power supply type
+  usb host` with no kernel — alarming, and *not* caused by the change. The
+  documented path (`fb-snapshot.py --board n45ap`) reached the home screen at
+  47.2% non-black. Regression-check with the harness the project already uses,
+  not with an ad-hoc invocation.
+
+### What actually worked, and why
+
+- **Locate by pattern, verify by equivalence.** Every patch converted from a
+  fixed offset to a pattern was checked by reproducing the *old* result exactly
+  on the build the old code was written for: the iBoot patch output is
+  byte-identical on 4A102, the lockdownd patch lands on 1.1.4's same three
+  offsets, and the charge-wait patch produces a byte-identical N45AP image.
+  A "generalisation" that cannot reproduce the original is a rewrite, not a
+  generalisation.
+- **Derive from the guest, not from a constant.** The TVOut window was already
+  runtime-derived and cost nothing on 1.1.1, whose swap device sits at a
+  different address. That is the pattern the rest of the tree should follow.
+- **Get the key from the artifact.** The VFDecrypt key for 1.0.2 was recovered
+  from the IPSW's own restore ramdisk rather than a wiki, and verified by
+  actually decrypting the image.
+
 ## 6. Recommended order
 
 1. ~~**Add the firmware-profile dimension first**~~ ✅ **Done** —
