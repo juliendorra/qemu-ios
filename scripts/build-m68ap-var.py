@@ -38,6 +38,21 @@ MEASURED RESULTS (2026-07-25, springboard-lab.py) -- read before using:
     early userland. DO NOT use the full set until that is bisected.
 Default is therefore `--minimal`; pass `--full` deliberately.
 
+THE ANSWER (2026-07-26): neither list. **The root filesystem carries the
+authoritative template at `/private/var`** -- 73 directories with their real
+modes, including `tmp` (1777), `run`, `preferences`, `logs`, `db/timezone`,
+`Keychains`, `vm`, `mobile/Media` and `mobile/Library`. On a real device the
+restore ramdisk lays that template onto the data partition; `--template-from
+<root image>` does the same thing here, and it is the default for the product
+recipe.
+
+What it fixed, measured on the packaged bundle: `com.apple.AddressBook` had
+been failing `CREATE TABLE` with SQLITE_BUSY ("database is locked") and
+retrying ~250x/s forever, pegging a host core at ~98%. With the template the
+guest reaches the HOME SCREEN with **zero** SQLite errors and idles at 6-10%
+CPU -- better than the iPod's 11-15%. The 56-entry hand-written `--full` list
+is not the same thing and is still the harmful one; do not confuse them.
+
 Ownership: hdiutil mounts without owners, so entries land as the invoking uid.
 On this host that happens to be 501, which is exactly `mobile` -- correct for
 /var/mobile by luck. Paths that must be root-owned are rewritten explicitly
@@ -46,6 +61,7 @@ bypasses permissions anyway but daemons do check some of these.
 
 Usage:
   scripts/build-m68ap-var.py --out /tmp/data-var.img \
+      [--template-from m68ap-artifacts/stage/filesystem-m68ap-readonly.img] \
       [--size-from m68ap-artifacts/stage/data-m68ap.dmg] \
       [--data-ark /tmp/data_ark.plist] [--fix-owners]
 """
@@ -159,6 +175,12 @@ def main() -> int:
                          "seeded databases must be written during construction "
                          "-- the same reason the data ark is copied here and "
                          "not injected afterwards.")
+    ap.add_argument("--template-from", type=Path,
+                    help="root filesystem image whose /private/var skeleton is "
+                         "copied in first (modes preserved). This is what the "
+                         "restore ramdisk does on a real device, and it is the "
+                         "fix for the AddressBook SQLITE_BUSY spin that pegged "
+                         "the host CPU at 98%% (T6).")
     ap.add_argument("--data-ark", type=Path,
                     help="also inject this binary plist at "
                          "root/Library/Lockdown/data_ark.plist")
@@ -188,6 +210,18 @@ def main() -> int:
     made = []
     dirs = (ROOT_DIRS + MOBILE_DIRS) if args.full else MINIMAL_DIRS
     with attached(built, mountpoint=mnt, readonly=False):
+        if args.template_from:
+            # The restore ramdisk's job, done here: copy the root filesystem's
+            # OWN /private/var template (modes included -- /var/tmp is 1777).
+            # `ditto` preserves them; a plain mkdir loop does not, and the
+            # missing skeleton is what made every /var-writing daemon fail.
+            with attached(args.template_from, readonly=True) as root_mnt:
+                template = Path(root_mnt) / "private" / "var"
+                if not template.is_dir():
+                    raise SystemExit(f"no /private/var in {args.template_from}")
+                subprocess.run(["ditto", str(template), str(mnt)], check=True)
+                made += [str(p.relative_to(mnt))
+                         for p in sorted(mnt.rglob("*"))]
         for rel in dirs:
             (mnt / rel).mkdir(parents=True, exist_ok=True)
             made.append(rel)

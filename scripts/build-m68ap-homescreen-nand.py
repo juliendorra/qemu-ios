@@ -132,19 +132,22 @@ def without_addressbook(root: Path, work: Path, drop: bool) -> Path:
 
 
 def data_partition(work: Path) -> Path:
-    """/var: the minimal directory skeleton PLUS the activation data ark.
+    """/var: the root filesystem's OWN /private/var template + the data ark.
 
-    The skeleton is not cosmetic. A /var without `/var/mobile/Library` sends
-    com.apple.AddressBook into an endless SQLite retry loop -- it can neither
-    open nor create its database ("no such table: ABPerson", "error 5 creating
-    properties table: database is locked") -- which pegs the emulated CPU at
-    ~98% forever. The iPod does not have this problem, and NOT because it
-    ships a database: its /var/mobile/Library simply EXISTS and is writable,
-    so the daemon creates the file once and goes quiet. (Reference checked:
-    the iPod's own /var has no AddressBook database either.)
+    The skeleton is not cosmetic, and a hand-written one is not enough. With
+    the 8-directory minimal list, `com.apple.AddressBook` failed CREATE TABLE
+    with SQLITE_BUSY ("error 5 creating properties table: database is locked")
+    and retried ~250x/s forever, pegging the host CPU at ~98% (T6). Seeding
+    the database did not help: the daemon was not failing to READ, it was
+    failing to WRITE into a /var that has none of the directories the OS
+    expects (`tmp` 1777, `run`, `preferences`, `logs`, `db/timezone`, ...).
 
-    Use --minimal, never --full: 56 dirs + chmod 1777 stops launchd starting
-    at all (measured; see build-m68ap-var.py).
+    `--template-from` copies those from the root image, which is exactly what
+    the restore ramdisk does on a real device. Measured on the packaged
+    bundle: home screen, zero SQLite errors, 6-10% idle CPU.
+
+    Never pass --full to the /var builder: that is a different, hand-written
+    56-entry list plus chmods, and it stops launchd starting at all.
     """
     out = work / "data-var.img"
     if out.exists():
@@ -161,7 +164,8 @@ def data_partition(work: Path) -> Path:
     # constructed: a file added to a finished image is not reliably traversed
     # by the 2007 HFS driver.
     cmd = [sys.executable, SCRIPTS / "build-m68ap-var.py",
-           "--out", out, "--data-ark", ark]
+           "--out", out, "--data-ark", ark,
+           "--template-from", ROOT_HFS]
     if not SEED_DATABASES[0]:
         print("      (databases NOT seeded: --no-seed-databases)")
     else:
