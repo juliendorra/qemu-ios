@@ -523,10 +523,9 @@ node sits between the i2c0 and i2c1 nodes in the 1C28 DeviceTree); N45AP puts it
 on i2c1. The machine attached it to i2c1 for both boards, so every M68AP PMU
 read returned 0xFF from an unanswered bus.
 
-1.1.x survives that — it simply believes it is permanently on external power,
-which is exactly where the long-standing "always shows the charging battery" and
-`disabling idle sleep` symptoms come from — but it stalls the 1.0 kernel dead in
-`IOIpodUSBDevice`'s power path. With the PMU on the board's real bus:
+1.1.x survives that — it simply believes it is permanently on external power —
+but it stalls the 1.0 kernel dead in `IOIpodUSBDevice`'s power path. With the
+PMU on the board's real bus:
 
 ```
 ApplePCF50635PMUPowerSource: cap 63, ext 0, chrgCap 0, chrg 0   (1.0.2, correct)
@@ -536,6 +535,29 @@ ApplePCF50635PMUPowerSource: cap 100, ext 1, chrgCap 1, chrg 1  (was, from 0xFF)
 The `IOIpodUSBDevice` stall disappears entirely and the kernel proceeds to
 root-device matching. N45AP is unaffected by construction; 1.1.1 still reaches
 `BSD root: disk0s1` and the iPod still renders at 47.2 % non-black.
+
+#### Does this also fix the iPhone's sleep/battery/clock symptoms? Partly at most
+
+`SLEEP_BATTERY_SCREEN_FIX.md` carries a note diagnosing this same bus mismatch
+and predicting that it explains the iPhone's "always shows the charging
+battery", "clock stuck at the epoch", `disabling idle sleep`, "never auto-locks"
+and "never reaches OOCSHDWN" symptoms. **The mechanism is the same defect and
+this commit is the fix that note deferred** — independently confirmed: the
+`pmu,pcf506*` node sits under i2c0 in *all three* M68AP device trees checked
+(4A102, 3A109a, 1C28).
+
+The **symptom** half is a separate claim and is NOT verified here. What was
+measured is 1.0.2 only: sane PMU values and the `IOIpodUSBDevice` stall
+clearing. Two attempts to observe the 1.1.x symptoms failed to produce evidence
+either way — short 1.1.1 runs stop before the power source reports, and the
+1.1.4 run does not log `ApplePCF50635PMUPowerSource` at its kextlog level.
+
+There is also a concrete reason to expect "never reaches OOCSHDWN" to survive
+this fix: the wake path in `hw/arm/ipod_touch.c:920` detects the guest's
+power-off loop by a hardcoded **N45AP kernel VA window**
+(`pc >= 0xc005a6c0 && pc <= 0xc005a6d8`). M68AP runs a different kernel build,
+so that detection cannot fire whatever the I2C bus does. Treat the sleep/wake
+symptoms as still open until measured on a run that actually reaches them.
 
 ### Current wall: the two releases upload DIFFERENT ADM firmware
 

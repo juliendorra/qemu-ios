@@ -169,8 +169,7 @@ wait. Getting there needed four emulator fixes, each an unimplemented corner of
 hardware that 1.1.x never exercises — the NAND ECC engine's data path and its
 main-page/spare region selector, the uncached memory aliases (bit 31 of a
 physical address), an iBoot-159 patch for its hardcoded rejection of unsigned
-flash images, and the PMU's real I2C bus (i2c0 on M68AP, which also explains
-1.1.x's "always charging / disabling idle sleep"). The remaining wall is that
+flash images, and the PMU's real I2C bus (i2c0 on M68AP). The remaining wall is that
 the ADM command-block layout belongs to the ADM/FMC firmware blob the kernel
 uploads: 1.0 uploads `CalmADMFMCFirmware-14`, 1.1.x uploads `-17`.
 
