@@ -265,6 +265,69 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         }
                     }
                 }
+                /*
+                 * IT_ADM_DIFF=1: which words does the guest change between one
+                 * engine kick and the next?
+                 *
+                 * The command-block offset is a property of the ADM/FMC
+                 * firmware the kernel uploads, not of the hardware: 1.1.x
+                 * ("CalmADMFMCFirmware-17") uses data2 + 0x1104, 1.0/1.0.x
+                 * ("CalmADMFMCFirmware-14") uses something else, and scanning
+                 * for non-zero data only finds static tables. Whatever the
+                 * guest WRITES just before kicking the engine is the command
+                 * block, wherever it lives -- so snapshot the sections and
+                 * diff them here rather than guessing an offset.
+                 */
+                if (getenv("IT_ADM_DIFF")) {
+                    static uint8_t *prev[3];
+                    static unsigned n;
+                    /* data2+0x1c68 holds a BIG-ENDIAN pointer to a further
+                     * buffer (and +0x1c6c its length): the per-command ring the
+                     * counter at data2+0xc68 indexes into. Diff it too. */
+                    uint32_t ringp = be32_to_cpu(adm_read_u32(
+                        s, s->data2_sec_addr + 0x1c68));
+                    const struct { const char *nm; hwaddr base; } secs[3] = {
+                        { "data2", s->data2_sec_addr },
+                        { "ring",  ringp },
+                        { "data3", s->data3_sec_addr },
+                    };
+                    const size_t span = 0x2000;
+
+                    if (n++ < 12) {
+                        fprintf(stderr, "[ADM-DIFF] kick #%u\n", n);
+                        for (int si = 0; si < 3; si++) {
+                            uint8_t *cur = g_malloc0(span);
+                            address_space_read(&s->downstream_as,
+                                               secs[si].base,
+                                               MEMTXATTRS_UNSPECIFIED, cur,
+                                               span);
+                            if (prev[si]) {
+                                unsigned shown = 0;
+                                for (size_t off = 0; off + 4 <= span;
+                                     off += 4) {
+                                    uint32_t a = ldl_le_p(prev[si] + off);
+                                    uint32_t b = ldl_le_p(cur + off);
+                                    if (a == b) {
+                                        continue;
+                                    }
+                                    if (shown++ < 12) {
+                                        fprintf(stderr,
+                                                "   %s+%04x: %08x -> %08x\n",
+                                                secs[si].nm, (unsigned)off,
+                                                a, b);
+                                    }
+                                }
+                                if (shown > 12) {
+                                    fprintf(stderr,
+                                            "   %s: +%u more changed words\n",
+                                            secs[si].nm, shown - 12);
+                                }
+                                g_free(prev[si]);
+                            }
+                            prev[si] = cur;
+                        }
+                    }
+                }
                 // printf("Setting command: 0x%08x\n", cmd);
                 // for(int i = 0; i < 20; i++) {
                 //     printf("0x%08x ", buf[i]);

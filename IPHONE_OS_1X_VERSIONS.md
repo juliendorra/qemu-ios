@@ -769,6 +769,41 @@ layout is defined by the CalmRISC code the kernel uploads at
 2. Disassemble the uploaded blob. It is a Calm/CalmRISC DSP image, not ARM, so
    this is a project in its own right — treat it as the fallback.
 
+#### The write-diff located the structures, but not a command block
+
+`IT_ADM_DIFF=1` snapshots the ADM sections on every engine kick and reports the
+words that changed since the previous one — the recommended approach, since
+whatever the guest writes before kicking *is* the command. What it shows for
+firmware-14:
+
+```
+kick #2   data2+0834..0860  the static config table being installed
+          data2+1c68: 00000000 -> 0060b208   (big-endian pointer 0x08b26000)
+          data2+1c6c: 00000000 -> 00200000   (its length)
+kick #3+  data2+0c68: 01000000 -> 02000000 -> 03000000 ...   (nothing else)
+```
+
+So after setup, **only a single big-endian counter at `data2+0xc68` changes per
+kick** — an index, not a command. Following the pointer at `data2+0x1c68` leads
+to a region whose contents include ASCII kernel data (`link`, `<irq`), so it is
+either not the descriptor ring or is aliased with something else.
+
+The per-command descriptors therefore live somewhere the section registers do
+not point at, and the indirection is set up by the uploaded blob itself.
+
+#### Failed shortcut: forcing the plain-FMC fallback
+
+Both `AppleS5L8900XADMFMC` and `AppleS5L8900XFMC` probe the same
+`flash-controller0` nub (visible in any boot log), and the plain FMC driver
+would use the direct register path that iBoot-159 already drives successfully in
+this model — sidestepping the ADM command interface entirely. Tried making the
+ADM never report ready so `ADMFMC::start` would fail and IOKit would fall back.
+
+It does not fall back: IOKit retries `AppleS5L8900XADMFMC::start` forever
+(45,568 serial lines of it in a 300 s run, re-uploading `CalmADMFMCFirmware-14`
+each time). Removed. If this is revisited, the driver has to be made to *decline
+the match* rather than fail its start.
+
 ### Round 3 (kernel bring-up) — what did NOT work
 
 - **Forcing the image validator to report "trusted".** `movs r5,#4` →
