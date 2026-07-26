@@ -323,41 +323,82 @@ static void ipod_touch_install_8900_ops(void)
 }
 
 /*
- * iBoot-204's warm resume runs a mandatory pre-boot charging wait before the
- * type-4 handoff: its boot task (0x18004c76) enters a charging dispatcher
- * (0x180099f4) whose loop sleeps in 5-second chunks (pool literal at
- * 0x18009980) until a charge budget derived from the constant at 0x18021458
- * (10,000,000 microseconds) elapses. On this emulated device the charge is
- * fiction — there is no battery — so every Power/Home wake stalled about
- * 10 seconds inside iBoot before `System Wake`. Shrink both durations in the
- * freshly reloaded volatile iBoot image (never the file on disk). Each word
- * is verified first so a different iBoot build passes through unpatched.
+ * iBoot's warm resume runs a mandatory pre-boot charging wait before the
+ * type-4 handoff: its boot task enters a charging dispatcher whose loop sleeps
+ * in 5-second chunks until a charge budget of 10,000,000 microseconds elapses.
+ * On this emulated device the charge is fiction — there is no battery — so
+ * every Power/Home wake stalled about 10 seconds inside iBoot before
+ * `System Wake`. Shrink both durations in the freshly loaded iBoot image
+ * (never the file on disk).
+ *
+ * Both words are LOCATED BY PATTERN, not by address. They used to be the fixed
+ * offsets 0x21458 and 0x09980, which were read off the N45AP iBoot: 0x09980
+ * is an iPod address, so on the iPhone the poll-sleep word has NEVER matched
+ * and that half of the fix has been silently skipped since it was written.
+ * The bare constants are not unique either (10,000,000 occurs 4x and 5,000,000
+ * 3x in every image), so each is anchored on its neighbouring pool words:
+ *
+ *   budget: 8 zero bytes, 0x00000008, <10,000,000>, 0x00000140
+ *   poll:   the pool pointer 0x18021398 immediately followed by <5,000,000>
+ *
+ * Measured unique, and landing on the correct site, in all four images on hand
+ * (4A102 0x21458/0xa200, 3A109a 0x21458/0xa1c0, 1A543a 0x21438/0x9b14, and
+ * N45AP 0x21458/0x9980 — the last reproducing the original hardcoded pair).
+ * A non-unique match leaves the word alone and says so.
  */
-static void ipod_touch_patch_iboot_charge_wait(void)
+static bool ipod_touch_find_unique(const uint8_t *hay, size_t hay_len,
+                                   const uint8_t *needle, size_t needle_len,
+                                   size_t *offset_out)
 {
+    size_t found = 0;
+
+    if (hay_len < needle_len) {
+        return false;
+    }
+    for (size_t i = 0; i + needle_len <= hay_len; i++) {
+        if (memcmp(hay + i, needle, needle_len) == 0) {
+            if (++found > 1) {
+                return false;
+            }
+            *offset_out = i;
+        }
+    }
+    return found == 1;
+}
+
+static void ipod_touch_patch_iboot_charge_wait(uint8_t *iboot, size_t size)
+{
+    static const uint8_t budget_sig[] = {
+        0, 0, 0, 0, 0, 0, 0, 0,   /* padding ahead of the pool entry  */
+        0x08, 0x00, 0x00, 0x00,   /* 0x00000008                       */
+        0x80, 0x96, 0x98, 0x00,   /* 10,000,000  <- patched           */
+        0x40, 0x01, 0x00, 0x00,   /* 0x00000140                       */
+    };
+    static const uint8_t poll_sig[] = {
+        0x98, 0x13, 0x02, 0x18,   /* pool pointer 0x18021398          */
+        0x40, 0x4b, 0x4c, 0x00,   /* 5,000,000   <- patched           */
+    };
     static const struct {
-        uint32_t addr;
-        uint32_t expected;
+        const char *what;
+        const uint8_t *sig;
+        size_t sig_len;
+        size_t word_off;
         uint32_t replacement;
     } patches[] = {
-        /* Charging-loop total budget: 10,000,000 us -> 5,000 us. */
-        { IBOOT_BASE + 0x21458, 10000000, 5000 },
-        /* Charging-loop poll sleep: 5,000,000 us -> 100,000 us. */
-        { IBOOT_BASE + 0x09980, 5000000, 100000 },
+        { "budget", budget_sig, sizeof(budget_sig), 12, 5000 },
+        { "poll sleep", poll_sig, sizeof(poll_sig), 4, 100000 },
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(patches); i++) {
-        uint32_t current;
+        size_t at;
 
-        cpu_physical_memory_read(patches[i].addr, &current, sizeof(current));
-        if (current != patches[i].expected) {
-            fprintf(stderr, "[WAKE] iBoot charge-wait word at 0x%08x is "
-                    "0x%08x (expected 0x%08x); leaving unpatched\n",
-                    patches[i].addr, current, patches[i].expected);
+        if (!ipod_touch_find_unique(iboot, size, patches[i].sig,
+                                    patches[i].sig_len, &at)) {
+            fprintf(stderr, "[WAKE] iBoot charge-wait %s pattern is not unique "
+                    "in this image; leaving unpatched\n", patches[i].what);
             continue;
         }
-        cpu_physical_memory_write(patches[i].addr, &patches[i].replacement,
-                                  sizeof(patches[i].replacement));
+        stl_le_p(iboot + at + patches[i].word_off, patches[i].replacement);
     }
 }
 
@@ -404,9 +445,9 @@ static void ipod_touch_cpu_reset(void *opaque)
                              &iboot_size, NULL)) {
         error_report("Unable to reload iBoot from %s", nms->iboot_path);
     } else {
+        ipod_touch_patch_iboot_charge_wait(iboot_data, iboot_size);
         cpu_physical_memory_write(IBOOT_BASE, iboot_data, iboot_size);
         g_free(iboot_data);
-        ipod_touch_patch_iboot_charge_wait();
     }
 
     volatile_boot_ram = g_malloc0(0x30000);
