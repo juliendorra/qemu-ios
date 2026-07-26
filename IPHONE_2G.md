@@ -149,11 +149,23 @@ Required m68ap firmware files (not in this repo):
 
 ## Other iPhone OS 1.x builds
 
-The machine currently runs **only** 1.1.4 / 4A102, and there is no firmware-version
-axis in the code — "M68AP" is used throughout as a synonym for that one build.
-[`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md) evaluates what running
-1.0 / 1.0.x / 1.1.x would cost, with the per-build container format, security
-epoch, iBoot version and NAND signature measured from the real IPSWs.
+The machine runs **1.1.4 / 4A102 and 1.1.1 / 3A109a**; both reach the SpringBoard
+home screen. Firmware-specific constants now live in
+`scripts/firmware_profiles.py` (container format, security epoch, iBoot build,
+FIL/WMR signature, VFDecrypt key), selected with `--ipsw-build` /
+`-M iPhone-2G,epoch=N`, and `scripts/iphone-firmware-acceptance.py` rejects
+mismatched artifacts in seconds before any boot.
+
+Key correction the profile work forced: **the NAND signature and the security
+epoch are keyed to the FIRMWARE, not the board.** 1.1.1 on M68AP uses the iPod's
+own `200C` signature and epoch 2 while still needing the four-bank M68AP
+interleave; the old code inferred the bank count from the signature word, which
+made that combination unbuildable.
+
+The 1.0 family (1A543a / 1C28) is a different bootloader generation — iBoot-159,
+plaintext images, epoch 0, signature `000C` — and has not been attempted.
+Details, measurements and the test plan:
+[`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md).
 
 ## Historical NAND provenance and route decision
 

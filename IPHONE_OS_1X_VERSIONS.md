@@ -1,9 +1,12 @@
 # Running other iPhone OS 1.x builds on M68AP (1.0 / 1.0.x / 1.1.x)
 
 > Evaluation written 2026-07-25. Every table entry marked **measured** was read
-> out of the real IPSW on this machine, not taken from a wiki. Nothing in the
-> emulator or the toolchain was changed by this evaluation — see
-> [Work required](#work-required) for the change list.
+> out of the real IPSW on this machine, not taken from a wiki.
+>
+> **UPDATE 2026-07-26 — iPhone OS 1.1.1 (3A109a) REACHES THE HOME SCREEN.**
+> The profile work below was implemented and 1.1.1 booted to SpringBoard on the
+> first attempt with no new emulator code. See
+> [Result: 1.1.1 runs](#result-111-runs). The 1.0 family is still unattempted.
 
 Today `-M iPhone-2G` runs exactly one firmware: **iPhone OS 1.1.4 / 4A102**
 (see [`IPHONE_2G.md`](IPHONE_2G.md), [`M68AP_HOMESCREEN_CASE_STUDY.md`](M68AP_HOMESCREEN_CASE_STUDY.md)).
@@ -228,17 +231,69 @@ Every boot test must keep the hard timeout discipline already established in
 `scripts/iphone-smoke-test.py` (an untimed boot wait once wedged a session for
 two hours).
 
+## Result: 1.1.1 runs
+
+Implemented and verified on 2026-07-26, in one pass, with **no changes to the
+emulator's C code** — every change was in the toolchain:
+
+| Gate | 3A109a result |
+|---|---|
+| 0 artifact acceptance | passes (format 3, epoch 2, iBoot-204, signature `200C`) |
+| 1 WMR init | `FIL_Init/BUF_Init/VFL_Init/VFL_Open/FTL_Open [OK]`, four banks, 512 pages/subblock |
+| 2 kernel + root | `Darwin 9.0.0d1 … xnu-933.0.0.203`, `BSD root: disk0s1`, `/dev/disk0s2 on /private/var` |
+| 3 SpringBoard | **home screen renders** — 60.7 % non-black at `0x0f496000` |
+
+What it took beyond the profile table: the same two guest-data fixes 1.1.4
+needs (`LK_ENABLE_MBX2D=0`, lockdownd activation patch), and the epoch set to 2.
+Nothing else.
+
+Three things that the evaluation listed as "must be re-derived per build" turned
+out **not** to need it, once they were located by pattern instead of by offset:
+
+- **The secure-boot bypass.** The 32 bytes ending at the patch site (containing
+  the literal `0x18022fa0` and its test/branch) occur exactly once in *every*
+  1.x m68ap iBoot — 4A102 at `0x5990`, 3A109a at `0x5930`, and 1A543a's
+  iBoot-159 at `0x5350`. The helper is byte-identical across the whole line;
+  only its address moves. `patch-m68ap-iboot.py` now finds it, and its 4A102
+  output is byte-identical to the previously staged patched image.
+- **The lockdownd activation patch.** Same structure in both builds, different
+  literal-pool values (`0x0007def0`/isa `0x384c73b8` in 1.1.1 vs
+  `0x0009d8a0`/`0x384ff3b8` in 1.1.4). `hacktivate-m68ap.py` now derives them:
+  it locates the unique `state\0+Unactivated\0` site, walks back to lockdownd's
+  Mach-O header (the binary is contiguous in the HFS image), parses its load
+  commands, computes the string's VA, and finds the two `__cfstring` constants
+  that point at it. Verified to reproduce 1.1.4's exact three patch offsets.
+- **The TVOut swap-device window.** Already runtime-derived, and it paid off
+  immediately: 1.1.1's swap device is at VA `0xc09c7400`, a different address
+  from 1.1.4's `0xc09c8400`, and the console tap relocated the window with no
+  intervention.
+
+Still genuinely per-build, and still unsolved for other versions: the iBoot
+**charge-wait** patch in `hw/arm/ipod_touch.c`, whose fixed guest addresses do
+not match 3A109a (it logs `charge-wait word at 0x18009980 is 0xaf034b21
+(expected 0x004c4b40); leaving unpatched` and boots anyway). It should get the
+same pattern-locator treatment.
+
+One caveat carried over unchanged from 1.1.4: the **scanout** is still black
+(0.003 %) while the framebuffer is fully rendered — the known
+"black screen is scanout, not SpringBoard" behaviour, not a 1.1.1 regression.
+
+Reproduce with:
+
+```bash
+python3 scripts/iphone-firmware-acceptance.py --all-known m68ap-artifacts/unpacked
+```
+
+```bash
+python3 scripts/fb-snapshot.py --board m68ap --epoch 2 --iboot-m68ap m68ap-artifacts/stage-1.1.1/iboot_204_m68ap_sbpatch.bin --nor-m68ap m68ap-artifacts/stage-1.1.1/nor_m68ap.bin --nand-m68ap m68ap-artifacts/stage-1.1.1/nand --boot-wait 300 --logs /tmp/fbsnap-1.1.1
+```
+
 ## 6. Recommended order
 
-1. **Add the firmware-profile dimension first** (build → epoch, FIL signature,
-   VFDecrypt key, patch table), plus the 8900 format-4 guard and the Gate-0
-   acceptance check. Small, and it prevents a second set of magic numbers.
-2. **1.1.1 / 3A109a.** Same iBoot-204, epoch 2, signature `200C` — the closest
-   thing to the working N45AP baseline that is still an iPhone. Expect the
-   existing iBoot patch offsets to have a good chance of applying unchanged
-   (same iBoot build number; verify, do not assume), and expect the NAND
-   constructor to need only the signature switch. This is the cheap win, and it
-   is also the best proof that the profile abstraction works.
+1. ~~**Add the firmware-profile dimension first**~~ ✅ **Done** —
+   `scripts/firmware_profiles.py`, the format-4 guard, and
+   `scripts/iphone-firmware-acceptance.py`.
+2. ~~**1.1.1 / 3A109a**~~ ✅ **Done, home screen reached.** See above.
 3. **1.0.2 / 1C28** before 1.0 — same bootloader generation as 1.0 but the more
    widely-used shipping build, so it is the better-documented target for
    activation behaviour.
@@ -247,7 +302,9 @@ two hours).
    validator, and a new hacktivation pattern. Its bonus is the absent TVOut
    device.
 
-Rough shape of the effort: 1.1.1 is plausibly a few sessions if the profile work
-is done first; the 1.0 family is a genuine second bring-up, because a different
-bootloader means every iBoot-derived constant in the tree is re-derived from
-scratch.
+Rough shape of the remaining effort: the 1.0 family is still a genuine second
+bring-up (different bootloader generation, plaintext images, epoch 0, a third
+NAND signature, and the TSL2561 sensor), but it is cheaper than this document
+originally estimated — the secure-boot patch already locates itself in
+iBoot-159, and the acceptance gate will tell you within seconds whether the
+artifacts are what you think they are.
