@@ -11,8 +11,10 @@
 >   rendering at 59% non-black with the frame actually scanned out (45%). Six
 >   emulator gaps were fixed to get there, every one of them an unimplemented
 >   corner of hardware that 1.1.x never touches.
-> - **1.0 (1A543a): not yet attempted**, but it shares iBoot-159 with 1.0.2, so
->   it should follow immediately once 1.0.2 mounts root.
+> - **1.0 (1A543a): REACHES THE HOME SCREEN TOO.** It shares iBoot-159 with
+>   1.0.2 and needed no further emulator work — the same pipeline, run with
+>   `--build 1A543a`, produced `Darwin ... xnu-933.0.0.178`,
+>   `BSD root: disk0s1`, and SpringBoard at 59.0% non-black.
 >
 > Section 3's "work required" list below is the ORIGINAL estimate, kept for the
 > record; the ✅/⛔ markers say what survived contact. Nearly every real blocker
@@ -834,6 +836,13 @@ Plus the same two guest-data fixes 1.1.x needs — the lockdownd activation patc
    launchd, which the OOCSHDWN path turns into a reboot loop. Verified by A/B:
    **45.4% screenout with it, 0.58% without.** N45AP is deliberately excluded —
    the iPod's sleep/wake support depends on being able to idle-sleep.
+
+**1.0 / 1A543a followed for free.** The same pipeline with `--build 1A543a`
+(extract → patch iBoot → NOR → decrypt root → hacktivate + `LK_ENABLE_MBX2D=0`
+→ /var → NAND) boots the original June-2007 software: `Darwin Kernel Version
+9.0.0d1 ... xnu-933.0.0.178`, `BSD root: disk0s1`, framebuffer 59.0% non-black.
+No emulator changes were needed beyond the six above — as predicted, because it
+shares iBoot-159 and blob -14 with 1.0.2.
 
 Reproduce:
 
