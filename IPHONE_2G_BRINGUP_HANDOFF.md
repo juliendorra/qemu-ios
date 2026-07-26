@@ -13,6 +13,51 @@ the live bring-up state.
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
 
+## Session log — 2026-07-26 (T6 idle CPU SOLVED: /var was missing the OS's own skeleton; T7b Home button fixed)
+
+**T6.** The iPhone app pegged a host core; the iPod idled at 11-15%.
+`com.apple.AddressBook` failed `CREATE TABLE` with SQLITE_BUSY ~250x/s.
+
+The measurement path, in order, because each step killed a hypothesis:
+
+1. **One instance only.** Every AddressBook line in the guest log carries the
+   same pid (`16/com.apple.AddressBook`), so no two doctors are locking each
+   other out.
+2. **The shipped image really does carry the seeded database.** Getting at it
+   needed two fixes to `extract-hfs-from-nand.py` (pack addressing assumed 8
+   active banks; sparse packs were rejected). The extracted `/var` has
+   `mobile/Library/AddressBook/AddressBook.sqlitedb`, 118 784 bytes, page size
+   4096, schema format 1, 20 tables including `ABPerson` and
+   `_SqliteDatabaseProperties`, `integrity_check` ok.
+3. **The guest reads it.** `IT_NAND_WATCH` showed the guest reading the file's
+   first physical pages; and overwriting page 1's SQLite magic through a NAND
+   page override made SpringBoard report `SQLITE_CORRUPT encountered while
+   accessing /var/mobile/Library/AddressBook/AddressBook.sqlitedb` -- the
+   bytes reach SQLite. So the daemon was never failing to READ.
+4. **Not `$HOME`.** The real iPod keeps its AddressBook under `/var/root`
+   (on 1.1 the daemon runs as root; the 1.1.4 plist says `UserName=mobile`),
+   so a copy was added at `/var/root/Library/AddressBook/` -- no change.
+5. **The root filesystem carries the answer.** `<root>/private/var` is a
+   73-entry template with real modes: `tmp` (1777), `run`, `preferences`,
+   `logs`, `log`, `db/{dyld,timezone}`, `Keychains`, `vm`, `msgs`, `empty`,
+   `mobile/{Library,Media}`, `root/Library`. On a real device the restore
+   ramdisk lays that onto the data partition. We shipped a hand-written
+   8-directory list. Copying the template in: **home screen, zero SQLite
+   errors anywhere in the guest log, idle CPU 6-10%.**
+
+The loop that made this affordable is `scripts/overlay-hfs-into-nand.py` --
+edit a 25 MB `/var` image, drop it into a NAND tree as page overrides, boot.
+Seconds per hypothesis instead of a full NAND rebuild.
+
+**T7b.** `hw/arm/ipod_touch.c` used the iPod's Home pin (`0x1606`) and IRQ
+(`0x2E`) on both boards; M68AP's device tree puts `button_menu` on `0x1600`
+and never lists `0x2E`, while Power/`hold` (`0x1605`) is shared -- exactly the
+reported "P sleeps, H does nothing". Home is now board-aware. The IRQ is
+derived, not measured: N45AP fixes `IRQ = 0x28 + (pin & 0xf)`, and that rule
+reproduces M68AP's DT interrupt SET exactly (`0x2d 0x28 0x29 0x2a 0x2b`, 0x2C
+absent because pin 0x1604 is unused), giving menu = `0x28`.
+`IT_M68AP_HOME_IRQ` overrides it without a rebuild.
+
 ## Session log — 2026-07-25 (HOME SCREEN reached; the reference ark settles activation)
 
 M68AP now boots iPhone OS 1.1.4 to the **SpringBoard home screen** (dock with

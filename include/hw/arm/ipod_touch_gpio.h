@@ -40,6 +40,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchGPIOState, IPOD_TOUCH_GPIO)
 #define GPIO_BUTTON_M68AP_RINGER   0x1603
 #define GPIO_BUTTON_M68AP_HOLD     0x1605
 
+/*
+ * The interrupt that goes with each of those pins.
+ *
+ * N45AP fixes the rule: pin 0x1605 -> IRQ 0x2D and pin 0x1606 -> IRQ 0x2E,
+ * i.e. IRQ = 0x28 + (pin & 0xf). Applying it to M68AP's five pins yields
+ * {menu 0x28, volup 0x29, voldown 0x2A, ringerab 0x2B, hold 0x2D} -- exactly
+ * the set its device tree lists for the `buttons` node (0x2d, 0x28, 0x29,
+ * 0x2a, 0x2b), with 0x2C absent because pin 0x1604 is unused. The DT does not
+ * state the pairing, so the SET is evidence and the rule is a derivation;
+ * IT_M68AP_HOME_IRQ overrides it without a rebuild if a measurement disagrees.
+ *
+ * Until 2026-07-26 the key handler used N45AP's home pin/IRQ (0x1606/0x2E) on
+ * BOTH boards. 0x2E is not in M68AP's list at all, which is why Power (0x1605,
+ * shared) worked on the iPhone and Home did nothing.
+ */
+#define GPIO_BUTTON_M68AP_MENU_IRQ 0x28
+#define GPIO_BUTTON_M68AP_HOLD_IRQ 0x2D
+
 #define IPOD_TOUCH_GPIO_M68AP_IDLE \
     ((1 << (GPIO_BUTTON_M68AP_VOLUP & 0xf)) | \
      (1 << (GPIO_BUTTON_M68AP_VOLDOWN & 0xf)))

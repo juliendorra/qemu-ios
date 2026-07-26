@@ -740,6 +740,38 @@ static uint32_t s5l8900_usb_hwcfg[] = {
     0x01f08024
 };
 
+/*
+ * Home is on a DIFFERENT pin on the two boards: N45AP puts it on 0x1606 (IRQ
+ * 0x2E), M68AP's device tree puts button_menu on 0x1600 (IRQ 0x28, derived --
+ * see ipod_touch_gpio.h). Power/hold is 0x1605/0x2D on both, which is why the
+ * board-blind code that shipped until 2026-07-26 slept the iPhone with P and
+ * then ignored H forever.
+ */
+static bool ipod_touch_is_m68ap(void)
+{
+    return g_ipod_touch_nms &&
+           g_ipod_touch_nms->board_id == BOARD_ID_M68AP;
+}
+
+static uint32_t ipod_touch_home_pin(void)
+{
+    return ipod_touch_is_m68ap() ? GPIO_BUTTON_M68AP_MENU : GPIO_BUTTON_HOME;
+}
+
+static uint32_t ipod_touch_home_irq(void)
+{
+    const char *env;
+
+    if (!ipod_touch_is_m68ap()) {
+        return GPIO_BUTTON_HOME_IRQ;
+    }
+    env = getenv("IT_M68AP_HOME_IRQ");
+    if (env && *env) {
+        return (uint32_t)strtoul(env, NULL, 0);
+    }
+    return GPIO_BUTTON_M68AP_MENU_IRQ;
+}
+
 static void ipod_touch_key_event(void *opaque, int keycode)
 {
     bool do_irq = false;
@@ -899,16 +931,19 @@ static void ipod_touch_key_event(void *opaque, int keycode)
         }
     }
     else if(keycode == 35 || keycode == 163) {
-        // home button
-        gpio_group = GPIO_BUTTON_HOME_IRQ / NUM_GPIO_PINS;
-        gpio_selector = GPIO_BUTTON_HOME_IRQ % NUM_GPIO_PINS;
+        // home button (M68AP calls it button_menu and puts it on another pin)
+        uint32_t home_pin = ipod_touch_home_pin();
+        uint32_t home_irq = ipod_touch_home_irq();
 
-        if(keycode == 35 && (s->gpio_state->gpio_state & (1 << (GPIO_BUTTON_HOME & 0xf))) == 0) {
-            s->gpio_state->gpio_state |= (1 << (GPIO_BUTTON_HOME & 0xf));
+        gpio_group = home_irq / NUM_GPIO_PINS;
+        gpio_selector = home_irq % NUM_GPIO_PINS;
+
+        if(keycode == 35 && (s->gpio_state->gpio_state & (1 << (home_pin & 0xf))) == 0) {
+            s->gpio_state->gpio_state |= (1 << (home_pin & 0xf));
             do_irq = true;
         }
         else if(keycode == 163) {
-            s->gpio_state->gpio_state &= ~(1 << (GPIO_BUTTON_HOME & 0xf));
+            s->gpio_state->gpio_state &= ~(1 << (home_pin & 0xf));
             do_irq = true;
         }
     }

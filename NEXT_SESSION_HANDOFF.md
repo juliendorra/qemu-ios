@@ -1,141 +1,129 @@
-# Next session — start here: T6 (speed) then T7b (iPhone wake)
+# Next session — start here
 
-**Date:** 2026-07-26 · **Branch:** `ipod_touch_1g` · **Head:** `066df863d5`
+**Date:** 2026-07-26 · **Branch:** `ipod_touch_1g`
 
-Two problems, in the user's priority order. Both are **iPhone-only**: the
-packaged **iPod Touch app works fine** and is the reference to copy from — it
-idles at 11–15% CPU, its sleep/wake + slide-to-unlock work, and its guest logs
-zero storage errors.
+Both problems the previous handoff carried are addressed in this session:
+
+* **T6 — the iPhone app pegged a host core: SOLVED.** The generated `/var`
+  was missing the OS's own directory skeleton. Idle CPU 98% → **6–10%**, and
+  the guest log now contains **zero** SQLite errors (it had 15 592 AddressBook
+  lines per boot).
+* **T7b — the iPhone would not wake (P sleeps, H does nothing): FIXED in the
+  model.** The key handler used the iPod's Home pin/IRQ on both boards.
 
 ```bash
-# reproduce either problem in one command each (both bundles are installed)
-open -a "/Applications/iPhone 2G.app"     # slow, and P then H does not wake
-open -a "/Applications/iPod Touch.app"    # the reference: fast, wakes, unlocks
+open -a "/Applications/iPhone 2G.app"     # the iPhone
+open -a "/Applications/iPod Touch.app"    # the reference
 ```
 
 ---
 
-## Priority 1 — T6: the iPhone app is pegged at ~98% CPU
+## T6 — what it actually was
 
-**Symptom.** `iPhone 2G.app` burns ~a full host core at idle; `iPod Touch.app`
-idles at 11–15%. Everything else works (home screen renders, touch works).
-
-**Cause, as far as it is established.** `com.apple.AddressBook`
-(`ABDatabaseDoctor`) fails and retries **~250×/s** forever. Its guest log:
+**Not** storage, not SQLite locking, not a missing database. `/var` is a
+separate HFS partition we generate ourselves, and it shipped a **hand-written
+8-directory list** (`MINIMAL_DIRS` in `build-m68ap-var.py`). A real device's
+`/var` is laid down by the restore ramdisk from a template that the **root
+filesystem itself carries at `/private/var`** — 73 entries with their real
+modes:
 
 ```
-error compiling query "SELECT value FROM _SqliteDatabaseProperties ...": no such table
-error compiling query "SELECT ... FROM ABPerson;": no such table: ABPerson
-error 5 creating properties table: database is locked          <-- SQLITE_BUSY
+tmp (1777)  run  preferences  logs  log  db/{dyld,timezone}  Keychains
+vm  msgs  empty  mobile/{Library,Media}  root/Library ...
 ```
 
-**What is NOT the cause** (all measured this session — do not re-chase):
+Without them every daemon that writes to /var failed;
+`com.apple.AddressBook` (`ABDatabaseDoctor`) failed `CREATE TABLE` with
+SQLITE_BUSY and retried ~250×/s forever, which is what burned the core.
+
+**The fix** — `scripts/build-m68ap-var.py --template-from <root image>`,
+wired into the product recipe (`build-m68ap-homescreen-nand.py`). Measured on
+the app's own artifacts: home screen renders (69.6% non-black on all three FB
+bases), **0** `database is locked`, **0** `no such table`, idle CPU 6–10%
+(the iPod idles at 11–15%). The guest even gets a sane clock now, because
+`/var/db/timezone` exists.
+
+**Ruled out along the way — do not re-chase** (each measured this session):
 
 | Hypothesis | Verdict |
 |---|---|
-| "the guest never writes; the FTL issues no page writes on a generated NAND" | **WRONG — my earlier claim.** It writes: ADM `0x500`, ~100–144 pages/boot, **including 5 SQLite JOURNAL pages**. The measurement that said otherwise counted files in a tree where every page already existed, so overwrites were invisible. |
-| Writes are discarded because the model writes `<page>_new.page` and reads `<page>.page` | **Real, and fixed** — `IT_NAND_WRITABLE=1` makes writes land where reads look and shadow the pack. Not sufficient on its own. |
-| The written pages carry the wrong FTL metadata | **Real, and fixed** — the ADM write path stored the spare left over from the previous READ; it now takes the spare from the guest at `data3_sec_addr`. Not sufficient either. |
-| A missing `/var` skeleton | No — `mobile/Library/AddressBook` present, unchanged behaviour |
-| Seeding the database (schema extracted from the firmware) | No — tried in modern SQLite format ("unsupported file format"), in legacy format (schema format 1 stamped into the header), injected after build AND written during volume construction. `--no-seed-databases` also tried. Same failure. |
+| The guest cannot READ the seeded database | **False.** Corrupting the file's SQLite magic *through a NAND page override* made SpringBoard report `SQLITE_CORRUPT encountered while accessing /var/mobile/Library/AddressBook/AddressBook.sqlitedb`. The bytes reach SQLite. |
+| Two `ABDatabaseDoctor` instances locking each other out | **False.** Only ever pid 16 in the log. |
+| The database is under the wrong `$HOME` (the real iPod keeps its under `/var/root`, because on 1.1 the daemon runs as root; on 1.1.4 it runs as `mobile`) | **False.** Adding a second copy at `/var/root/Library/AddressBook/` changed nothing. |
+| The volume's case-sensitivity | **False.** Ours and the real device are both HFSX. |
+| SQLite page size (guest ships 3.1.3) | **False.** The real device's own database is page-size 4096, same as ours. |
 
-**So the live question is not storage but SQLite:** why does `CREATE TABLE`
-return `SQLITE_BUSY` when the writes underneath it do persist?
+## T7b — what it was
 
-**Next diagnostics, cheapest first:**
+`hw/arm/ipod_touch.c` used `GPIO_BUTTON_HOME` (0x1606) and
+`GPIO_BUTTON_HOME_IRQ` (0x2E) for **both** boards. M68AP's device tree puts
+`button_menu` on **0x1600** and never lists 0x2E. Power/`hold` is 0x1605 on
+both boards, which is exactly why P worked and H did not.
 
-1. **Is more than one `ABDatabaseDoctor` running?** Its job is `OnDemand` with a
-   `MachService`; two instances would lock each other out. Count them in the
-   guest log by pid.
-2. **Does `fcntl` locking work on our `/var` volume?** It is a macOS-created
-   **case-sensitive HFS+ (HFSX), non-journaled** image; the iPod's `/var` is a
-   directory on its device-dump root volume. A locking difference would produce
-   exactly `SQLITE_BUSY`.
-3. **A SQLite-independent persistence test.** Does *any* file the guest creates
-   survive a reboot? That separates "storage still broken" from "SQLite
-   specifically unhappy", and nothing so far tests it directly.
-4. **Copy the iPod's shape.** Its NAND declares **one** partition and mounts
-   `/` **read-write** (`/dev/disk0s1 on / (hfs, local, noatime)`); ours mounts
-   `/` read-only plus a separate `/private/var`. Building the M68AP NAND
-   single-partition, iPod-style, is a big but well-lit lever — it is the
-   configuration known to work.
-
-**Stopgap the user has REJECTED (do not ship it):** dropping the AddressBook
-daemon (`build-m68ap-homescreen-nand.py --drop-addressbook`) takes CPU from
-98% → ~9% but costs Contacts. Keep it as a measurement, not a product.
-
-**Tools:** `IT_NAND_WRITABLE=1` (writes readable in-session), `IT_NAND_TRACE=1`
-(ADM commands: `0x200`/`0x300` read, `0x500` write), `IT_NAND_RB=1` (did the
-guest read back a page it wrote), `IT_NAND_WATCH=<bank>/<page>,…` (exact-match
-page read watch).
+The IRQ pairing is a **derivation, not a measurement**: N45AP fixes the rule
+`IRQ = 0x28 + (pin & 0xf)` (0x1605→0x2D, 0x1606→0x2E), and applying it to
+M68AP's five pins reproduces its device tree's interrupt SET exactly
+(`0x2d 0x28 0x29 0x2a 0x2b`, with 0x2C absent because pin 0x1604 is unused).
+So Home/menu = **0x1600 / IRQ 0x28**. `IT_M68AP_HOME_IRQ=<n>` overrides it
+without a rebuild if a measurement ever disagrees.
 
 ---
 
-## Priority 2 — T7b: the iPhone does not wake (P then H does nothing)
+## Tools added this session
 
-**Symptom (user, 2026-07-26).** On `iPhone 2G.app`, press P (sleep) then H —
-nothing happens. The iPod app wakes correctly from the same keys.
+* **`scripts/overlay-hfs-into-nand.py`** — drop an HFS partition image into a
+  NAND tree as `bank<N>/<page>.page` overrides (spare copied from the pack).
+  Changing `/var` and booting is now ~1 second + a boot instead of a full NAND
+  rebuild. This is what made T6 tractable; use it for any "what if /var looked
+  like this?" question.
 
-**Prime suspect, already evidenced — the Home button is on the wrong GPIO pin
-for M68AP.** From the board's own device tree
-(`m68ap-artifacts/extracted/DeviceTree.m68ap.bin`, node `buttons`,
-compatible `buttons,m68`):
+  ```bash
+  scripts/extract-hfs-from-nand.py "<bundle>/…/nand" /tmp/var.img \
+      --active-banks 4 --partition data          # get the pristine partition
+  # …edit /tmp/var.img…
+  scripts/overlay-hfs-into-nand.py --nand /tmp/nand-test --image /tmp/var.img \
+      --pack "<bundle>/…/nand/nand.pack" --partition data --active-banks 4
+  S5L8900_STAGE_NAND=0 S5L8900_NAND=/tmp/nand-test IT_NAND_WRITABLE=1 \
+      S5L8900_DEBUG=1 "/Applications/iPhone 2G.app/Contents/MacOS/iPod Touch"
+  ```
 
-```
-function-button_menu      GPIO 0x1600   flags 0x100     <-- Home on the iPhone
-function-button_volup     GPIO 0x1601   flags 0x000
-function-button_voldown   GPIO 0x1602   flags 0x000
-function-button_ringerab  GPIO 0x1603   flags 0x100
-function-button_hold      GPIO 0x1605   flags 0x100     <-- Power (same as iPod)
-interrupts  0x2d 7  0x28 7  0x29 5  0x2a 5  0x2b 7
-```
+* **`scripts/extract-hfs-from-nand.py` — two real bugs fixed.** It addressed
+  pack entries as if `active_banks` were always 8, so on a generated 4-bank
+  M68AP NAND it read the wrong pages and died with "invalid HFS volume
+  signature"; and it refused any pack with holes, which every generated
+  (sparse) NAND has. Holes now read as zeros, exactly as the QEMU model reads
+  them. Both partitions of the shipped iPhone NAND now extract.
 
-The key handler in `hw/arm/ipod_touch.c` uses `GPIO_BUTTON_HOME = 0x1606` and
-`GPIO_BUTTON_HOME_IRQ = 0x2E` for **both** boards. `0x1606`/`0x2E` are the
-**iPod's** home button; M68AP's menu is `0x1600` and `0x2E` is not even in its
-interrupt list. So P (hold, `0x1605`) works on both, and H is delivered to a
-pin the iPhone does not watch — which matches the symptom exactly.
+* `S5L8900_DEBUG=1` on either bundle gives serial on stdout — the cheapest
+  window into the guest, and how all of the above was measured.
 
-**To fix:** make the button pin *and* its IRQ board-aware. The pin is certain;
-the **IRQ mapping is not** — the DT lists five (`0x2d, 0x28, 0x29, 0x2a,
-0x2b`) without an explicit pairing, and `0x2d` is the iPod's power IRQ, so
-`0x2d`↔hold is the likely anchor. Determine the rest empirically (press H,
-watch which IRQ the guest unmasks/acknowledges) rather than guessing; a wrong
-IRQ will look like "still not waking".
+## Still open
 
-**Related, already done (do not redo):** the M68AP volume pins are active-low
-and idle HIGH; leaving them at 0 made the ringer/volume HUD stick permanently.
-They are set at the kernel banner because iBoot samples the same port at
-t=0.087 s to pick a boot mode, and presenting them released at reset panics
-the kernel 3/3 (task T5).
+* **T1/T2** — model the MBX (swap completion + 2D) and drop
+  `LK_ENABLE_MBX2D=0`.
+* **T5** — drive the M68AP button pins from reset instead of at the kernel
+  banner.
+* Repackage both bundles once the engine change is verified
+  (`scripts/package-iphone-app.sh`) — the shipped bundle carries its own
+  engine copy and its own NAND, so neither fix reaches the user until it is
+  rebuilt.
 
----
+## Ground rules (carried forward, all still true)
 
-## Ground rules this session earned the hard way
-
-1. **Test the packaged bundle, not the repo build.** `lock-unlock-probe.py
-   --app "/Applications/iPod Touch.app"` runs the bundle's own launcher,
-   engine, firmware and bridges. A fix passed the repo build and regressed the
-   app earlier today.
-2. **Never test headless.** `-display none` means QEMU never calls
-   `gfx_update`, so the display/touch readiness paths do not execute. The probe
-   attaches a VNC refresh client by default; `--no-display-client` exists only
-   for A/B against old runs.
-3. **Assert at the model boundary, not on pixels.** The probe counts touch
-   frames the guest actually consumed (`IT_MT_TRACE=1` → "frame consumed").
-   A pixel-only verdict once scored a cycle `unlocked` with **0 frames
-   consumed**.
+1. **Test the packaged bundle, not the repo build.**
+2. **Never test headless** — `-display none` means no `gfx_update`.
+3. **Assert at the model boundary, not on pixels.**
 4. **If the harness cannot observe the thing under test without changing it,
-   the harness is wrong** — do not change the model to make the test work.
-5. **Disk fills fast and fatally.** A NAND tree is ~300 MB packed, ~900 MB
-   sparse. Clean up `/tmp/nand-*`, `/tmp/sblab-*`, `/tmp/fbsnap-*` and detach
-   `hdiutil` mounts; a leaked mount pins its storage. In zsh a non-matching
-   glob aborts the whole `rm` line — loop over paths instead.
+   the harness is wrong.**
+5. **Disk fills fast and fatally.** Clean `/tmp/nand-*`, `/tmp/sblab-*`,
+   `/tmp/s5l8900-nand.*` (the launcher's per-launch clones leak when a run is
+   killed) and detach `hdiutil` mounts. In zsh a non-matching glob aborts the
+   whole `rm` line — loop over paths instead.
 
 ## Reference documents
 
 * `M68AP_RENDER_HANDOFF.md` — §0 task table (T1–T8), current status.
-* `M68AP_HOMESCREEN_CASE_STUDY.md` — how the home screen and the touch bug were
-  actually solved, including every dead end and the test-fidelity ladder.
+* `M68AP_HOMESCREEN_CASE_STUDY.md` — how the home screen and the touch bug
+  were solved, including every dead end.
 * `IPHONE_2G_BRINGUP_HANDOFF.md` — long-form log.
 * `BUILD.md` §2b — one-command packaging for both bundles.
