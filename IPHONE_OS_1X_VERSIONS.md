@@ -3,14 +3,20 @@
 > Evaluation written 2026-07-25. Every table entry marked **measured** was read
 > out of the real IPSW on this machine, not taken from a wiki.
 >
-> **UPDATE 2026-07-26 — iPhone OS 1.1.1 (3A109a) REACHES THE HOME SCREEN.**
-> The profile work below was implemented and 1.1.1 booted to SpringBoard on the
-> first attempt with no new emulator code. See
-> [Result: 1.1.1 runs](#result-111-runs). 1.0.2 was then attempted and is
-> blocked on ONE emulator gap — see
-> [Result: 1.0.2 blocked](#result-102-is-blocked-in-the-emulator-not-in-the-artifacts).
+> **STATUS 2026-07-26.**
+> - **1.1.1 (3A109a): reaches the SpringBoard HOME SCREEN**, first attempt, no
+>   emulator code changes. See [Result: 1.1.1 runs](#result-111-runs).
+> - **1.0.2 (1C28): iBoot-159 fully working, Darwin kernel boots**, 1835 serial
+>   lines, stops at the root-device wait. Four emulator gaps were fixed to get
+>   there. The remaining wall is that the ADM command layout belongs to the
+>   firmware blob the kernel uploads, and 1.0 uploads a different one.
+> - **1.0 (1A543a): not yet attempted**, but it shares iBoot-159 with 1.0.2, so
+>   it should follow immediately once 1.0.2 mounts root.
+>
 > Section 3's "work required" list below is the ORIGINAL estimate, kept for the
-> record; the ✅/⛔ markers say what survived contact.
+> record; the ✅/⛔ markers say what survived contact. Nearly every real blocker
+> turned out to be an unimplemented corner of hardware that 1.1.x never touches,
+> not anything about the firmware.
 
 Today `-M iPhone-2G` runs exactly one firmware: **iPhone OS 1.1.4 / 4A102**
 (see [`IPHONE_2G.md`](IPHONE_2G.md), [`M68AP_HOMESCREEN_CASE_STUDY.md`](M68AP_HOMESCREEN_CASE_STUDY.md)).
@@ -158,8 +164,10 @@ each new firmware:
 - **TSL2561 ambient-light model** for 1.0, alongside the existing ISL29003.
   (Not yet reached — 1.0.2 stops before the kernel runs.)
 - ⛔ **The one that actually blocks 1.0, and was not on this list at all:**
-  iBoot-159's NAND page reads never reach `hw/arm/ipod_touch_adm.c`. See the
-  1.0.2 result section.
+  iBoot-159 does not use the ADM at all (it drives the controller directly, and
+  its reads work once the ECC engine has a data path). The ADM *does* matter for
+  the 1.0 KERNEL, but for a different reason — the command-block layout belongs
+  to the uploaded firmware blob. See the 1.0.2 result sections.
 - (Checked and *not* a difference: the kernelcache is `8900 → complzss` with no
   IMG2 wrapper in 1.0, 1.1.1 and 1.1.4 alike. `extract-kernelcache.py`'s
   docstring claims 1.1.x interposes an IMG2 layer; it does not.)
@@ -710,6 +718,38 @@ the next hypothesis.
 - **Forcing the image validator to report "trusted".** Verified under the
   debugger that r5 becomes 1, and the device tree still does not load. Trust
   level is not the device-tree gate.
+
+### Round 3 (kernel bring-up) — what did NOT work
+
+- **Forcing the image validator to report "trusted".** `movs r5,#4` →
+  `movs r5,#1` at file `0x7fec`. The validator's return really does change
+  (r5 = 1, confirmed under the debugger) and the device tree still fails,
+  because iBoot-159 fixes the return value at −1 *earlier*, on the unsigned-image
+  path, before the trust level or the security config is ever consulted. A fix
+  aimed one layer above the actual decision.
+- **Hand-disassembling iBoot from guessed addresses.** Produced a table of
+  plausible instruction addresses, several of which do not exist; breakpoints on
+  them silently never fired, which looked like impossible control flow. Cost
+  several runs. Superseded by `-d in_asm` — see below.
+- **"Same fields, shifted base" for ADM firmware-14.** Documented in full above:
+  it decodes commands and gets 600 more serial lines, then reads garbage and
+  panics. Reverted.
+- **Assuming the ADM offset is a hardware property.** It is not — it belongs to
+  the firmware blob the kernel uploads. Two releases on the same silicon use two
+  different layouts, which is invisible until you compare the
+  `Loading ADM/FMC firmware '...'` line in each boot log. When a per-version
+  difference appears in a *driver-visible* structure, check whether the guest
+  uploaded the code that defines it.
+
+### The through-line for 1.0
+
+Every 1.0 blocker so far has been an **unimplemented corner of the hardware**
+rather than anything about the firmware: the ECC engine's data path, its
+main-page/spare region selector, the uncached address aliases, the PMU's real
+I2C bus, and now the ADM's per-firmware command layout. 1.1.x never exercises
+any of them, so they sat empty for years without anyone noticing. Expect the
+remaining 1.0 work to have the same shape, and prefer "which register block does
+this path actually touch?" over "what is different about this firmware?".
 
 ### Debugger notes (this is the tool that broke the deadlock)
 

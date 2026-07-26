@@ -163,8 +163,18 @@ interleave; the old code inferred the bank count from the signature word, which
 made that combination unbuildable.
 
 The 1.0 family (1A543a / 1C28) is a different bootloader generation — iBoot-159,
-plaintext images, epoch 0, signature `000C` — and has not been attempted.
-Details, measurements and the test plan:
+plaintext images, epoch 0, signature `000C`. **1.0.2 now boots the Darwin
+kernel**: iBoot-159 is fully working and the kernel runs to the root-device
+wait. Getting there needed four emulator fixes, each an unimplemented corner of
+hardware that 1.1.x never exercises — the NAND ECC engine's data path and its
+main-page/spare region selector, the uncached memory aliases (bit 31 of a
+physical address), an iBoot-159 patch for its hardcoded rejection of unsigned
+flash images, and the PMU's real I2C bus (i2c0 on M68AP, which also explains
+1.1.x's "always charging / disabling idle sleep"). The remaining wall is that
+the ADM command-block layout belongs to the ADM/FMC firmware blob the kernel
+uploads: 1.0 uploads `CalmADMFMCFirmware-14`, 1.1.x uploads `-17`.
+
+Details, measurements, dead ends and the test plan:
 [`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md).
 
 ## Historical NAND provenance and route decision
