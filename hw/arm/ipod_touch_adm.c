@@ -180,6 +180,7 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                  * command.
                  */
                 hwaddr cmdbase = s->data2_sec_addr + 0x1104;
+                hwaddr page_off = 0x244;
                 uint32_t cmd = adm_read_u32(s, cmdbase + 0x24);
                 if (cmd == 0) {
                     hwaddr alt = s->data2_sec_addr + 0x0824;
@@ -187,6 +188,11 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                     if (altcmd != 0) {
                         cmdbase = alt;
                         cmd = altcmd;
+                        /* -14 keeps the page number 0x200 further out than
+                         * -17 does; measured with IT_ADM_DIFF, which shows it
+                         * incrementing big-endian at data2+0x0c68 as the
+                         * kernel scans. */
+                        page_off = 0x444;
                     }
                 }
                 /* IT_NAND_TRACE=1: which NAND operations the guest actually
@@ -311,7 +317,13 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                     };
                     const size_t span = 0x2000;
 
-                    if (n++ < 12) {
+                    unsigned first = (unsigned)strtoul(getenv("IT_ADM_DIFF"),
+                                                       NULL, 0);
+                    if (first < 2) {
+                        first = 1;
+                    }
+                    n++;
+                    if (n >= first && n < first + 10) {
                         fprintf(stderr, "[ADM-DIFF] kick #%u\n", n);
                         for (int si = 0; si < 3; si++) {
                             uint8_t *cur = g_malloc0(span);
@@ -367,7 +379,7 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         //printf("Reading %d pages at once, ", num_pages);
 
                         page = adm_read_be32(
-                            s, cmdbase + 0x244);
+                            s, cmdbase + page_off);
                         //printf("starting with page %d\n", page);
 
                         /*
@@ -412,7 +424,14 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                                 s, cmdbase + 0x44);
 
                             page = adm_read_be32(
-                                s, cmdbase + 0x244);
+                                s, cmdbase + page_off);
+                            if (getenv("IT_ADM_PAGES")) {
+                                static unsigned n;
+                                if (n++ < 4000) {
+                                    fprintf(stderr, "[ADM-PAGE] bank%u page %u\n",
+                                            bank, page);
+                                }
+                            }
                             if (page >= 25855 && page <= 25859) {
                                 trace_itadm_root_read(cmd, num_pages, 0, bank,
                                                      page);
@@ -436,7 +455,7 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                             s->nand_state->reading_multiple_pages = true;
                             for(int i = 0; i < num_pages; i++) {
                                 page = adm_read_be32(
-                                    s, cmdbase + 0x244 +
+                                    s, cmdbase + page_off +
                                     4 * i);
                                 bank = adm_read_u8(
                                     s, cmdbase + 0x44 + i);
@@ -461,7 +480,7 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         bank = adm_read_u8(
                             s, cmdbase + 0x44);
                         page = adm_read_be32(
-                            s, cmdbase + 0x244);
+                            s, cmdbase + page_off);
 
                         // set the bank, page, and operation.
                         //printf("Activating bank for writing: %d, page: %d\n", bank, page);
