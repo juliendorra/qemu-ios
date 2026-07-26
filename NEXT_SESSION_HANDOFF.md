@@ -103,10 +103,11 @@ without a rebuild if a measurement ever disagrees.
   `LK_ENABLE_MBX2D=0`.
 * **T5** — drive the M68AP button pins from reset instead of at the kernel
   banner.
-* Repackage both bundles once the engine change is verified
-  (`scripts/package-iphone-app.sh`) — the shipped bundle carries its own
-  engine copy and its own NAND, so neither fix reaches the user until it is
-  rebuilt.
+* ~~Repackage the iPhone bundle~~ **done** — `/Applications/iPhone 2G.app`
+  carries both fixes (engine + regenerated NAND) and passes
+  `lock-unlock-probe.py --app` 2/2 with **47 touch frames consumed per
+  cycle**. The iPod bundle was left alone: the engine change is
+  board-conditional and nothing in it touches N45AP.
 
 ## Ground rules (carried forward, all still true)
 

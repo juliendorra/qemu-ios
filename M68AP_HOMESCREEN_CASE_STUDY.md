@@ -455,10 +455,21 @@ baseline:
 | pre-fix engine | no `[LCD] Merlot panel woke from sleep` at all; screen frozen at its pre-sleep 63.5% (the pixel classifier called this "unlocked" — a false pass) | `stuck-locked` at 42.2% |
 | post-fix engine | wakes: 69.1% home → sleep → H → 42.2% lock screen → slide → 69.1% home | same, 2/2 `unlocked` |
 
-Recorded as a limitation: neither run counted touch frames at the model
-boundary, because `lock-unlock-probe.py` only reports them when the **caller**
-sets `IT_MT_TRACE=1`. The wake claim rests on the panel's own wake trace and
-on the lock screen actually appearing, not on pixels alone.
+Neither of those runs counted touch frames at the model boundary, because
+`lock-unlock-probe.py` only reports them when the **caller** sets
+`IT_MT_TRACE=1`. Closed afterwards on the **repackaged bundle** (its own
+launcher, engine, firmware and per-launch NAND staging):
+
+```
+booted: home (64.7% non-black)
+cycle 1: unlocked  (slept 64.7%, woken 42.2%, after 69.4%, frames consumed 47)
+cycle 2: unlocked  (slept 69.4%, woken 42.2%, after 69.4%, frames consumed 47)
+first failing cycle: none
+```
+
+2/2, with 47 frames the guest actually consumed per cycle — the assertion the
+fidelity ladder asks for, not a pixel verdict. Idle CPU of that same bundle:
+13–14% while a probe client was still attached and refreshing.
 
 ## Lesson
 
