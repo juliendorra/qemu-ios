@@ -72,7 +72,7 @@ PATCHED = bytes.fromhex("0120")  # movs r0, #1  (allow unsigned)
 # address, stored little-endian as a0 2f 02 18) plus its load/test/branch, which
 # is what makes it unique.
 LOCATOR = bytes.fromhex(
-    "13402022134306602010bd"          # tail of the preceding function
+    "1340202213430b60201c10bd"        # tail of the preceding function
     "a02f0218"                        # &security_config == 0x18022fa0
     "fffff3df01280bd1074a1368d90601d4"  # cmp r0,#1 / ldr / tst bit 4 / bmi
 )
