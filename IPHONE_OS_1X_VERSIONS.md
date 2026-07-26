@@ -502,7 +502,29 @@ it answer "allowed". The caller's `cmp r0,#0 / beq <fail>` therefore passes.
    to the security-config call.
 
 Break at `0x180083be` and read `r0`, then at `0x180083ca` and compare `r2`/`r3`.
-Two measurements should close it.
+
+**Attempted, and it exposed a tooling problem rather than an answer.** With
+breakpoints on `0x180083be`, `0x180083ca`, `0x180083dc`, `0x180084c6` and
+`0x180084ca`, execution lands directly on the failure exit `0x180084ca` without
+hitting any of the earlier ones. Since `0x180084ca` is reachable from
+`0x180083c2` — immediately after `0x180083be` — that is impossible if all five
+addresses are real instruction boundaries.
+
+**They are probably not.** Every address in the table above came from linear
+Thumb disassembly started at an address I chose, and Thumb is variable-length:
+if the chosen start is not a real boundary the decode silently desynchronises
+and produces plausible-looking but fictional instructions. That also explains
+earlier breakpoints in this investigation that never fired (`0x1800c726`,
+`0x1800c73e` in one run) while neighbouring ones did.
+
+So the addresses in this section should be treated as **approximate** until
+re-derived from a known-good anchor — a function entry found via its `push
+{...}` prologue, or better, by disassembling forward from a PC value actually
+observed in a register dump rather than from a guess. The measured *facts*
+(find_image succeeds, the tag is accepted, the size passes, `load_image` returns
+−1, the header CRC matches, trust is 4 and forcing 1 does not help) are all from
+register and memory reads and remain valid; only the instruction addresses are
+suspect.
 
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
