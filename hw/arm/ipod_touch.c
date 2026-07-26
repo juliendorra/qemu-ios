@@ -1361,6 +1361,21 @@ static void ipod_touch_machine_init(MachineState *machine)
     // init the PMU
     I2CSlave *pmu = i2c_slave_create_simple(pmu_bus, "pcf50633", 0x73);
     spi2_state->mt->pmu = PCF50633(pmu);
+    if (nms->board_id == BOARD_ID_M68AP) {
+        /*
+         * Report the USB charger as present on the iPhone.
+         *
+         * MBCS1 was never initialised, so with the PMU finally answering on
+         * its real bus the guest reads "no external power" and iPhone OS 1.0
+         * idle-sleeps within seconds of launchd -- before SpringBoard ever
+         * starts -- which the OOCSHDWN path then turns into a reboot loop.
+         * An emulated device is always on USB power, so saying so is both
+         * honest and what 1.1.x accidentally saw when every PMU read returned
+         * 0xFF. N45AP is deliberately left alone: the iPod's sleep/wake
+         * support depends on it being able to idle-sleep.
+         */
+        PCF50633(pmu)->regs[PMU_MBCS1] = PMU_MBCS1_USBPRES | PMU_MBCS1_USBOK;
+    }
     // Wire PMU interrupt output to SYSIC (GPIO 0x55 = group 2, bit 21)
     PCF50633(pmu)->sysic = sysic_state;
     PCF50633(pmu)->vic0 = nms->vic0;

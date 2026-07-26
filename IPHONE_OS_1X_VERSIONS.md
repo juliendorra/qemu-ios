@@ -6,10 +6,11 @@
 > **STATUS 2026-07-26.**
 > - **1.1.1 (3A109a): reaches the SpringBoard HOME SCREEN**, first attempt, no
 >   emulator code changes. See [Result: 1.1.1 runs](#result-111-runs).
-> - **1.0.2 (1C28): iBoot-159 fully working, Darwin kernel boots**, 1835 serial
->   lines, stops at the root-device wait. Four emulator gaps were fixed to get
->   there. The remaining wall is that the ADM command layout belongs to the
->   firmware blob the kernel uploads, and 1.0 uploads a different one.
+> - **1.0.2 (1C28): REACHES THE SPRINGBOARD HOME SCREEN.** iBoot-159, the
+>   Darwin kernel, `BSD root: disk0s1`, `/private/var`, launchd, and SpringBoard
+>   rendering at 59% non-black with the frame actually scanned out (45%). Six
+>   emulator gaps were fixed to get there, every one of them an unimplemented
+>   corner of hardware that 1.1.x never touches.
 > - **1.0 (1A543a): not yet attempted**, but it shares iBoot-159 with 1.0.2, so
 >   it should follow immediately once 1.0.2 mounts root.
 >
@@ -803,6 +804,47 @@ It does not fall back: IOKit retries `AppleS5L8900XADMFMC::start` forever
 (45,568 serial lines of it in a 300 s run, re-uploading `CalmADMFMCFirmware-14`
 each time). Removed. If this is revisited, the driver has to be made to *decline
 the match* rather than fail its start.
+
+## Result: iPhone OS 1.0.2 reaches the home screen
+
+Six emulator fixes, in the order they were hit:
+
+1. **NAND ECC engine data path** — the block moved no bytes at all.
+2. **ECC region selector** — `NANDECC_SETUP` bits[1:0] = sector count − 1;
+   4 sectors = main page, 1 sector = spare. Copying the page for both left
+   `spare[8]/spare[9]` zero, so `_LoadVFLCxt` never recognised its context page.
+3. **Uncached memory aliases** — bit 31 of a physical address selects the
+   uncached view; neither window was mapped.
+4. **iBoot-159's unsigned-image rejection** — it hardcodes −1 before consulting
+   the security config. One instruction, pattern-located, skipped on iBoot-204.
+5. **PMU on i2c0** — M68AP's device tree puts it there; we had it on i2c1, so
+   every read returned 0xFF and the 1.0 kernel stalled in `IOIpodUSBDevice`.
+6. **ADM command layout** — belongs to the uploaded firmware blob, not the
+   hardware. Firmware-14 keeps its command at `data2+0x0824+0x24` and its **page
+   number at +0x444** (firmware-17 uses `+0x1104+0x24` and `+0x244`). Until the
+   page offset was right every read targeted page 0, so the kernel's
+   production-format scan never found `DEVICEINFOBBT` and panicked.
+
+Plus the same two guest-data fixes 1.1.x needs — the lockdownd activation patch
+(which located 1.0.2's binary on its own, at a different address) and
+`LK_ENABLE_MBX2D=0` — and one new one:
+
+7. **Report the USB charger present (`MBCS1`)** on M68AP. With the PMU finally
+   answering, the guest saw no external power and idle-slept within seconds of
+   launchd, which the OOCSHDWN path turns into a reboot loop. Verified by A/B:
+   **45.4% screenout with it, 0.58% without.** N45AP is deliberately excluded —
+   the iPod's sleep/wake support depends on being able to idle-sleep.
+
+Reproduce:
+
+```bash
+python3 scripts/fb-snapshot.py --board m68ap --epoch 0 --iboot-m68ap m68ap-artifacts/stage-1.0.2/iboot_159_m68ap_sbpatch.bin --nor-m68ap m68ap-artifacts/stage-1.0.2/nor_m68ap.bin --nand-m68ap m68ap-artifacts/stage-1.0.2/nand --boot-wait 85 --logs /tmp/fb102
+```
+
+Known remaining behaviour: the device still idle-sleeps a little after the home
+screen appears, and the OOCSHDWN wake path then restarts the SoC, so a long run
+shows repeated boots. The home screen renders well before that. The sleep path
+itself is N45AP-tuned (see the poweroff-loop VA note) and has not been ported.
 
 ### What the ADM actually is, and why only 1.0 needs new work
 
