@@ -508,20 +508,68 @@ byte ranges is guaranteed correctly aligned, and the set of blocks that appear
 is itself the executed path. The failing branch was obvious within one pass.
 **Use `-d in_asm` before hand-disassembling anything in this bootloader.**
 
-### Current wall: kernel stalls at `IOIpodUSBDevice`
+### SOLVED: the `IOIpodUSBDevice` stall — the PMU was on the wrong I2C bus
 
-1.0.2 now runs 1329 serial lines and stops at:
+The M68AP device tree makes `pmu,pcf50635` a child of the **i2c0** node (the
+node sits between the i2c0 and i2c1 nodes in the 1C28 DeviceTree); N45AP puts it
+on i2c1. The machine attached it to i2c1 for both boards, so every M68AP PMU
+read returned 0xFF from an unanswered bus.
+
+1.1.x survives that — it simply believes it is permanently on external power,
+which is exactly where the long-standing "always shows the charging battery" and
+`disabling idle sleep` symptoms come from — but it stalls the 1.0 kernel dead in
+`IOIpodUSBDevice`'s power path. With the PMU on the board's real bus:
 
 ```
-AppleS5L8900XUSBWrangler::doCoreInit core reset complete
-AppleS5L8900XIpodHAL::message
-IOIpodUSBDevice::gated_message cable is connected, starting stack
+ApplePCF50635PMUPowerSource: cap 63, ext 0, chrgCap 0, chrg 0   (1.0.2, correct)
+ApplePCF50635PMUPowerSource: cap 100, ext 1, chrgCap 1, chrg 1  (was, from 0xFF)
 ```
 
-Unchanged at 300 s, so it is a stall rather than slowness. Notably this is the
-same service the 1.1.4 bring-up once panicked inside (`IPHONE_2G.md`, "the first
-production boundary is now the M68 USB service lookup/order"), so the history
-there is worth re-reading before treating it as new.
+The `IOIpodUSBDevice` stall disappears entirely and the kernel proceeds to
+root-device matching. N45AP is unaffected by construction; 1.1.1 still reaches
+`BSD root: disk0s1` and the iPod still renders at 47.2 % non-black.
+
+### Current wall: the two releases upload DIFFERENT ADM firmware
+
+1.0.2 now reaches the root-device wait:
+
+```
+Waiting on <dict ... <key>BSD Name</key><string>disk0s1</string> ... >
+```
+
+The kernel's `AppleNANDFTL` starts, `_FILInit` advertises ReadMultiple /
+ReadScattered / WriteMultiple, and WMR reports `FIL_Init`, `BUF_Init`,
+`VFL_Init`, `FTL_Init` all `[OK]` — then nothing. No `VFL_Open`, no
+`IOFlashBlockDevice`, no error.
+
+The cause is visible in one line of each boot log:
+
+```
+AppleS5L8900XADMFMC::start: Loading ADM/FMC firmware 'CalmADMFMCFirmware-14'   (1.0.2)
+AppleS5L8900XADMFMC::start: Loading ADM/FMC firmware 'CalmADMFMCFirmware-17'   (1.1.1)
+```
+
+**The ADM command-block layout belongs to that uploaded blob, not to the
+hardware.** `hw/arm/ipod_touch_adm.c` reads the command word at a hardcoded
+`data2 + 0x1104 + 0x24`, which is firmware-17's layout. Under firmware-14 that
+address is zero, so every command decodes as `0x0` and no NAND operation is ever
+performed — hence a kernel that initialises the FTL fine and then never opens
+it.
+
+`IT_ADM_DUMP=1` scans the data2 section and shows firmware-14's block at
+**`data2 + 0x840`**, e.g.:
+
+```
+[ADM-SCAN] data2=0x08a20000
+   +0840: 00 05 00 00  00 03 00 00  00 03 00 00  00 01 00 00
+          00 00 00 00  00 04 00 00  00 01 02 03  00 00 00 00
+```
+
+Those little-endian words (`0x500`, `0x300`, `0x300`, `0x100`, …) are the same
+command codes the 0x1104 layout uses, so this looks like a descriptor list
+rather than a single command. Decoding it is the next task, and it is a real
+piece of work rather than a constant: the model needs a per-firmware ADM layout,
+selected by which blob the guest uploaded.
 
 ## Dead ends, false paths and wrong turns (2026-07-26)
 

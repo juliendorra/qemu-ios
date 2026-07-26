@@ -191,6 +191,44 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                         }
                     }
                 }
+                /*
+                 * IT_ADM_DUMP=1: where in the data2 section does this firmware
+                 * keep its command block?
+                 *
+                 * The offset is NOT a property of the hardware -- it belongs to
+                 * the ADM/FMC firmware blob the kernel uploads, and different
+                 * iPhone OS releases upload different blobs. 1.1.x loads
+                 * "CalmADMFMCFirmware-17" and puts the command word at
+                 * data2 + 0x1104 + 0x24, which is what the decoding below
+                 * assumes. 1.0/1.0.x loads "CalmADMFMCFirmware-14", whose block
+                 * sits at data2 + 0x840 instead, so that fixed offset reads
+                 * zeroes and every command decodes as 0x0.
+                 */
+                if (getenv("IT_ADM_DUMP")) {
+                    static unsigned n;
+                    if (n++ < 3) {
+                        uint8_t w[0x40];
+                        fprintf(stderr, "[ADM-SCAN] data2=0x%08x\n",
+                                (uint32_t)s->data2_sec_addr);
+                        for (hwaddr off = 0; off < 0x4000; off += 0x40) {
+                            bool nz = false;
+                            address_space_read(&s->downstream_as,
+                                               s->data2_sec_addr + off,
+                                               MEMTXATTRS_UNSPECIFIED, w,
+                                               sizeof(w));
+                            for (int k = 0; k < (int)sizeof(w); k++) {
+                                if (w[k]) { nz = true; break; }
+                            }
+                            if (nz) {
+                                fprintf(stderr, "   +%04x:", (unsigned)off);
+                                for (int k = 0; k < 32; k++) {
+                                    fprintf(stderr, " %02x", w[k]);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                }
                 // printf("Setting command: 0x%08x\n", cmd);
                 // for(int i = 0; i < 20; i++) {
                 //     printf("0x%08x ", buf[i]);
