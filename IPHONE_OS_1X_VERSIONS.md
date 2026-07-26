@@ -459,25 +459,50 @@ non-black and 1.1.1 still reaches `BSD root: disk0s1`.
 
 ### Current wall: `load_macho_image: failed to load device tree`
 
-The same wall the 1.1.4 bring-up hit, but *not* the same cause — the fixes that
-cleared it there are already in place and verified:
+The same message the 1.1.4 bring-up hit, but **not** the same cause. Everything
+that fixed it there is in place and verified by measurement, not assumption:
 
-- iBoot-159 checks the same flag as iBoot-204: `[img+0x1c]` bit 24, tested at
-  `0x18007f70` (`lsls r2, r3, #7` / `bmi`). `build-m68ap-nor.py promote_loadable`
-  already sets it; the built NOR has `flags@+0x1c = 0x01000000`, and the CRC at
-  `+0x64` is recomputed.
-- The secure-boot relaxation is applied (`site 0x5350`, verified).
+- iBoot-159 gates on the same flag as iBoot-204 — `[img+0x1c]` bit 24, tested at
+  `0x18007f70`. The built NOR has `flags@+0x1c = 0x01000000`.
+- The header CRC matches: read at a breakpoint, computed `0x32c55ce2` == stored
+  `0x32c55ce2`, and equal to `zlib.crc32(header[:0x64])`.
+- The secure-boot relaxation is applied (site `0x5350`, verified).
 
-Measured with the debugger: the image validator at `0x18007f36` runs to its exit
-at `0x18008060` repeatedly and returns trust level **4** (unverified, hash
-compare at `0x18007fc6` fails as expected for images we cannot re-sign). Forcing
-it to report **1** (trusted) by patching `movs r5, #4` → `movs r5, #1` at file
-`0x7fec` changes the returned level — confirmed r5 = 1 under the debugger — and
-the device tree **still** fails to load. So the trust level is not the gate.
+Traced call chain, with the measured value at each step:
 
-The load call at `0x1800c6f8` (from `0x1800d790`, `lr = 0x1800d795`) is entered
-repeatedly and, in a 30-stop window, never reaches its return check at
-`0x1800d794`. That is where the next session should start.
+| Where | What | Measured |
+|---|---|---|
+| `0x1800c714` | `find_image("dtre")` | **succeeds**, struct at `0x1802bd40` |
+| `0x1802bd40+0xc` | image kind tag | `0x22f5ef0e` (flash) — **accepted** |
+| `0x1800c726` | size vs 1 MiB cap | `0x896c` ≤ `0x100000` — **passes** |
+| `0x1800c73a` | `load_image()` | returns **−1** |
+| `0x18007e0e` | kind check inside `load_image` | passes (flash tag) |
+| `0x18008364` | flash-image loader | the rejection happens in here |
+| `0x18008060` | image validator exit | returns trust **4** (unverified) |
+
+Forcing the validator to report trusted (`movs r5,#4` → `movs r5,#1` at file
+`0x7fec`) does change its return — confirmed r5 = 1 under the debugger — and
+`load_image` **still** returns −1. So the trust level is not the gate either.
+
+The security-config helper at `0x18005344` is fully understood and our patch is
+correct for it: called with `r0 = 1` from `0x180083d6`, it tests bit 4 of the
+config word at `0x18022fa0`, and the patched `movs r0,#1` at `0x18005350` makes
+it answer "allowed". The caller's `cmp r0,#0 / beq <fail>` therefore passes.
+
+**Remaining candidates inside `0x18008364`**, in order:
+
+1. `0x180083ba` — `bl 0x18007f34` (the validator) and `bge` on its result. A
+   negative return jumps straight to the failure exit at `0x180084ca`. The
+   validator returns −1 on a magic or header-CRC mismatch, and the header it is
+   handed here (`[[r5+0x10]+0xc]`) is **not** the one already verified at
+   `0x1802b910` — that is the most likely culprit and the first thing to check.
+2. `0x180083c4`–`0x180083cc` — compares `[sl+0x10]` against the validator's
+   out-parameter at `sp+0x74` and fails on mismatch.
+3. `0x180083d0`–`0x180083d4` — tests bit 2 of `[sl+0x18]`, which is what leads
+   to the security-config call.
+
+Break at `0x180083be` and read `r0`, then at `0x180083ca` and compare `r2`/`r3`.
+Two measurements should close it.
 
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
