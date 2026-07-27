@@ -28,7 +28,7 @@ green repo build says nothing about what the user launches.
 
 Usage:
   # the installed app bundles -- what the user actually runs
-  python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G.app"
+  python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G (iOS 1.1.4).app"
   python3 scripts/verify-boot-logo.py --app "/Applications/iPod Touch.app"
 
   # the repo build, for a given firmware

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Full packaging for "iPhone 2G.app" (M68AP) — one command, end to end.
+# Full packaging for "iPhone 2G (iOS 1.1.4).app" (M68AP) — one command, end to end.
 #
 #   scripts/package-iphone-app.sh --firmware BUILD
 #                                 [--app PATH] [--qemu PATH] [--build]
@@ -43,7 +43,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-APP="/Applications/iPhone 2G.app"
+APP="/Applications/iPhone 2G (iOS 1.1.4).app"
 QEMU="$REPO/build-ipod11/qemu-system-arm"
 FIRMWARE=""
 NAND_SRC=""
@@ -252,7 +252,7 @@ if [[ $fail -ne 0 ]]; then
 fi
 cat <<EOF
 
-iPhone 2G.app is ready: open it, or \`open -a "$APP"\`
+iPhone 2G (iOS 1.1.4).app is ready: open it, or \`open -a "$APP"\`
   expect: ~2-3 min to the home screen (Phone/Mail/Safari/iPod dock).
   the status bar reads "No Service" — telephony registration is still open work.
 EOF

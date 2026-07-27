@@ -171,6 +171,22 @@ Rule 5 above says *read the working reference*. These are its limits.
    throttled), and reach for the level-triggered one first when the question
    is about configuration rather than timing.
 
+## One rule added by the provenance case (2026-07-27)
+
+10. **Derive a record from the artifact, never from the inputs — and make
+    "unknown" a value you can write down.** The bundle firmware manifest was
+    built from the arguments handed to the installer, and the primary packaging
+    path did not call the installer at all. Result: a shipped bundle whose
+    manifest had a well-formed hash for every file and was wrong about all of
+    them, and which described a patched guest image as stock firmware. It never
+    announced itself precisely *because* it was well-formed — nothing compares
+    a recorded hash to the file beside it, so correct and rotten looked
+    identical. Two habits follow. Compute the record from what is on disk at
+    the moment you write it, so it cannot outlive its subject. And when a piece
+    of provenance is unavailable, record `MISSING` rather than omitting the
+    field: an absent key silently reads as "nothing to report", which is the
+    one meaning it must never have.
+
 ## Retrospective: where this would have saved time
 
 - **WiFi SDIO** (the proof case, pre-tooling): every hypothesis was a C

@@ -23,6 +23,105 @@ the live bring-up state.
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
 
+## Session log — 2026-07-27 (the bundle firmware manifest described artifacts that were long gone — FIXED)
+
+**Status: fixed** (`a923e44ab2`). No runtime impact: this is a record-keeping
+defect. It is logged in full because it silently disabled the one control that
+answers the question this tree has repeatedly had to answer the expensive way —
+*which firmware, and which guest modifications, are in this artifact?*
+
+**How it surfaced.** Not by looking for it. While checking whether the "M68AP
+kernel framebuffers stay black" report was real, I needed to tell two NANDs
+apart — the repo's plain `builds/<BUILD>/nand` and the bundle's home-screen
+one. Reading provenance is a one-command answer to that, so I read the
+bundle's:
+
+```
+"nand_provenance": { "page_count": 37,
+                     "guest_file_modifications": "none (metadata-only)",
+                     "source": { "hfs_sha256": null } }
+```
+
+37 pages and no filesystem, for a NAND that boots to a SpringBoard home screen.
+Nonsense on its face. I fell back to counting page files (313 + a 315 MB pack)
+and reading `package-iphone-app.sh`.
+
+**First diagnosis, and why it was incomplete.** "The sidecar isn't propagated,
+so the key went stale." True but shallow, and it would have produced a fix that
+did not work: I would have made `install-iphone-firmware.py` carry the sidecar
+and stopped. What broke that reading was comparing the two bundles side by
+side:
+
+| bundle | `nand_provenance` |
+|---|---|
+| 1.1.4 | present, **false** (`"none (metadata-only)"`) |
+| 1.0 | **absent entirely** |
+
+Same pipeline, two different symptoms. That only makes sense if the two files
+were last written by *different* code paths — and the 1.0 one had been written
+by `install-iphone-firmware.py` (which I had run an hour earlier), while the
+1.1.4 one had not been written by anything for a long time.
+
+**The actual cause.** `package-iphone-app.sh` — the primary packaging path —
+**never calls `install-iphone-firmware.py`**. It installs the firmware itself
+(`cp` the iBoot/NOR/bootrom, then `nand.pack` plus empty bank dirs,
+deliberately, for launch speed) and never touched `firmware-provenance.json`.
+That file is written *only* by the installer. So the manifest in a shipped
+bundle was a fossil of the last time someone happened to run the installer by
+hand, and every `package-iphone-app.sh` run since had silently invalidated it.
+
+**How much had drifted — measured, not assumed.** Running the new
+`--refresh-manifest` against the shipped 1.1.4 bundle:
+
+| field | manifest said | actually |
+|---|---|---|
+| `iboot_204_m68ap.bin` | `17bb2b76…` | `ab9d4136…` |
+| `nand.tree_sha256` | `da27b620…` | `7f26324b…` |
+| `nand_provenance` | `"none (metadata-only)"` | the home-screen recipe |
+
+So not "the NAND record is stale" — **every** hash was stale. The descriptive
+field was merely the one that read as an assertion: a bundle carrying the
+lockdownd activation patch and a forced-software-compositing SpringBoard was
+describing itself as untouched Apple firmware.
+
+**Why it never announced itself.** The manifest was *well-formed*. It had
+hashes, in the right shape, for every file. Any check of the form "does this
+bundle carry provenance?" passed. Nothing compares the recorded hash to the
+file on disk, so being wrong and being right looked identical — the same
+failure mode as the TVOut magic address (playbook rule 1: silence is the bug).
+
+**The fix, in three small pieces** (no emulator change):
+
+1. `build_manifest(fw)` in `install-iphone-firmware.py` describes a firmware
+   directory **from its own contents**, so it cannot describe something else.
+   Exposed as `--refresh-manifest`, which installs nothing.
+2. `package-iphone-app.sh` copies the constructor's `nand-provenance.json`
+   next to the pack (~2 KB) and ends with `--refresh-manifest` instead of a
+   bare `codesign`.
+3. `build-m68ap-homescreen-nand.py` declares its own guest modifications in
+   that sidecar under a `recipe` key — activation patch, `LK_ENABLE_MBX2D=0`,
+   the `/var` template and ark, database seeding. `build-m68ap-nand.py` cannot
+   know any of these; it only sees two HFS+ partitions being placed.
+
+A missing sidecar is now recorded as `{"status": "MISSING", "detail": …}` and
+warned about, rather than the key being omitted. **"No record" must not read as
+"nothing was modified"** — that distinction is the whole point, and omitting the
+key erases it.
+
+**Deliberately not done:** the shipped bundles' `nand_provenance` is *not*
+back-filled. Their NANDs predate this change and the sidecars are genuinely
+gone, so `MISSING` is the honest record; it becomes real on the next
+`package-iphone-app.sh --firmware <BUILD>` run. Inventing a plausible history
+for artifacts that cannot be verified would recreate the defect being fixed.
+
+**The generalisable part** (now playbook rule 10): a record written by one code
+path and consumed by another will drift, unless it is *derived from the
+artifact it describes* at the moment it is written. Carrying inputs forward is
+what let this rot — the manifest recorded what it was *told*, not what was
+*there*.
+
+---
+
 ## Session log — 2026-07-27 (1.0's dead park was a QEMU main-loop DEADLOCK, not a swallowed key — FIXED)
 
 **Status: fixed.** iPhone OS 1.0/1A543a parked on sleep (`88e73d8cec`) but
@@ -3148,7 +3247,7 @@ python3 scripts/nor-image-store.py <nor.bin> --check --expect 7   # exit 1 if no
 python3 scripts/nor-image-store.py <nor.bin> --reference "/Applications/iPod Touch.app/Contents/Resources/ipod_files/nor_n45ap.bin"
 
 # DYNAMIC: is the logo on the panel during the early boot?
-python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G.app"
+python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G (iOS 1.1.4).app"
 python3 scripts/verify-boot-logo.py --board m68ap --build 4A102   # repo build
 ```
 

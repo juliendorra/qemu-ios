@@ -23,7 +23,7 @@ Both problems the previous handoff carried are addressed in this session:
   model.** The key handler used the iPod's Home pin/IRQ on both boards.
 
 ```bash
-open -a "/Applications/iPhone 2G.app"     # the iPhone
+open -a "/Applications/iPhone 2G (iOS 1.1.4).app"     # the iPhone
 open -a "/Applications/iPod Touch.app"    # the reference
 ```
 
@@ -102,7 +102,7 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
   scripts/overlay-hfs-into-nand.py --nand /tmp/nand-test --image /tmp/var.img \
       --pack "<bundle>/…/nand/nand.pack" --partition data --active-banks 4
   S5L8900_STAGE_NAND=0 S5L8900_NAND=/tmp/nand-test IT_NAND_WRITABLE=1 \
-      S5L8900_DEBUG=1 "/Applications/iPhone 2G.app/Contents/MacOS/iPod Touch"
+      S5L8900_DEBUG=1 "/Applications/iPhone 2G (iOS 1.1.4).app/Contents/MacOS/iPod Touch"
   ```
 
 * **`scripts/extract-hfs-from-nand.py` — two real bugs fixed.** It addressed
@@ -125,7 +125,7 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
 
   ```bash
   python3 scripts/nor-image-store.py <nor.bin> --check --expect 7
-  python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G.app"
+  python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G (iOS 1.1.4).app"
   python3 scripts/test-nor-image-store.py     # fixture tests, no Apple payloads
   ```
 
@@ -165,7 +165,7 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
   logo from ~4 s instead of ~13 s.
 * **T5** — drive the M68AP button pins from reset instead of at the kernel
   banner.
-* ~~Repackage the iPhone bundle~~ **done** — `/Applications/iPhone 2G.app`
+* ~~Repackage the iPhone bundle~~ **done** — `/Applications/iPhone 2G (iOS 1.1.4).app`
   carries both fixes (engine + regenerated NAND) and passes
   `lock-unlock-probe.py --app` 2/2 with **47 touch frames consumed per
   cycle**. The iPod bundle was left alone: the engine change is

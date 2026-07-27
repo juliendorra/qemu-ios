@@ -245,7 +245,7 @@ python3 scripts/nor-image-store.py <nor.bin> [--check --expect 7] [--reference <
 python3 scripts/test-nor-image-store.py          # fixture tests, no Apple payloads
 # Is the logo actually on the panel early? Defaults to the INSTALLED bundle,
 # because the NOR half of the fix lives in the bundle's firmware.
-python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G.app"
+python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G (iOS 1.1.4).app"
 python3 scripts/verify-boot-logo.py --board m68ap --build 4A102
 # Partial bundle firmware update (reuses the installed iBoot/NAND, keeps epoch)
 python3 scripts/install-iphone-firmware.py --app <bundle> --nor <nor.bin> --keep-existing
