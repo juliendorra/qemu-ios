@@ -126,6 +126,29 @@ def lit_percent(ppm: Path) -> float:
     return 100.0 * lit / total if total else 0.0
 
 
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the launcher AND the emulator it started.
+
+    Killing only `proc` is not enough: the bundle's entry point is a shell
+    script that runs qemu as a child and waits, so the emulator outlives the
+    signal and keeps its per-launch NAND clone (~300 MB) alive. Paired with
+    start_new_session at spawn, killing the process GROUP takes both.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if proc.poll() is None:
+        try:
+            proc.send_signal(signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def bundle_command(app: Path, sock: str) -> list[str]:
     """Launch the bundle through its own launcher, so the epoch file, NAND
     staging and firmware paths are resolved exactly as for a real user."""
@@ -203,8 +226,14 @@ def main() -> int:
             label = (f"repo {args.board}"
                      + (f" {args.build}" if args.build else ""))
 
+        # start_new_session puts the launcher in its own process group so the
+        # whole tree can be killed together. The bundle entry point is a shell
+        # script that RUNS qemu rather than exec'ing it, so killing just the
+        # child we spawned leaves an orphaned emulator holding a ~300 MB NAND
+        # clone -- one per run, until the volume fills. (It did.)
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=(work / "stderr.log").open("wb"))
+                                stderr=(work / "stderr.log").open("wb"),
+                                start_new_session=True)
         samples = []
         try:
             time.sleep(args.first_sample)
@@ -222,9 +251,7 @@ def main() -> int:
                       flush=True)
             qmp.close()
         finally:
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGKILL)
-                proc.wait()
+            kill_tree(proc)
 
         worst = min(s["lit_pct"] for s in samples) if samples else -1.0
         ok = bool(samples) and worst >= args.threshold

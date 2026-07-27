@@ -394,6 +394,15 @@ Or just: `python3 scripts/springboard-lab.py --logs /tmp/x --variants m68ap-full
   The whole iBoot era is over within a few seconds. For anything about the
   boot logo or the pre-kernel display, use `--boot-wait 4 --samples 7`, or
   just `verify-boot-logo.py`.
+* **Killing a bundle launch does not kill the emulator.** The bundle entry
+  point is a shell script that *runs* qemu and waits rather than `exec`ing it,
+  so signalling the process you spawned leaves an orphaned emulator holding
+  its per-launch NAND clone (~300 MB) — one per run, until the volume fills.
+  This is how `verify-boot-logo.py` filled the disk on 2026-07-27 before it
+  was given `start_new_session=True` + `killpg`. Any new harness that launches
+  a bundle needs the same, and `pgrep -c` does not exist on macOS, so a
+  before/after process count must go through `pgrep … | wc -l` — otherwise the
+  leak check silently compares two empty strings and always says "no leak".
 * **The bundle launcher is `Contents/MacOS/iPod Touch`**, on the iPhone
   bundles too — the name is retained for compatibility, and
   `scripts/ipod-app-launcher.sh` is what gets installed under it. Launching
