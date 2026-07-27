@@ -54,13 +54,44 @@ def align_up(value, alignment):
 
 
 # IMG2 header field offsets used by the "loadable" promotion below.
+IMG2_STRIDE_OFF = 0x18      # uint32 on-NOR allocation for this image, in 0x40s
 IMG2_FLAGS2_OFF = 0x1c      # uint32 flags word
 IMG2_FLAGS2_LOADABLE = 0x01000000   # bit 24: image may be loaded/booted
 IMG2_FLAGS2_EXTCKSUM = 0x40000000   # bit 30: extended +0x60/+0x68 sub-checksum
 IMG2_HDR_CRC_OFF = 0x64     # uint32 CRC32 over header bytes [0:0x64]
 
 
-def promote_loadable(container):
+def set_stride(hdr, stride):
+    """Fill in +0x18, the field iBoot's image-store walk uses to step from one
+    IMG2 header to the next.
+
+    This is how iBoot finds image N+1: not by scanning for the '2gmI' magic and
+    not by adding the padded data length, but as
+    `next_header = this_header + (u32 at +0x18) * 0x40`. Derived from the real
+    N45AP NOR, where the field predicts the next header's offset exactly for all
+    six gaps:
+
+        dtre @0x10400 +0x18=0x215 -> 0x215*0x40 = 0x8540 -> batC @0x18940
+        batC @0x18940 +0x18=0x435 -> 0x435*0x40 = 0x10d40 -> logo @0x29680
+        logo @0x29680 +0x18=0x095 -> 0x095*0x40 = 0x2540 -> nsrv @0x2bbc0
+        nsrv @0x2bbc0 +0x18=0x135 -> 0x135*0x40 = 0x4d40 -> batl @0x30900
+        batl @0x30900 +0x18=0x355 -> 0x355*0x40 = 0xd540 -> batL @0x3de40
+        batL @0x3de40 +0x18=0x3d5 -> 0x3d5*0x40 = 0xf540 -> recm @0x4d380
+
+    The IPSW's own IMG2 containers ship 0xFFFFFFFF here -- the field describes an
+    on-NOR allocation, so it is only meaningful once a NOR programmer has chosen
+    the layout. Leaving it at 0xFFFFFFFF sends the walk 256 MiB past the end of
+    the store on the very first step, so iBoot enumerates dtre and nothing else:
+    no `logo` entry, hence no Apple logo drawn for the whole boot. Every image
+    the store holds after the first one was invisible to iBoot.
+
+    The last image's stride just has to land on erased (0xFF) NOR to terminate
+    the walk, which its own allocation does.
+    """
+    struct.pack_into("<I", hdr, IMG2_STRIDE_OFF, stride // 0x40)
+
+
+def promote_loadable(container, stride):
     """Normalise the IMG2 +0x1c flags to the value m68ap iBoot's image_load path
     requires, and recompute the header CRC.
 
@@ -85,13 +116,15 @@ def promote_loadable(container):
     against the N45AP NOR). This makes the NOR header self-consistent for
     enumeration AND identical to iBoot's RAM copy for the load-time validator,
     and it makes the validator take the no-extended-checksum path.
+
+    The +0x18 walk stride (see set_stride) is filled in here too, since both
+    edits share the one CRC recomputation.
     """
     hdr = bytearray(container[:0x400])
     flags2 = struct.unpack_from("<I", hdr, IMG2_FLAGS2_OFF)[0]
     new_flags2 = (flags2 & ~IMG2_FLAGS2_EXTCKSUM) | IMG2_FLAGS2_LOADABLE
-    if new_flags2 == flags2:
-        return container  # already normalised
     struct.pack_into("<I", hdr, IMG2_FLAGS2_OFF, new_flags2)
+    set_stride(hdr, stride)
     crc = zlib.crc32(bytes(hdr[:IMG2_HDR_CRC_OFF])) & 0xFFFFFFFF
     struct.pack_into("<I", hdr, IMG2_HDR_CRC_OFF, crc)
     return bytes(hdr) + container[0x400:]
@@ -123,7 +156,11 @@ def main():
         container = open(path, "rb").read()
         if container[:4] != b"2gmI":
             sys.exit(f"{path}: not an IMG2 container")
-        container = promote_loadable(container)
+        # Every container starts on a 0x40 boundary, so the distance to the next
+        # header is just this container's length rounded up to ALIGN -- that is
+        # the allocation the +0x18 walk stride has to advertise.
+        stride = align_up(len(container), ALIGN)
+        container = promote_loadable(container, stride)
         img_type = container[4:8][::-1].decode("ascii", "replace")
         epoch = struct.unpack("<H", container[0xa:0xc])[0]
         end = offset + len(container)
@@ -131,15 +168,17 @@ def main():
             sys.exit(f"image store overflow placing {stem} "
                      f"({hex(offset)}..{hex(end)} > {hex(STORE_END)})")
         nor[offset:end] = container
-        placed.append((img_type, offset, len(container), epoch))
+        placed.append((img_type, offset, len(container), epoch, stride))
         offset = align_up(end, ALIGN)
+        assert offset == placed[-1][1] + stride, "stride must reach the next header"
 
     with open(args.out, "wb") as fh:
         fh.write(nor)
 
     print(f"wrote {args.out} ({nor_size} bytes)")
-    for img_type, off, length, epoch in placed:
-        print(f"  {img_type} @ {hex(off)}  {hex(length)} bytes  epoch={epoch}")
+    for img_type, off, length, epoch, stride in placed:
+        print(f"  {img_type} @ {hex(off)}  {hex(length)} bytes  epoch={epoch}"
+              f"  next @ {hex(off + stride)}")
 
 
 if __name__ == "__main__":
