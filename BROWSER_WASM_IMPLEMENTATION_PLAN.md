@@ -82,15 +82,14 @@ set is required to build for the browser.
 
 ## Goals
 
-- Boot the same M68AP/iPhone1,1 iPhone OS 1.1.4 stack as the native emulator,
-  and keep N45AP/iPod1,1 bootable from the same build.
+- Boot the same M68AP/iPhone1,1 stacks as the native emulator — 1.0 first, then
+  1.0.2, 1.1.1 and 1.1.4 — and keep N45AP/iPod1,1 bootable from the same build.
 - Reach a usable SpringBoard with display, touch, Home, Power, sleep, and wake.
-- Run all guest code on the student's computer inside the browser sandbox.
-- Ship a fast classroom deployment that needs no student interaction before boot.
-- Ship a source-loaded deployment that automatically obtains its configured
-  artifacts and caches them after the first run.
+- Run all guest code on the visitor's computer inside the browser sandbox.
+- Boot a chosen version with no interaction beyond choosing it, and make
+  switching versions cheap enough to compare them.
 - Use one frontend, one QEMU/Wasm build, one asset schema, and one test suite for
-  both deployment flavors.
+  every version and board.
 - Keep the native build (`build-ipod11/`) working as the correctness oracle the
   browser build is measured against.
 - Make asset identity, integrity, cache state, and emulator version visible and
