@@ -2,7 +2,10 @@
 
 The dated, working state of the browser port. The design of record is
 [`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](BROWSER_WASM_IMPLEMENTATION_PLAN.md);
-this file records what is actually built, what is proven, and what is next.
+this file records what is actually built and proven.
+
+> **Starting a session? Read [`BROWSER_WASM_HANDOFF.md`](BROWSER_WASM_HANDOFF.md)**
+> — the ordered next steps, their acceptance criteria, and the traps.
 
 **Target:** iPhone 2G (M68AP), executed entirely in the viewer's browser, as a
 picker across iPhone OS 1.0 / 1.0.2 / 1.1.1 / 1.1.4 — **1.0 first**. Assets are
@@ -110,8 +113,8 @@ exists and boots to the home screen**:
 against a 215.6 MiB raw pack — a 12× reduction, and a third of what a
 compressed whole-pack download would cost.
 
-**Measurements still owed:** the cold-boot working set for 1.0, 1.0.2 and 1.1.1
-(1.1.4 is done), and how much chunk content the four versions share
+**Measurements still owed:** the cold-boot working set for 1.0.2 and 1.1.1
+(1.0 and 1.1.4 are done), and how much chunk content the versions share
 (`measure-pack.py --cross`, which needs the other packs built first).
 
 ### Reproducing the measurements
@@ -123,11 +126,10 @@ scripts/wasm/measure-pack.py <nand.pack> --full     # exact, slow
 scripts/wasm/measure-pack.py a.pack b.pack --cross  # sharing between versions
 
 # cold-boot working set: trace a VERIFIED home-screen boot, then reduce it
-cp -Rc <bundle nand> /tmp/nand-clone                # APFS clone, ~0 bytes
+cp -Rc m68ap-artifacts/builds/<BUILD>/nand /tmp/nand-clone   # APFS clone, ~0 B
 IT_NAND_WRITABLE=1 IT_NAND_TRACE_PAGES=/tmp/boot.trace \
-    python3 scripts/fb-snapshot.py --board m68ap --boot-wait 420 \
-    --bootrom … --iboot-m68ap … --nor-m68ap … --nand-m68ap /tmp/nand-clone \
-    --logs /tmp/fb
+    python3 scripts/fb-snapshot.py --board m68ap --build <BUILD> \
+    --boot-wait 420 --nand-m68ap /tmp/nand-clone --logs /tmp/fb
 # require kernel_0x0f400000 nonzero_pct to be high before trusting the trace
 scripts/wasm/analyze-nand-trace.py /tmp/boot.trace <nand.pack> \
     --pages-per-chunk 62 --prefetch prefetch.json

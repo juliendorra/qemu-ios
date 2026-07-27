@@ -1,10 +1,12 @@
 # Browser/WebAssembly build tooling
 
 Tools for producing a browser build of the emulator: iPhone 2G (M68AP) running
-iPhone OS 1.1.4, downloaded and executed entirely on the viewer's machine.
+iPhone OS 1.x — 1.0 first — downloaded and executed entirely on the viewer's
+machine.
 
 The plan of record is [`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](../../BROWSER_WASM_IMPLEMENTATION_PLAN.md);
-current, dated state is in [`BROWSER_WASM_STATUS.md`](../../BROWSER_WASM_STATUS.md).
+current, dated state is in [`BROWSER_WASM_STATUS.md`](../../BROWSER_WASM_STATUS.md);
+the ordered next steps are in [`BROWSER_WASM_HANDOFF.md`](../../BROWSER_WASM_HANDOFF.md).
 
 ## Docker is optional
 
@@ -32,8 +34,11 @@ scripts/wasm/setup-toolchain.sh        # python + emsdk 4.0.10 + meson
 scripts/wasm/build-deps.sh             # wasm64 zlib, libffi, pixman, glib
 scripts/wasm/build-qemu.sh             # qemu-system-arm.js/.wasm -> build-wasm/
 
-scripts/wasm/stage-assets.py --from-app "/Applications/iPhone 2G.app" \
-    --board m68ap --firmware 1.1.4     # -> web/public/assets/m68ap-114-v1/
+scripts/wasm/stage-assets.py --board m68ap --firmware 1.0 \
+    --bootrom m68ap-artifacts/shared/bootrom_s5l8900 \
+    --iboot   m68ap-artifacts/builds/1A543a/iboot-sb.bin \
+    --nor     m68ap-artifacts/builds/1A543a/nor.bin \
+    --nand    m68ap-artifacts/builds/1A543a/nand/nand.pack
 
 scripts/wasm/serve.py                  # http://localhost:8010 with COOP/COEP
 ```

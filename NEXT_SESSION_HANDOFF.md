@@ -2,6 +2,17 @@
 
 **Date:** 2026-07-26 · **Branch:** `ipod_touch_1g`
 
+> **2026-07-27 — the active thread is the browser/WebAssembly port.**
+> Start at [`BROWSER_WASM_HANDOFF.md`](BROWSER_WASM_HANDOFF.md): iPhone OS 1.0
+> and 1.1.4 are packaged and measured, the Emscripten toolchain is installed,
+> and the next step is finishing the wasm build of QEMU. The M68AP build system
+> was reorganised the same day — every firmware now lives in
+> `m68ap-artifacts/builds/<BUILD>/` and every tool takes an explicit `--build`
+> ([`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md)), so commands quoted below
+> need their paths translated.
+
+The sections below remain the record of the 2026-07-26 session.
+
 Both problems the previous handoff carried are addressed in this session:
 
 * **T6 — the iPhone app pegged a host core: SOLVED.** The generated `/var`
