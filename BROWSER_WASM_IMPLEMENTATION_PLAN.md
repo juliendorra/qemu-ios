@@ -346,9 +346,10 @@ version picker and chunked NAND need (`build`, `epoch`, chunked `nand`):
       "chunkUrl": "./nand/chunks/",
       "size": 314886212,
       "compressedSize": 0,
+      "prefetchSize": 0,
       "sha256": "FILLED_AT_STAGING_TIME",
       "format": "ipod-nand-chunks-v1",
-      "pagesPerChunk": 124,
+      "pagesPerChunk": 62,
       "compression": "br",
       "prefetch": ["FIRST_BOOT_CHUNK_HASHES_IN_ACCESS_ORDER"]
     }
@@ -533,24 +534,62 @@ wants to compare 1.0 against 1.1.4 pays twice.
 
 ### What the pack actually looks like (measured 2026-07-27)
 
-The shipping M68AP 1.1.4 pack:
+The shipping M68AP 1.1.4 pack, via `scripts/wasm/measure-pack.py`:
 
 | | |
 | --- | --- |
-| total size | 314.9 MB |
-| pages present | 148,812 |
-| index / payload split | 0.6 MB / 314.3 MB |
-| zlib -9 over sampled 256 KiB chunks | **36.6%** → ~115 MB |
-| lzma over the same chunks | **31.2%** → ~98 MB |
-| all-one-byte chunks | 0 of 120 sampled |
-| duplicate chunks | 7 of 120 sampled |
+| total size | 300.3 MiB (314,886,212 B) |
+| pages present | 148,812 × 2,112 B |
+| index / payload split | 581 KiB / 299.7 MiB |
+| chunks at 124 pages | 1,201 |
+| **brotli** (q11, per chunk) | **31.4%** → 94.2 MiB |
+| lzma | 30.9% → 92.9 MiB |
+| zlib -9 | 36.5% → 109.5 MiB |
+| uniform (all-one-byte) chunks | 0 of 150 sampled |
+| **duplicate chunks (full scan)** | **197 of 1,201 = 16.4%**, one chunk repeating 198× |
 
-So compression is worth roughly a **3× reduction** — a version drops from
-~315 MB to ~100 MB — and Brotli should land near the lzma figure. Whole-chunk
-deduplication is real but minor (~6%): the pack already omits absent pages, so
-the trivially-blank regions a raw disk image would contain are simply not in it.
-Do not expect Infinite Mac's content-addressing to pay off the same way here; its
-value for us is cache identity, not size.
+Compression is worth roughly a **3× reduction**: a version drops from 300 MiB to
+~94 MiB. Content-addressed deduplication is worth another ~16% *within* a single
+version, and its cross-version value is still to be measured
+(`measure-pack.py --cross`).
+
+### What a cold boot actually touches (measured 2026-07-27)
+
+This is the number the whole design turns on, and it is now measured rather than
+assumed. `IT_NAND_TRACE_PAGES` records every page fetch (see
+`hw/arm/ipod_touch_nand.c`); `scripts/wasm/analyze-nand-trace.py` reduces the
+trace against the pack. The run booted M68AP 1.1.4 to a verified home screen
+(kernel framebuffer 73.95% non-black at 420 s):
+
+| | |
+| --- | --- |
+| page fetches | 31,384 (2,426 of them for pages absent from the pack) |
+| **distinct pages touched** | **25,030 = 16.8% of the pack** |
+| distinct chunks touched (124 pages) | 351 of 1,201 = 29.2% |
+| **first-boot download, chunked + brotli** | **24.3 MiB** |
+| first-boot download, whole pack + brotli | 94.2 MiB |
+| first-boot download, whole pack raw | 300.3 MiB |
+
+**Lazy loading wins decisively.** A cold boot needs a sixth of the pack's pages,
+and chunked delivery turns a 94 MiB download into **24 MiB** — about 4× better
+than a compressed whole-pack download, and 12× better than the raw pack. Four
+versions of the catalog cost less to try than one version costs today.
+
+Chunk size trades read amplification against per-chunk compression:
+
+| pages/chunk | chunk size | chunks touched | first-boot download |
+| --- | --- | --- | --- |
+| 124 | 256 KiB | 29.2% | 24.3 MiB |
+| 62 | 128 KiB | 24.9% | 20.9 MiB |
+| 32 | 66 KiB | 21.8% | 18.5 MiB |
+| 16 | 33 KiB | 19.7% | 17.0 MiB |
+
+Smaller chunks fetch less waste (the touched pages are scattered, so a big chunk
+drags in neighbours nobody reads) but cost more requests and compress slightly
+worse. Going from 124 to 16 pages saves 7.3 MiB while multiplying request count
+by 5. **62 pages (128 KiB) is the recommended starting point** — most of the
+saving, half the requests of the aggressive option — to be confirmed against
+real network latency, since these numbers say nothing about round trips.
 
 ### Design, following Infinite Mac
 
@@ -560,9 +599,10 @@ screen in one second, fully booted in three, with a cold HTTP cache — is the b
 
 - **Fixed-size content-addressed chunks.** Infinite Mac uses 256 KiB. Our page
   stride is 2,112 bytes, which does not divide evenly into any power of two, so
-  a chunk is defined as a **fixed page count** (124 pages = 261,888 B ≈ 256 KiB)
-  rather than a fixed byte count. A page then maps to a chunk by index
-  arithmetic alone, with no lookup table.
+  a chunk is defined as a **fixed page count** rather than a fixed byte count. A
+  page then maps to a chunk by index arithmetic alone, with no lookup table.
+  **62 pages (130,944 B ≈ 128 KiB) is the recommended size**, chosen from the
+  measured chunk-size table above rather than inherited from Infinite Mac.
 - **Each chunk compressed individually.** This is the specific reason to chunk
   manually instead of using HTTP range requests: range requests and
   `Content-Encoding` interact badly in practice, whereas a pre-compressed chunk
@@ -580,11 +620,24 @@ screen in one second, fully booted in three, with a cold HTTP cache — is the b
   0.3%. Ours is the same shape of problem: a 315 MB pack that a boot only
   partially reads.
 
-The decisive unknown is **how much of the pack a cold boot actually touches**.
-Measure it natively before building any of this: instrument the pack read path,
-boot each version to the home screen, and record the distinct chunk set. That
-number determines whether first boot moves ~100 MB or ~15 MB, and it is cheap to
-obtain.
+This is no longer speculative: the measurement above was taken, and it says
+first boot moves ~24 MiB rather than ~94 MiB. Repeat it per version — 1.0 in
+particular, since it is the first to ship — with:
+
+```sh
+IT_NAND_TRACE_PAGES=/tmp/boot.trace IT_NAND_WRITABLE=1 \
+    python3 scripts/fb-snapshot.py --board m68ap --boot-wait 420 \
+    --nand-m68ap <throwaway clone> ... --logs /tmp/fb
+scripts/wasm/analyze-nand-trace.py /tmp/boot.trace <nand.pack> \
+    --pages-per-chunk 62 --prefetch prefetch.json
+```
+
+The trace must come from a boot that reached a **verified** home screen, not
+merely a boot that ran for a while: `fb-snapshot.py` reports the kernel
+framebuffer's non-black percentage, and a boot that stalled early would report
+a smaller, wrong working set. Note also that the NAND must be a throwaway clone
+with `IT_NAND_WRITABLE=1`; a read-only NAND stalls before SpringBoard by design,
+because daemons that must create state spin forever.
 
 ### What this requires from the device model
 
@@ -1280,12 +1333,12 @@ Still open:
 
 - Whether TCI is fast enough, and therefore whether the out-of-tree JIT is
   required. **This is the decisive one.**
-- **How much of the pack a cold boot touches.** Sizes the entire delivery
-  design; measurable natively today.
 - How the pack is reached from the wasm heap: MEMFS + mmap, a Blob-backed
   reader, chunk cache, or complete-memory load.
-- Chunk size in pages: 124 (≈256 KiB, Infinite Mac's figure) is the starting
-  point, to be confirmed against our own access pattern.
+- Whether 62 pages/chunk survives contact with real network latency — the
+  measured table optimises bytes, and says nothing about round trips.
+- The cold-boot working set for 1.0, 1.0.2 and 1.1.1 (1.1.4 is measured), and
+  how much chunk content the four versions share.
 - Whether `OffscreenCanvas` is the default or an optimization.
 - Exact supported browser versions and hardware baseline.
 - The hosting origin, its cache headers, and whether IPFS is added later.

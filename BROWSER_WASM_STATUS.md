@@ -16,18 +16,78 @@ prepared offline here and self-hosted. iPod touch (N45AP) comes after.
   compressed. No in-browser conversion of original artifacts — the M68AP NAND is
   constructed from an IPSW by this repo's pipeline and has no downloadable
   equivalent.
-- **Measured the shipping 1.1.4 pack** (314.9 MB, 148,812 pages): zlib -9 over
-  sampled 256 KiB chunks compresses to **36.6%**, lzma to **31.2%** — so ~100 MB
-  per version with Brotli. Whole-chunk duplicates were only 7 of 120 sampled,
-  and *no* chunk was uniform: the pack already omits absent pages, so
-  content-addressing buys cache identity here, not size.
+- **Measured the shipping 1.1.4 pack** (300.3 MiB, 148,812 × 2,112 B pages) with
+  `scripts/wasm/measure-pack.py`: per-chunk **brotli q11 = 31.4%** → 94.2 MiB
+  (lzma 30.9%, zlib 36.5%). No chunk is uniform, but a **full scan found 197 of
+  1,201 chunks are duplicates (16.4%)**, one repeating 198 times.
+
+  *Correction to an earlier figure in this session:* a first pass reported ~6%
+  duplicates. That sample was taken at raw 256 KiB **byte** offsets, which
+  straddle the header/index boundary and are misaligned to the 2,112-byte page
+  stride, so almost no two windows could match. Measured at the real chunk
+  definition — page-aligned, fixed page count — dedup is 16.4%. Only the
+  page-aligned number is meaningful.
+
+- **Measured what a cold boot actually touches — the number the whole delivery
+  design turns on.** Added `IT_NAND_TRACE_PAGES` to `hw/arm/ipod_touch_nand.c`
+  (records every page fetch as a little-endian u32 VPN, in access order) and
+  `scripts/wasm/analyze-nand-trace.py` to reduce a trace against a pack. From a
+  boot verified to reach the home screen (kernel framebuffer 73.95% non-black at
+  420 s):
+
+  | | |
+  | --- | --- |
+  | page fetches | 31,384 |
+  | distinct pages touched | **25,030 = 16.8% of the pack** |
+  | distinct chunks (124 pages) | 351 of 1,201 = 29.2% |
+  | **first-boot download, chunked + brotli** | **24.3 MiB** |
+  | whole pack + brotli | 94.2 MiB |
+  | whole pack raw | 300.3 MiB |
+
+  **Lazy loading wins decisively — ~4× better than a compressed whole-pack
+  download.** Chunk size trades read amplification against request count:
+  124 pages → 24.3 MiB, 62 → 20.9 MiB, 32 → 18.5 MiB, 16 → 17.0 MiB. **62 pages
+  (128 KiB) is now the recommended size**, chosen from our own data rather than
+  inherited from Infinite Mac's 256 KiB.
+
+- **Two traps found while taking that measurement**, both worth knowing before
+  anyone repeats it:
+  - A **read-only NAND never reaches SpringBoard**. Without
+    `IT_NAND_WRITABLE=1` writes are silently discarded, and daemons that must
+    create state spin forever — the boot stalls after launchd with no error. Use
+    a throwaway APFS clone (`cp -Rc`, near-zero space) plus that flag.
+  - **SpringBoard does not announce itself on serial.** Grepping the log for
+    "SpringBoard" finds nothing even on a fully successful boot. Verify with
+    `scripts/fb-snapshot.py`, which reports the kernel framebuffer's non-black
+    percentage; scanout itself reads ~0% because the panel sleeps, which is the
+    already-documented "black screen is scanout, not SpringBoard" artifact.
 - **Researched Infinite Mac's approach** and adopted it: content-addressed
   fixed-size chunks, per-chunk Brotli, service-worker interception keeping the
   emulator's reads synchronous, prefetch of the boot working set, per-chunk
   residency. Its measured bar is boot screen in 1 s, booted in 3 s, cold cache.
+- **Established what "the JIT" is, and what our engine already has.** The JIT is
+  [qemu-wasm](https://github.com/ktock/qemu-wasm)'s WebAssembly TCG backend:
+  each translation block becomes one Wasm module executed via the browser's
+  `WebAssembly.Module`/`Instance` APIs, and it is *hybrid* — a forked TCI
+  interprets everything and only blocks run ~1000 times get compiled, because
+  compilation is costly and browsers cap live Wasm instances.
+
+  Upstreaming is half done and **we have the half that landed**: Emscripten host
+  support plus TCI for 32-bit guests merged in QEMU 10.1, which is why 11.0.2
+  builds for the browser at all. The backend is still out of tree — verified
+  2026-07-27 that **QEMU master has no `tcg/wasm*` directory**, and our own
+  `tcg/` has none either. Our guest is 32-bit ARM (the upstreamed case) and the
+  v2 backend series targets wasm64 (how we configure), so adoption would be
+  well-aligned if it becomes necessary.
+
+  *Correction:* our build links libffi and passes `ASYNCIFY_IMPORTS=ffi_call_js`,
+  which looks like JIT plumbing already present. It is not — that is TCI's own
+  helper-call path (`ffi_call`, `tcg/tci.c:366`). No part of the JIT is in tree.
+
 - **Found supporting evidence for the JIT fallback**: Infinite Mac benchmarked
   qemu-wasm at 8 s on an MD5 workload against DingusPPC's 13 s and PearPC's 18 s
-  — a JIT-equipped QEMU beats hand-ported emulators. Says nothing about TCI.
+  — a JIT-equipped QEMU beats hand-ported emulators. Says nothing about TCI,
+  which is what we currently have.
 - **Corrected a stale assumption**: all four 1.x builds now reach the home
   screen natively (`IPHONE_OS_1X_VERSIONS.md`, 2026-07-26), including 1.0. The
   1.0-first plan is therefore feasible; earlier notes saying 1.0 was blocked on
@@ -38,9 +98,28 @@ prepared offline here and self-hosted. iPod touch (N45AP) comes after.
 `build-m68ap-nand.py` and `firmware_profiles.py` already carry the version axis.
 Wiring that through is the prerequisite for producing a 1.0 asset set.
 
-**The measurement to take next, before building the chunk pipeline:** how much
-of the pack a cold boot actually touches, per version. It sizes everything, and
-it is obtainable natively today.
+**Measurements still owed:** the cold-boot working set for 1.0, 1.0.2 and 1.1.1
+(1.1.4 is done), and how much chunk content the four versions share
+(`measure-pack.py --cross`, which needs the other packs built first).
+
+### Reproducing the measurements
+
+```sh
+# whole-pack compression and dedup
+scripts/wasm/measure-pack.py <nand.pack>            # sampled, fast
+scripts/wasm/measure-pack.py <nand.pack> --full     # exact, slow
+scripts/wasm/measure-pack.py a.pack b.pack --cross  # sharing between versions
+
+# cold-boot working set: trace a VERIFIED home-screen boot, then reduce it
+cp -Rc <bundle nand> /tmp/nand-clone                # APFS clone, ~0 bytes
+IT_NAND_WRITABLE=1 IT_NAND_TRACE_PAGES=/tmp/boot.trace \
+    python3 scripts/fb-snapshot.py --board m68ap --boot-wait 420 \
+    --bootrom … --iboot-m68ap … --nor-m68ap … --nand-m68ap /tmp/nand-clone \
+    --logs /tmp/fb
+# require kernel_0x0f400000 nonzero_pct to be high before trusting the trace
+scripts/wasm/analyze-nand-trace.py /tmp/boot.trace <nand.pack> \
+    --pages-per-chunk 62 --prefetch prefetch.json
+```
 
 ---
 

@@ -8,9 +8,11 @@
 
 This guide covers building the QEMU-based iPod Touch 1G (S5L8900) emulator on **macOS (Apple Silicon)**.
 
-The proposed browser/WebAssembly port, including its bundled classroom and
-source-loaded deployment flavors, is specified in
-[`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](BROWSER_WASM_IMPLEMENTATION_PLAN.md).
+The browser/WebAssembly port — iPhone 2G running iPhone OS 1.0/1.0.2/1.1.1/1.1.4
+in a browser, from prepared self-hosted assets — is designed in
+[`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](BROWSER_WASM_IMPLEMENTATION_PLAN.md),
+with live state in [`BROWSER_WASM_STATUS.md`](BROWSER_WASM_STATUS.md) and its
+build tooling in [`scripts/wasm/`](scripts/wasm/README.md).
 
 The active QEMU 11 native forward-port, including its commits, successful NAND
 DMA fix, current GUI blocker, rejected workarounds, and promotion matrix, is
