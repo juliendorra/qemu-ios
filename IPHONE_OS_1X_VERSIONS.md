@@ -883,47 +883,54 @@ itself.)
 Bank values confirm the decode: the low byte of the bank word cycles
 `…00 → …01 → …02 → …03` in both.
 
-### The remaining behaviour: 1.0 idle-sleeps, 1.1.4 does not
+### Sleep and wake on 1.0 — sleep is correct, and wake works
 
-Measured over an identical 260 s window:
+An earlier revision of this section framed the 1.0 idle-sleep as a defect and
+went looking for ways to suppress it. **That framing was wrong.** Sleeping after
+idle is correct behaviour; the only thing worth checking is whether the device
+comes back.
 
-| | boots | `System Sleep` |
-|---|---|---|
-| 1.1.4 (fw-17) | 1 | 0 |
-| 1.0.2 (fw-14) | 2 | 1 |
+**It does.** `scripts/lock-unlock-probe.py --board m68ap --cycles 3` against the
+1A543a stage: 3 of 3 cycles pass, `first failing cycle: none`, and the
+post-wake screenshot is a live home screen. The old N45AP symptom (cycle 1
+passes, cycle 2 dead) does **not** reproduce here.
 
-So it is specific to the 1.0 family, on a ~140 s cycle (`BOOT_TIME` 02:55:24 →
-02:57:44). It is **not** ADM-related — the field map above is complete and the
-storage path is healthy right up to the sleep.
-
-The trigger is visible in the serial log immediately before `System Sleep`:
+The wake goes through the **pre-warm** path, not the poweroff-loop detector:
 
 ```
-PM notification timeout (pid 13, CommCenter)
-...
-IOIpodUSBDevice::gated_message cable removed, stopping stack
-System Sleep
+[PMU]  OOCSHDWN=0x02 ... Application processor awaiting power loss
+[WAKE] Pre-warming retained-RAM wake after OOCSHDWN
+[WAKE] Power requested wake during pre-warm boot
 ```
 
-The guest starts its USB stack at boot (`cable is connected, starting stack`),
-finds no host to enumerate with — this machine models the OTG device side but
-attaches no host — and eventually concludes the cable was removed. With no
-charger and no user input, the kernel then idle-sleeps, and the OOCSHDWN path
-restarts the SoC, which is why long runs show repeated boots. The home screen
-renders well before that point.
+A Power press then completes it and the framebuffer comes back at 45.5%
+non-black.
 
-**Tried and did not work:** SpringBoard exposes `SBDisableIdleSleep` and
-`SBDisableAutoDim` (and rejects an `SBAutoLockTime` of 0 — *"Tried to set an
-autolock duration of 0"*). Injecting both as `true` into
-`/var/mobile/Library/Preferences/com.apple.springboard.plist` changed nothing:
-3 boots / 2 sleeps over 400 s. The sleep is initiated below SpringBoard, by the
-kernel's own idle path, so a SpringBoard preference cannot suppress it.
+Two honest caveats:
 
-Real fixes, in increasing order of cost: attach a USB host model so enumeration
-succeeds and the cable stays "present"; or port the sleep/wake path to M68AP so
-sleeping is harmless and Power resumes instead of rebooting (note
-`hw/arm/ipod_touch.c`'s poweroff-loop detector keys on an **N45AP kernel VA
-window**, `0xc005a6c0..0xc005a6d8`, which cannot match on M68AP).
+- **`hw/arm/ipod_touch.c`'s poweroff-loop detector is still pinned to an N45AP
+  kernel VA window** (`0xc005a6c0..0xc005a6d8`) and cannot match on M68AP. I
+  wrote a build-independent replacement (detect the tight `b .` with IRQ+FIQ
+  masked in kernel space) and then **discarded it**, because an A/B with the
+  probe showed it changes nothing: 2/2 cycles pass with and without it. M68AP
+  wake does not reach that branch. Recorded so the next person does not
+  "fix" it on spec either — get a failing case first.
+- **1.0 never shows a lock screen**, so the probe's slide is a no-op on an
+  already-unlocked home screen. Its `unlocked` verdict here means "the screen
+  came back and stayed live", not "slide-to-unlock was exercised". Every state
+  in the report is `kind: "home"`. Whether 1.0 should present the lock screen
+  after a retained-RAM wake (which is really a reboot) is a separate question.
+
+For the record, what does *not* stop the sleep: SpringBoard exposes
+`SBDisableIdleSleep` and `SBDisableAutoDim` and rejects an `SBAutoLockTime` of 0
+(*"Tried to set an autolock duration of 0"*); injecting both as `true` into
+`/var/mobile/Library/Preferences/com.apple.springboard.plist` changed nothing
+(3 boots / 2 sleeps over 400 s). The sleep is initiated by the kernel's idle
+path, below SpringBoard. The trigger is that the guest starts its USB stack,
+finds no host to enumerate with — this machine models the OTG device side and
+attaches no host — and reports `cable removed`; with no charger and no input the
+kernel idles. That is all *correct emulated behaviour*; nothing needs
+suppressing.
 
 ### What the ADM actually is, and why only 1.0 needs new work
 
