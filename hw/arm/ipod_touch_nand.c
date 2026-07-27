@@ -186,6 +186,47 @@ static bool nand_read_packed_page(ITNandState *s, uint32_t bank,
     return true;
 }
 
+/* IT_NAND_TRACE_PAGES=<path> records every page FETCH (buffer miss) as a
+ * little-endian u32 virtual page number, in access order.
+ *
+ * This exists for the browser port: the delivery design turns on how much of
+ * the ~300 MB base pack a cold boot actually touches, and in what order. The
+ * distinct set sizes the download, the order gives the prefetch list. Buffer
+ * hits are deliberately not recorded -- they never reach storage, and in the
+ * browser they would never reach the chunk cache either.
+ *
+ * scripts/wasm/analyze-nand-trace.py consumes this. Off unless the variable is
+ * set; when on it costs one buffered fwrite per miss. */
+static void nand_trace_page(uint32_t bank, uint32_t page)
+{
+    static FILE *trace;
+    static int checked;
+    uint32_t vpn;
+
+    if (!checked) {
+        const char *path = getenv("IT_NAND_TRACE_PAGES");
+
+        checked = 1;
+        if (path && *path) {
+            trace = fopen(path, "wb");
+            if (trace == NULL) {
+                fprintf(stderr, "[NANDTRACE] cannot write %s\n", path);
+            } else {
+                fprintf(stderr, "[NANDTRACE] recording page fetches to %s\n",
+                        path);
+            }
+        }
+    }
+    if (trace == NULL) {
+        return;
+    }
+    vpn = page * NAND_NUM_BANKS + bank;
+    fwrite(&vpn, sizeof(vpn), 1, trace);
+    /* Flushed continuously so a run stopped with SIGKILL still yields a usable
+     * trace: these boots are ended by a watchdog, not by a clean exit. */
+    fflush(trace);
+}
+
 void nand_set_buffered_page(ITNandState *s, uint32_t page) {
     uint32_t bank = get_bank(s);
     if(bank == -1) {
@@ -194,6 +235,7 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
 
     if(bank != s->buffered_bank || page != s->buffered_page) {
         // refresh the buffered page
+        nand_trace_page(bank, page);
         char filename[200];
         bool present = true;
         sprintf(filename, "%s/bank%d/%d.page", s->nand_path, bank, page);
