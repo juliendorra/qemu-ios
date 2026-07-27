@@ -31,7 +31,7 @@ and added only the board distinctions that real M68AP firmware requires:
 | `board_id` on the machine state/class | Allows shared peripherals to select M68AP or N45AP behavior while preserving the iPod path. |
 | Board-aware NAND identification and ADM striping | N45AP exposes eight active chips and a 1024-page superblock; M68AP exposes four active chips, four absent ID slots, and a 512-page superblock. Multi-page ADM reads now stripe across the board's active bank count instead of a fixed eight. |
 | S-Gold2 chardev on UART1 | The iPhone has a cellular baseband and routes its vibrator through that interface. |
-| ISL29003 on I2C0 | The iPhone firmware probes this ambient-light sensor. |
+| Ambient-light-sensor stub on I2C0 at 0x49 | The iPhone firmware probes an ambient-light sensor there (the real part is a TSL2561; our device is named `isl29003` for historical reasons). |
 | Zephyr1 multitouch mode and M68AP ATN GPIO | The iPhone controller protocol and interrupt line differ from the iPod's Zephyr2/HBPP setup. |
 | M68AP image extractor | Apple IPSW boot images are 8900-encrypted/IMG2-wrapped, while the machine's direct-iBoot path expects raw ARM code. |
 | iPhone smoke test | Checks board-profile divergence with N45AP firmware; it is a regression test, not proof that an M68AP kernel boots. |
@@ -231,13 +231,41 @@ Baseband GPIOs (openiboot `hardware/radio.h`: BB_ON 0x1807, RADIO_ON 0x1507,
 BB_RESET 0x700, BB_DETECT 0x701) need no work: the GPIO model ignores writes
 and returns 0 on reads, and BB_DETECT == 0 already means "comm board present".
 
-### ISL29003 ambient light sensor (`hw/arm/ipod_touch_isl29003.c`)
+### Ambient light sensor (`hw/arm/ipod_touch_isl29003.c`)
 
-I2C bus 0, 7-bit address 0x49 (device tree 8-bit 0x92). Implements the
-8-register map used by openiboot's `als-ISL29003.c`: command/control registers
-read back as written (the driver verifies the round-trip), the 16-bit sensor
-register pair reports a constant mid-range 0x0800, and the register pointer
-auto-increments for the 2-byte data read.
+I2C bus 0, 7-bit address 0x49 (device tree 8-bit 0x92).
+
+**The file and QOM type are named after the wrong board's part.** The two boards
+carry *different* ambient-light sensors at *different* addresses, per their own
+device trees:
+
+| | part | I2C0 address | interrupt |
+|---|---|---|---|
+| N45AP (iPod Touch 1G) | `als,isl29003` | 0x44 | 0x4C |
+| M68AP (iPhone 2G) | `als,tsl2561` | **0x49** | 0x49 |
+
+The M68AP node is byte-identical in 1.0 (1A543a) and 1.1.4 (4A102) — the part
+cannot change between OS releases — and every 1.x kernel loads `AppleTSL2561`.
+The stub was written from openiboot's `als-ISL29003.c` before any M68AP firmware
+ran, but it is instantiated **only on M68AP and only at 0x49**, so in practice it
+has always served the iPhone's TSL2561 driver. The iPod's real ISL29003 at 0x44 is
+not modelled at all (its driver tolerates the unanswered bus). Renaming the device
+to `tsl2561` is a cosmetic cleanup nobody has needed yet.
+
+What it implements: an 8-register map, register pointer masked to 3 bits and
+auto-incrementing across a 2-byte data read, command/control registers reading
+back as written, and a constant mid-range `0x0800` in the 16-bit sensor pair.
+
+The real M68AP driver attaches and starts against this without complaint on both
+1.0 and 1.1.1 — `AppleTSL2561::start(als) <1>`, followed by `IOHIDUserClientIniter`
+and `IOHIDEventServiceUserClient` binding to it — because the 3-bit mask aliases
+TSL2561's DATA0LOW/HIGH (0x0C/0x0D) onto regs 4/5, which return the constant
+0x0800 = 2048 counts, while DATA1 reads 0. channel1/channel0 = 0 gives the lux
+formula a constant, plausible mid-bright value. Two infidelities the driver does
+not gate on: the ID register (0x0A) aliases to reg 2 and reads `0x00` rather than
+TSL2561's `0x5x`, and CONTROL reads back `0x03` rather than the real chip's
+`0x33`. The one behavioural consequence is that auto-brightness sees a fixed
+ambient level and never varies.
 
 ### Zephyr1 multitouch protocol (`hw/arm/ipod_touch_multitouch.c`)
 
@@ -270,7 +298,7 @@ early; revisit if a real m68ap driver ever hits this.
 
 `scripts/iphone-smoke-test.py` boots `-M iPhone-2G` with the n45ap images
 and checks the divergence points that are observable without m68ap firmware:
-kernel boot, AppleISL29003 probing the ALS stub, the expected
+kernel boot, `AppleISL29003` loading (see the caveat under "Verified"), the expected
 `Could not detect HBPP` Zephyr-mode mismatch, no panics, and both machine
 types still listed by `-M help`. Every wait has a timeout and the whole
 script sits under a SIGALRM watchdog, so it can never hang a caller
@@ -287,9 +315,15 @@ IPOD_QEMU=build/qemu-system-arm python3 scripts/iphone-smoke-test.py
   `scripts/ipod-acceptance-test.py` sleep/wake matrix.
 - Smoke boot of `-M iPhone-2G` with the n45ap images boots the **full
   Darwin kernel** (not just iBoot) with no panic, and:
-  - `AppleISL29003` probes, starts, and registers against the new ALS stub
-    (iPod OS 1.1 ships the driver; it matches and completes power-state
-    transitions).
+  - `AppleISL29003` probes, starts, and registers. **This does not exercise the
+    ALS stub** (corrected 2026-07-27): IOKit matching is device-tree driven, and
+    the n45ap tree puts its `als,isl29003` node at 0x44, while the stub answers
+    only at the iPhone's 0x49. The driver loads whether or not anything replies,
+    so this check proves the kernel got far enough to match i2c children — not
+    that the model works. The stub's real coverage is M68AP firmware, where
+    `AppleTSL2561` drives it at 0x49 (see the ALS section above). The smoke test
+    still greps for `AppleISL29003`, which is correct for the n45ap firmware it
+    boots; it would be the wrong string for an M68AP run.
   - `AppleMultitouchZ2SPI` reports "Could not detect HBPP" — expected: the
     n45ap firmware speaks Zephyr2 while the iPhone machine now runs the
     controller in Zephyr1 mode. Real m68ap firmware loads the Z1 driver.

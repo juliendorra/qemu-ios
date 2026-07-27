@@ -8,7 +8,12 @@ It passes `epoch=2` because the board's default SYSIC epoch is now the
 real M68AP value (3), which n45ap iBoot rejects in miu_init:
 
   1. The full Darwin kernel boots (not just iBoot) with no panic.
-  2. AppleISL29003 matches and starts against the ALS stub.
+  2. AppleISL29003 matches and starts. Note this does NOT exercise the
+     ALS stub: IOKit matching is device-tree driven, the n45ap tree puts
+     its `als,isl29003` node at 0x44, and the stub answers only at the
+     iPhone's 0x49 (`als,tsl2561`). The driver loads either way, so this
+     is a "kernel got far enough to match i2c children" check. Real
+     M68AP firmware drives the stub via AppleTSL2561 -- see IPHONE_2G.md.
   3. The multitouch controller runs in Zephyr1 mode, so the n45ap
      Zephyr2 driver reports "Could not detect HBPP" (expected mismatch;
      real m68ap firmware would load the Z1 driver instead).
@@ -150,7 +155,7 @@ process = subprocess.Popen([
 try:
     check("Darwin kernel boots",
           wait_for(serial, b"Darwin Kernel Version", 180))
-    check("AppleISL29003 probes the ALS stub",
+    check("AppleISL29003 matches (n45ap ALS node; does not touch our stub)",
           wait_for(serial, b"AppleISL29003", 60))
     check("multitouch is in Zephyr1 mode (n45ap Z2 driver mismatches)",
           wait_for(serial, b"Could not detect HBPP", 60),

@@ -107,7 +107,7 @@ Read from the decompressed kernelcaches:
 | | 1.0 | 1.1.1 | 1.1.4 |
 |---|---|---|---|
 | TVOut swap device (`AppleH1TVOut`) | **absent** | present | present |
-| Ambient light sensor | **`AppleTSL2561` only** | `AppleEmbeddedLightSensor` + ISL29003 | same as 1.1.1 |
+| Ambient light sensor | `AppleTSL2561` | same | same |
 | Display / panel | `AppleH1CLCD` + `AppleMerlotLCD` | same | same |
 | Multitouch | `AppleMultitouchSPI` | same | same |
 | Audio | `AppleWM875xAudio` | Wolfson/WM8758/WM8991 | same as 1.1.1 |
@@ -118,9 +118,27 @@ the kernel has no such device. 1.1.1 does have it — but the workaround is
 already runtime-derived from the kernel's own console announcement, so it should
 port to 1.1.1 for free.
 
-The **ALS is a real gap for 1.0**: `hw/arm/ipod_touch_isl29003.c` models a part
-the 1.0 kernel never probes. 1.0 wants a TSL2561 on I²C instead. Whether that
-blocks boot or merely logs a probe failure is unknown until tested.
+The **ALS is not a version difference at all** (corrected 2026-07-27; an earlier
+revision of this table claimed 1.1.x used an ISL29003 and called 1.0's TSL2561 "a
+real gap"). The part cannot change between OS releases — it is the same M68AP
+board — and the device trees agree: `builds/1A543a/…/DeviceTree.m68ap.bin` and
+`builds/4A102/…/DeviceTree.m68ap.bin` both carry an `als` node with
+`compatible = "als,tsl2561"`, `reg = 0x49`, under i2c0. Every 1.x build loads
+`AppleTSL2561`; the string `ISL29003` appears in no guest log from any build.
+
+Our `hw/arm/ipod_touch_isl29003.c` is misnamed but harmless: it is a generic
+8-register I²C stub at the right address on the right bus, and the real driver
+attaches and starts cleanly (`AppleTSL2561::start(als) <1>`, then
+`IOHIDUserClientIniter` and `IOHIDEventServiceUserClient` bind to it) on 1.0 and
+1.1.1 alike. It works because the stub masks the register pointer to 3 bits, so
+TSL2561's DATA0LOW/HIGH (0x0C/0x0D) alias onto regs 4/5 and return the hardcoded
+`0x0800` = 2048 counts while DATA1 reads 0 — channel1/channel0 = 0 feeds the lux
+formula a constant, plausible mid-bright value. Two cosmetic infidelities: the ID
+register (0x0A) aliases to reg 2 and reads `0x00` instead of TSL2561's `0x5x`, and
+CONTROL reads back `0x03` instead of the real chip's `0x33`. Apple's driver gates
+on neither. The only behavioural effect is that auto-brightness sees a fixed
+ambient level and never varies, which is what you want in an emulator. See
+[IPHONE_2G.md](IPHONE_2G.md) for the device-model description.
 
 ## 3. Work required
 
