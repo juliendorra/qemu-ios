@@ -40,6 +40,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import plistlib
 import shutil
@@ -201,6 +202,46 @@ def data_partition(work: Path) -> Path:
     return out
 
 
+def declare_recipe(out: Path, args) -> None:
+    """Record this recipe's guest-side modifications in the NAND sidecar.
+
+    Additive: build-m68ap-nand.py has already written nand-provenance.json with
+    the geometry, signature and partition hashes. This adds what only the
+    recipe knows -- which guest files it altered and why -- under a `recipe`
+    key, and amends `guest_file_modifications` so the summary line cannot
+    describe a patched image as untouched.
+    """
+    sidecar = out / "nand-provenance.json"
+    if not sidecar.exists():
+        print(f"WARNING: no {sidecar.name} to annotate; the NAND will carry no "
+              "record of the guest modifications made here", file=sys.stderr)
+        return
+    manifest = json.loads(sidecar.read_text())
+    steps = [
+        "lockdownd activation patch (hacktivate-m68ap.py patch)",
+        "SpringBoard LK_ENABLE_MBX2D=0 -- forces software compositing, "
+        "because the MBX 2D block is a stub (task T2)",
+        "/var built from the root filesystem's own /private/var template, "
+        "plus a reference-shaped data ark",
+    ]
+    if SEED_DATABASES[0]:
+        steps.append("AddressBook databases pre-created")
+    if args.drop_addressbook:
+        steps.append("com.apple.AddressBook REMOVED (--drop-addressbook)")
+    manifest["recipe"] = {
+        "constructor": "build-m68ap-homescreen-nand.py",
+        "build": PATHS.build,
+        "version": PATHS.version,
+        "steps": steps,
+    }
+    base = manifest.get("guest_file_modifications", "")
+    manifest["guest_file_modifications"] = (
+        f"{base}; plus the home-screen recipe (see `recipe`)" if base
+        else "home-screen recipe (see `recipe`)")
+    sidecar.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"declared {len(steps)} guest modification(s) in {sidecar}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -254,6 +295,16 @@ def main() -> int:
          # single pack file is instant (BUILD.md). The browser port consumes
          # the same pack.
          "--pack"])
+
+    # build-m68ap-nand.py only knows it placed two HFS+ partitions; the guest
+    # modifications THIS recipe made are invisible to it, and its
+    # `guest_file_modifications` line would otherwise be the whole record. A
+    # bundle carrying the activation patch and a forced-software-compositing
+    # SpringBoard must not be describable as stock firmware -- declaring what
+    # was changed in a guest image is the repository's firmware policy
+    # (AGENTS.md), and it is also the only after-the-fact answer to "which
+    # recipe is in this NAND?".
+    declare_recipe(out, args)
 
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)

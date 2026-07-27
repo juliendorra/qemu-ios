@@ -398,6 +398,20 @@ Or just: `python3 scripts/springboard-lab.py --logs /tmp/x --variants m68ap-full
   bundles too — the name is retained for compatibility, and
   `scripts/ipod-app-launcher.sh` is what gets installed under it. Launching
   `Contents/MacOS/ipod-app-launcher.sh` fails with a bare "No such file".
+* **The bundle manifest used to describe artifacts that were long gone.**
+  `package-iphone-app.sh` installs the firmware itself rather than going
+  through `install-iphone-firmware.py` — it ships only `nand.pack` plus empty
+  bank dirs, for launch speed — so nothing in the packaging path ever rewrote
+  `firmware-provenance.json`. A shipped bundle was found carrying **every**
+  hash stale (iBoot, NOR, the NAND tree) plus a `nand_provenance` reading
+  `"none (metadata-only)"`, i.e. actively asserting that a NAND carrying the
+  activation patch and a forced-software-compositing SpringBoard was stock
+  firmware. Fixed 2026-07-27: packaging now copies the constructor's
+  `nand-provenance.json` next to the pack and ends with
+  `install-iphone-firmware.py --refresh-manifest`, which derives the manifest
+  from what is actually on disk. When the sidecar is absent the manifest says
+  `status: MISSING` rather than omitting the key — "no record" must not read
+  as "nothing was modified".
 * **`install-iphone-firmware.py` replaces `iphone_files/` wholesale.** Before
   2026-07-27 it also required every input, so a NOR-only update meant either
   passing the bundle's own NAND back to it or editing the file in place — and

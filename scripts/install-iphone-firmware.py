@@ -77,6 +77,12 @@ def main() -> int:
                     help="shared S5L8900 bootrom (default: ipod_files/bootrom_s5l8900)")
     ap.add_argument("--no-resign", action="store_true",
                     help="do not re-codesign the bundle after installing")
+    ap.add_argument("--refresh-manifest", action="store_true",
+                    help="install nothing; just rewrite "
+                         "firmware-provenance.json from what the bundle "
+                         "already contains. For packaging paths that install "
+                         "the firmware themselves, so the manifest cannot go "
+                         "on describing artifacts that have been replaced.")
     ap.add_argument("--keep-existing", action="store_true",
                     help="for any input not given, reuse what the bundle "
                          "already has instead of erroring. Makes a partial "
@@ -91,6 +97,15 @@ def main() -> int:
     iphone_files = resources / "iphone_files"
     if not resources.is_dir():
         raise SystemExit(f"not an app bundle: {args.app}")
+
+    if args.refresh_manifest:
+        if not iphone_files.is_dir():
+            raise SystemExit(f"no iphone_files in {args.app}; nothing to "
+                             "describe")
+        manifest = build_manifest(iphone_files)
+        write_manifest(iphone_files, manifest)
+        resign_and_report(args, iphone_files, manifest)
+        return 0
 
     # Resolve inputs
     src = args.src
@@ -140,30 +155,76 @@ def main() -> int:
     if epoch_src.exists():
         shutil.copy2(epoch_src, stage / "epoch")
 
+    manifest = build_manifest(stage)
+    write_manifest(stage, manifest)
+
+    if iphone_files.exists():
+        shutil.rmtree(iphone_files)
+    stage.rename(iphone_files)
+
+    resign_and_report(args, iphone_files, manifest)
+    return 0
+
+
+def build_manifest(fw: Path) -> dict:
+    """Describe the firmware directory `fw` FROM ITS OWN CONTENTS.
+
+    Deriving the manifest from the installed bytes, rather than from the
+    inputs that were passed in, is what stops it describing something else.
+    `package-iphone-app.sh` installs the NAND itself (it ships only nand.pack
+    plus empty bank dirs, for launch speed) and used to leave this file
+    untouched, so a bundle could carry a manifest describing a NAND replaced
+    several packagings ago -- which is exactly what happened. Any packaging
+    path can now call `--refresh-manifest` and get a truthful record.
+    """
     manifest = {
         "profile": "iphone-2g",
         "board": "M68AP",
         "soc": "S5L8900",
         "files": {
-            "bootrom_s5l8900": {"sha256": sha256(stage / "bootrom_s5l8900"),
+            "bootrom_s5l8900": {"sha256": sha256(fw / "bootrom_s5l8900"),
                                 "source": "shared S5L8900 bootrom"},
-            "iboot_204_m68ap.bin": {"sha256": sha256(stage / "iboot_204_m68ap.bin")},
-            "nor_m68ap.bin": {"sha256": sha256(stage / "nor_m68ap.bin")},
-            "nand": {"tree_sha256": sha256_tree(stage / "nand")},
+            "iboot_204_m68ap.bin": {"sha256": sha256(fw / "iboot_204_m68ap.bin")},
+            "nor_m68ap.bin": {"sha256": sha256(fw / "nor_m68ap.bin")},
+            "nand": {"tree_sha256": sha256_tree(fw / "nand")},
         },
         "note": "Apple-derived firmware, not committed to the repository "
                 "(AGENTS.md). Parity layout with ipod_files/.",
     }
-    # carry over the NAND constructor's provenance if present
-    nand_prov = nand / "nand-provenance.json"
+    epoch = fw / "epoch"
+    if epoch.exists():
+        manifest["epoch"] = epoch.read_text().strip()
+
+    # The NAND constructor's own sidecar, which is the only record of WHICH
+    # firmware's filesystem and WHICH guest modifications are in this tree.
+    # When it is absent, say so explicitly: silently omitting the key leaves a
+    # manifest that looks complete, and "no record" must be distinguishable
+    # from "nothing was modified" -- a bundle carrying the activation patch
+    # and a forced-software-compositing SpringBoard is not stock firmware.
+    nand_prov = fw / "nand" / "nand-provenance.json"
     if nand_prov.exists():
         manifest["nand_provenance"] = json.loads(nand_prov.read_text())
-    (stage / "firmware-provenance.json").write_text(
+    else:
+        manifest["nand_provenance"] = {
+            "status": "MISSING",
+            "detail": "no nand-provenance.json alongside the installed NAND, "
+                      "so the source firmware and guest modifications of this "
+                      "tree are unrecorded. Regenerate with "
+                      "scripts/package-iphone-app.sh --firmware <BUILD>.",
+        }
+    return manifest
+
+
+def write_manifest(fw: Path, manifest: dict) -> None:
+    (fw / "firmware-provenance.json").write_text(
         json.dumps(manifest, indent=2) + "\n")
 
-    if iphone_files.exists():
-        shutil.rmtree(iphone_files)
-    stage.rename(iphone_files)
+
+def resign_and_report(args, iphone_files: Path, manifest: dict) -> None:
+    if manifest.get("nand_provenance", {}).get("status") == "MISSING":
+        print("WARNING: the installed NAND carries no nand-provenance.json; "
+              "the manifest records this as MISSING rather than implying the "
+              "tree is unmodified.", file=sys.stderr)
 
     if not args.no_resign:
         rc = subprocess.run(
@@ -181,7 +242,6 @@ def main() -> int:
     print("\nfile hashes:")
     for name, meta in manifest["files"].items():
         print(f"  {name}: {meta.get('sha256') or meta.get('tree_sha256')}")
-    return 0
 
 
 if __name__ == "__main__":

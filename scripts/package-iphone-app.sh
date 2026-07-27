@@ -186,6 +186,17 @@ if [[ $VERIFY_ONLY -eq 0 ]]; then
     for bank in "$NAND_SRC"/bank*; do
         mkdir -p "$FW/nand.new/$(basename "$bank")"   # writable, empty
     done
+    # Carry the constructor's sidecar. Shipping pack+empty-banks discards the
+    # page tree deliberately, but the sidecar is the ONLY record of which
+    # firmware's filesystem and which guest modifications are in that pack --
+    # and without it a bundle cannot be told apart from stock firmware after
+    # the fact. It is ~2 KB.
+    if [[ -f "$NAND_SRC/nand-provenance.json" ]]; then
+        cp "$NAND_SRC/nand-provenance.json" "$FW/nand.new/nand-provenance.json"
+    else
+        say "WARNING: $NAND_SRC has no nand-provenance.json; the bundle will" \
+            "record its NAND provenance as MISSING"
+    fi
     rm -rf "$FW/nand"
     mv "$FW/nand.new" "$FW/nand"
     if [[ -n "$TMP_NAND" && $KEEP_NAND -eq 0 ]]; then
@@ -195,8 +206,16 @@ if [[ $VERIFY_ONLY -eq 0 ]]; then
     fi
 
     printf 'iphone-2g\n' > "$APP/Contents/Resources/s5l8900-profile"
-    say "signing"
-    codesign --force --deep -s - "$APP"
+
+    # This script installs the firmware itself rather than going through
+    # install-iphone-firmware.py, so nothing here would otherwise touch
+    # firmware-provenance.json -- and it silently did not, for long enough
+    # that a shipped bundle carried a manifest describing a NAND that had been
+    # replaced several packagings earlier. Derive it from what is now on disk.
+    # (This also signs, so no separate codesign call is needed.)
+    say "refreshing the firmware manifest"
+    python3 "$SCRIPT_DIR/install-iphone-firmware.py" \
+        --app "$APP" --refresh-manifest
 fi
 
 say "verifying"
