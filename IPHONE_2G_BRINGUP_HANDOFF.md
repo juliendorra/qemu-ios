@@ -3056,6 +3056,33 @@ The one measurement that mattered took one boot: `grep -c "image 0x"`. Note
 1.0/1.0.2's iBoot does **not** print those lines, so on the 1.0 family this
 check is unavailable and the drawn logo is the only signal.
 
+**All four builds now carry a correct NOR.** 3A109a (1.1.1) had no extracted
+images at all and no `nor.bin`; both were built from its own IPSW
+(`extract-m68ap-images.py --build 3A109a`, then `build-m68ap-nor.py`), epoch 2
+as expected. Rebuild any NOR with:
+
+```
+python3 scripts/build-m68ap-nor.py \
+    --template "/Applications/iPod Touch.app/Contents/Resources/ipod_files/nor_n45ap.bin" \
+    --containers m68ap-artifacts/builds/<BUILD>/ipsw/extracted/nor-containers \
+    --out m68ap-artifacts/builds/<BUILD>/nor.bin
+```
+
+The builder now prints `next @ <addr>` per image; that column must equal the
+following image's offset, and an assert enforces it.
+
+### 1.0 and 1.0.2 ship a byte-identical all_flash — not an extraction error
+
+Recorded to stop it being re-investigated. `1A543a/` and `1C28/` contain
+byte-identical `ipsw/extracted/` trees — same iBoot (both are **iBoot-159**,
+not 204), same DeviceTree, same seven NOR containers. That looked like the
+1.0.2 extraction having been run against 1.0's IPSW. It was not: unzipping
+`Firmware/all_flash/all_flash.m68ap.production/` straight out of each retail
+IPSW and hashing gives the same digests
+(`applelogo.img2` = `0a9df26b7256…`, `DeviceTree.m68ap.img2` = `7d5aa11d9a22…`).
+Apple shipped the same all_flash bundle in both releases. The two builds still
+differ everywhere else — root filesystem, kernel, NAND signature.
+
 ### The LCD scanned out the wrong window during iBoot (fixed 2026-07-27)
 
 Filling in the stride put the logo into iBoot's framebuffer at 0x0fe00000
@@ -3104,6 +3131,45 @@ screenout 2.173% from t=4s on **both** boards, N45AP still transitioning to the
 home screen at ~13s exactly as before. 1A543a (1.0) likewise shows the logo from
 t=4s; note its iBoot does not print the `image 0x...` lines at all, so for the
 1.0 family the drawn logo is the only available check.
+
+### Repeating this — the two scripts that replace the hand-work
+
+Everything above was done with one-off Python in a scratch directory. Both
+halves are now tools, because both are exactly the checks that were missing.
+
+```bash
+# STATIC: what can iBoot actually reach in this NOR?
+python3 scripts/nor-image-store.py <nor.bin>
+python3 scripts/nor-image-store.py <nor.bin> --check --expect 7   # exit 1 if not
+python3 scripts/nor-image-store.py <nor.bin> --reference "/Applications/iPod Touch.app/Contents/Resources/ipod_files/nor_n45ap.bin"
+
+# DYNAMIC: is the logo on the panel during the early boot?
+python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G.app"
+python3 scripts/verify-boot-logo.py --board m68ap --build 4A102   # repo build
+```
+
+`nor-image-store.py` reports **reachable** (following +0x18, as iBoot does)
+separately from **present** (magic search). The gap between the two IS the
+diagnosis: on the shipped NOR it prints `reachable 1, present 7` and names the
+unreachable images, which is the whole investigation in one command. Fixture
+tests in `scripts/test-nor-image-store.py` (no Apple payloads; synthesises its
+own NORs, including the 0xFFFFFFFF case).
+
+`verify-boot-logo.py` defaults to the **installed bundle**, because the NOR
+half of the fix lives in the bundle's firmware — a green repo build proves
+nothing about what the user launches. It was confirmed to FAIL (0.000%, exit 1)
+when the pre-fix NOR is put back, so it is a real gate and not a check that
+cannot fail. On failure it prints which of the two fixes to look at and
+reminds you that `IT_LCD_TRACE` will stay silent.
+
+Bundle updates are now scriptable too: `install-iphone-firmware.py` grew
+`--keep-existing` (reuse the installed iBoot/NAND for whatever you do not
+pass, so `--nor X --keep-existing` is a NOR-only swap) and now carries the
+`epoch` file across the install. That file matters: the installer replaces
+`iphone_files/` wholesale, and losing `epoch` silently turns a working 1.0
+(epoch 0) or 1.1.1 (epoch 2) bundle into one that wedges in iBoot with an
+empty serial log. Doing the swap by hand — as this session first did — is what
+exposed both gaps.
 
 Two things seen while verifying that are NOT caused by these fixes, and are
 open:

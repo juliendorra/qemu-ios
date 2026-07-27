@@ -237,6 +237,18 @@ python3 scripts/extract-kernelcache.py <8900 kernelcache> -o kc.raw   # GID AES 
 
 # Disk hygiene (imported by the labs; also a CLI)
 python3 scripts/lab_workspace.py --free /tmp --size DIR --prune DIR
+
+# Boot logo / NOR image store (2026-07-27)
+# What can iBoot REACH in a NOR (walking +0x18) vs what is merely PRESENT?
+# The gap between the two is the diagnosis; --check makes it a gate.
+python3 scripts/nor-image-store.py <nor.bin> [--check --expect 7] [--reference <n45ap nor>] [--json]
+python3 scripts/test-nor-image-store.py          # fixture tests, no Apple payloads
+# Is the logo actually on the panel early? Defaults to the INSTALLED bundle,
+# because the NOR half of the fix lives in the bundle's firmware.
+python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G.app"
+python3 scripts/verify-boot-logo.py --board m68ap --build 4A102
+# Partial bundle firmware update (reuses the installed iBoot/NAND, keeps epoch)
+python3 scripts/install-iphone-firmware.py --app <bundle> --nor <nor.bin> --keep-existing
 ```
 
 **Full reproduction of the current best M68AP state:**
@@ -380,7 +392,18 @@ Or just: `python3 scripts/springboard-lab.py --logs /tmp/x --variants m68ap-full
   register trace), rebuild the argv list in Python.
 * **`fb-snapshot.py --boot-wait` defaults to 180 s — past everything early.**
   The whole iBoot era is over within a few seconds. For anything about the
-  boot logo or the pre-kernel display, use `--boot-wait 4 --samples 7`.
+  boot logo or the pre-kernel display, use `--boot-wait 4 --samples 7`, or
+  just `verify-boot-logo.py`.
+* **The bundle launcher is `Contents/MacOS/iPod Touch`**, on the iPhone
+  bundles too — the name is retained for compatibility, and
+  `scripts/ipod-app-launcher.sh` is what gets installed under it. Launching
+  `Contents/MacOS/ipod-app-launcher.sh` fails with a bare "No such file".
+* **`install-iphone-firmware.py` replaces `iphone_files/` wholesale.** Before
+  2026-07-27 it also required every input, so a NOR-only update meant either
+  passing the bundle's own NAND back to it or editing the file in place — and
+  it dropped the `epoch` file, which silently turns a working 1.0 (epoch 0) or
+  1.1.1 (epoch 2) bundle into one that wedges in iBoot with an empty serial
+  log. `--keep-existing` and epoch carry-over now cover both.
 * **hdiutil types raw images by their extension.** A working copy named
   `root.img.tmp` fails to attach with "image not recognized"; name temp
   copies `*.tmp.img`. This silently killed the first `sb_env` lab seat.

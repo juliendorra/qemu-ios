@@ -115,6 +115,27 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
 * `S5L8900_DEBUG=1` on either bundle gives serial on stdout — the cheapest
   window into the guest, and how all of the above was measured.
 
+* **`scripts/nor-image-store.py` + `scripts/verify-boot-logo.py`** (2026-07-27,
+  from the boot-logo fix). The first walks a NOR's IMG2 store the way iBoot
+  does and reports **reachable** separately from **present** — a store can hold
+  all seven images and expose only one. The second boots and asserts the logo
+  is lit early, defaulting to the installed bundle. Both are gates
+  (`--check`, non-zero exit), and `verify-boot-logo.py` was confirmed to FAIL
+  on the pre-fix NOR, so neither is a check that cannot fail.
+
+  ```bash
+  python3 scripts/nor-image-store.py <nor.bin> --check --expect 7
+  python3 scripts/verify-boot-logo.py --app "/Applications/iPhone 2G.app"
+  python3 scripts/test-nor-image-store.py     # fixture tests, no Apple payloads
+  ```
+
+  Run both after regenerating any NOR or touching `ipod_touch_lcd.c`.
+
+* **`install-iphone-firmware.py --keep-existing`** — partial firmware update:
+  reuses the installed iBoot/NAND for anything not passed, so a NOR-only swap
+  is one command. It also now carries the `epoch` file across, which it
+  previously dropped (silently wedging a 1.0 or 1.1.1 bundle in iBoot).
+
 ## Still open
 
 * **T1/T2** — model the MBX (swap completion + 2D) and drop
