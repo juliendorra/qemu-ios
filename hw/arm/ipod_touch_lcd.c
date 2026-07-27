@@ -377,9 +377,15 @@ static void lcd_update_input_ready(IPodTouchLCDState *lcd)
             return;
         }
 
-        if (lcd->retained_input_wait) {
-            return;
-        }
+        /* Do NOT bail out here. This used to `return` whenever a retained
+         * wake was pending, which meant that if neither fast path above
+         * matched -- the panel still off when the base was programmed, or a
+         * framebuffer base other than the two listed -- the generic
+         * stable-frame path below never ran and touch stayed dead for the
+         * rest of the session. That is the intermittent "slide-to-unlock does
+         * nothing after a sleep" seen on BOTH boards. Falling through costs
+         * only the original two seconds of visible frames, and always
+         * terminates. */
 
         for (int b = 0; b < ARRAY_SIZE(known_bases); b++) {
             uint32_t base = known_bases[b];
