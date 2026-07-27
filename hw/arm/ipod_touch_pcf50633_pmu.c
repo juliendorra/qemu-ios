@@ -412,8 +412,12 @@ static void pcf50633_prewarm_deadline(void *opaque)
     s->prewarm_no_park = true;
     fprintf(stderr, "[WAKE] No type-4 commit within the deadline; this "
             "firmware cannot be pre-warmed -- parking here and sleeping\n");
-    s->prewarm_parked = true;
-    vm_stop(RUN_STATE_SUSPENDED);
+    /* vm_stop() must NOT be called from a QEMU_CLOCK_VIRTUAL timer callback:
+     * pause_all_vcpus() disables that very clock, which waits for this
+     * timerlist to finish running -- a deadlock that freezes the whole main
+     * loop, so QMP is never serviced and no wake key can ever arrive. Park
+     * from the bottom half, exactly like the type-4 commit path does. */
+    qemu_bh_schedule(s->prewarm_park_bh);
 }
 
 static void pcf50633_prewarm_park(void *opaque)

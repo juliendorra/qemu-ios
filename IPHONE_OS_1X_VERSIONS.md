@@ -659,13 +659,10 @@ at `ADM_CODE_SEC_ADDR`.
 All four 1.x builds reach the home screen. What is still wrong, in priority
 order, with the evidence needed to resume each:
 
-1. **1.0 cannot be woken from its park.** It now sleeps instead of reboot-
-   looping (`88e73d8cec`), but Power/Home produces no serial growth and no
-   `[WAKE]` line. Proven not to be key delivery: the identical QMP press wakes
-   the iPod's park (`Home completed pre-warmed wake`, 8.5 KB of serial).
-   `prewarm_active` and `prewarm_parked` are both set. Suspect an earlier
-   `return` in `ipod_touch_key_event()`. **Do not sample the framebuffer with
-   QMP stop/cont while parked — `cont` un-parks the device and invalidates the
+1. ~~**1.0 cannot be woken from its park.**~~ **SOLVED 2026-07-27** — see
+   "1.0's dead park was a main-loop deadlock" below. Power and Home now wake
+   it. **Still true and still a trap: do not sample the framebuffer with QMP
+   stop/cont while parked — `cont` un-parks the device and invalidates the
    test.**
 2. **No Apple logo during boot, on every iPhone version** (the iPod shows it
    throughout). Hypothesis, unconfirmed: iBoot enumerates only `dtre` from our
@@ -685,6 +682,63 @@ order, with the evidence needed to resume each:
 Not an issue, recorded to stop it being re-investigated: the black screendump
 with a non-black framebuffer is the known panel-auto-sleep artefact.
 
+### 1.0's dead park was a main-loop deadlock, not a swallowed key (2026-07-27)
+
+The wake key was never the problem, and neither was any `return` in
+`ipod_touch_key_event()` — **the handler was never reached, because the whole
+QEMU main loop was deadlocked from the instant the park happened.** The
+give-away is cheap and was missed for a session: while "parked", a QMP client
+`connect()`s successfully (the listen backlog accepts it) but **never receives
+the greeting**. Nothing was servicing the monitor.
+
+`sample <pid>` on the frozen process gives the exact stack:
+
+```
+qemu_main_loop → main_loop_wait → qemu_clock_run_all_timers
+  → timerlist_run_timers            (running a QEMU_CLOCK_VIRTUAL timer)
+    → pcf50633_prewarm_deadline
+      → vm_stop → do_vm_stop → pause_all_vcpus
+        → qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false)
+          → qemu_event_wait(&tl->timers_done_ev)   ← blocks forever
+```
+
+`pause_all_vcpus()` disables the virtual clock, and `qemu_clock_enable()` waits
+for every timerlist on that clock to *finish running its callbacks*. We are
+inside that very callback, so the event it waits on can never be set. QEMU
+documents this precisely, in the comment above `qemu_clock_enable()` in
+`util/qemu-timer.c`: the function "should not be used from the callback of a
+timer that is based on @clock. Doing so would cause a deadlock."
+
+The 25 s deadline added in `88e73d8cec` is a `QEMU_CLOCK_VIRTUAL` timer and
+called `vm_stop()` directly from its callback. The type-4 commit path never hit
+this because it parks from a **bottom half** (`prewarm_park_bh`), and BHs run
+outside `timerlist_run_timers`. That is also why the iPod, which always takes
+the type-4 path, was unaffected — and why "keys reach a suspended VM" was a
+true statement that pointed at the wrong suspect.
+
+Fix (one line): the deadline sets `prewarm_no_park` and schedules
+`prewarm_park_bh` instead of calling `vm_stop()` itself. The BH does the stop,
+handles the wake-arrived-first race it already handled, and prints the usual
+`[WAKE] Pre-warmed wake parked; awaiting Power/Home`.
+
+Measured after the fix on 1.0/1A543a: park at ~162 s emits **both** the
+deadline line and the parked line (the second line alone proves the main loop
+survived); QMP then answers `{"status": "suspended"}`; `send-key h` logs
+`[WAKE] Home starting retained-RAM wake boot`, RESUME + guest RESET events
+follow, serial grows 144 KB → 217 KB, and the framebuffer comes back at **45.6 %
+non-black** on all three bases. `scripts/lock-unlock-probe.py --board n45ap
+--cycles 4` stays 4/4, "first failing cycle: none".
+
+Two things worth keeping from this:
+
+- **A parked/suspended VM that ignores QMP entirely is a deadlocked QEMU, not a
+  guest problem.** Test the monitor before instrumenting the device model: if
+  the greeting never arrives, go straight to `sample`.
+- `IT_KEY_TRACE=1` now prints every button event with keycode plus
+  `prewarm_active/parked/no_park` and the suppress flags, at the top of
+  `ipod_touch_key_event()`. Zero lines out of it means the handler is not being
+  called at all — which is a main-loop question, not a key-routing one.
+
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
 The process, not just the findings — so the next attempt does not repeat them.
@@ -692,6 +746,19 @@ Roughly chronological.
 
 ### Claims I made that were wrong, and how they were caught
 
+- **"1.0's park swallows the wake key somewhere in `ipod_touch_key_event()`."**
+  (2026-07-27.) False, and instructive: every supporting premise was *true*
+  ("keys reach a suspended VM" — yes, on the iPod; "`prewarm_active` and
+  `prewarm_parked` are set" — yes) while the conclusion was wrong. The handler
+  was never called; the whole main loop was deadlocked by `vm_stop()` inside a
+  `QEMU_CLOCK_VIRTUAL` timer callback. Caught by instrumenting the **entry** of
+  the handler rather than a suspected branch (zero lines out ≠ wrong branch
+  taken), and by noticing that a QMP client `connect()`s while parked but never
+  gets the greeting. See "1.0's dead park was a main-loop deadlock" above, and
+  finding #96 in `SLEEP_WAKE_INVESTIGATION.md`. Related: a **stale row** in that
+  file's dead-ends table claiming `sendkey` never reaches
+  `ipod_touch_key_event()` helped make "the key is being lost" look plausible;
+  it has been corrected in place.
 - **"Both extractors die on 1.0 images."** False.
   `scripts/extract-m68ap-images.py` already branched on the 8900 format byte;
   only `scripts/extract-kernelcache.py` did not. Caught by reading the file

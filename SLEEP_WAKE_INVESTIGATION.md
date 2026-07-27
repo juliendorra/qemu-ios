@@ -1973,7 +1973,7 @@ But all 3 framebuffers remained all black (`0xFF000000`). The snapshot itself wa
 | Patching `powerChangeDone` BEQ→B at PA 0x0815D5F4 | Force unconditional wake path | Same — affects ALL PM transitions; system becomes unresponsive |
 | Combined setPowerState + powerChangeDone patches | Two-pronged wake transition fix | Regression: power/home buttons completely stop working |
 | OOCSHDWN-time instruction patches for PM functions | Patch at sleep trigger time | Too late for current cycle (setPowerState already ran), too broad for future cycles |
-| `sendkey` via QEMU monitor socket for testing | Automate P/H presses from terminal | Events never reach `ipod_touch_key_event` — `sendkey` doesn't trigger the legacy keyboard handler in this QEMU build. Only GUI keyboard works. |
+| ~~`sendkey` via QEMU monitor socket for testing~~ **STALE — see below** | Automate P/H presses from terminal | ~~Events never reach `ipod_touch_key_event`~~ **This is no longer true and must not be relied on.** QMP `send-key` reaches `ipod_touch_key_event()` today, on a running *and* on a parked (`RUN_STATE_SUSPENDED`) machine — proven by `IT_KEY_TRACE=1` and by the iPod's and 1.0's parked wakes. Believing this row is part of what sent finding #96 down the wrong path. |
 
 ### Discovered Code Identity Corrections
 
@@ -3805,3 +3805,102 @@ check, and every serial/stderr log and screendump is kept in a printed
 
 Run this before promoting any engine change; it replaces the ad-hoc
 `/private/tmp` harnesses used during Phases 22–27.
+
+---
+
+## Finding #96: `vm_stop()` from a virtual-clock timer callback deadlocks the whole main loop (2026-07-27)
+
+**Symptom.** iPhone OS 1.0/1A543a on `-M iPhone-2G` parked on sleep as designed
+(`88e73d8cec`), but Power/Home did nothing at all: no serial growth, no `[WAKE]`
+line, no reaction of any kind. Only a restart brought the device back. The iPod
+(N45AP) and 1.1.x were unaffected.
+
+**Root cause.** The 25 s "no type-4 commit" deadline added in `88e73d8cec` is a
+`QEMU_CLOCK_VIRTUAL` timer, and its callback called `vm_stop()` **inline**:
+
+```
+qemu_main_loop → main_loop_wait → qemu_clock_run_all_timers
+  → timerlist_run_timers            (running a QEMU_CLOCK_VIRTUAL timer)
+    → pcf50633_prewarm_deadline
+      → vm_stop → do_vm_stop → pause_all_vcpus
+        → qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false)
+          → qemu_event_wait(&tl->timers_done_ev)   ← never returns
+```
+
+`pause_all_vcpus()` disables the virtual clock. `qemu_clock_enable()` waits for
+every timerlist on that clock to finish running its callbacks — and we are
+inside one of those callbacks, so `timers_done_ev` can never be set. The main
+loop is dead from that instant: no BHs, no timers, no chardev I/O, no monitor.
+
+QEMU documents this exactly, in the comment above `qemu_clock_enable()` in
+`util/qemu-timer.c`: the function "should not be used from the callback of a
+timer that is based on @clock. Doing so would cause a deadlock."
+
+**Why the iPod never hit it.** The type-4 commit path parks from a **bottom
+half** (`prewarm_park_bh`), and BHs run outside `timerlist_run_timers`.
+iBoot-204 always writes the type-4 commit, so N45AP and 1.1.x never reach the
+deadline path. Only iBoot-159 (1.0/1.0.x), which writes `RESUME_STATUS` zero
+times, does — which is why the defect looked firmware-specific when it was
+purely a host-side threading bug.
+
+**Fix** (`hw/arm/ipod_touch_pcf50633_pmu.c`, `pcf50633_prewarm_deadline`): set
+`prewarm_no_park`, then `qemu_bh_schedule(s->prewarm_park_bh)` instead of
+calling `vm_stop()`. The BH performs the stop and retains the
+wake-arrived-before-the-park race handling it already had. Both park paths now
+stop the VM from a BH; neither does it from a timer.
+
+**Verification, 1.0/1A543a:**
+
+| | before | after |
+|---|---|---|
+| deadline line at ~162 s | printed | printed |
+| `[WAKE] Pre-warmed wake parked; awaiting Power/Home` | **never** (loop already dead) | **printed** |
+| QMP greeting on connect while parked | **never sent** | `{"status": "suspended"}` |
+| `send-key h` → `ipod_touch_key_event()` | **not called** | `[KEYTRACE] keycode=35 … active=1 parked=1 no_park=1` |
+| wake | none | `[WAKE] Home starting retained-RAM wake boot`, RESUME + guest RESET |
+| serial | 144 151 B, frozen | 217 480 B |
+| framebuffer (`pmemsave`, 3 bases) | — | **45.6 % non-black** |
+
+Regression gate `scripts/lock-unlock-probe.py --board n45ap --cycles 4` stays
+4/4, "first failing cycle: none" — the iPod path is untouched.
+
+### The false path this session took, and why each true premise misled
+
+The investigation was framed as "which early `return` in
+`ipod_touch_key_event()` swallows the key?" Every stated premise was correct and
+the conclusion was still wrong:
+
+| Premise | True? | Why it misled |
+|---|---|---|
+| "Keys reach a suspended VM" | **Yes** — the iPod's park wakes on the identical QMP `send-key` | Says nothing about whether *this* process can receive anything at all |
+| "`prewarm_active` and `prewarm_parked` are both set" | **Yes** | State was fine; the code reading it was never reached |
+| "No log output ⇒ an earlier `return` fired" | **No** | The unexamined leap. The handler was never *entered* |
+| "`sendkey` never reaches `ipod_touch_key_event`" (stale row in the dead-ends table above) | **No longer true** | An out-of-date doc claim that made "keys are being lost" look plausible; now corrected in place |
+
+**What actually resolved it, in two cheap steps:**
+
+1. Instrument the **entry** of `ipod_touch_key_event()` — not a suspected branch.
+   `IT_KEY_TRACE=1` (committed) prints keycode plus
+   `prewarm_active/parked/no_park` and the suppress flags on every button event.
+   **Zero lines** is a qualitatively different signal from "wrong branch taken",
+   and it points away from the device model entirely.
+2. Notice that a QMP client `connect()`s while parked but **never receives the
+   greeting** — `connect()` succeeds off the listen backlog, so a successful
+   connect proves nothing. Nothing was servicing the monitor. `sample <pid>`
+   then produced the deadlock stack immediately.
+
+### Rules
+
+- **Never call `vm_stop()` from a `QEMU_CLOCK_VIRTUAL` timer callback.** Park
+  from a BH. The same applies to anything else that funnels into
+  `pause_all_vcpus()`.
+- **A parked/suspended VM that ignores QMP *entirely* is a deadlocked QEMU**, not
+  a guest bug and not a key-routing bug. Check the monitor greeting first, then
+  `sample <pid>`, before touching the device model.
+- **Do not sample the framebuffer with QMP `stop`/`cont` while parked** —
+  `cont` un-parks the device and invalidates the test. Use `pmemsave` on the
+  running machine after the wake (unchanged by this fix).
+
+Board-side write-up and the 1.0 open-issue list:
+[`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md) and
+[`IPHONE_2G_BRINGUP_HANDOFF.md`](IPHONE_2G_BRINGUP_HANDOFF.md) § 2026-07-27.

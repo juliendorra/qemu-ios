@@ -23,6 +23,83 @@ the live bring-up state.
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
 
+## Session log — 2026-07-27 (1.0's dead park was a QEMU main-loop DEADLOCK, not a swallowed key — FIXED)
+
+**Status: fixed.** iPhone OS 1.0/1A543a parked on sleep (`88e73d8cec`) but
+Power/Home did nothing: no serial growth, no `[WAKE]` line, restart required.
+
+**The false path, recorded because it cost a session.** The framing was "which
+`return` in `ipod_touch_key_event()` swallows the key?" Every premise behind it
+was individually true and the conclusion was still wrong:
+
+- "Keys reach a suspended VM" — *true* (the iPod's park wakes on the identical
+  QMP `send-key`), but it says nothing about *this* VM being able to receive
+  anything.
+- "`prewarm_active` and `prewarm_parked` are both set" — *true*, and irrelevant.
+- "The handler produces no output, so an early `return` fires first" — the
+  unexamined leap. Instrumenting the **entry** of `ipod_touch_key_event()`
+  (`IT_KEY_TRACE=1`, now committed) printed **zero lines**. Not a swallowed key:
+  an uncalled handler.
+
+The cheap tell that was available the whole time: while parked, a QMP client
+`connect()`s successfully — the listen backlog accepts it — but **never receives
+the greeting**. Nothing was servicing the monitor. `sample <pid>` then gave the
+answer in one shot:
+
+```
+qemu_main_loop → main_loop_wait → qemu_clock_run_all_timers
+  → timerlist_run_timers            (running a QEMU_CLOCK_VIRTUAL timer)
+    → pcf50633_prewarm_deadline
+      → vm_stop → do_vm_stop → pause_all_vcpus
+        → qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false)
+          → qemu_event_wait(&tl->timers_done_ev)   ← blocks forever
+```
+
+`pause_all_vcpus()` disables the virtual clock; `qemu_clock_enable()` waits for
+that clock's timerlists to finish running their callbacks; we are inside one, so
+the event is never set. QEMU says so itself, above `qemu_clock_enable()` in
+`util/qemu-timer.c`: it "should not be used from the callback of a timer that is
+based on @clock. Doing so would cause a deadlock." The 25 s deadline added in
+`88e73d8cec` is exactly such a timer and called `vm_stop()` inline.
+
+Why only 1.0, and why never the iPod: the type-4 commit path parks from a
+**bottom half** (`prewarm_park_bh`), which runs outside `timerlist_run_timers`.
+iBoot-204 always writes the type-4 commit, so the iPod and 1.1.x never touch the
+deadline path at all.
+
+**Fix** (one line, `hw/arm/ipod_touch_pcf50633_pmu.c`): the deadline sets
+`prewarm_no_park` and schedules `prewarm_park_bh` instead of stopping the VM
+itself. The BH does the `vm_stop` and keeps the wake-arrived-first race it
+already handled.
+
+**Measured after the fix, 1.0/1A543a:** park at ~162 s prints both the deadline
+line *and* `[WAKE] Pre-warmed wake parked; awaiting Power/Home` — the second line
+alone proves the main loop survived. QMP then answers `{"status":"suspended"}`;
+`send-key h` logs `[KEYTRACE] keycode=35 … active=1 parked=1 no_park=1` →
+`[WAKE] Home starting retained-RAM wake boot`; RESUME + guest RESET events
+follow; serial 144 KB → 217 KB; framebuffer **45.6 % non-black** on all three
+bases. Regression gate `scripts/lock-unlock-probe.py --board n45ap --cycles 4`
+stays 4/4, "first failing cycle: none".
+
+**Two rules worth carrying forward:**
+
+1. **A parked/suspended VM that ignores QMP *entirely* is a deadlocked QEMU, not
+   a guest or device-model problem.** Test the monitor before instrumenting the
+   device: if the greeting never arrives, go straight to `sample <pid>`.
+2. **Never call `vm_stop()` from a `QEMU_CLOCK_VIRTUAL` timer callback** in this
+   tree. Park from a BH. Both existing park paths now do.
+
+Still true and still a trap, unchanged by this fix: **do not sample the
+framebuffer with QMP `stop`/`cont` while parked** — `cont` un-parks the device
+and invalidates the test. Use `pmemsave` on the running machine after the wake.
+
+Full write-up, including the measurement table:
+[`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md) § "1.0's dead park was a
+main-loop deadlock". Sleep/wake finding number: **#96** in
+[`SLEEP_WAKE_INVESTIGATION.md`](SLEEP_WAKE_INVESTIGATION.md).
+
+---
+
 ## Session log — 2026-07-26 (the M68AP PMU is on the wrong I²C bus — diagnosed here, FIXED by c5ea96a7e1, and the 1.1.4 symptom relief now MEASURED)
 
 **Status: fixed.** This section diagnosed the defect from the two user-visible

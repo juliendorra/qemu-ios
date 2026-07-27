@@ -4,6 +4,26 @@ Status: **fixed and verified** on QEMU 11 (`ipod_touch_1g`), 2026-07-20.
 Fix commit: "Keep the panel dark during iBoot's pre-warm charging scanout"
 (`hw/arm/ipod_touch_lcd_panel.c`).
 
+> **Was N45AP-only until 2026-07-26.** Everything below describes the iPod.
+> On `-M iPhone-2G` this code had never executed: the M68AP device tree puts
+> the PMU on **i2c0** while the machine attached our `pcf50633` model to
+> **i2c1**, so every PMU read returned 0xFF, the guest concluded it was
+> permanently on external power, and `ApplePCF50635PMUPowerSource` logged
+> `disabling idle sleep` — the iPhone never auto-locked and never reached
+> OOCSHDWN. That also caused the iPhone's "always shows the charging battery"
+> and "clock stuck at the epoch" symptoms: one defect, three symptoms.
+>
+> **Fixed by c5ea96a7e1**, and verified on 1.1.4 (`mbcs1-3 00 00 00`,
+> `ext 0 … cap 61`, `enabling idle sleep`, RTC reading correct UTC, wallpaper
+> restored). The iPhone now auto-locks and reaches this sleep path for the
+> first time — and it works: three consecutive Power/Home wake cycles each
+> relight the lock screen within 2 s, hold it ~9 s, then switch the display
+> off, exactly as N45AP does under the same probe. Everything below therefore
+> now applies to **both** boards. See the 2026-07-26 PMU-bus section of
+> `IPHONE_2G_BRINGUP_HANDOFF.md`, including the recorded dead end: a single
+> post-wake `screendump` lands past the lit window and looks like a dead
+> panel — always sample a time series.
+
 ## Symptom
 
 When the emulated iPod Touch 1G went to sleep (auto-lock after 1 minute, or a
@@ -54,6 +74,15 @@ the retained-RAM wake: it reloads iBoot and runs it up to the type-4 handoff,
 then parks the whole VM (`vm_stop(RUN_STATE_SUSPENDED)`) awaiting a Power/Home
 press. This makes a later wake cheap. (See `ipod_touch_pcf50633_pmu.c`,
 `PMU_OOCSHDWN` handler and `pcf50633_prewarm_park`.)
+
+> **Both park paths must call `vm_stop()` from a bottom half, never from a
+> timer callback** (2026-07-27). `vm_stop()` → `pause_all_vcpus()` disables
+> `QEMU_CLOCK_VIRTUAL` and waits for its timerlists to finish their callbacks,
+> so calling it *from* such a callback deadlocks the entire main loop — the VM
+> parks and then ignores QMP and every key forever. This is what broke iPhone
+> OS 1.0's park (its iBoot-159 never writes the type-4 commit, so it parks off
+> the deadline timer rather than the BH). Finding #96 in
+> `SLEEP_WAKE_INVESTIGATION.md`.
 
 During that pre-warm iBoot run, iBoot enters its pre-boot **charging
 dispatcher** — it believes external power is present because the emulator's

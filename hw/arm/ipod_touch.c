@@ -848,6 +848,17 @@ static void ipod_touch_key_event(void *opaque, int keycode)
 
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
 
+    if (getenv("IT_KEY_TRACE")) {
+        fprintf(stderr, "[KEYTRACE] keycode=%d pmu=%p active=%d parked=%d "
+                "no_park=%d sup_pwr=%d sup_home=%d oocshdwn=%d\n",
+                keycode, (void *)s->pmu,
+                s->pmu ? s->pmu->prewarm_active : -1,
+                s->pmu ? s->pmu->prewarm_parked : -1,
+                s->pmu ? s->pmu->prewarm_no_park : -1,
+                s->suppress_power_release, s->suppress_home_release,
+                s->pmu ? s->pmu->oocshdwn_fired : -1);
+    }
+
     if (keycode == 153 && s->suppress_power_release) {
         if (s->pmu) {
             /* The AP may still be in iBoot, but the always-on PMU sees the
