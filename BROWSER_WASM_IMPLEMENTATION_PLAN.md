@@ -66,10 +66,13 @@ set is required to build for the browser.
 - Reimplementing missing Wi-Fi, audio, Bluetooth, USB host integration, or other
   hardware that the native emulator does not currently provide.
 - Running QEMU on a server and streaming its display.
-- Supporting arbitrary Apple devices, IPSW versions, or NAND layouts.
+- Supporting arbitrary Apple devices, IPSW versions, or NAND layouts. The
+  catalog is a fixed, curated set: the four iPhone OS 1.x builds, then N45AP.
 - Making a single giant HTML file containing the app, Wasm module, and firmware.
-- Providing a general QEMU command-line interface to students.
+- Providing a general QEMU command-line interface to visitors.
 - Mutating the immutable base NAND. Guest writes go to a separate overlay.
+- Converting original firmware artifacts in the browser. Preparation happens
+  offline, in this repository.
 - Depending on a public asset URL remaining available forever without a fallback.
 
 ## Current repository baseline
@@ -184,13 +187,12 @@ The firmware is **bundled with the deployment**, but it is not linked into
 - easier integrity verification;
 - lower peak memory than embedding large blobs in JavaScript.
 
-The classroom app automatically loads the local manifest and boots. Students do
-not select files or source URLs. The deployment should be hosted on a classroom
-LAN or a nearby institutional server when possible. A service worker may precache
-the application shell, but large firmware data should be fetched and cached with
-explicit progress reporting rather than silently delaying service-worker install.
+The app loads the catalog, the visitor picks a version, and it boots. Nobody
+selects files or source URLs. The service worker precaches the application shell
+and serves NAND chunks; large firmware data is fetched with explicit progress
+reporting rather than silently delaying service-worker install.
 
-### Source-loaded flavor
+### Source-loaded flavor (design history, not scope)
 
 The source-loaded output contains the emulator and a manifest of known artifact
 URLs. It performs this first-run flow:
@@ -219,21 +221,22 @@ not the primary experience.
 
 ## Asset manifest
 
-Both builds consume the same versioned schema. This is the classroom manifest
-`scripts/wasm/stage-assets.py` writes, with digests filled in from the staged
-bytes:
+Every asset set uses the same versioned schema. This is what
+`scripts/wasm/stage-assets.py` writes today, extended with the fields the
+version picker and chunked NAND need (`build`, `epoch`, chunked `nand`):
 
 ```json
 {
   "schemaVersion": 1,
-  "assetSet": "m68ap-114-v1",
+  "assetSet": "m68ap-10-v1",
   "board": "M68AP",
   "machine": "iPhone-2G",
   "productType": "iPhone1,1",
-  "description": "iPhone 2G (M68AP), S5L8900, iPhone OS 1.1.4",
-  "firmware": "1.1.4",
+  "description": "iPhone 2G (M68AP), S5L8900, iPhone OS 1.0",
+  "firmware": "1.0",
+  "build": "1A543a",
   "delivery": "bundled",
-  "machineOptions": [],
+  "machineOptions": ["epoch=0"],
   "assets": {
     "bootrom": {
       "url": "./bootrom_s5l8900",
@@ -254,10 +257,15 @@ bytes:
       "format": "raw"
     },
     "nand": {
-      "url": "./nand.pack",
+      "url": "./nand/index.bin",
+      "chunkUrl": "./nand/chunks/",
       "size": 314886212,
+      "compressedSize": 0,
       "sha256": "FILLED_AT_STAGING_TIME",
-      "format": "ipod-nand-pack-v1"
+      "format": "ipod-nand-chunks-v1",
+      "pagesPerChunk": 124,
+      "compression": "br",
+      "prefetch": ["FIRST_BOOT_CHUNK_HASHES_IN_ACCESS_ORDER"]
     }
   }
 }
@@ -265,8 +273,14 @@ bytes:
 
 `machine` and `machineOptions` exist so the frontend builds QEMU's argv from the
 manifest rather than carrying board knowledge in JavaScript: an asset set is
-self-describing, and adding the N45AP set requires no frontend change. Asset
-URLs are relative to the manifest, so a set can be moved or mirrored whole.
+self-describing, and adding a version or the N45AP set requires no frontend
+change. The security epoch is a per-*firmware* value (0 for 1.0/1.0.2, 2 for
+1.1.1, 3 for 1.1.4), which is exactly why it belongs in `machineOptions` and not
+in a board table — `-M iPhone-2G,epoch=N` already exists for this.
+
+Asset URLs are relative to the manifest, so a set can be moved or mirrored
+whole. `prefetch` is the recorded cold-boot chunk order; `compressedSize` lets
+the picker state the real download cost.
 
 The source-loaded manifest uses the same asset keys but may describe source
 archives and their conversion:
@@ -515,6 +529,16 @@ WebAssembly TCG/JIT from the out-of-tree [qemu-wasm](https://github.com/ktock/qe
 tree becomes a **requirement**, and carrying that patch set on 11.0.2 becomes a
 scoped project of its own. Measure before deciding; do not adopt the patch set
 speculatively.
+
+**External evidence that the JIT path is viable.** Infinite Mac benchmarked
+qemu-wasm against the two hand-ported PowerPC emulators it already ships: an
+MD5 checksum over 100 MB completed in **8 seconds under qemu-wasm, versus 13 for
+DingusPPC and 12–18 for PearPC**. A general-purpose emulator compiled to
+WebAssembly beating purpose-built C ports is a strong signal that a JIT-equipped
+QEMU is fast enough for a browser product. It says nothing about *TCI*, which is
+the interpreter — so it raises confidence in the fallback plan, not in the
+current build. It is also the reason to keep the JIT decision open rather than
+treating TCI's result as final.
 
 The first performance gate compares:
 
@@ -904,30 +928,53 @@ baseline to compare browser runs against.
 Exit condition: browser SpringBoard is interactive and performance direction is
 known.
 
-### Phase 3: NAND and persistence (1-2 weeks)
+### Phase 2.5: Package iPhone OS 1.0 (1-2 weeks)
+
+The first shipped version is 1.0 (`1A543a`), not 1.1.4. It boots natively, but
+the *packaging* path is still pinned to 1.1.4:
+`scripts/build-m68ap-homescreen-nand.py` hardcodes `--ipsw-build 4A102`, while
+`scripts/build-m68ap-nand.py` and `scripts/firmware_profiles.py` already carry
+the version axis.
+
+- Wire `--ipsw-build` through the home-screen recipe so each version is one
+  command from IPSW to pack.
+- Produce and verify a 1.0 asset set end to end; confirm `epoch=0` and the
+  `000C` FIL signature come from the profile, not from a default.
+- Repeat for 1.0.2, 1.1.1, 1.1.4 and record each set's provenance.
+
+Exit condition: four asset sets build reproducibly from one command each.
+
+### Phase 3: NAND delivery and persistence (2-3 weeks)
 
 - ~~Specify `ipod-nand-pack-v1`.~~ Built and in production; documented above.
 - ~~Implement the native converter and replace per-page access with pack
   lookup.~~ Done (`scripts/pack-ipod-nand.py`, `hw/arm/ipod_touch_nand.c`).
-- Add golden fixtures and round-trip tests for the pack. **Still owed.**
-- Implement the copy-on-write overlay and persistence. **The real remaining
-  work of this phase** — guest writes currently have nowhere to go in the
-  browser.
-- Select the browser storage/loading strategy from measurements.
+- **Measure the cold-boot working set** — which chunks a boot to the home screen
+  actually touches, per version. Everything below is sized by this number, and
+  it is cheap to obtain natively. Do it first.
+- Add the page-read seam in `ipod_touch_nand.c` so a chunk cache can back the
+  pack.
+- Build the chunker: content-addressed, fixed page count, Brotli, deterministic.
+- Add the service worker that serves chunks, plus prefetch of the recorded boot
+  set.
+- Add golden fixtures and round-trip tests for pack and chunks. **Still owed.**
+- Implement the copy-on-write overlay and persistence — guest writes currently
+  have nowhere to go in the browser.
 
 Exit condition: a warm browser boot uses the cached pack, and guest writes survive
 restart without modifying the base.
 
-### Phase 4: Dual deployments (1-2 weeks)
+### Phase 4: The version picker (1-2 weeks)
 
-- Add the deployment manifest schema.
-- Build the automatic classroom flavor.
-- Build the automatic source-loaded flavor.
-- Add download, verification, conversion, caching, and fallback UI.
-- Add the service worker and offline warm-boot flow.
+- Add `catalog.json` and the picker UI: device, OS version, build, release date,
+  honest download size.
+- Per-version cache namespaces, and a way to see and clear what is stored.
+- Offline warm boot for any version already cached.
+- Make switching versions cheap enough to actually compare them — that is the
+  product, not a convenience.
 
-Exit condition: both builds pass the same emulator tests and differ only in asset
-delivery.
+Exit condition: a visitor can boot 1.0, switch to 1.1.4, and come back to a
+warm 1.0 with no network.
 
 ### Phase 5: Hardening and classroom release (2-4 weeks)
 
@@ -953,7 +1000,11 @@ failure that forces adopting the out-of-tree JIT would extend it substantially.
 | ~~Forward port changes guest behavior~~ (retired: the port is done and promoted) | — | Native baseline tests still owed for browser comparison | — |
 | Device code assumes a real filesystem (`fopen`, `g_mapped_file`) | High | Measure MEMFS/mmap behavior early; add a pack access seam if needed | The 300 MiB pack cannot be mapped within browser memory |
 | NAND pack consumes too much memory | High | Blob/chunk access, bounded caches, storage benchmarks | Reference 8 GiB machine repeatedly crashes |
-| M68AP NAND has no public single-file source | High for source build | Classroom flavor first; mirror or port the generator later | No permitted delivery path for a prepared pack |
+| M68AP NAND has no public single-file source | Resolved by decision | Prepare offline and self-host; no in-browser conversion | — |
+| The packaging path is pinned to 1.1.4 (`build-m68ap-homescreen-nand.py` hardcodes `4A102`) | High for a 1.0-first release | Wire the existing `--ipsw-build` axis through the home-screen recipe | 1.0 cannot be packaged reproducibly |
+| Per-version fixed constants drift (epoch, FIL signature, PC windows) | High | `firmware_profiles.py` is the single source; manifest carries `epoch` | A version boots with another version's constants |
+| Four versions multiply hosting and cache cost | Medium | Chunked + Brotli (~3×), content-addressed sharing, lazy load | Storage or bandwidth exceeds what the origin can serve |
+| A cold boot touches most of the pack anyway | Medium | Measure the working set before building the chunk pipeline | Lazy loading saves little over a whole-pack download |
 | The build host runs out of disk | Medium | ~5 GiB free needed: deps, build tree, staged assets | Build cannot complete locally |
 | Public source blocks browser fetch | High for source build | Preflight, authorized mirror/proxy, manual fallback | No reliable permitted delivery path exists |
 | Browser storage is evicted | Medium | Request persistence, export support, clear UI | Required browsers cannot retain a warm asset set |
@@ -1011,8 +1062,15 @@ contains metadata, timings, stable error codes, and filtered emulator logs.
 
 - Forward-port the device model to modern QEMU rather than backporting Wasm.
   *(Done: QEMU 11.0.2.)*
-- Target iPhone 2G / iPhone OS 1.1.4 first, with N45AP as a second asset set
-  from the same build.
+- Target iPhone 2G. Ship **iPhone OS 1.0 first**, then 1.0.2, 1.1.1, 1.1.4 as a
+  version picker; N45AP after those, from the same build.
+- Prepare every asset set offline in this repository and serve it from our own
+  origin. Do not build in-browser conversion of original artifacts.
+- Deliver the NAND as content-addressed, individually Brotli-compressed chunks
+  loaded on demand through a service worker, following Infinite Mac's measured
+  approach. Measured here: ~3× size reduction, 315 MB → ~100 MB per version.
+- Keep the firmware version in the asset manifest (`build`, `epoch`), never in
+  a board table — epoch and NAND signature are firmware-keyed, not board-keyed.
 - Build with the native pinned Emscripten toolchain by default; keep the
   container for reproducible and CI builds. Docker is not a requirement.
 - Ship wasm64 + TCI first and let measurement decide whether a JIT is required.
@@ -1043,14 +1101,19 @@ Still open:
 
 - Whether TCI is fast enough, and therefore whether the out-of-tree JIT is
   required. **This is the decisive one.**
+- **How much of the pack a cold boot touches.** Sizes the entire delivery
+  design; measurable natively today.
 - How the pack is reached from the wasm heap: MEMFS + mmap, a Blob-backed
-  reader, IndexedDB/OPFS chunks, or complete-memory load.
-- Whether independent NAND chunk compression is needed after profiling.
+  reader, chunk cache, or complete-memory load.
+- Chunk size in pages: 124 (≈256 KiB, Infinite Mac's figure) is the starting
+  point, to be confirmed against our own access pattern.
 - Whether `OffscreenCanvas` is the default or an optimization.
-- Exact supported browser versions and institutional hardware baseline.
-- Final public source URLs and their CORS/COEP behavior.
-- Authorized private classroom publishing destination.
-- Whether classroom devices preload assets before class or fetch on first use.
+- Exact supported browser versions and hardware baseline.
+- The hosting origin, its cache headers, and whether IPFS is added later.
+
+Closed by the 2026-07-27 revision: independent chunk compression **is** the
+plan (measured ~3×); the source-loaded first run is **not** being built; the
+publishing destination is our own origin.
 
 Each open decision must be closed with a short decision record containing measured
 evidence, not preference alone.
@@ -1059,18 +1122,19 @@ evidence, not preference alone.
 
 The browser project is complete when:
 
-- one pinned QEMU/Wasm build runs the M68AP (iPhone OS 1.1.4) emulator in
-  supported browsers, and the N45AP asset set on the same build;
+- one pinned QEMU/Wasm build runs iPhone OS 1.0 in supported browsers, and the
+  same build runs 1.0.2, 1.1.1 and 1.1.4 from their own asset sets;
+- the N45AP asset set runs on that same build;
 - native QEMU 11.0.2 still passes the reference behavior tests;
-- the classroom deployment boots automatically from bundled assets;
-- the source-loaded deployment downloads, verifies, converts, caches, and boots
-  automatically;
-- a warm source-loaded deployment boots offline;
+- the picker boots any version from the catalog, and a cached version boots
+  offline;
+- every asset set builds reproducibly from one command against its IPSW;
 - display, touch, Home, Power, sleep, wake, and persistence pass regression tests;
-- asset corruption and source failures produce actionable UI errors;
-- the packed NAND and overlay formats have specifications and golden tests;
-- performance and memory gates pass on representative classroom hardware;
-- classroom deployment headers and concurrent delivery are verified;
+- asset corruption produces actionable UI errors;
+- the packed NAND, chunk, and overlay formats have specifications and golden
+  tests;
+- performance and memory gates pass on representative hardware;
+- deployment headers and concurrent delivery are verified;
 - public CI and releases contain no unintended private firmware;
 - source, licenses, provenance, build instructions, deployment documentation, and
   instructor troubleshooting documentation are complete.
@@ -1084,3 +1148,18 @@ The browser project is complete when:
 - [Emscripten filesystem API](https://emscripten.org/docs/api_reference/Filesystem-API.html)
 - [Emscripten runtime environment](https://emscripten.org/docs/porting/emscripten-runtime-environment.html)
 - [Current native build instructions](BUILD.md)
+- [Per-version firmware matrix and status](IPHONE_OS_1X_VERSIONS.md)
+
+### Infinite Mac (the model for asset delivery)
+
+- [infinitemac.org](https://infinitemac.org) — the product shape: many OS
+  versions, one browser emulator, instant boot
+- [An Instant-Booting Quadra in Your Browser](https://blog.persistent.info/2022/03/blog-post.html)
+  — 256 KiB content-addressed chunks, per-chunk Brotli, service-worker
+  interception, prefetch; boot screen in 1 s, booted in 3 s cold
+- [Disks, CD-ROMs and Custom Instances](https://blog.persistent.info/2023/08/infinite-mac-cd-roms.html)
+  — per-chunk residency dropped out-of-memory rates from 6.5% to 0.3%
+- [Infinite Mac OS X](https://blog.persistent.info/2025/03/infinite-mac-os-x.html)
+  — qemu-wasm benchmarked at 8 s on an MD5 workload against 13 s (DingusPPC)
+  and 18 s (PearPC)
+- [mihaip/infinite-mac](https://github.com/mihaip/infinite-mac) — source

@@ -4,9 +4,43 @@ The dated, working state of the browser port. The design of record is
 [`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](BROWSER_WASM_IMPLEMENTATION_PLAN.md);
 this file records what is actually built, what is proven, and what is next.
 
-**Target:** iPhone 2G (M68AP) running iPhone OS 1.1.4, downloaded and executed
-entirely in the viewer's browser. The plan was written for N45AP/iPod touch; the
-tooling is board-agnostic and both asset sets are producible.
+**Target:** iPhone 2G (M68AP), executed entirely in the viewer's browser, as a
+picker across iPhone OS 1.0 / 1.0.2 / 1.1.1 / 1.1.4 — **1.0 first**. Assets are
+prepared offline here and self-hosted. iPod touch (N45AP) comes after.
+
+---
+
+## Session — 2026-07-27: delivery decided, assets measured
+
+- **Delivery model settled**: prepared offline, self-hosted, chunked and
+  compressed. No in-browser conversion of original artifacts — the M68AP NAND is
+  constructed from an IPSW by this repo's pipeline and has no downloadable
+  equivalent.
+- **Measured the shipping 1.1.4 pack** (314.9 MB, 148,812 pages): zlib -9 over
+  sampled 256 KiB chunks compresses to **36.6%**, lzma to **31.2%** — so ~100 MB
+  per version with Brotli. Whole-chunk duplicates were only 7 of 120 sampled,
+  and *no* chunk was uniform: the pack already omits absent pages, so
+  content-addressing buys cache identity here, not size.
+- **Researched Infinite Mac's approach** and adopted it: content-addressed
+  fixed-size chunks, per-chunk Brotli, service-worker interception keeping the
+  emulator's reads synchronous, prefetch of the boot working set, per-chunk
+  residency. Its measured bar is boot screen in 1 s, booted in 3 s, cold cache.
+- **Found supporting evidence for the JIT fallback**: Infinite Mac benchmarked
+  qemu-wasm at 8 s on an MD5 workload against DingusPPC's 13 s and PearPC's 18 s
+  — a JIT-equipped QEMU beats hand-ported emulators. Says nothing about TCI.
+- **Corrected a stale assumption**: all four 1.x builds now reach the home
+  screen natively (`IPHONE_OS_1X_VERSIONS.md`, 2026-07-26), including 1.0. The
+  1.0-first plan is therefore feasible; earlier notes saying 1.0 was blocked on
+  the ADM are out of date.
+
+**The packaging gap for a 1.0-first release:**
+`scripts/build-m68ap-homescreen-nand.py` hardcodes `--ipsw-build 4A102`, while
+`build-m68ap-nand.py` and `firmware_profiles.py` already carry the version axis.
+Wiring that through is the prerequisite for producing a 1.0 asset set.
+
+**The measurement to take next, before building the chunk pipeline:** how much
+of the pack a cold boot actually touches, per version. It sizes everything, and
+it is obtainable natively today.
 
 ---
 
