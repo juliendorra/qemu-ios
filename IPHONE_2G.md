@@ -20,6 +20,50 @@ machine (see `hw/arm/ipod_touch.c`):
   It is copied to `IPodTouchMachineState.board_id` at machine init so device
   models can branch on it as iPhone bring-up uncovers differences.
 
+## The two flash media, and why there are two
+
+Both boards carry NOR **and** NAND. They are different technologies with
+opposite trade-offs, and nearly every storage-shaped problem in this tree is
+easier to place once you know which medium it is on.
+
+|  | NOR | NAND |
+|---|---|---|
+| Cell array | parallel to the bit line, so every word is independently addressable | series strings, addressed a page at a time |
+| Access | **random, memory-mapped, execute-in-place** — the CPU fetches instructions straight out of it | through a controller; read/write whole 2048-byte pages |
+| Reliability | no factory bad blocks, no wear levelling, no ECC needed | bad blocks from the factory, wears out, needs ECC + a flash translation layer |
+| Density / cost | expensive per bit — **1 MiB total** | cheap per bit — the multi-GB user storage |
+| In QEMU | `-pflash`, a CFI chip (`hw/block/pflash_cfi02.c`) | `nand=<dir>` page tree + `hw/arm/ipod_touch_nand.c` |
+
+The split exists because the bootstrap has a chicken-and-egg problem: reading
+NAND requires an FTL, ECC and a driver, all of which are software that has to
+live somewhere the CPU can already execute. So the boot chain is
+
+```
+mask ROM (in SoC silicon)  ->  LLB + iBoot (NOR)  ->  kernelcache + root fs (NAND)
+```
+
+NOR holds the small, trusted, must-work-before-anything-else things; NAND holds
+the bulk. Apple's FTL here is "Whimory", and its metadata (FIL signature, VFL
+contexts, BBT) is what `scripts/build-m68ap-nand.py` has to synthesise.
+
+**What is in this device's 1 MiB NOR:**
+
+| Region | Contents |
+|---|---|
+| `0x00000`–`0x10000` | LLB region (zero in the shipped dump; this machine pre-stages iBoot to `IBOOT_BASE` rather than executing a NOR LLB) |
+| `0x10400`+ | **IMG2 image store** — seven images: `dtre` (DeviceTree), `batC`, `logo`, `nsrv`, `batl`, `batL`, `recm` |
+| `0xfc000` | SysCfg / NVRAM — serial number, `boot-args` |
+
+QEMU does **not** parse the NOR; the guest reads it directly. Byte-level layout
+and the walk rule are in `IPHONE_2G_BRINGUP_HANDOFF.md` § "NOR layout facts";
+inspect any NOR with `scripts/nor-image-store.py`.
+
+This is also why the **Apple boot logo lives in NOR**: it has to be paintable
+before a filesystem exists — before NAND is readable at all — so iBoot draws it
+from the `logo` image. The 2026-07-27 black-screen-through-boot bug was exactly
+that: the images after `dtre` were physically present in the NOR but
+unreachable by iBoot's walk, so `logo` was never found.
+
 ## What changed from the iPod profile, and why
 
 The iPhone work has deliberately kept the shared S5L8900 implementation intact

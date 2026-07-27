@@ -2983,6 +2983,10 @@ working N45AP behavior remains epoch 2.
 
 ## NOR layout facts (for the rebuild)
 
+> For *why* the device has both a NOR and a NAND, what each is for, and where
+> the boot logo fits, see `IPHONE_2G.md` § "The two flash media, and why there
+> are two". This section is the byte-level layout.
+
 `data/nor_n45ap.bin` is a raw 1 MiB CFI NOR (`hw/block/pflash_cfi02.c`, mapped in
 `hw/arm/ipod_touch.c:398-412`). **QEMU does not parse it** — the guest reads it
 directly. Layout:
