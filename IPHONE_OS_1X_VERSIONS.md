@@ -664,12 +664,20 @@ order, with the evidence needed to resume each:
    it. **Still true and still a trap: do not sample the framebuffer with QMP
    stop/cont while parked — `cont` un-parks the device and invalidates the
    test.**
-2. **No Apple logo during boot, on every iPhone version** (the iPod shows it
-   throughout). Hypothesis, unconfirmed: iBoot enumerates only `dtre` from our
-   synthetic NOR where the iPod enumerates seven including `logo`. The NOR does
-   contain all seven — verified by walking it — so the suspect is the image
-   store *layout* after the first entry, not the content. First measurement:
-   count `image 0x…` lines on a 1.1.4 boot.
+2. ~~**No Apple logo during boot, on every iPhone version.**~~ **SOLVED
+   2026-07-27 — two stacked faults.** The enumeration hypothesis was right:
+   1 `image 0x…` line on 1.1.4 versus the iPod's 7. But the cause was **not**
+   the store layout — our spacing is fine. iBoot walks the store by
+   `next = this + (u32 at header+0x18) * 0x40`; the IPSW containers ship
+   `0xFFFFFFFF` in that field and `build-m68ap-nor.py` never filled it in, so
+   the first step left the store entirely. Fixing that put the logo in iBoot's
+   framebuffer — and the screen was **still** black, because
+   `lcd_refresh()` scanned out display window 1 while iBoot draws into window
+   2, on *both* boards. The iPod was masking that second bug: its kernel adopts
+   iBoot's 0x0fe00000 into window 1 at ~13 s, so the logo looked continuous.
+   Now: screenout 2.173% from t=4 s on N45AP, 1.1.4 and 1.0 alike. Derivation,
+   dead ends and traps in `IPHONE_2G_BRINGUP_HANDOFF.md` and
+   `M68AP_RENDER_HANDOFF.md` §4.
 3. **ADM commands `0x400` and `0x100` unimplemented.** `0x400` is issued
    immediately before *every* sleep (13× per 300 s run); `0x100` once per boot,
    and 1.1.x issues it too, apparently harmlessly. The field map for both

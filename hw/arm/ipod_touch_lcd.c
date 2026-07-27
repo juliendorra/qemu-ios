@@ -217,6 +217,9 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
         case 0x78:
             if (val != s->w2_framebuffer_base) {
                 it_lcd_trace_base("w2", (uint32_t)val);
+                /* Window 2 can be the scanned-out window (see
+                 * lcd_scanout_base), so a base change here must repaint. */
+                s->invalidate = 1;
             }
             s->w2_framebuffer_base = val;
             break;
@@ -275,6 +278,37 @@ static int lcd_visible_sample_count(uint32_t base)
     return visible_count;
 }
 
+/* Which window the panel is actually scanning out.
+ *
+ * The controller has two window register blocks -- 0x58..0x68 ("w1") and
+ * 0x70..0x80 ("w2") -- and real silicon composites both. iBoot and the OS do
+ * not use the same one:
+ *
+ *   iBoot  programs ONLY w2, with its own framebuffer at 0x0fe00000. That is
+ *          where it draws the Apple boot logo (and the battery/recovery
+ *          images). Confirmed on both boards by IT_FB_TRACE: the only window
+ *          writes before iBoot's banner are 0x070..0x080.
+ *   kernel  programs w1, first adopting iBoot's 0x0fe00000 so the logo stays
+ *          up, then flipping between its own buffers at 0x0f400000/0x0f496000.
+ *
+ * Scanning out w1 unconditionally therefore showed nothing at all for the
+ * whole of iBoot: w1 is still zero then. On the iPod that was masked, because
+ * its kernel reaches the adopt-0x0fe00000 step quickly and the logo appears to
+ * have been there all along; on the iPhone the kernel takes far longer to get
+ * there, so the screen stayed black for the entire boot and the logo only
+ * flashed at the very end. Same defect, different exposure.
+ *
+ * w1 wins as soon as it has been programmed, so the OS-era behaviour is
+ * exactly what it was; w2 is the fallback that covers the iBoot era.
+ * WNDCON (0x20) cannot arbitrate: it is written once, by iBoot, and the
+ * kernel never touches it.
+ */
+static uint32_t lcd_scanout_base(IPodTouchLCDState *lcd)
+{
+    return lcd->w1_framebuffer_base ? lcd->w1_framebuffer_base
+                                    : lcd->w2_framebuffer_base;
+}
+
 static void lcd_refresh(void *opaque)
 {
     //fprintf(stderr, "%s: refreshing LCD screen\n", __func__);
@@ -311,7 +345,7 @@ static void lcd_refresh(void *opaque)
     linesize = surface_stride(surface);
 
     if(lcd->invalidate) {
-        framebuffer_update_memory_section(&lcd->fbsection, lcd->sysmem, lcd->w1_framebuffer_base, height, 4 * width);
+        framebuffer_update_memory_section(&lcd->fbsection, lcd->sysmem, lcd_scanout_base(lcd), height, 4 * width);
     }
 
     framebuffer_update_display(surface, &lcd->fbsection,

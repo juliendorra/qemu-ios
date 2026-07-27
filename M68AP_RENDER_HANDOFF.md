@@ -167,6 +167,36 @@ M68AP. Judge by **LCD bases** and **framebuffer content**, not by that phase.
 | Full `/var` skeleton would help | **harmful** | 56 dirs + `chmod 1777` → launchd never starts at all (0/0/0 lines at a 700 s cap) |
 | Zephyr1 multitouch never signals "ready" | **not the blocker** | `IT_MT_TRACE` (2026-07-25): the Z1 bootloader + raw main-firmware upload completes and verifies on M68AP — `firmware_loaded=1` on both boards. Control: `IT_FORCE_MT_Z2=1` (model answers Z2 semantics) breaks boot far *earlier* (phase=kernel, 0 SpringBoard lines), confirming the guest really speaks Z1 |
 | Kernel display-controller programming diverges | **no** | `IT_FB_TRACE` (2026-07-25): both boards write the *identical* CLCD register set (only the gamma-ramp values differ, iPhone vs iPod panel calibration). The divergence is in userland compositing, not the kernel LCD driver |
+| iBoot's display programming diverges between boards (raised 2026-07-27 by the missing boot logo) | **no** | `IT_FB_TRACE`: **both** boards' iBoot program window 2 only (0x070..0x080 = SFN/base/size/hspan/qlen) and write WNDCON once. Identical. See "the boot logo" below |
+
+### The boot logo — SOLVED 2026-07-27 (two stacked faults, again)
+
+The Apple logo never appeared during an M68AP boot, on **every** iPhone OS 1.x
+build; it flashed only at the very end as SpringBoard took over. Two independent
+causes, the second of which the iPod was **masking**:
+
+1. **NOR side.** iBoot walks the IMG2 image store by `next_header =
+   this_header + (u32 at +0x18) * 0x40`. IPSW containers ship `0xFFFFFFFF`
+   there and `scripts/build-m68ap-nor.py` never filled it in, so enumeration
+   stopped after `dtre` (1 `image 0x...` line vs the iPod's 7) and iBoot could
+   not reach the `logo` entry. Full derivation and dead-ends in
+   `IPHONE_2G_BRINGUP_HANDOFF.md`.
+2. **Emulator side.** `lcd_refresh()` scanned out **window 1** (0x58..0x68)
+   unconditionally. iBoot draws into **window 2** (0x70..0x80) — on both boards
+   — and window 1 is the *kernel's*. The iPod looked correct only because its
+   kernel adopts iBoot's 0x0fe00000 into window 1 at ~13 s, so the logo appears
+   continuous. `lcd_scanout_base()` now falls back to window 2 while window 1
+   is unprogrammed; window 1 still wins the moment it is written, so the OS-era
+   behaviour is bit-identical to before.
+
+Measured after both (`--boot-wait 4 --samples 7`): screenout 2.173% from t=4 s
+on N45AP, M68AP 1.1.4 **and** M68AP 1.0; N45AP still reaching the home screen
+at ~13 s exactly as before.
+
+Two things seen while verifying that these fixes did **not** cause, both open:
+an intermittent `IOIpodUSBDevice::start` panic on 1.1.4 (the next identical run
+was clean — this is the known host-contention race in §7), and M68AP's kernel
+framebuffers still fully black 110 s in with SpringBoard already running.
 
 ## 5. Tools built this session (all committed, all reusable)
 
@@ -337,6 +367,20 @@ Or just: `python3 scripts/springboard-lab.py --logs /tmp/x --variants m68ap-full
   "dubious" non-root plists). lockdownd read a uid-501 data ark happily.
   `inject-guest-file.py --root-owned` covers the strict cases.
 * **`Configuring SpringBoard` is an iPod-only string** — see §3.
+* **`IT_LCD_TRACE` only fires on a base *change*.** A window the guest never
+  writes produces no line at all, and a rewrite of the same value is invisible.
+  So an empty trace does not mean "nothing happened" — it can mean "the
+  register you care about was never touched", which is exactly how the boot
+  logo hid. When the question is *what did the guest program*, use
+  `IT_FB_TRACE=1`; keep `IT_LCD_TRACE` for *when did the base flip*.
+* **`logs/command.txt` is not shell-safe.** It is `" ".join(argv)`, and the
+  artifact paths contain a space (`iPod Touch.app`), so `bash command.txt`
+  dies with a truncated `Could not open …`. To re-launch a recorded run with a
+  tweak (e.g. `-serial file:/dev/stdout` to interleave guest output into the
+  register trace), rebuild the argv list in Python.
+* **`fb-snapshot.py --boot-wait` defaults to 180 s — past everything early.**
+  The whole iBoot era is over within a few seconds. For anything about the
+  boot logo or the pre-kernel display, use `--boot-wait 4 --samples 7`.
 * **hdiutil types raw images by their extension.** A working copy named
   `root.img.tmp` fails to attach with "image not recognized"; name temp
   copies `*.tmp.img`. This silently killed the first `sb_env` lab seat.

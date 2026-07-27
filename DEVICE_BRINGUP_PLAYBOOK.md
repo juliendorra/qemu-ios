@@ -148,6 +148,29 @@ that were wrong for interesting reasons.
    shows no effect, ask whether the system even reaches the code it concerns
    before discarding it.
 
+## Two rules added by the boot-logo case (2026-07-27)
+
+Narrative in `M68AP_RENDER_HANDOFF.md` §4 and `IPHONE_2G_BRINGUP_HANDOFF.md`.
+Rule 5 above says *read the working reference*. These are its limits.
+
+8. **A working reference proves the outcome, not the mechanism.** The iPod
+   showed the Apple logo throughout its boot, so "the display path is correct
+   on N45AP" looked settled. It was not: **both** boards' iBoot draw the logo
+   into display window 2, which our LCD model never scanned out. The iPod
+   merely recovered — its kernel adopts iBoot's framebuffer into window 1 at
+   ~13 s, early enough that the logo looks continuous. The reference was
+   carrying the same defect and hiding it. Before concluding "this is
+   board-specific", trace the reference doing the thing, not just succeeding
+   at it — and expect a fix aimed at the broken board to improve the reference
+   too. (Here it did: the iPod now shows the logo *earlier*.)
+9. **Know which of your traces are edge-triggered.** `IT_LCD_TRACE` logs a
+   framebuffer base only when it *changes*, so a register the guest never
+   writes yields no line — indistinguishable from a quiet, working path. An
+   empty edge-trace is not evidence of absence. Pair every "when did it
+   change" trace with a "what was written" one (`IT_FB_TRACE`: every access,
+   throttled), and reach for the level-triggered one first when the question
+   is about configuration rather than timing.
+
 ## Retrospective: where this would have saved time
 
 - **WiFi SDIO** (the proof case, pre-tooling): every hypothesis was a C

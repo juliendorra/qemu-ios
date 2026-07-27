@@ -119,6 +119,18 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
 
 * **T1/T2** — model the MBX (swap completion + 2D) and drop
   `LK_ENABLE_MBX2D=0`.
+* **The M68AP kernel framebuffers stay black for a long time.** Found while
+  fixing the boot logo (2026-07-27): 110 s in, with SpringBoard already
+  running, both `0x0f400000` and `0x0f496000` were still 0.0% non-black. The
+  logo now correctly stays up for that whole window, so it is no longer
+  *visible* as a black screen — which makes it easier to miss. Reproduce with
+  `fb-snapshot.py --board m68ap --build 4A102 --boot-wait 60 --samples 6
+  --sample-interval 10`.
+* **Bundles predate the boot-logo fix.** Both the NOR builder change and the
+  LCD window change are needed; the installed `/Applications/iPhone 2G*.app`
+  bundles carry neither, and their `nor.bin` must be regenerated (not just the
+  engine replaced). The N45AP bundle also benefits — the iPod now shows the
+  logo from ~4 s instead of ~13 s.
 * **T5** — drive the M68AP button pins from reset instead of at the kernel
   banner.
 * ~~Repackage the iPhone bundle~~ **done** — `/Applications/iPhone 2G.app`

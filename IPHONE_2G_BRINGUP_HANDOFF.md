@@ -3008,6 +3008,112 @@ parses the NOR and checks header metadata including its security epoch. The
 extractor and NOR builder now preserve that complete 0x400-byte header; keep
 this as a regression invariant.
 
+### IMG2 +0x18 is the image-store walk stride (fixed 2026-07-27)
+
+**Symptom:** no Apple logo for the whole boot on `-M iPhone-2G`, on every
+iPhone OS 1.x build; the logo appeared only for a fraction of a second at the
+very end. The iPod shows it throughout.
+
+**How iBoot walks the store:** not by scanning for the `2gmI` magic, and not by
+adding the padded data length, but
+
+    next_header = this_header + (u32 at header+0x18) * 0x40
+
+Derived from the real N45AP NOR, where that field predicts the next header's
+offset exactly for all six gaps (`dtre` 0x215*0x40=0x8540 → `batC`@0x18940,
+and so on). It is an on-NOR *allocation* size, so the IPSW's own containers
+ship `0xFFFFFFFF` there — meaningful only once a NOR programmer has chosen the
+layout.
+
+`build-m68ap-nor.py` never filled it in, so every synthetic M68AP NOR carried
+`0xFFFFFFFF`: iBoot's first step jumped 256 MiB past the end of the store and
+enumeration stopped after `dtre`. Measured directly — one `image 0x...` line on
+1.1.4 versus the iPod's seven. The `logo` entry was present in the NOR payload
+the whole time; iBoot simply could not reach it. Fixed by `set_stride()`, which
+writes `align_up(len(container), 0x40) / 0x40` and folds into the existing
++0x64 CRC recomputation. Verify with
+`grep -c "image 0x" serial.log` — it must be 7.
+
+**Dead ends on the way to that (all cheap, all wrong):**
+
+- *"The store LAYOUT is wrong — spacing/alignment of entries after the first."*
+  It is not. Our 0x40-packed layout is fine; Apple's is merely *looser*. The
+  reference spacing looks mysterious on purpose — slack between one image's
+  data end and the next header runs 0x2ab..0x917 bytes, and every delta happens
+  to be ≡ 0x540 (mod 0x800) — but that is a **consequence** of the +0x18 field,
+  not a rule to reverse-engineer. Chasing "derive the real spacing rule from the
+  reference NOR" would never have converged, because there is no spacing rule.
+- *"`promote_loadable()` is only applied to the first image, or rewrites a field
+  the walk depends on."* Neither. It is applied to every container, and
+  enumeration does not look at flags2 or the CRC at all (an image with bit 24
+  clear still *enumerates*; it only fails later, at load).
+- *"The payload is missing."* It never was. Walking the synthetic NOR directly
+  found all seven containers with correct magic, epoch and self-consistent CRCs
+  — which is exactly why the enumeration count, not the payload, was the thing
+  to measure first.
+
+The one measurement that mattered took one boot: `grep -c "image 0x"`. Note
+1.0/1.0.2's iBoot does **not** print those lines, so on the 1.0 family this
+check is unavailable and the drawn logo is the only signal.
+
+### The LCD scanned out the wrong window during iBoot (fixed 2026-07-27)
+
+Filling in the stride put the logo into iBoot's framebuffer at 0x0fe00000
+(1.627% non-black, byte-identical to the iPod's) but the screen was still
+black: `screenout_nonzero_pct` stayed at 0.003%.
+
+`IT_FB_TRACE=1` on both boards shows iBoot programs **only window 2**
+(0x70..0x80) — that is where it draws the logo — while `lcd_refresh()` scanned
+out **window 1** (0x58..0x68) unconditionally, which is still zero at that
+point. The kernel is what programs window 1, first adopting iBoot's 0x0fe00000
+and later flipping its own 0x0f400000/0x0f496000 buffers. On the iPod that
+kernel step lands early enough (~13s) that the logo looks continuous; on the
+iPhone the kernel takes much longer, so the screen stayed black.
+
+So this was never iPhone-specific: the iPod was masking the same emulator bug.
+`lcd_scanout_base()` now falls back to window 2 while window 1 is unprogrammed.
+WNDCON (0x20) cannot arbitrate — it is written once, by iBoot, and the kernel
+never touches it.
+
+**Dead ends and traps here:**
+
+- *`IT_LCD_TRACE=1` cannot answer "which window is programmed".* It only fires
+  on a **change** of base, so a window that is never written produces no line
+  at all, and a rewrite of the same value is invisible. The M68AP trace showed
+  `w2 base <- 0x0fe00000` and nothing else, which reads as "nothing else
+  happened" but actually means "w1 was never touched". `IT_FB_TRACE=1` — every
+  MMIO access, throttled — is the tool for this question. Reach for it first
+  when the question is *what did the guest program*, and keep `IT_LCD_TRACE`
+  for *when did the base flip*.
+- *"The N45AP window-1 writes are iBoot's, so M68AP's iBoot must be doing
+  something different."* Wrong, and it briefly pointed the investigation at the
+  iBoot patching. Merging serial output into the register trace (one QEMU with
+  `-serial file:/dev/stdout` and stderr redirected to the same file) puts the
+  window-1 writes at line 3052, **after** the Darwin banner at line 1013 — they
+  are the kernel's. Both boards' iBoot programs only window 2.
+- *Trap when reproducing that:* `logs/command.txt` is `" ".join(argv)` and is
+  **not shell-safe** — the artifact paths contain a space (`iPod Touch.app`),
+  so `bash command.txt` fails with a truncated `Could not open …`. Re-launch it
+  from Python with the argv list, not from a shell.
+- *`fb-snapshot.py`'s default `--boot-wait 180` is far too late to see any of
+  this.* The whole iBoot era is over in the first few seconds. Use
+  `--boot-wait 4 --samples 7 --sample-interval 3`.
+
+Measured after both fixes (`scripts/fb-snapshot.py --boot-wait 4 --samples 7`):
+screenout 2.173% from t=4s on **both** boards, N45AP still transitioning to the
+home screen at ~13s exactly as before. 1A543a (1.0) likewise shows the logo from
+t=4s; note its iBoot does not print the `image 0x...` lines at all, so for the
+1.0 family the drawn logo is the only available check.
+
+Two things seen while verifying that are NOT caused by these fixes, and are
+open:
+- An intermittent `panic(cpu 0 ...)` inside `IOIpodUSBDevice::start` on 1.1.4;
+  the immediately following identical run reached SpringBoard with no panic.
+- On M68AP the kernel framebuffers at 0x0f400000/0x0f496000 were still fully
+  black 110s in, with SpringBoard already running. The logo stays up for that
+  whole window (which is the intended behaviour), but the home screen taking
+  that long to reach the framebuffer is worth its own look.
+
 ---
 
 ## Next plan (in order)
