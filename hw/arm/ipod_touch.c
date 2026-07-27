@@ -894,6 +894,22 @@ static void ipod_touch_key_event(void *opaque, int keycode)
             pmu->prewarm_parked = false;
             pmu->prewarm_active = false;
             pmu->retained_int2_reexposed = true;
+            if (pmu->prewarm_no_park) {
+                /* Parked without a type-4 commit (iBoot-159), so the guest is
+                 * sitting in its power-off spin rather than just before the
+                 * kernel handoff: resuming it would only continue the spin
+                 * with the panel dark. Start the retained-RAM wake boot for
+                 * real, on demand. Costs a boot, but only when the user asks
+                 * for one -- which is the difference between this and the
+                 * spontaneous reboot loop it replaces. */
+                fprintf(stderr, "[WAKE] %s starting retained-RAM wake boot\n",
+                        keycode == 25 ? "Power" : "Home");
+                pmu->retained_int2_reexposed = false;
+                ipod_touch_prepare_retained_wake();
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                vm_start();
+                return;
+            }
             fprintf(stderr, "[WAKE] %s completed pre-warmed wake\n",
                     keycode == 25 ? "Power" : "Home");
             vm_start();

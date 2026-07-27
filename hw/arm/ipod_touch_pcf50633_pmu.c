@@ -4,6 +4,7 @@
 #include "hw/intc/pl192.h"
 #include "qemu/main-loop.h"
 #include "system/runstate.h"
+#include "qemu/timer.h"
 #include "system/rtc.h"
 
 // Check if any interrupt is pending and update the nIRQ line.
@@ -111,6 +112,7 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
                      * half. */
                     fprintf(stderr, "[WAKE] Pre-warm reached type-4 commit; "
                             "parking\n");
+                    timer_del(s->prewarm_deadline);
                     qemu_bh_schedule(s->prewarm_park_bh);
                     break;
                 }
@@ -217,9 +219,27 @@ static void pcf50633_write_reg(Pcf50633State *s, uint8_t reg, uint8_t val)
                      * before the type-4 handoff (see PMU_RESUME_STATUS
                      * above). A later Power/Home press then only pays for
                      * the kernel resume. */
+                    if (s->prewarm_no_park) {
+                        /* This firmware never signals the type-4 commit, so a
+                         * pre-warm would just boot all the way through and
+                         * idle out again. Stay asleep instead; the Power/Home
+                         * handler starts the wake boot on demand. */
+                        fprintf(stderr, "[WAKE] Sleeping (this firmware cannot "
+                                "be pre-warmed); press Power or Home to wake\n");
+                        /* prewarm_active gates both the park BH and the
+                         * Power/Home wake branch, so it must be set even
+                         * though no pre-warm boot is being run. */
+                        s->prewarm_active = true;
+                        s->prewarm_wake_requested = false;
+                        qemu_bh_schedule(s->prewarm_park_bh);
+                        break;
+                    }
                     s->prewarm_active = true;
                     s->prewarm_parked = false;
                     s->prewarm_wake_requested = false;
+                    timer_mod(s->prewarm_deadline,
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                              25 * NANOSECONDS_PER_SECOND);
                     fprintf(stderr, "[WAKE] Pre-warming retained-RAM wake "
                             "after OOCSHDWN\n");
                 }
@@ -379,6 +399,23 @@ static int pcf50633_send(I2CSlave *i2c, uint8_t data)
     return 0;
 }
 
+static void pcf50633_prewarm_deadline(void *opaque)
+{
+    Pcf50633State *s = opaque;
+
+    if (!s->prewarm_active || s->prewarm_parked) {
+        return;
+    }
+    /* No type-4 commit arrived: this bootloader does not announce its handoff
+     * (iBoot-159 never writes RESUME_STATUS). Park the pre-warmed boot where
+     * it stands and stop pre-warming for the rest of the session. */
+    s->prewarm_no_park = true;
+    fprintf(stderr, "[WAKE] No type-4 commit within the deadline; this "
+            "firmware cannot be pre-warmed -- parking here and sleeping\n");
+    s->prewarm_parked = true;
+    vm_stop(RUN_STATE_SUSPENDED);
+}
+
 static void pcf50633_prewarm_park(void *opaque)
 {
     Pcf50633State *s = opaque;
@@ -409,6 +446,8 @@ static void pcf50633_init(Object *obj)
     s->int5m = 0xFF;
     s->regs[PMU_OOCSTAT] = PMU_OOCSTAT_ONKEY;
     s->prewarm_park_bh = qemu_bh_new(pcf50633_prewarm_park, s);
+    s->prewarm_deadline = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       pcf50633_prewarm_deadline, s);
 }
 
 static void pcf50633_class_init(ObjectClass *klass, const void *data)

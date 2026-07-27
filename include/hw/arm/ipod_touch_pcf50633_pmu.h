@@ -123,6 +123,19 @@ typedef struct Pcf50633State {
     bool prewarm_active;
     bool prewarm_parked;
     bool prewarm_wake_requested;
+    /* Not every bootloader signals the type-4 commit that the pre-warm parks
+     * on. iBoot-204 writes RESUME_STATUS = 0x40 there; iBoot-159 (iPhone OS
+     * 1.0/1.0.x) never writes RESUME_STATUS at all. Without that signal the
+     * pre-warm boot runs to completion, the device reaches SpringBoard, idles
+     * out again, and the user sees a spontaneous reboot loop with the boot
+     * logo instead of a sleeping phone.
+     *
+     * So: arm a deadline when a pre-warm starts. The commit cancels it (the
+     * iPod and 1.1.x always do, so their behaviour is untouched). If it fires
+     * instead, this firmware cannot be pre-warmed -- park where we are and
+     * remember it, so later sleeps just stop rather than rebooting. */
+    QEMUTimer *prewarm_deadline;
+    bool prewarm_no_park;
     /* Virtual-clock stamp of the last normally-delivered Power/Home press.
      * A press that lands just before OOCSHDWN was meant to wake the device;
      * the sleep commit turns it into an immediate wake. */
