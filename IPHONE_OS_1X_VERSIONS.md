@@ -859,6 +859,72 @@ screen appears, and the OOCSHDWN wake path then restarts the SoC, so a long run
 shows repeated boots. The home screen renders well before that. The sleep path
 itself is N45AP-tuned (see the poweroff-loop VA note) and has not been ported.
 
+### Firmware-17 vs firmware-14: the complete field map
+
+Captured with `IT_ADM_DIFF=3000` on both (kernel-era kicks, so the fields in
+active use), by diffing what the guest writes between engine kicks:
+
+| field | firmware-17 (1.1.x) | firmware-14 (1.0.x) | relative |
+|---|---|---|---|
+| base | `data2+0x1104` | `data2+0x0824` | — |
+| command | `+0x1128` | `+0x0848` | base+0x24 (same) |
+| page count | `+0x112c` | `+0x084c` | base+0x28 (same) |
+| bank | `+0x1148` | `+0x0868` | base+0x44 (same) |
+| **page number** | `+0x1348` | `+0x0c68` | **+0x244 vs +0x444** |
+| DMA target / length | `+0x1b48` / `+0x1b4c` | `+0x1c68` / `+0x1c6c` | **+0xa44 vs +0x1444** |
+
+Four of the six fields sit at identical relative offsets; only the page number
+and the DMA descriptor move. The page number is the one that mattered — the
+model pulls page data through the NAND FIFO rather than honouring the DMA
+target, so that field's offset is not currently used by the emulator at all.
+(Recorded because it *would* matter if the model ever performs the transfer
+itself.)
+
+Bank values confirm the decode: the low byte of the bank word cycles
+`…00 → …01 → …02 → …03` in both.
+
+### The remaining behaviour: 1.0 idle-sleeps, 1.1.4 does not
+
+Measured over an identical 260 s window:
+
+| | boots | `System Sleep` |
+|---|---|---|
+| 1.1.4 (fw-17) | 1 | 0 |
+| 1.0.2 (fw-14) | 2 | 1 |
+
+So it is specific to the 1.0 family, on a ~140 s cycle (`BOOT_TIME` 02:55:24 →
+02:57:44). It is **not** ADM-related — the field map above is complete and the
+storage path is healthy right up to the sleep.
+
+The trigger is visible in the serial log immediately before `System Sleep`:
+
+```
+PM notification timeout (pid 13, CommCenter)
+...
+IOIpodUSBDevice::gated_message cable removed, stopping stack
+System Sleep
+```
+
+The guest starts its USB stack at boot (`cable is connected, starting stack`),
+finds no host to enumerate with — this machine models the OTG device side but
+attaches no host — and eventually concludes the cable was removed. With no
+charger and no user input, the kernel then idle-sleeps, and the OOCSHDWN path
+restarts the SoC, which is why long runs show repeated boots. The home screen
+renders well before that point.
+
+**Tried and did not work:** SpringBoard exposes `SBDisableIdleSleep` and
+`SBDisableAutoDim` (and rejects an `SBAutoLockTime` of 0 — *"Tried to set an
+autolock duration of 0"*). Injecting both as `true` into
+`/var/mobile/Library/Preferences/com.apple.springboard.plist` changed nothing:
+3 boots / 2 sleeps over 400 s. The sleep is initiated below SpringBoard, by the
+kernel's own idle path, so a SpringBoard preference cannot suppress it.
+
+Real fixes, in increasing order of cost: attach a USB host model so enumeration
+succeeds and the cable stays "present"; or port the sleep/wake path to M68AP so
+sleeping is harmless and Power resumes instead of rebooting (note
+`hw/arm/ipod_touch.c`'s poweroff-loop detector keys on an **N45AP kernel VA
+window**, `0xc005a6c0..0xc005a6d8`, which cannot match on M68AP).
+
 ### What the ADM actually is, and why only 1.0 needs new work
 
 The S5L8900's flash controller has a companion **DSP core** — a Samsung "Calm"
