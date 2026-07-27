@@ -363,6 +363,34 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                 //     printf("0x%08x ", buf[i]);
                 // }
                 // printf("\n");
+                /*
+                 * IT_ADM_SEQ=<limit>: every engine kick in order, with the
+                 * fields that identify it.
+                 *
+                 * The model implements no erase, and IT_NAND_CMDS shows the
+                 * guest issuing no erase OPCODE either -- yet its FTL happily
+                 * writes a fresh context over pages that still hold the old
+                 * one, which is only sane if it believes the block was erased.
+                 * If an erase is being issued, it is one of the ADM commands
+                 * this model already accepts, so log them all in order and see
+                 * what surrounds a context write.
+                 */
+                if (getenv("IT_ADM_SEQ")) {
+                    static unsigned n;
+                    unsigned limit = (unsigned)strtoul(getenv("IT_ADM_SEQ"),
+                                                       NULL, 0);
+                    if (limit < 2) {
+                        limit = 100000;
+                    }
+                    if (n++ < limit) {
+                        fprintf(stderr,
+                                "[ADM-SEQ] #%u cmd 0x%x count=%u bank=%u "
+                                "page=%u\n", n, cmd,
+                                adm_read_be16(s, cmdbase + 0x28),
+                                adm_read_u8(s, cmdbase + 0x44),
+                                adm_read_be32(s, cmdbase + page_off));
+                    }
+                }
                 switch(cmd) {
                     case 0x200:
                         // read multiple pages simultaneously from the same bank

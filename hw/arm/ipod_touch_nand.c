@@ -248,9 +248,27 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
         else if (stat(filename, &st) == -1) {
             // page storage does not exist - initialize an empty buffer
             present = false;
-            memset(s->page_buffer, 0, NAND_BYTES_PER_PAGE);
-            memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
-            s->page_spare_buffer[0xA] = 0xFF; // make sure we add the FTL mark to an empty page
+            /*
+             * IT_NAND_ERASED_FF=1: a page with no backing store reads as
+             * ERASED -- 0xFF everywhere -- which is what the silicon does.
+             *
+             * The default below instead hands back zeroes with a hand-placed
+             * 0xFF at spare[0xA], i.e. a page that looks WRITTEN and valid,
+             * carrying logical page 0. Most of a generated NAND has no backing
+             * store, so under that default every unwritten page in the device
+             * answers "yes, I hold valid data". Anything that walks a block
+             * looking for the frontier between written and erased pages --
+             * FTL_Open picking the newest context from the last valid page,
+             * for one -- can never find it.
+             */
+            if (getenv("IT_NAND_ERASED_FF")) {
+                memset(s->page_buffer, 0xFF, NAND_BYTES_PER_PAGE);
+                memset(s->page_spare_buffer, 0xFF, NAND_BYTES_PER_SPARE);
+            } else {
+                memset(s->page_buffer, 0, NAND_BYTES_PER_PAGE);
+                memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
+                s->page_spare_buffer[0xA] = 0xFF; // make sure we add the FTL mark to an empty page
+            }
         }
         else {
             FILE *f = fopen(filename, "rb");

@@ -1209,17 +1209,123 @@ symptom of the same inconsistent media. And it is **not strictly about the
 sleep** — 1.1.4 never slept; it just wrote enough (712 pages) to restructure
 something. The sleep matters on 1.0 only because that is when its FTL commits.
 
-##### Where to pick it up
+##### The mechanism, established
 
-The remaining suspect is the relationship between the generated FTL context
-section and what the guest's FTL does to it at shutdown: the guest appends a new
-context over the generator's mapping pages, never rewrites the CXT index page at
-bank0/25728, and iBoot then reads that area and gives up. Worth testing next:
-whether `dwCxtAge` (`0xffffffe9` = -23 in the guest's new pages, `0` in the
-generator's) is compared signed or unsigned when iBoot picks a context — that
-single question decides whether iBoot is selecting the guest's fresh context or
-the generator's stale one. A NAND generated with a **decrementing** starting age
-would settle it.
+Two more experiments pinned it down.
+
+**It is the data, not the spare.** Hybrid pages, rebuilt one field at a time on
+the three breaking pages:
+
+| bank1-3 of 25728 | boot B |
+|---|---|
+| guest's DATA (zeros) + pristine spare | **wedges**, 0 serial lines |
+| pristine DATA + guest's context spare | **boots**, 2790 lines |
+
+So the context markers, `dwCxtAge`, and the spare type are all irrelevant —
+iBoot needs the **logical→virtual mapping-table content** that used to be at
+those pages. The `dwCxtAge` signed-vs-unsigned question posed above never
+needed answering; it was the wrong question.
+
+**And there is no erase anywhere.** `IT_ADM_SEQ` logs every engine kick in
+order. A whole boot-through-sleep session:
+
+```
+   1 cmd 0x100      6322 cmd 0x300      339 cmd 0x500
+ 850 cmd 0x200         4 cmd 0x400
+```
+
+One `0x100` at start-up, reads, and writes. No erase, through the ADM or the
+register interface. The guest never erases, so "the model swallows an erase"
+is dead in both directions: the model does not implement one, and nothing asks
+for one.
+
+What is left is a **collision**, and it is now understood end to end:
+
+- Sub-block 201 (`FTL_CXT_SECTION_START`, `pages_per_subblock` = 4 × 128 =
+  512 vpns) is laid out `+0` CXT index, `+1..+18` the 18 mapping tables,
+  `+511` the FTL meta.
+- At shutdown the guest's FTL saves a new 23-page context into the **same**
+  sub-block starting at `+1` — straight over the mapping tables.
+- iBoot then reads `+0`, the meta at `+511` (page 25855 bank3 — visible in the
+  page trace), and follows that meta's `adwMapTablePtrs`, which still say
+  `1, 2, 3, …`. Those pages now hold the new context's header, so iBoot reads
+  a header where it expects a mapping table and gives up.
+
+##### False paths in this round — both looked right, both were wrong
+
+**"The generator puts the mapping tables in the wrong place."** Moving all 18
+from `+1..+18` to `+64..+81` and repointing the meta's `adwMapTablePtrs` makes
+the whole cycle pass: boot A through the sleep (396 pages), boot B up in 12 s.
+It is not the fix. The **real iPod NAND has the identical layout** — CXT index
+at bank0/25728 and 18 mapping tables immediately after it — so the placement is
+faithful, and relocating only buys the two or three saves it takes for the
+context to grow into the new location. Recorded because it *works*, which makes
+it exactly the kind of change that gets committed by mistake.
+
+**"The iPod is the ground truth that proves the emulator innocent."** It is
+not. The iPod's VFL context page is byte-identical to the generated one —
+`dwGlobalCxtAge=0`, `aFTLCxtVbn=(0,0,0)`, `wNextCxtPOffset=0`, spare age 1,
+type 0x80. That image is *generated too*, not a device dump. Its persistence
+pass earlier in this session only means its FTL never got as far as a context
+save (its boot A never slept). It carries the same latent bug.
+
+##### What the reference says
+
+[openiBoot's `plat-s5l8900/ftl.c`](https://github.com/iDroid-Project/openiBoot/blob/master/plat-s5l8900/ftl.c)
+is the same FTL on the same SoC, so it is worth more than another guess:
+
+- `FTL_Open` **scans** the control block and takes the context from the **last
+  valid page**, choosing by a *decrementing* sequence number guarded by
+  `usnDec > 0`. That is our `dwCxtAge` — `0xffffffe9` in the guest's pages,
+  `0` in the generator's, and `0` fails the guard.
+- A new context is **appended sequentially** (`++pstFTLCxt->FTLCtrlPage`)
+  **without erasing**; a block is only erased when it fills and rotates.
+
+So the guest writing at `+1..+23` is correct behaviour, and the collision with
+the mapping tables is a property of how the image is laid out, not a misbehaving
+guest and not a missing emulator feature.
+
+##### More false paths — all four measured, all four wrong
+
+| tried | result |
+|---|---|
+| `aFTLCxtVbn[0..2] = 0, 1, 2` so the FTL can rotate between blocks 201/202/203 instead of rewriting one in place | no change; the save still lands at `+1` in block 201 |
+| move the FTL meta off `+511` to `+19`, right after the mapping tables, so a frontier scan can track the guest | **breaks boot A entirely** — 0 writes, never comes up |
+| blank **only** `+511`, changing nothing else (the control for the above) | **also breaks boot A** — so the meta at the block's last page is load-bearing and read from a FIXED location, not found by scanning |
+| make a page with no backing store read as **erased** (`0xFF` data and spare) instead of zeroes-with-a-hand-placed-marker | boot A fine — no regression — but boot B still wedges |
+
+The last one is worth keeping anyway, as `IT_NAND_ERASED_FF=1`, off by default.
+It is a genuine fidelity gap: by default an unwritten page answers "I hold valid
+data, logical page 0", so *nothing* that walks a block for the boundary between
+written and erased pages can ever find it. It is simply not what breaks this.
+
+##### Where it actually stands
+
+Everything now points at one contradiction, and it is a contradiction in the
+**image**, not the emulator:
+
+- the meta at `+511` is required to boot and is read from a fixed location;
+- its `adwMapTablePtrs` point at `+1..+18`;
+- nothing ever rewrites `+511`;
+- the guest's FTL correctly appends its context at `+1..+23`, over those tables.
+
+So the first context save always destroys the mapping tables the only meta
+anyone reads still points at. The one configuration that survives a full cycle
+is moving the tables clear of the append zone (`+64`, verified) — and that only
+postpones it by the two or three saves it takes for the context to grow that
+far.
+
+Ranked next steps, cheapest first:
+
+1. **Read the real `FTL_Open` / `FTL_Commit`**, not a summary of it — where a
+   freshly formatted device puts its meta, and whether `+511` is genuinely
+   fixed or is just where a *full* control block's newest context ends up. That
+   single answer decides whether the generator should place the meta low and
+   let it migrate, or whether iBoot-159 differs from openiBoot here.
+2. **Disassemble iBoot-159's FTL open path** for the fixed offset it reads.
+   Heavier, but definitive, and the binary is in the tree.
+3. Only then change `build-m68ap-nand.py`, and regenerate every build's NAND —
+   which also needs 1.0.2 and 1.1.1 artifacts, absent from this tree.
 
 Two traces stay in the tree for this: `IT_ADM_UNK=1` (descriptor dump for any
 unimplemented command) and `IT_NAND_WRITE=1` (every committed page with its
