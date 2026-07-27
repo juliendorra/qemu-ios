@@ -654,6 +654,37 @@ would mask the real layout. Firmware-14's descriptor format needs to be read
 properly — most cheaply from the uploaded blob itself, which the guest hands us
 at `ADM_CODE_SEC_ADDR`.
 
+## Open issues on the iPhone side (2026-07-27)
+
+All four 1.x builds reach the home screen. What is still wrong, in priority
+order, with the evidence needed to resume each:
+
+1. **1.0 cannot be woken from its park.** It now sleeps instead of reboot-
+   looping (`88e73d8cec`), but Power/Home produces no serial growth and no
+   `[WAKE]` line. Proven not to be key delivery: the identical QMP press wakes
+   the iPod's park (`Home completed pre-warmed wake`, 8.5 KB of serial).
+   `prewarm_active` and `prewarm_parked` are both set. Suspect an earlier
+   `return` in `ipod_touch_key_event()`. **Do not sample the framebuffer with
+   QMP stop/cont while parked — `cont` un-parks the device and invalidates the
+   test.**
+2. **No Apple logo during boot, on every iPhone version** (the iPod shows it
+   throughout). Hypothesis, unconfirmed: iBoot enumerates only `dtre` from our
+   synthetic NOR where the iPod enumerates seven including `logo`. The NOR does
+   contain all seven — verified by walking it — so the suspect is the image
+   store *layout* after the first entry, not the content. First measurement:
+   count `image 0x…` lines on a 1.1.4 boot.
+3. **ADM commands `0x400` and `0x100` unimplemented.** `0x400` is issued
+   immediately before *every* sleep (13× per 300 s run); `0x100` once per boot,
+   and 1.1.x issues it too, apparently harmlessly. The field map for both
+   firmware layouts is already derived — see the table above.
+4. **Installed 1.1.4/1.1.1 bundles predate this session's fixes** — notably the
+   PMU bus, which is what makes them show the big charging battery. Repackaging
+   picks that up, and they will then idle-sleep like real devices (correct);
+   iBoot-204 parks properly so their wake should stay fast.
+
+Not an issue, recorded to stop it being re-investigated: the black screendump
+with a non-black framebuffer is the known panel-auto-sleep artefact.
+
 ## Dead ends, false paths and wrong turns (2026-07-26)
 
 The process, not just the findings — so the next attempt does not repeat them.
