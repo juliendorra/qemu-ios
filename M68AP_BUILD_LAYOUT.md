@@ -112,7 +112,7 @@ build, so a tree cannot be moved under the wrong firmware.
 | Build | root.img | NAND + pack | Home screen verified |
 | --- | --- | --- | --- |
 | 1A543a (1.0) | yes | **yes, 215.6 MiB pack, 106,858 pages** | **yes — 59.04% non-black, 2026-07-27** |
-| 1C28 (1.0.2) | no | no | booted natively during bring-up, not packaged |
+| 1C28 (1.0.2) | **yes** (decrypted 2026-07-27) | no | booted natively during bring-up, not packaged |
 | 3A109a (1.1.1) | no | no | booted natively during bring-up, not packaged |
 | 4A102 (1.1.4) | yes | yes, 300.3 MiB pack, 148,812 pages | yes — 73.95% non-black |
 
@@ -124,6 +124,11 @@ Notes:
 - **1.0's ambient light sensor is a TSL2561**, where the machine models an
   ISL29003. It reaches the home screen anyway; whether anything depends on the
   sensor beyond a probe failure is untested.
+- **1.0.2's root filesystem is staged and verified** (`ProductBuildVersion
+  1C28`, `ProductVersion 1.0.2`, kernelcache dated Aug 2007). Its
+  `LK_ENABLE_MBX2D` knob and `com.apple.SpringBoard.plist` are where the recipe
+  expects them, so `build-m68ap-homescreen-nand.py --build 1C28` should run;
+  note SpringBoard itself lives in `/System/Library/CoreServices/` on 1.0.x.
 - HFS images are not bit-reproducible: `hdiutil` records timestamps, so two runs
   of the same recipe produce different `hfs_sha256` values. Reproducibility is
   at the level of *the recipe*, not of the bytes.

@@ -169,8 +169,8 @@ switching versions cheaply enough that comparing them is the point.
 
 ## W8 — Package the remaining versions
 
-1.0.2 and 1.1.1 both boot natively but have no staged `root.img`, so each needs
-its IPSW decrypted first. The per-build constants (root DMG name, VFDecrypt key,
+1.0.2 and 1.1.1 both boot natively but are not packaged. **1.0.2's `root.img`
+is now staged**; 1.1.1 still needs its IPSW decrypted. The per-build constants (root DMG name, VFDecrypt key,
 epoch, FIL signature) are already in `scripts/firmware_profiles.py`.
 
 ```sh
@@ -192,11 +192,11 @@ python3 scripts/fb-snapshot.py --board m68ap --build 1C28 \
 **Disk:** step 2 needs roughly 700 MiB of scratch (the encrypted DMG, the UDIF
 output, the raw conversion, and the final image). Step 4 needs ~1.2 GiB.
 
-**Unverified:** `decrypt-m68ap-rootfs.sh --build` was reworked on 2026-07-27 and
-its resolution path is tested for all four builds (`--dry-run`), but no
-end-to-end decrypt has been run since the change — the host disk was full. The
-decrypt/convert/slice pipeline itself was not modified. Running step 2 for 1C28
-is both the next packaging task and the test.
+**Step 2 is done for 1C28** (2026-07-27) and the reworked script is verified
+end to end: it picked 1.0.2's own key from the profile, extracted
+`694-5298-5.dmg` from the IPSW itself, and produced a 193,699,840-byte HFS+
+volume that mounts and reports `ProductVersion 1.0.2 / 1C28`. So 1.0.2 now needs
+only steps 3–5.
 
 ---
 
