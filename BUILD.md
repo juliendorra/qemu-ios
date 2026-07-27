@@ -437,6 +437,32 @@ IPOD_QEMU=/path/to/build/qemu-system-arm python3 scripts/ipod-acceptance-test.py
 
 ---
 
+## Part 3b — A bundle for a DIFFERENT iPhone OS version
+
+`package-iphone-app.sh` can build a bundle from scratch and pin it to any 1.x
+firmware. Two things vary per version and both must be passed: the iBoot build
+(1.0/1.0.x ship iBoot-159, 1.1.x iBoot-204) and the **security epoch** — M68AP
+defaults to 1.1.4's epoch 3, and booting 1.0's epoch-0 images under it wedges in
+iBoot with an *empty* serial log, which looks exactly like a hang.
+
+```bash
+scripts/package-iphone-app.sh --create \
+    --app "/Applications/iPhone 2G (iOS 1.0).app" \
+    --name "iPhone 2G (iOS 1.0)" \
+    --nand  m68ap-artifacts/stage-1.0/nand \
+    --iboot m68ap-artifacts/stage-1.0/iboot_159_m68ap_sbpatch.bin \
+    --nor   m68ap-artifacts/stage-1.0/nor_m68ap.bin \
+    --epoch 0
+```
+
+`--create` builds the skeleton from `packaging/iphone-2g/Info.plist.in` (plus
+`--bundle-id` and an optional `--icon`), so no existing bundle is needed. The
+epoch is written to `Contents/Resources/iphone_files/epoch` and the launcher
+appends `,epoch=N` to the machine options when that file is present.
+
+Pass `--stage DIR` to take the iBoot/NOR defaults from a different staging
+directory instead of naming them individually.
+
 ## Part 3 — Building the iPhone 2G (M68AP) app bundle
 
 The same engine/launcher serve both boards; the bundle differs only in its

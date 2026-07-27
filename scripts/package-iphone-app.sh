@@ -4,6 +4,8 @@
 #
 #   scripts/package-iphone-app.sh [--app PATH] [--qemu PATH] [--build]
 #                                 [--nand PATH] [--keep-nand] [--verify-only]
+#                                 [--create [--name N] [--bundle-id ID] [--icon F]]
+#                                 [--stage DIR] [--iboot F] [--nor F] [--epoch N]
 #
 # Steps: (optionally build) -> install engine + launcher + bundled dylibs ->
 # GENERATE the home-screen NAND from the staged artifacts -> install the M68AP
@@ -36,6 +38,13 @@ QEMU="$REPO/build-ipod11/qemu-system-arm"
 STAGE="$REPO/m68ap-artifacts/stage"
 APPDBG="$REPO/m68ap-artifacts/appdbg"
 NAND_SRC=""
+IBOOT_SRC=""
+NOR_SRC=""
+EPOCH=""
+DO_CREATE=0
+BUNDLE_NAME=""
+BUNDLE_ID=""
+ICON_SRC=""
 KEEP_NAND=0
 DO_BUILD=0
 VERIFY_ONLY=0
@@ -45,6 +54,14 @@ while [[ $# -gt 0 ]]; do
         --app) APP="$2"; shift 2 ;;
         --qemu) QEMU="$2"; shift 2 ;;
         --nand) NAND_SRC="$2"; shift 2 ;;
+        --stage) STAGE="$2"; shift 2 ;;
+        --iboot) IBOOT_SRC="$2"; shift 2 ;;
+        --nor) NOR_SRC="$2"; shift 2 ;;
+        --epoch) EPOCH="$2"; shift 2 ;;
+        --create) DO_CREATE=1; shift ;;
+        --name) BUNDLE_NAME="$2"; shift 2 ;;
+        --bundle-id) BUNDLE_ID="$2"; shift 2 ;;
+        --icon) ICON_SRC="$2"; shift 2 ;;
         --keep-nand) KEEP_NAND=1; shift ;;
         --build) DO_BUILD=1; shift ;;
         --verify-only) VERIFY_ONLY=1; shift ;;
@@ -60,6 +77,29 @@ if [[ $VERIFY_ONLY -eq 0 ]]; then
     if [[ $DO_BUILD -eq 1 ]]; then
         say "building the engine"
         ninja -C "$REPO/build-ipod11" qemu-system-arm
+    fi
+    if [[ $DO_CREATE -eq 1 && ! -d "$APP" ]]; then
+        # Build the skeleton from the committed template instead of requiring
+        # an existing bundle to clone. Everything else in a .app is built
+        # (engine, dylibs, signature) or Apple-derived (firmware), so the
+        # template plus the launcher IS the whole non-derivable part.
+        say "creating bundle skeleton at $APP"
+        # install-ipod-app-engine.sh validates the bundle by the presence of
+        # Contents/Frameworks and Contents/Info.plist, so create both.
+        # install-ipod-app-engine.sh validates the bundle by Contents/
+        # Frameworks + Info.plist, and refuses to run without a firmware NAND
+        # directory, so create the placeholders it wants. The real firmware is
+        # installed by the step after it.
+        mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" \
+                 "$APP/Contents/Frameworks" \
+                 "$APP/Contents/Resources/iphone_files/nand"
+        name="${BUNDLE_NAME:-$(basename "$APP" .app)}"
+        sed -e "s|@NAME@|$name|g" \
+            -e "s|@BUNDLE_ID@|${BUNDLE_ID:-com.qemu.iphone-2g}|g" \
+            "$REPO/packaging/iphone-2g/Info.plist.in" > "$APP/Contents/Info.plist"
+        if [[ -n "$ICON_SRC" && -f "$ICON_SRC" ]]; then
+            cp "$ICON_SRC" "$APP/Contents/Resources/AppIcon.icns"
+        fi
     fi
     [[ -x "$QEMU" ]] || { echo "no engine at $QEMU (pass --build)" >&2; exit 1; }
     [[ -d "$APP" ]] || { echo "no app bundle at $APP (see BUILD.md Part 3)" >&2; exit 1; }
@@ -96,9 +136,19 @@ if [[ $VERIFY_ONLY -eq 0 ]]; then
     mkdir -p "$FW"
     # The launcher loads the iBoot under its plain name; it MUST be the
     # secure-boot-patched build or the kernel never starts.
-    cp "$STAGE/iboot_204_m68ap_sbpatch.bin" "$FW/iboot_204_m68ap.bin"
+    # --iboot/--nor/--epoch let one recipe ship a DIFFERENT firmware version.
+    # The launcher loads the iBoot under its plain name whatever its build, so
+    # a 1.0 bundle carries iBoot-159 here; --epoch is what stops it wedging
+    # (M68AP defaults to 1.1.4's epoch 3, and 1.0's images are epoch 0).
+    cp "${IBOOT_SRC:-$STAGE/iboot_204_m68ap_sbpatch.bin}" "$FW/iboot_204_m68ap.bin"
     cp "$APPDBG/bootrom_s5l8900"            "$FW/bootrom_s5l8900"
-    cp "$STAGE/nor_m68ap.bin"               "$FW/nor_m68ap.bin"
+    cp "${NOR_SRC:-$STAGE/nor_m68ap.bin}"   "$FW/nor_m68ap.bin"
+    if [[ -n "$EPOCH" ]]; then
+        printf '%s\n' "$EPOCH" > "$FW/epoch"
+        say "security epoch pinned to $EPOCH"
+    else
+        rm -f "$FW/epoch"
+    fi
     rm -rf "$FW/nand.new"
     mkdir -p "$FW/nand.new"
     cp "$NAND_SRC/nand.pack" "$FW/nand.new/nand.pack"
@@ -129,8 +179,13 @@ check "no Homebrew load paths (found $homebrew_deps)" "$([[ "$homebrew_deps" == 
 check "engine supports -M iPhone-2G" \
       "$("$APP/Contents/MacOS/qemu-system-arm" -M help 2>/dev/null | grep -i iPhone-2G || true)"
 check "firmware: bootrom" "$([[ -f "$FW/bootrom_s5l8900" ]] && echo y)"
+# Verify the PROPERTY (is it patched?), not identity with one staged file:
+# a versioned bundle may legitimately carry a different build -- a 1.0 bundle
+# ships iBoot-159, whose patch site is 0x5350, not 204's 0x5990. The patch tool
+# locates it by pattern in any 1.x image.
 check "firmware: iBoot (secure-boot-patched)" \
-      "$(cmp -s "$FW/iboot_204_m68ap.bin" "$STAGE/iboot_204_m68ap_sbpatch.bin" && echo y)"
+      "$(python3 "$SCRIPT_DIR/patch-m68ap-iboot.py" --verify \
+             "$FW/iboot_204_m68ap.bin" 2>/dev/null | grep -c ': patched')"
 check "firmware: NOR" "$([[ -f "$FW/nor_m68ap.bin" ]] && echo y)"
 check "firmware: NAND pack" "$([[ -f "$FW/nand/nand.pack" ]] && echo y)"
 check "firmware: writable bank dirs" "$([[ -d "$FW/nand/bank3" ]] && echo y)"

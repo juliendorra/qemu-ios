@@ -196,8 +196,22 @@ if [[ "$DEBUG" == "1" ]]; then
     QEMU_DIAGNOSTICS=(-serial mon:stdio -d unimp)
 fi
 
+# Optional per-bundle SYSIC security epoch. The M68AP default (3) is 1.1.4's;
+# iPhone OS 1.1.1 images carry epoch 2 and 1.0/1.0.x carry 0, and booting a
+# firmware under the wrong epoch wedges in iBoot with an EMPTY serial log --
+# which looks exactly like a hang. A bundle that ships such a firmware drops the
+# number in <firmware dir>/epoch and the launcher passes it through.
+MACHINE_OPTS="$MACHINE,bootrom=$BOOTROM,iboot=$IBOOT,nand=$NAND"
+EPOCH_FILE="$FIRMWARE_DIR/epoch"
+if [[ -z "${EPOCH:-}" && -r "$EPOCH_FILE" ]]; then
+    EPOCH="$(tr -cd '0-9' < "$EPOCH_FILE")"
+fi
+if [[ -n "${EPOCH:-}" ]]; then
+    MACHINE_OPTS="$MACHINE_OPTS,epoch=$EPOCH"
+fi
+
 "$DIR/MacOS/qemu-system-arm" \
-    -M "$MACHINE,bootrom=$BOOTROM,iboot=$IBOOT,nand=$NAND" \
+    -M "$MACHINE_OPTS" \
     -m 1G \
     -pflash "$NOR" \
     -L "$RESOURCES/pc-bios" \
