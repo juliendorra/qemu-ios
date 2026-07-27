@@ -93,10 +93,22 @@ prepared offline here and self-hosted. iPod touch (N45AP) comes after.
   1.0-first plan is therefore feasible; earlier notes saying 1.0 was blocked on
   the ADM are out of date.
 
-**The packaging gap for a 1.0-first release:**
-`scripts/build-m68ap-homescreen-nand.py` hardcodes `--ipsw-build 4A102`, while
-`build-m68ap-nand.py` and `firmware_profiles.py` already carry the version axis.
-Wiring that through is the prerequisite for producing a 1.0 asset set.
+**The packaging gap for a 1.0-first release is closed** (2026-07-27). Every
+build now uses one layout and an explicit `--build` — see
+[`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md). The **iPhone OS 1.0 pack
+exists and boots to the home screen**:
+
+| | 1.0 (`1A543a`) | 1.1.4 (`4A102`) |
+| --- | --- | --- |
+| pack | **215.6 MiB, 106,858 pages** | 300.3 MiB, 148,812 pages |
+| brotli, whole pack | **63.8 MiB (29.6%)** | 94.2 MiB (31.4%) |
+| cold boot touches | **20,397 pages = 19.1%** | 25,030 pages = 16.8% |
+| **first boot, chunked (62 pages) + brotli** | **18.6 MiB** | 20.9 MiB |
+| home screen verified | 59.04% non-black | 73.95% non-black |
+
+1.0 is both the first target and the **cheapest**: 18.6 MiB to first boot
+against a 215.6 MiB raw pack — a 12× reduction, and a third of what a
+compressed whole-pack download would cost.
 
 **Measurements still owed:** the cold-boot working set for 1.0, 1.0.2 and 1.1.1
 (1.1.4 is done), and how much chunk content the four versions share

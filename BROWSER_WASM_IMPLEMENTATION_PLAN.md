@@ -1160,21 +1160,18 @@ baseline to compare browser runs against.
 Exit condition: browser SpringBoard is interactive and performance direction is
 known.
 
-### Phase 2.5: Package iPhone OS 1.0 (1-2 weeks)
+### Phase 2.5: Package the versions — 1.0 done
 
-The first shipped version is 1.0 (`1A543a`), not 1.1.4. It boots natively, but
-the *packaging* path is still pinned to 1.1.4:
-`scripts/build-m68ap-homescreen-nand.py` hardcodes `--ipsw-build 4A102`, while
-`scripts/build-m68ap-nand.py` and `scripts/firmware_profiles.py` already carry
-the version axis.
+- ~~Wire the version axis through the home-screen recipe.~~ Done 2026-07-27:
+  one layout (`m68ap-artifacts/builds/<BUILD>/`), one explicit `--build`, no
+  default firmware. See [`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md).
+- ~~Produce and verify a 1.0 asset set end to end.~~ Done: 215.6 MiB pack,
+  106,858 pages, signature `000C` and `epoch=0` from the profile, booting to a
+  verified home screen (59.04% non-black).
+- Repeat for 1.0.2 and 1.1.1: both booted natively during bring-up but neither
+  has a staged `root.img` yet, so each needs its IPSW decrypted first.
 
-- Wire `--ipsw-build` through the home-screen recipe so each version is one
-  command from IPSW to pack.
-- Produce and verify a 1.0 asset set end to end; confirm `epoch=0` and the
-  `000C` FIL signature come from the profile, not from a default.
-- Repeat for 1.0.2, 1.1.1, 1.1.4 and record each set's provenance.
-
-Exit condition: four asset sets build reproducibly from one command each.
+Exit condition: four asset sets build from one command each.
 
 ### Phase 3: NAND delivery and persistence (2-3 weeks)
 
