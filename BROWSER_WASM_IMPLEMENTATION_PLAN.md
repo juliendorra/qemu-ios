@@ -10,30 +10,67 @@
 > sections below have been rewritten accordingly. Live, dated state lives in
 > [`BROWSER_WASM_STATUS.md`](BROWSER_WASM_STATUS.md); this file is the design of
 > record.
+>
+> **Revised 2026-07-27.** Delivery is decided: prepared assets, self-hosted, no
+> source-loaded first run. The product is a **version picker** — iPhone OS 1.0,
+> 1.0.2, 1.1.1 and 1.1.4 side by side — with **1.0 first**. Asset delivery is
+> redesigned around chunking and compression following
+> [Infinite Mac](https://infinitemac.org)'s measured approach.
 
 ## Status and decision
 
 This document is the implementation plan for running the existing S5L8900
 emulator entirely in a web browser.
 
-**Primary target: iPhone 2G (M68AP) running iPhone OS 1.1.4.** That software
-stack reaches the home screen on the native emulator and is the build the
-browser port must reproduce. The iPod touch (N45AP) remains a supported asset
-set — the machine, the tooling, and the frontend are board-agnostic and select a
-board from the asset manifest — but it is no longer the thing being aimed at
-first.
+**Primary target: iPhone 2G (M68AP).** The product is a **version picker**: the
+visitor chooses an iPhone OS release, boots it, and can compare releases against
+each other. All four 1.x builds reach the SpringBoard home screen on the native
+emulator as of 2026-07-26 (`IPHONE_OS_1X_VERSIONS.md`):
 
-The project will produce two deployment flavors from one codebase:
+| Build | Version | iBoot | Epoch | FIL signature | Native status |
+| --- | --- | --- | --- | --- | --- |
+| `1A543a` | **1.0** | 159 | 0 | `000C` | home screen — **first browser target** |
+| `1C28` | 1.0.2 | 159 | 0 | `000C` | home screen |
+| `3A109a` | 1.1.1 | 204 | 2 | `200C` | home screen |
+| `4A102` | 1.1.4 | 204 | 3 | `300C` | home screen; the most exercised build |
 
-1. **Classroom**: firmware and a prepacked NAND image are served with the web
-   application. This is the primary, fastest path for supervised private use.
-2. **Source-loaded**: the application downloads the original firmware/NAND
-   artifacts automatically from configured source URLs, verifies them, converts
-   them locally when necessary, and caches the prepared result in the browser.
+**1.0 ships first.** It is the museum-accurate target, its bootloader
+generation (iBoot-159, plaintext 8900 containers, epoch 0) is shared with 1.0.2,
+and its kernel has *no* TVOut swap device — the single hardest fix in the 1.1.4
+bring-up has nothing to hook in 1.0. Ordering after that follows bootloader
+generation: 1.0 → 1.0.2 (same iBoot), then 1.1.1 → 1.1.4 (iBoot-204).
 
-Both flavors execute QEMU and the guest locally. There is no remote emulator and
-no server-side VM. A server is needed only to serve static files with the HTTP
-headers required for threaded WebAssembly.
+**iPod touch 1G (N45AP) is secondary** — worth having, scheduled after the
+iPhone versions ship. The machine, tooling, and frontend stay board-agnostic and
+read the board from the asset manifest, so N45AP costs a staging run, not a code
+change.
+
+### Delivery: prepared assets, self-hosted
+
+Decided 2026-07-27. Every version is **prepared offline by this repository's
+existing pipeline and served from our own origin** as compressed chunks. The
+"source-loaded" flavor described later in this document — download the original
+artifacts and convert them in the browser on first run — is **not being built**.
+Two reasons:
+
+- The M68AP NAND is *constructed* from a retail IPSW (decrypted root filesystem,
+  synthesized Whimory/FTL structures, activation patch, LayerKit setting,
+  reference data ark). There is nothing at any URL to download and verify.
+  Porting that pipeline to JavaScript would be a project larger than the browser
+  port itself.
+- Preparing offline is also what lets the assets be *optimized*: deterministic
+  packing, chunking, and compression happen once at build time instead of on
+  every visitor's machine.
+
+Hosting is our own static origin to start. IPFS or another distribution layer is
+an option later; nothing in the design depends on the origin beyond HTTP range
+support and the isolation headers. [infinitemac.org](https://infinitemac.org) is
+the model for this product shape, and a plausible future host — offering them the
+emulator is an option once it is good, not a dependency.
+
+QEMU and the guest execute locally in the visitor's browser. There is no remote
+emulator and no server-side VM. The server only serves static files with the
+HTTP headers threaded WebAssembly requires.
 
 The browser port must be based on a modern QEMU tree with Emscripten host
 support. **This has happened.** The tree is QEMU 11.0.2 (`QEMU_11_PORT.md`), the
@@ -146,36 +183,84 @@ Browser storage
 The main UI thread must remain responsive. QEMU, asset conversion, decompression,
 hashing, and NAND preparation run in workers.
 
-## One application, two deployment flavors
+## One application, one delivery model
 
-The two flavors are selected by a build-time deployment manifest. Runtime code
-must not contain classroom-only branches beyond interpreting that manifest.
+Everything is prepared offline and served from our origin. There is no
+first-run conversion, no file picker, and no build-time flavor switch: the app
+reads a **catalog** of available versions and boots the one the visitor picks.
 
-### Classroom flavor
+The "source-loaded flavor" documented below is **retained as design history and
+as the path N45AP could take**, since the iPod artifacts do exist as published
+files. It is not being built for the iPhone versions. Read that subsection as an
+option, not as scope.
 
-The classroom output contains all required prepared assets on the same origin:
+### Prepared deployment (what ships)
+
+The output contains all prepared assets on the same origin:
 
 ```text
-dist/classroom/
+dist/
   index.html
   manifest.webmanifest
-  service-worker.js
+  service-worker.js              # intercepts chunk requests
+  catalog.json                   # the versions on offer
   emulator/
-    qemu-system-arm.js        # Emscripten ES module loader
+    qemu-system-arm.js           # Emscripten ES module loader
     qemu-system-arm.wasm
   assets/
-    m68ap-114-v1/
+    m68ap-10-v1/                 # iPhone OS 1.0, build 1A543a — ships first
       asset-manifest.json
       bootrom_s5l8900
       iboot.bin
       nor.bin
-      nand.pack
+      nand/
+        index.bin                # page index + chunk map
+        chunks/<hash>.br         # Brotli-compressed, content-addressed
+    m68ap-102-v1/                # 1.0.2
+    m68ap-111-v1/                # 1.1.1
+    m68ap-114-v1/                # 1.1.4
+    n45ap-…                      # iPod touch, later
 ```
 
 Artifact names inside an asset set are normalized (`iboot.bin`, `nor.bin`)
-rather than board-specific, because the manifest already names the board; this
-keeps the frontend from having to know per-board filenames. The set directory
-and layout are produced by `scripts/wasm/stage-assets.py`.
+rather than board- or build-specific, because the manifest already names both;
+this keeps the frontend from having to know per-board filenames. The set
+directory and layout are produced by `scripts/wasm/stage-assets.py`.
+
+Chunks are content-addressed and therefore shareable **across versions**: an
+identical chunk in 1.0 and 1.0.2 is stored and downloaded once. The measured
+duplicate rate within a single pack is only ~6%, so treat cross-version sharing
+as a bonus to measure, not a saving to promise.
+
+### Version catalog
+
+`catalog.json` is what the picker renders, and the only file the app fetches
+before the visitor chooses:
+
+```json
+{
+  "schemaVersion": 1,
+  "default": "m68ap-10-v1",
+  "versions": [
+    {
+      "id": "m68ap-10-v1",
+      "device": "iPhone 2G",
+      "os": "1.0",
+      "build": "1A543a",
+      "released": "2007-06-29",
+      "manifest": "./assets/m68ap-10-v1/asset-manifest.json",
+      "downloadSize": 0,
+      "notes": "The original release. No TV-out, TSL2561 light sensor."
+    }
+  ]
+}
+```
+
+`downloadSize` is the compressed prefetch working set, not the full pack, so the
+picker can tell the truth about what choosing a version costs. Each version is
+an independent cache namespace keyed by its digests: switching versions never
+invalidates another version's cache, and a re-prepared asset set never collides
+with the old one.
 
 The firmware is **bundled with the deployment**, but it is not linked into
 `emulator.wasm` or encoded into JavaScript. Separate files provide:
@@ -440,21 +525,82 @@ Two known deviations from the original proposal, both deliberate:
 
 Golden test vectors for the pack are still owed.
 
-The initial implementation should favor a simple uncompressed, memory-mappable
-or Blob-backed pack. Compression and HTTP range loading add complexity to a
-synchronous MMIO path and should be introduced only after measuring the MVP.
+## Chunked, compressed asset delivery
 
-Three loading strategies must be benchmarked:
+A whole-pack download is not the shipping design. With four versions on offer,
+naive delivery is 4 × 315 MiB before anyone has picked one, and a visitor who
+wants to compare 1.0 against 1.1.4 pays twice.
 
-1. Mount the downloaded pack as a read-only worker Blob without copying it into
-   the Wasm heap.
-2. Store large pack chunks in browser storage and maintain a bounded page/chunk
-   cache in the worker.
-3. Load the complete logical pack into Wasm memory.
+### What the pack actually looks like (measured 2026-07-27)
 
-Strategy 3 is the simplest but has the highest memory cost. The chosen release
-strategy must work on representative student hardware without relying on the
-maximum theoretical WebAssembly memory size.
+The shipping M68AP 1.1.4 pack:
+
+| | |
+| --- | --- |
+| total size | 314.9 MB |
+| pages present | 148,812 |
+| index / payload split | 0.6 MB / 314.3 MB |
+| zlib -9 over sampled 256 KiB chunks | **36.6%** → ~115 MB |
+| lzma over the same chunks | **31.2%** → ~98 MB |
+| all-one-byte chunks | 0 of 120 sampled |
+| duplicate chunks | 7 of 120 sampled |
+
+So compression is worth roughly a **3× reduction** — a version drops from
+~315 MB to ~100 MB — and Brotli should land near the lzma figure. Whole-chunk
+deduplication is real but minor (~6%): the pack already omits absent pages, so
+the trivially-blank regions a raw disk image would contain are simply not in it.
+Do not expect Infinite Mac's content-addressing to pay off the same way here; its
+value for us is cache identity, not size.
+
+### Design, following Infinite Mac
+
+[Infinite Mac](https://infinitemac.org) solved this problem for classic Mac disk
+images and its approach transfers almost unchanged. Its measured result — boot
+screen in one second, fully booted in three, with a cold HTTP cache — is the bar.
+
+- **Fixed-size content-addressed chunks.** Infinite Mac uses 256 KiB. Our page
+  stride is 2,112 bytes, which does not divide evenly into any power of two, so
+  a chunk is defined as a **fixed page count** (124 pages = 261,888 B ≈ 256 KiB)
+  rather than a fixed byte count. A page then maps to a chunk by index
+  arithmetic alone, with no lookup table.
+- **Each chunk compressed individually.** This is the specific reason to chunk
+  manually instead of using HTTP range requests: range requests and
+  `Content-Encoding` interact badly in practice, whereas a pre-compressed chunk
+  is a plain immutable object. Brotli at maximum quality, computed once at
+  build time.
+- **Lazy loading with a service worker.** The emulator worker's NAND read path
+  stays synchronous; the service worker intercepts the request and serves the
+  chunk from cache or network. This is what keeps QEMU's synchronous MMIO path
+  intact without threading async through the device model.
+- **Prefetch the boot working set.** The chunks touched during a cold boot are
+  known — they can be recorded from a native run — and shipped as an ordered
+  prefetch list in the manifest, so startup is not serialized on demand-faults.
+- **Only touched chunks occupy memory.** Infinite Mac's move from whole-image
+  buffering to per-chunk residency dropped its out-of-memory rate from 6.5% to
+  0.3%. Ours is the same shape of problem: a 315 MB pack that a boot only
+  partially reads.
+
+The decisive unknown is **how much of the pack a cold boot actually touches**.
+Measure it natively before building any of this: instrument the pack read path,
+boot each version to the home screen, and record the distinct chunk set. That
+number determines whether first boot moves ~100 MB or ~15 MB, and it is cheap to
+obtain.
+
+### What this requires from the device model
+
+`hw/arm/ipod_touch_nand.c` currently maps the pack with `g_mapped_file` and
+indexes straight into it. Chunked delivery needs a **seam**: a page-read
+function that can resolve a page from a chunk cache instead of from a mapped
+range. Native builds keep the mapped-file implementation; the browser build
+supplies a chunk-backed one. This is a small, well-scoped change and should land
+with tests before any frontend work depends on it.
+
+### Fallback
+
+If chunking proves troublesome, a single Brotli-compressed pack served with
+`Content-Encoding: br` still gets the ~3× size reduction, at the cost of
+downloading a whole version before it boots. That is the safety net, not the
+target.
 
 ### Copy-on-write overlay
 
@@ -524,11 +670,44 @@ wasm target, and the emscripten host path routes through TCI. So TCI is not a
 "correctness fallback" here; it is the only thing this base can do, and the
 first measurement.
 
-If TCI cannot reach an acceptable time to a usable SpringBoard, the hybrid
-WebAssembly TCG/JIT from the out-of-tree [qemu-wasm](https://github.com/ktock/qemu-wasm)
-tree becomes a **requirement**, and carrying that patch set on 11.0.2 becomes a
-scoped project of its own. Measure before deciding; do not adopt the patch set
-speculatively.
+### What "the JIT" actually is
+
+The JIT is [qemu-wasm](https://github.com/ktock/qemu-wasm), Kohei Tokunaga's
+QEMU fork, and specifically its WebAssembly **TCG backend**. Its design:
+
+- Each translation block is compiled into **one WebAssembly module**; a TCG IR
+  instruction becomes the corresponding Wasm instruction(s). Generated modules
+  are instantiated and run through the browser's own `WebAssembly.Module` /
+  `WebAssembly.Instance` APIs — the browser's Wasm engine is the JIT's backend.
+- It is **hybrid, not pure JIT**. A forked TCI interprets every block by
+  default, and only blocks executed many times (the threshold cited is ~1000)
+  are compiled to Wasm. Two reasons: compilation is expensive, and browsers cap
+  how many Wasm instances a page may hold. The code generator emits Wasm *and*
+  TCI instructions from the same IR.
+
+**Upstreaming is half-done, and we have the half that landed.** The Emscripten
+host support plus TCI for 32-bit guests merged in QEMU 10.1 (August 2025), which
+is why 11.0.2 builds for the browser at all. The Wasm backend itself is still
+out of tree: the v1 series (`tcg/wasm32`, May 2025) was followed by a v2 series
+rebased on wasm64 (August 2025), and **QEMU master still has no `tcg/wasm*`
+directory** — checked 2026-07-27. So the split is exactly:
+
+| | in our 11.0.2 | out of tree |
+| --- | --- | --- |
+| Emscripten host, `--cpu=wasm64` | yes | — |
+| TCI for 32-bit guests (our ARM1176) | yes | — |
+| Wasm TCG backend (the JIT) | **no** | qemu-wasm |
+
+Two things work in our favour if we do adopt it: our guest is 32-bit ARM, the
+case that was upstreamed first and is best exercised, and the v2 backend series
+is built on wasm64, which is already how we configure.
+
+If TCI cannot reach an acceptable time to a usable SpringBoard, adopting that
+patch set becomes a **requirement**, and carrying an out-of-tree TCG backend on
+11.0.2 becomes a scoped project of its own — including the risk that it rebases
+onto a QEMU we are not on. Measure before deciding; do not adopt speculatively.
+Re-check upstream status before starting: if the backend merges, this stops
+being a patch-carrying problem and becomes a version bump.
 
 **External evidence that the JIT path is viable.** Infinite Mac benchmarked
 qemu-wasm against the two hand-ported PowerPC emulators it already ships: an
