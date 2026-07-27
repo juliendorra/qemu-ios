@@ -177,5 +177,11 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
 * `M68AP_RENDER_HANDOFF.md` — §0 task table (T1–T8), current status.
 * `M68AP_HOMESCREEN_CASE_STUDY.md` — how the home screen and the touch bug
   were solved, including every dead end.
+* `IOS_1_0_BRINGUP_CASE_STUDY.md` — the 1.0/1.0.2 bring-up as *process*: the
+  six fixes, the claims asserted without measuring, the hypotheses killed (the
+  NAND signature among them), and the rabbit holes with the escape from each.
+  Read it before touching the NAND/FTL path or hand-disassembling iBoot.
+* `IPHONE_OS_1X_VERSIONS.md` — the per-build measurement matrix (format,
+  epoch, iBoot, FIL signature, root FS) and the open-issue list.
 * `IPHONE_2G_BRINGUP_HANDOFF.md` — long-form log.
 * `BUILD.md` §2b — one-command packaging for both bundles.
