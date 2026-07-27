@@ -1137,13 +1137,66 @@ A/B, both with `IT_NAND_WRITABLE=1`, 1.0 / 1A543a:
 | `0x400` dropped | `BSD root`, home screen 59.0 % | wedged in iBoot, 0 serial lines |
 
 So the damage comes from the pre-existing single-page (`0x500`) write path or
-from the writable model generally, not from WriteMultiple. Worth knowing before
-chasing it: ~98 pages *per bank* differ from pristine after a 300 s run, and
-most of them **overwrite pages that already held data** — which a real NAND
-cannot do without erasing the block first, and which the model has no erase
-operation to represent. Nothing in the tree has ever booted from a
-guest-written NAND before, because in the default read-only mode every write
-lands in a `<page>_new.page` file that is never read back.
+from the writable model generally, not from WriteMultiple. Nothing in the tree
+had ever booted from a guest-written NAND before, because in the default
+read-only mode every write lands in a `<page>_new.page` file that is never read
+back.
+
+##### What the investigation established (2026-07-27)
+
+`scripts/nand-persistence-probe.py` automates boot → write → reboot, and
+`--bisect` delta-debugs the written pages down to a minimal breaking set. What
+it found, in order:
+
+1. **Persistence mostly works.** A run stopped *before* the guest sleeps writes
+   326 pages and reboots fine (12 s to `BSD root`). The iPod does 488 pages and
+   reboots fine. So writes reach the media and are read back correctly.
+2. **The failure needs the sleep.** Only a boot A carried through
+   `System Sleep` breaks the reboot — that is when the FTL commits its context.
+3. **It is one 23-page context write**, at page 25728-25733: pristine + those
+   23 pages wedges, pristine + the *other* 382 written pages boots normally.
+4. **Within that context write, WriteMultiple is innocent.** The 20 pages
+   `0x400` wrote boot fine on their own; the **3 pages the single-page `0x500`
+   path wrote** — banks 1-3 of page 25728 — wedge on their own. That page is
+   `FTL_CXT_SECTION_START * 1024` = vpn 205824, i.e. the first page of the FTL
+   context section, and banks 1-3 of it are the first three
+   logical→virtual mapping pages the generator writes.
+5. **iBoot dies exactly there.** `IT_NAND_TRACE_PAGES` shows the failing boot's
+   last fetches are 25728/0, 25728/1, 25728/2, 25728/3, 25729/0 and then
+   nothing — 1240 fetches against 11867 for a healthy boot.
+
+##### Ruled out, each by measurement — do not re-run these
+
+| hypothesis | how it died |
+|---|---|
+| the model silently drops block **erases** | `IT_NAND_CMDS` shows the guest issuing only `0xff`/`0x90`/`0x00`/`0x30`/`0x70` in a 200 s writable session — no erase opcode, no program opcode, and zero unrecognized ADM commands. It never erases. |
+| the spare's **tail garbage** | Real bug and fixed (below), but the wedge is byte-identical with and without the fix. |
+| a **missing eccMarker** on the generator's mapping pages | Those 18 pages really do ship with an all-zero spare while every other generated page carries `spare[10] = 0xFF`. Patching the marker into all 18 changes nothing. |
+| **ECC bytes** in the spare | There are none anywhere — pristine spares are a 12-byte record then zeros. |
+| **NOR** state diverging between boots | The guest does not modify the NOR at all: boot A's copy is byte-identical to the pristine image. |
+| a **torn write** from the probe killing the VM | The context run ends with its own `ffffffff` terminator page, so it completed. |
+
+##### The one real bug this did find
+
+The single-page write copied `NAND_BYTES_PER_SPARE` (64) bytes out of data3 into
+the spare, when the guest only ever puts a `0xc`-byte record there. The other 52
+bytes belong to the model — at start-up data3 holds the bank chip-ID table — so
+**every singly-written page carried `NAND_CHIP_ID` and other emulator scratch in
+its spare**. Fixed to take the record and zero the rest, which is both what the
+guest wrote and what the pristine image's own pages look like. It does not fix
+the reboot.
+
+##### Where to pick it up
+
+The remaining suspect is the relationship between the generated FTL context
+section and what the guest's FTL does to it at shutdown: the guest appends a new
+context over the generator's mapping pages, never rewrites the CXT index page at
+bank0/25728, and iBoot then reads that area and gives up. Worth testing next:
+whether `dwCxtAge` (`0xffffffe9` = -23 in the guest's new pages, `0` in the
+generator's) is compared signed or unsigned when iBoot picks a context — that
+single question decides whether iBoot is selecting the guest's fresh context or
+the generator's stale one. A NAND generated with a **decrementing** starting age
+would settle it.
 
 Two traces stay in the tree for this: `IT_ADM_UNK=1` (descriptor dump for any
 unimplemented command) and `IT_NAND_WRITE=1` (every committed page with its

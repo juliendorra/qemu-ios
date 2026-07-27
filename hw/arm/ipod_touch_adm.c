@@ -598,11 +598,28 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                          * as empty ("no such table"), and daemons that create
                          * state retry forever (T6).
                          */
-                        address_space_rw(&s->downstream_as, s->data3_sec_addr,
-                                         MEMTXATTRS_UNSPECIFIED,
-                                         (uint8_t *)s->nand_state->page_spare_buffer,
-                                         NAND_BYTES_PER_SPARE, 0);
+                        /*
+                         * Take the RECORD, not a spare-sized block. The guest
+                         * writes one 0xc-byte record here (the same shape the
+                         * read completions and WriteMultiple use); everything
+                         * past it in data3 belongs to the model -- at start-up
+                         * this is where the bank chip-ID table goes. Copying
+                         * NAND_BYTES_PER_SPARE bytes stamped 52 bytes of our
+                         * own scratch, NAND_CHIP_ID included, into the spare of
+                         * every singly-written page, which is not something any
+                         * guest ever put there. The pristine image's own
+                         * convention is record-then-zeroes, and that is what
+                         * the multi-page path already writes.
+                         */
+                        memset(s->nand_state->page_spare_buffer, 0,
+                               NAND_BYTES_PER_SPARE);
+                        address_space_read(&s->downstream_as,
+                                           s->data3_sec_addr,
+                                           MEMTXATTRS_UNSPECIFIED,
+                                           s->nand_state->page_spare_buffer,
+                                           NAND_ADM_SPARE_RECORD);
                         s->nand_state->fmdnum = NAND_BYTES_PER_PAGE;
+                        s->nand_state->words_this_page = 0;
                         s->nand_state->is_writing = true;
                         s->nand_state->writing_multiple_pages = false;
                         break;

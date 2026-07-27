@@ -335,14 +335,22 @@ static void nand_flush_buffered_page(ITNandState *s)
          */
         static unsigned n[2];
         unsigned *cnt = &n[s->writing_multiple_pages ? 1 : 0];
-        if ((*cnt)++ < 200) {
+        /* IT_NAND_WRITE=<limit> raises the per-mode cap; the default hides
+         * anything past the first 200, which is how the one page that breaks
+         * a reboot managed to be written with no trace line at all. */
+        unsigned limit = (unsigned)strtoul(getenv("IT_NAND_WRITE"), NULL, 0);
+        if (limit < 2) {
+            limit = 200;
+        }
+        if ((*cnt)++ < limit) {
             fprintf(stderr, "[NAND-WRITE] bank%u page %u spare %08x %08x "
-                    "mark 0x%02x (multi %d, %u/%u, fmdnum %u)\n",
+                    "mark 0x%02x (multi %d, %u/%u, fmdnum %u, words %u/%u)\n",
                     s->buffered_bank, s->buffered_page,
                     ldl_le_p(s->page_spare_buffer),
                     ldl_le_p(s->page_spare_buffer + 4),
                     s->page_spare_buffer[0xa], s->writing_multiple_pages,
-                    s->cur_page_writing, s->num_pages_writing, s->fmdnum);
+                    s->cur_page_writing, s->num_pages_writing, s->fmdnum,
+                    s->words_this_page, NAND_BYTES_PER_PAGE / 4);
         }
     }
 }
@@ -358,6 +366,7 @@ static void nand_begin_write_page(ITNandState *s, uint32_t idx)
      * the guest's spare has to go in AFTER it, not before.
      */
     nand_set_buffered_page(s, s->pages_to_write[idx]);
+    s->words_this_page = 0;
     memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
     memcpy(s->page_spare_buffer, s->spares_to_write[idx],
            NAND_ADM_SPARE_RECORD);
@@ -550,9 +559,11 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 ((uint32_t *)s->page_buffer)
                     [(NAND_BYTES_PER_PAGE - page_offset) / 4] = val;
                 s->fmdnum -= 4;
+                s->words_this_page++;
 
                 if (s->fmdnum % NAND_BYTES_PER_PAGE == 0) {
                     nand_flush_buffered_page(s);
+                    s->words_this_page = 0;
                     s->cur_page_writing++;
                     if (s->fmdnum == 0 ||
                         s->cur_page_writing >= s->num_pages_writing) {
@@ -568,6 +579,7 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             //printf("Setting offset %d: %d\n", s->fmdnum, (NAND_BYTES_PER_PAGE - s->fmdnum) / 4);
             ((uint32_t *)s->page_buffer)[(NAND_BYTES_PER_PAGE - s->fmdnum) / 4] = val;
             s->fmdnum -= 4;
+            s->words_this_page++;
 
             if(s->fmdnum == 0) {
                 // we're done!

@@ -64,6 +64,10 @@ typedef struct ITNandState {
     uint32_t banks_to_read[512]; // used when in multiple page read mode
     uint32_t pages_to_read[512]; // used when in multiple page read mode
     bool is_writing;
+    /* FIFO words accepted since the current page's write began. A page that
+     * flushes with fewer than a full page of words was never delivered -- the
+     * model would be inventing its contents. */
+    uint32_t words_this_page;
     /*
      * Multi-page write (ADM command 0x400, the WriteMultiple the FIL
      * advertises). Like the multi-page READ above, the guest primes one
