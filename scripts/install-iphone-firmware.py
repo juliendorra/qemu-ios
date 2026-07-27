@@ -77,6 +77,12 @@ def main() -> int:
                     help="shared S5L8900 bootrom (default: ipod_files/bootrom_s5l8900)")
     ap.add_argument("--no-resign", action="store_true",
                     help="do not re-codesign the bundle after installing")
+    ap.add_argument("--keep-existing", action="store_true",
+                    help="for any input not given, reuse what the bundle "
+                         "already has instead of erroring. Makes a partial "
+                         "update possible -- e.g. --nor X --keep-existing "
+                         "swaps only the NOR and leaves the activated NAND "
+                         "and the iBoot alone.")
     args = ap.parse_args()
 
     contents = args.app / "Contents"
@@ -92,10 +98,24 @@ def main() -> int:
     nor = args.nor or (src and src / "nor_m68ap.bin")
     nand = args.nand or (src and src / "nand-m68ap")
     bootrom = args.bootrom or (ipod_files / "bootrom_s5l8900")
+    if args.keep_existing:
+        # Reuse whatever is installed for the inputs not supplied. Staging
+        # copies out of iphone_files before the swap below removes it, so
+        # sourcing from the destination is safe.
+        existing = {"iboot": iphone_files / "iboot_204_m68ap.bin",
+                    "nor": iphone_files / "nor_m68ap.bin",
+                    "nand": iphone_files / "nand"}
+        if iboot is None and existing["iboot"].exists():
+            iboot = existing["iboot"]
+        if nor is None and existing["nor"].exists():
+            nor = existing["nor"]
+        if nand is None and existing["nand"].exists():
+            nand = existing["nand"]
     for name, p in [("iboot", iboot), ("nor", nor), ("nand", nand),
                     ("bootrom", bootrom)]:
         if p is None:
-            raise SystemExit(f"missing input for {name}: pass --from or --{name}")
+            raise SystemExit(f"missing input for {name}: pass --from, --{name}"
+                             ", or --keep-existing to reuse the installed one")
         if not Path(p).exists():
             raise SystemExit(f"{name} not found: {p}")
     iboot, nor, nand, bootrom = map(Path, (iboot, nor, nand, bootrom))
@@ -109,6 +129,16 @@ def main() -> int:
     shutil.copy2(iboot, stage / "iboot_204_m68ap.bin")
     shutil.copy2(nor, stage / "nor_m68ap.bin")
     subprocess.run(["cp", "-Rc", str(nand), str(stage / "nand")], check=True)
+
+    # Carry over the SYSIC security epoch. The launcher reads <firmware
+    # dir>/epoch, and a firmware booted under the wrong epoch wedges in iBoot
+    # with an EMPTY serial log -- indistinguishable from a hang. Since this
+    # installer REPLACES iphone_files wholesale, forgetting the file silently
+    # converts a working 1.0/1.1.1 bundle (epoch 0/2) into one that boots to a
+    # black screen and says nothing. Copy it before the swap.
+    epoch_src = iphone_files / "epoch"
+    if epoch_src.exists():
+        shutil.copy2(epoch_src, stage / "epoch")
 
     manifest = {
         "profile": "iphone-2g",
