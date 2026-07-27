@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Build the M68AP NAND that boots iPhone OS 1.1.4 to the SpringBoard HOME SCREEN.
+"""Build the M68AP NAND that boots an iPhone OS 1.x build to the HOME SCREEN.
 
-This is the *product* recipe: one command, from the staged artifacts to a NAND
-tree an app bundle can ship. `springboard-lab.py` builds the same thing for
+This is the *product* recipe: one command, from a build's staged artifacts to a
+NAND tree an app bundle can ship. `springboard-lab.py` builds the same thing for
 experiments (with knobs); this script fixes the knobs at the combination that
 was measured to reach the home screen on 2026-07-25, so packaging cannot drift
 from the verified configuration.
+
+The firmware build is always explicit (`--build`) and every path comes from
+`m68ap_paths.py`, so 1.0, 1.0.2, 1.1.1 and 1.1.4 are built the same way. This
+recipe previously hardcoded 4A102, which made "the M68AP NAND" mean 1.1.4 and
+left no way to package another build without editing the source.
 
 What it applies, and why each part is needed
 --------------------------------------------
@@ -28,8 +33,9 @@ types and generic values only.
 
 Usage
 -----
-  scripts/build-m68ap-homescreen-nand.py --out /tmp/nand-homescreen
-  scripts/build-m68ap-homescreen-nand.py --out … --keep-work   # debugging
+  scripts/build-m68ap-homescreen-nand.py --build 1A543a
+  scripts/build-m68ap-homescreen-nand.py --build 4A102 --out /tmp/nand-test
+  scripts/build-m68ap-homescreen-nand.py --build 1A543a --keep-work
 """
 from __future__ import annotations
 
@@ -45,11 +51,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lab_workspace import (NAND_TREE_BYTES, ROOT_HFS_BYTES, DATA_HFS_BYTES,
                            attached, human, require_free_bytes)
 
+import m68ap_paths
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
-STAGE = REPO / "m68ap-artifacts" / "stage"
-ROOT_HFS = STAGE / "filesystem-m68ap-readonly.img"
-DATA_DMG = STAGE / "data-m68ap.dmg"
+
+# Set once in main() from --build. There is no default build: this recipe used
+# to hardcode 4A102, which made "the M68AP NAND" silently mean 1.1.4 and left
+# no way to package 1.0 without editing the script. See m68ap_paths.py.
+PATHS: "m68ap_paths.BuildPaths | None" = None
+
+# /var partition size when the build has no data.dmg to measure. This is OUR
+# choice, not a firmware constant -- on real hardware /var is whatever the
+# restore leaves after the root partition -- so it is stated here rather than
+# inferred from whichever file happens to sit in a staging directory.
+DEFAULT_VAR_BYTES = 24 * 1024 * 1024
+
+
+def root_hfs() -> Path:
+    return PATHS.root
 
 ARK_PROFILE = "reference-reg"
 SEED_DATABASES = [True]
@@ -66,7 +86,7 @@ def patched_root(work: Path) -> Path:
     if not out.exists():
         print("[1/4] lockdownd activation patch")
         run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "patch",
-             "--root-hfs", ROOT_HFS, "--out", out])
+             "--root-hfs", root_hfs(), "--out", out])
     return out
 
 
@@ -161,13 +181,21 @@ def data_partition(work: Path) -> Path:
     # /var builder so they are written WHILE the volume is constructed.
     cmd = [sys.executable, SCRIPTS / "build-m68ap-var.py",
            "--out", out, "--data-ark", ark,
-           "--template-from", ROOT_HFS]
+           "--template-from", root_hfs()]
+    # Size from this build's own data.dmg when it was extracted, otherwise the
+    # stated default -- never from another firmware's staging directory.
+    if PATHS.data.exists():
+        cmd += ["--size-from", PATHS.data]
+    else:
+        print(f"      (no {PATHS.data.name} for {PATHS.build}; "
+              f"/var sized at {human(DEFAULT_VAR_BYTES)})")
+        cmd += ["--size", str(DEFAULT_VAR_BYTES)]
     if not SEED_DATABASES[0]:
         print("      (databases NOT seeded: --no-seed-databases)")
     else:
         seed = work / "seed"
         run([sys.executable, SCRIPTS / "seed-guest-databases.py",
-             "--root-hfs", ROOT_HFS, "--out", seed])
+             "--root-hfs", root_hfs(), "--out", seed])
         cmd += ["--seed-dir", seed]
     run(cmd)
     return out
@@ -177,8 +205,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", type=Path, required=True,
-                    help="NAND tree to create (must not exist)")
+    m68ap_paths.add_build_argument(ap)
+    ap.add_argument("--out", type=Path,
+                    help="NAND tree to create (must not exist). Default: this "
+                         "build's canonical nand/ directory.")
     ap.add_argument("--work", type=Path,
                     help="scratch dir (default: <out>.work, removed on success)")
     ap.add_argument("--keep-work", action="store_true")
@@ -191,15 +221,16 @@ def main() -> int:
                          "database (last-resort fallback; costs Contacts)")
     args = ap.parse_args()
 
-    for needed in (ROOT_HFS, DATA_DMG):
-        if not needed.exists():
-            raise SystemExit(f"missing staged artifact: {needed}\n"
-                             f"(see BUILD.md — the IPSW-derived images are not "
-                             f"committed)")
-    if args.out.exists():
-        raise SystemExit(f"refusing to overwrite: {args.out}")
+    global PATHS
+    PATHS = m68ap_paths.get(args.build)
+    print(f"building for {m68ap_paths.describe(args.build)}")
+    PATHS.require("root")
 
-    work = args.work or Path(str(args.out) + ".work")
+    out = args.out or PATHS.nand
+    if out.exists():
+        raise SystemExit(f"refusing to overwrite: {out}")
+
+    work = args.work or Path(str(out) + ".work")
     work.mkdir(parents=True, exist_ok=True)
     require_free_bytes(work.parent,
                        NAND_TREE_BYTES + 2 * ROOT_HFS_BYTES + DATA_HFS_BYTES,
@@ -211,17 +242,33 @@ def main() -> int:
     data = data_partition(work)
 
     print("[4/4] building the NAND tree")
+    # --build carries the FIL/WMR signature word, which is firmware-keyed:
+    # 000C for 1.0/1.0.2, 200C for 1.1.1, 300C for 1.1.4. Hardcoding it here
+    # was what pinned this recipe to one firmware.
     run([sys.executable, SCRIPTS / "build-m68ap-nand.py",
-         "--out", args.out, "--active-banks", "4",
+         "--out", out, "--active-banks", "4",
          "--bbt", "production", "--hfs", root, "--data-hfs", data,
-         "--device", "iPhone1,1", "--ipsw-build", "4A102"])
+         "--device", PATHS.profile.device, "--build", PATHS.build,
+         # The product ships a PACKED NAND: the launcher clones the tree on
+         # every start, and cloning 100k+ page files takes minutes where the
+         # single pack file is instant (BUILD.md). The browser port consumes
+         # the same pack.
+         "--pack"])
 
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)
-    size = sum(f.stat().st_size for f in args.out.rglob("*") if f.is_file())
-    print(f"\nhome-screen NAND ready: {args.out} ({human(size)})")
-    print("boot it with -M iPhone-2G,…,nand=<this tree> plus the "
-          "secure-boot-patched iBoot (iboot_204_m68ap_sbpatch.bin).")
+    size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
+    print(f"\nhome-screen NAND ready for {PATHS.build} "
+          f"(iPhone OS {PATHS.version}): {out} ({human(size)})")
+    # The epoch is firmware-keyed, so it is printed with the command: booting
+    # this build under another's wedges in iBoot with an empty serial log.
+    print(f"\nboot it with:\n"
+          f"  -M iPhone-2G,bootrom={PATHS.bootrom.name},"
+          f"iboot={PATHS.iboot_sb.name},nand={out.name},"
+          f"epoch={PATHS.epoch}\n"
+          f"  -pflash {PATHS.nor.name}\n"
+          f"or simply: scripts/fb-snapshot.py --board m68ap "
+          f"--build {PATHS.build} --logs <dir>")
     return 0
 
 

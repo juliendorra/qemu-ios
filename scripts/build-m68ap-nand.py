@@ -494,10 +494,10 @@ def main() -> None:
                              "verify and hard-link its immutable data pages")
     parser.add_argument("--ipsw-hash", default=None,
                         help="SHA-256 of the source IPSW, recorded in provenance")
-    parser.add_argument("--ipsw-build", default=firmware_profiles.DEFAULT_BUILD,
-                        help="IPSW build tag; selects the firmware profile that "
-                             "supplies the FIL signature, and is recorded in "
-                             "provenance")
+    # Selects the firmware profile that supplies the FIL signature, and is
+    # recorded in provenance. Required: the signature is firmware-keyed, and a
+    # tree built under the wrong one fails WMR init without saying why.
+    firmware_profiles.add_build_argument(parser)
     parser.add_argument("--device", default=None,
                         help="source device, recorded in provenance (default: "
                              "from the build profile)")
@@ -510,7 +510,7 @@ def main() -> None:
                         help="also run pack-ipod-nand.py after the tree validates")
     args = parser.parse_args()
 
-    profile = firmware_profiles.get(args.ipsw_build)
+    profile = firmware_profiles.get(args.build)
 
     # The FIL signature belongs to the FIRMWARE (000C for 1.0/1.0.x, 200C for
     # 1.1.1 and the iPod, 300C for 1.1.4); the bank topology and BBT style
@@ -573,7 +573,7 @@ def main() -> None:
         "page_count": count,
         "source": {
             "kind": "ipsw", "device": args.device or profile.device,
-            "build": args.ipsw_build,
+            "build": profile.build,
             "ipsw_sha256": args.ipsw_hash,
             "hfs_sha256": sha256_file(args.hfs) if args.hfs else None,
             "data_hfs_sha256": (

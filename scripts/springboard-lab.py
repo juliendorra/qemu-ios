@@ -71,17 +71,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lab_workspace import (NAND_TREE_BYTES, ROOT_HFS_BYTES, DATA_HFS_BYTES,
                            Workspace, attached, human, prune_runs,
                            require_free_bytes)
+import m68ap_paths
 
 REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get("IPOD_APP", "/Applications/iPod Touch.app/Contents"))
 IPOD_FILES = APP / "Resources" / "ipod_files"
 PC_BIOS = APP / "Resources" / "pc-bios"
 QEMU = REPO / "build-ipod11" / "qemu-system-arm"
-M68_BOOTROM = REPO / "m68ap-artifacts" / "appdbg" / "bootrom_s5l8900"
-M68_IBOOT = REPO / "m68ap-artifacts" / "stage" / "iboot_204_m68ap_sbpatch.bin"
-M68_NOR = REPO / "m68ap-artifacts" / "stage" / "nor_m68ap.bin"
-M68_ROOT_HFS = REPO / "m68ap-artifacts" / "stage" / "filesystem-m68ap-readonly.img"
-M68_DATA_DMG = REPO / "m68ap-artifacts" / "stage" / "data-m68ap.dmg"
+# Resolved from --build in main(); no firmware is the default. The lab used to
+# point at m68ap-artifacts/stage/, which WAS 1.1.4.
+M68_BOOTROM = m68ap_paths.BOOTROM
+M68_IBOOT = M68_NOR = M68_ROOT_HFS = M68_DATA_DMG = None
+M68_BUILD = None
+
+
+def resolve_build(build: str) -> None:
+    """Point the M68AP artifact globals at one build's canonical directory."""
+    global M68_IBOOT, M68_NOR, M68_ROOT_HFS, M68_DATA_DMG, M68_BUILD
+    paths = m68ap_paths.get(build)
+    paths.require("iboot_sb", "nor", "root")
+    M68_BUILD = paths.build
+    M68_IBOOT, M68_NOR = paths.iboot_sb, paths.nor
+    M68_ROOT_HFS, M68_DATA_DMG = paths.root, paths.data
 
 KERNEL_FB_BASES = (0x0F400000, 0x0F496000)
 FB_BASES = {"iboot_0x0fe00000": 0x0FE00000,
@@ -522,7 +533,7 @@ def build_m68ap_nand(out: Path, dataark: bool, patch: bool, work: Path,
     run([sys.executable, str(REPO / "scripts" / "build-m68ap-nand.py"),
          "--out", str(out), "--active-banks", "4",
          "--bbt", "production", "--hfs", str(root), "--data-hfs", str(data),
-         "--device", "iPhone1,1", "--ipsw-build", "4A102"])
+         "--device", "iPhone1,1", "--build", M68_BUILD])
     # the NAND embeds both filesystems; drop the intermediate images so a
     # multi-recipe matrix peaks at one root image, not one per recipe
     if root != M68_ROOT_HFS:
@@ -855,6 +866,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--logs", type=Path, required=True)
+    m68ap_paths.add_build_argument(ap)
     ap.add_argument("--variants", nargs="+", default=["n45ap-control",
                                                       "m68ap-full",
                                                       "m68ap-plain"],
@@ -875,6 +887,7 @@ def main() -> int:
                     help="how many previous run dirs to keep under the logs "
                          "parent (0 = keep all)")
     args = ap.parse_args()
+    resolve_build(args.build)
 
     for v in args.variants:
         if v not in VARIANTS:

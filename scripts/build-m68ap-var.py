@@ -61,8 +61,8 @@ bypasses permissions anyway but daemons do check some of these.
 
 Usage:
   scripts/build-m68ap-var.py --out /tmp/data-var.img \
-      [--template-from m68ap-artifacts/stage/filesystem-m68ap-readonly.img] \
-      [--size-from m68ap-artifacts/stage/data-m68ap.dmg] \
+      [--template-from m68ap-artifacts/builds/<BUILD>/root.img] \
+      (--size-from m68ap-artifacts/builds/<BUILD>/data.dmg | --size BYTES) \
       [--data-ark /tmp/data_ark.plist] [--fix-owners]
 """
 from __future__ import annotations
@@ -78,7 +78,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lab_workspace import attached, human, require_free_bytes
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_SIZE_FROM = REPO / "m68ap-artifacts" / "stage" / "data-m68ap.dmg"
 
 # The iPhone OS 1.x /var skeleton. Paths are relative to the partition root
 # (which the guest mounts at /private/var). `mobile` entries are the ones that
@@ -165,8 +164,12 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True,
                     help="output raw HFS image for --data-hfs")
-    ap.add_argument("--size-from", type=Path, default=DEFAULT_SIZE_FROM,
-                    help="take the image size from this file")
+    size_group = ap.add_mutually_exclusive_group(required=True)
+    size_group.add_argument("--size-from", type=Path,
+                            help="take the image size from this file, e.g. "
+                                 "the build's own data.dmg")
+    size_group.add_argument("--size", type=int,
+                            help="image size in bytes")
     ap.add_argument("--seed-dir", type=Path,
                     help="copy every *.sqlitedb here into "
                          "mobile/Library/AddressBook/ WHILE the volume is "
@@ -193,7 +196,9 @@ def main() -> int:
                     help="rewrite non-mobile entries to root:wheel")
     args = ap.parse_args()
 
-    size = args.size_from.stat().st_size
+    # Required and explicit: sizing /var from whichever data.dmg happened to
+    # be in a shared staging directory silently tied every build to 1.1.4's.
+    size = args.size if args.size else args.size_from.stat().st_size
     require_free_bytes(args.out.parent, size * 3, "the /var image")
     work = args.out.with_suffix(".build.dmg")
     for p in (work, args.out):

@@ -30,13 +30,16 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import m68ap_paths  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get("IPOD_APP", "/Applications/iPod Touch.app/Contents"))
 IPOD_FILES = APP / "Resources" / "ipod_files"
 DEFAULT_QEMU = REPO / "build-ipod11" / "qemu-system-arm"
 DEFAULT_PLUGIN = REPO / "build-ipod11" / "contrib" / "plugins" / \
     "libm68ap-ftl-trace.dylib"
-DEFAULT_BOOTROM = REPO / "m68ap-artifacts" / "appdbg" / "bootrom_s5l8900"
+DEFAULT_BOOTROM = m68ap_paths.BOOTROM
 
 FB_W, FB_H, FB_BPP = 320, 480, 4
 FB_SIZE = FB_W * FB_H * FB_BPP
@@ -139,12 +142,31 @@ def main() -> int:
                     "to catch the awake window before the panel auto-sleeps.")
     ap.add_argument("--sample-interval", type=float, default=5.0)
     ap.add_argument("--logs", type=Path, required=True)
+    m68ap_paths.add_build_argument(ap, required=False)
     args = ap.parse_args()
 
     if args.board == "m68ap":
+        # --build fills the artifact paths and the security epoch from the
+        # canonical layout, so an M68AP run cannot silently mix one firmware's
+        # NAND with another's epoch. Explicit paths still win.
+        if args.build:
+            paths = m68ap_paths.get(args.build)
+            paths.require("iboot_sb", "nor", "nand")
+            if args.iboot_m68ap is None:
+                args.iboot_m68ap = paths.iboot_sb
+            if args.nor_m68ap is None:
+                args.nor_m68ap = paths.nor
+            if args.nand_m68ap is None:
+                args.nand_m68ap = paths.nand
+            if args.epoch is None:
+                args.epoch = paths.epoch
+            if args.bootrom == DEFAULT_BOOTROM and not args.bootrom.exists():
+                args.bootrom = paths.bootrom
+            print(f"[fb-snapshot] {m68ap_paths.describe(args.build)}")
         for name in ("iboot_m68ap", "nor_m68ap", "nand_m68ap"):
             if getattr(args, name) is None:
-                ap.error(f"--{name.replace('_', '-')} is required for m68ap")
+                ap.error(f"--{name.replace('_', '-')} is required for m68ap "
+                         "(or pass --build)")
 
     args.logs.mkdir(parents=True, exist_ok=True)
     stage = args.logs / "stage"

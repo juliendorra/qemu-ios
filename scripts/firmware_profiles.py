@@ -135,7 +135,7 @@ PROFILES: Dict[str, FirmwareProfile] = {
     ),
 }
 
-DEFAULT_BUILD = "4A102"
+# There is intentionally no DEFAULT_BUILD. See add_build_argument().
 
 
 def get(build: str) -> FirmwareProfile:
@@ -147,12 +147,31 @@ def get(build: str) -> FirmwareProfile:
     raise KeyError(f"unknown firmware build {build!r} (known: {known})")
 
 
-def add_build_argument(parser, flag="--build", default=DEFAULT_BUILD):
-    """Add a standard --build option to an argparse parser."""
+def m68ap_builds():
+    """Every iPhone build, in release order. Excludes the iPod reference."""
+    return [k for k in PROFILES if PROFILES[k].board == "m68ap"]
+
+
+def add_build_argument(parser, *flags, required=True):
+    """Add the one standard --build option, with NO default.
+
+    There is deliberately no default build. 1.0, 1.0.2, 1.1.1 and 1.1.4 are all
+    equally valid targets, and the failure mode of picking one silently is
+    severe: a NAND built with one firmware's filesystem and another firmware's
+    signature word, or a firmware booted under the wrong security epoch, wedges
+    in iBoot with an EMPTY serial log. That looks exactly like a hang, not like
+    a configuration mistake. Making the choice explicit is cheaper than
+    diagnosing it.
+
+    `--ipsw-build` is accepted as an alias so older command lines keep working.
+    """
     parser.add_argument(
-        flag, default=default, metavar="BUILD",
-        help=f"firmware build number (default {default}; "
-             f"one of {', '.join(k for k in PROFILES if k != 'n45ap')})")
+        "--build", "--ipsw-build", *flags, dest="build",
+        required=required, metavar="BUILD",
+        help="firmware build number, one of "
+             f"{', '.join(f'{k} ({PROFILES[k].version})' for k in m68ap_builds())}"
+             " (or n45ap for the iPod reference). No default: the choice is "
+             "always explicit.")
     return parser
 
 
