@@ -141,7 +141,11 @@ if __name__ == "__main__":
     parser.add_argument("--json", action="store_true",
                         help="machine-readable, for shell consumers")
     args = parser.parse_args()
-    paths = get(args.build)
+    try:
+        paths = get(args.build)
+    except KeyError as error:
+        # A CLI should say what is wrong, not show a traceback.
+        raise SystemExit(str(error).strip('"')) from None
 
     if args.json:
         import json
@@ -151,6 +155,11 @@ if __name__ == "__main__":
             "epoch": paths.epoch,
             "dir": str(paths.dir),
             "bootrom": str(paths.bootrom),
+            # Per-build firmware facts a shell caller would otherwise have to
+            # copy by hand. The VFDecrypt keys are published (they sit in the
+            # clear inside each restore ramdisk's asr binary), not secrets.
+            "root_dmg": paths.profile.root_dmg or "",
+            "vfdecrypt_key": paths.profile.vfdecrypt_key or "",
             **{name: str(getattr(paths, name)) for name in NAMED},
         }, sys.stdout, indent=2)
         print()

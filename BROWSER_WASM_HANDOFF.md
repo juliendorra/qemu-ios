@@ -176,9 +176,9 @@ epoch, FIL signature) are already in `scripts/firmware_profiles.py`.
 ```sh
 # 1. extract the images from the IPSW
 python3 scripts/extract-m68ap-images.py --build 1C28 <ipsw-dir> <out-dir>
-# 2. decrypt the root filesystem (key comes from the profile)
-scripts/decrypt-m68ap-rootfs.sh <root.dmg> \
-    m68ap-artifacts/builds/1C28/root.img <vfdecrypt-key>
+# 2. decrypt the root filesystem -- DMG name, key and output all come from
+#    the profile; add --dry-run to see what it resolved before spending disk
+scripts/decrypt-m68ap-rootfs.sh --build 1C28
 # 3. NOR + secure-boot-patched iBoot
 python3 scripts/build-m68ap-nor.py     --build 1C28 …
 python3 scripts/patch-m68ap-iboot.py   …
@@ -189,10 +189,14 @@ python3 scripts/fb-snapshot.py --board m68ap --build 1C28 \
     --boot-wait 420 --logs /tmp/fb-1C28
 ```
 
-**Known rough edge:** `decrypt-m68ap-rootfs.sh` still takes the VFDecrypt key as
-a positional argument and its header talks about 1.1.4, even though the key for
-every build is in `firmware_profiles.py`. Teaching it `--build` would remove the
-last place a per-version secret is passed by hand.
+**Disk:** step 2 needs roughly 700 MiB of scratch (the encrypted DMG, the UDIF
+output, the raw conversion, and the final image). Step 4 needs ~1.2 GiB.
+
+**Unverified:** `decrypt-m68ap-rootfs.sh --build` was reworked on 2026-07-27 and
+its resolution path is tested for all four builds (`--dry-run`), but no
+end-to-end decrypt has been run since the change — the host disk was full. The
+decrypt/convert/slice pipeline itself was not modified. Running step 2 for 1C28
+is both the next packaging task and the test.
 
 ---
 
