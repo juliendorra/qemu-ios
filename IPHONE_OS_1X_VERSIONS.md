@@ -932,6 +932,58 @@ attaches no host — and reports `cable removed`; with no charger and no input t
 kernel idles. That is all *correct emulated behaviour*; nothing needs
 suppressing.
 
+### The packaged 1.0 app is not stuck asleep — it is CYCLING
+
+Reported 2026-07-27: "iOS 1.0 app seems stuck in sleep, H doesn't wake it."
+Reproduced against the bundle itself (launcher + staged writable NAND + QMP),
+and it is not a stuck device:
+
+```
+boot -> home screen (45.5% non-black)  ->  idle sleep ~40 s later
+     -> OOCSHDWN -> pre-warm reboot -> home again -> sleep ...
+```
+
+Four boots, three `System Sleep` events and four `BSD root` in a single 300 s
+run — a **~75 s cycle**. The screen is only lit for part of each cycle, so a
+button press usually lands mid-reboot and shows black. The guest is alive
+throughout (IOKit keeps logging).
+
+**H is not being ignored.** Every press is accepted and logged —
+`[WAKE] Home requested wake during pre-warm boot` — it just arrives while a
+pre-warm boot is already in flight rather than parked, so it passes through
+instead of completing a wake.
+
+Why it sleeps, per cycle, from the serial log:
+
+```
+IOIpodUSBDevice::gated_message cable is connected, starting stack
+IOIpodUSBDevice.cpp power- suspend=0 limit=100      <- 100 mA, unconfigured
+IOIpodUSBDevice::gated_message cable removed, stopping stack
+System Sleep
+```
+
+The device connects, negotiates the pre-enumeration 100 mA, finds no host to
+configure it (this machine models the OTG **device** side and attaches no
+host), concludes the cable is gone, and with no external power the kernel
+idle-sleeps. **1.1.x never reports `cable removed`** — that is the difference to
+chase.
+
+**Two unimplemented ADM commands surfaced here**, both logged as
+`Unrecognized ADM command`:
+
+| cmd | count | when |
+|---|---|---|
+| `0x400` (1024) | 13 | immediately before **every** sleep — likely a flush/standby |
+| `0x100` (256) | 4 | once per boot at init; 1.1.x issues it too, apparently harmlessly |
+
+`0x400` sitting on the pre-sleep path makes it the first thing to implement.
+
+**Tried and reverted:** adding the adapter-present bits
+(`MBCS1_ADPPRES|ADPOK`) alongside the USB ones. `ext` stayed 0, the sleeps
+continued, and the reported charge fields got *worse* (0 mA / kind 0, against
+100 mA / kind 16384 with the USB bits alone). So the driver's `ext` flag does
+not come from MBCS1, and that guess is not in the tree.
+
 ### What the ADM actually is, and why only 1.0 needs new work
 
 The S5L8900's flash controller has a companion **DSP core** — a Samsung "Calm"
