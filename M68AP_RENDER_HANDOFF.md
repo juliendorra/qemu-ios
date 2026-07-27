@@ -1,5 +1,15 @@
 # M68AP (iPhone 2G) — session handoff: render SOLVED, home screen reached
 
+> **Artifact paths moved (2026-07-27).** Commands quoted below use the old
+> layout — `m68ap-artifacts/stage/` (which was 1.1.4), `stage-1.0/`,
+> `extracted/`. Every build now lives in `m68ap-artifacts/builds/<BUILD>/` with
+> version-neutral filenames, and every tool takes an explicit `--build`. The
+> quoted commands are kept as the dated record of what was run; to re-run them
+> today, translate the paths using
+> [`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md) — usually
+> `--build <BUILD>` replaces the path arguments entirely.
+
+
 **Date:** 2026-07-25 · **Branch:** `ipod_touch_1g` · **Head at handoff:** `d863470867`+
 
 This is a focused handoff. The wall it was written for (the black screen) is

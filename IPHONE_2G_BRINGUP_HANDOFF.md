@@ -1,5 +1,15 @@
 # iPhone 2G (M68AP) bring-up — session handoff
 
+> **Artifact paths moved (2026-07-27).** Commands quoted below use the old
+> layout — `m68ap-artifacts/stage/` (which was 1.1.4), `stage-1.0/`,
+> `extracted/`. Every build now lives in `m68ap-artifacts/builds/<BUILD>/` with
+> version-neutral filenames, and every tool takes an explicit `--build`. The
+> quoted commands are kept as the dated record of what was run; to re-run them
+> today, translate the paths using
+> [`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md) — usually
+> `--build <BUILD>` replaces the path arguments entirely.
+
+
 This is a working log for booting **iPhone OS 1.x** on the `-M iPhone-2G`
 machine. It records the path taken, what is proven, the dead ends, and the
 next concrete steps, so the next person (or LLM) can continue without redoing
@@ -12,6 +22,182 @@ the live bring-up state.
 > handoff (status, what is ruled out with the measurement that did it, the
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
+
+## Session log — 2026-07-26 (the M68AP PMU is on the wrong I²C bus — diagnosed here, FIXED by c5ea96a7e1, and the 1.1.4 symptom relief now MEASURED)
+
+**Status: fixed.** This section diagnosed the defect from the two user-visible
+1.1.4 symptoms; commit **c5ea96a7e1** ("The M68AP PMU lives on i2c0, not
+i2c1") landed the same fix independently, from the 1.0.2 side, a few hours
+later. Commit 6366a3e0f6 then correctly marked the 1.1.x symptom relief as
+*inferred, not measured* — "two attempts to observe the 1.1.x symptoms
+produced no evidence either way". **That evidence now exists; see
+"Post-fix verification" at the end of this section.**
+
+Symptoms originally reported against the packaged `iPhone 2G.app`, both
+absent from `iPod Touch.app`:
+
+1. The lock screen shows SpringBoard's **big green "charging" battery** where
+   the iPod shows the wallpaper, and the status bar shows the **plugged-in**
+   glyph where the iPod shows a partly-filled battery.
+2. The clock is wrong: `16:07 — Wednesday, December 31`. That is not a random
+   time, it is **Unix time ≈ 0 rendered in PST (UTC−8)**. The timezone is
+   correct (California); the *value* is zero.
+
+### One root cause behind both
+
+`hw/arm/ipod_touch.c:1338` attaches the `pcf50633` PMU slave to **i2c1** for
+every board:
+
+```c
+dev = qdev_new("ipodtouch.i2c");        /* i2c1 @ I2C1_MEM_BASE 0x3C900000 */
+...
+I2CSlave *pmu = i2c_slave_create_simple(i2c_state->bus, "pcf50633", 0x73);
+```
+
+That is right for N45AP and **wrong for M68AP**. The iPhone's own device tree
+puts the PMU on bus 0:
+
+```
+$ python3 scripts/inspect-apple-device-tree.py \
+      m68ap-artifacts/extracted/DeviceTree.m68ap.bin | grep -E 'i2c[01]/'
+  /device-tree/arm-io/i2c0/pmu        <- PMU (still slave address 0x73)
+  /device-tree/arm-io/i2c0/audio0
+  /device-tree/arm-io/i2c1/camera0    <- i2c1 carries the CAMERA on M68AP
+```
+
+The two boards swap the buses. So on `-M iPhone-2G` every PMU transaction —
+iBoot's and the kernel's — is addressed to an **empty bus**: nothing ACKs,
+and every register reads back **0xFF**.
+
+### Measurement (the diff that proves it)
+
+Both boards booted from the packaged bundles' own artifacts under
+`IPOD_TRACE_PMU=1`, headless:
+
+```bash
+IPOD_TRACE_PMU=1 ./build-ipod11/qemu-system-arm \
+  -M "iPhone-2G,bootrom=$R/iphone_files/bootrom_s5l8900,iboot=$R/iphone_files/iboot_204_m68ap.bin,nand=$STAGE/nand" \
+  -m 1G -pflash $STAGE/nor.bin -L "$R/pc-bios" -serial mon:stdio -display none
+```
+
+| | iPod (N45AP) | iPhone (M68AP) |
+|---|---|---|
+| `[PMUTRACE]` lines in a full boot | **288** | **0** |
+| `ApplePCF50635PMU::start: DOWN0` | `625mV` (= reg 0x00) | `7000mV` (= reg **0xFF**) |
+| `ApplePCF50635PMUPowerSource: mbcs1-3` | `00 00 00` | `ff ff ff` |
+| power-source verdict | `ext 0, chrg 0` … `cap 27` | `ext 1, chrg 1 (750 mA)` … `cap -1` |
+| USB cable | `AppleUSBCableDetect 0` | `AppleUSBCableDetect 1` |
+| idle sleep | `enabling idle sleep` | `disabling idle sleep` |
+| RTC regs 0x59–0x5F | read `19 01 16 00 26 07 26` (BCD: 16:01:19, 2026-07-26 UTC) | never reach the model → 0xFF |
+
+Zero `[PMUTRACE]` lines across an entire M68AP boot is the whole story: our
+PMU model is not on the bus the iPhone talks to. `DOWN0 = 7000mV` is the
+decode of an all-ones read (PCF50633 DOWNxOUT = 0.625 V + n·0.025 V;
+n = 255 → 7.000 V), i.e. the guest driver itself reporting the NAK.
+
+### How 0xFF produces each symptom
+
+- **Charging screen instead of wallpaper.** `MBCS1` (0x4B) = 0xFF has both
+  `USBPRES` and `USBOK` set, so `ApplePCF50635PMUPowerSource` concludes
+  `ext 1, chrg 1`. iPhone OS 1.x draws the charge battery, not the wallpaper,
+  on a locked device on external power, and shows the plugged-in status glyph.
+- **Battery always full.** The BATSNS ADC (`ADCS1`/`ADCS3`, 0x55/0x57) reads
+  full-scale — the kernel logs `adc dP 1023, dM 1023` and then `cap -1`
+  (capacity unknown), which renders as a full green cell. The iPod's real
+  0xA2/0x80 → 3.80 V → `cap 27`, the partly-filled icon in the screenshot.
+- **Clock at the epoch.** `pcf50633_recv()` serves RTCSC..RTCYR (0x59–0x5F)
+  from `qemu_get_timedate(&tm, 0)`, so the iPod gets correct UTC and applies
+  its own timezone. On M68AP those seven reads return 0xFF, which is not
+  valid BCD; `ApplePCF50635PMURTC` rejects it and the calendar starts at 0.
+  Hence Dec 31 1969 16:00 PST, counting up.
+- **Bonus, not yet reported by the user:** `disabling idle sleep` means the
+  iPhone never auto-locks, and the entire OOCSHDWN sleep/wake + retained
+  resume machinery (`ipod_touch_pcf50633_pmu.c`) has **never once run** on
+  M68AP. Everything in `SLEEP_BATTERY_SCREEN_FIX.md` and the sleep/wake
+  findings is iPod-only for exactly this reason.
+
+### The fix (c5ea96a7e1)
+
+Board-conditional bus selection in `ipod_touch_machine_init`: the PMU is
+created on `i2c0`'s bus when `board_id == BOARD_ID_M68AP`, on `i2c1`'s
+otherwise. `lis302dl` (0x1D) and `isl29003` (0x49) stay on i2c0 on both
+boards — the M68AP tree agrees (`accelerometer@1D`, `als@49` under `i2c0`) —
+and M68AP's i2c1 carries `camera0`, which we do not model, so leaving it
+empty is fine.
+
+### Post-fix verification — 1.1.4, measured 2026-07-26 ~23:10
+
+Same probe as above, same packaged `iPhone 2G.app` artifacts, run against the
+current `build-ipod11` binary (which also carries the in-flight, uncommitted
+power-off-loop generalisation, so attribute the *sleep* observations below
+with care; the PMU numbers are attributable to c5ea96a7e1 alone).
+
+| | before | after |
+|---|---|---|
+| `[PMUTRACE]` lines | 0 | **161** |
+| `DOWN0` | `7000mV` | **`625mV`** |
+| `mbcs1-3` | `ff ff ff` | **`00 00 00`** |
+| power source | `ext 1, chrg 1 … cap -1` | **`ext 0, chrg 0 … cap 61`** |
+| `AppleUSBCableDetect` | `1` | **`0`** |
+| idle sleep | `disabling` | **`enabling`** |
+| RTC 0x59–0x5F | never reached the model | **`57 08 21 00 26 07 26`** = 21:08:57 UTC, 2026-07-26 (host: 23:09 CEST) |
+
+And visually, off a `pmemsave` of the OS framebuffer at `0x0f400000` after a
+wake (render it as 320x480 BGRA): **the Earth wallpaper is back**, the clock reads
+`2:20 — Sunday, July 26` (21:20 UTC → 14:20 PDT, correct for the default
+California timezone), and the status-bar battery is a partly-filled outline,
+not the plugged-in glyph. Both reported symptoms are gone at the source.
+
+### New behaviour surfaced by the fix: M68AP sleeps and wakes — CORRECTLY
+
+With idle sleep now *enabled*, M68AP auto-locks and enters the OOCSHDWN →
+pre-warm → park path for the first time ever
+(`[WAKE] Pre-warmed wake parked; awaiting Power/Home` on an iPhone). **This
+works.** Three consecutive Power/Home wake cycles, polled by `screendump`
+every 2 s:
+
+```
+--- press Home (status=suspended) ---
+   2.0s  59.7% non-black      <- lock screen up within 2 s
+   4.0s  59.7%
+   6.1s  59.7%
+   8.1s  59.7%
+  10.1s   0.0%                <- display off
+  ...
+  re-parked after 62s         <- deeper sleep at the auto-lock interval
+```
+
+And the **iPod reference behaves identically** (`-M iPod-Touch`, same probe):
+lit 2-8 s, dark by 10 s, re-parked after 33 s. The only difference is the
+re-park delay, which is the two images' different Auto-Lock settings, not a
+defect. Screen-off-a-few-seconds-after-an-unacted-on-wake is what the real
+device does.
+
+**DEAD END, recorded so it is not chased again.** An earlier pass in this
+session reported "the panel never relights after a wake" and called it a
+regression. It was a **measurement artifact**: a single `screendump` taken
+30 s after the key press, i.e. well past the ~9 s lit window, plus a second
+Power/Home pair whose dumps landed in the same dark phase. `pmemsave` showed
+59.7 % non-black in the framebuffer at the same moment, which looked like
+"the guest renders but the scanout is not lit" -- it was simply the display
+correctly off. **Any sleep/wake screen check must be a time series, not one
+sample**, and must be compared against N45AP before being called a defect.
+
+That also disposes of the hypothesis stated earlier in this section, that the
+N45AP framebuffer constants in `ipod_touch_lcd.c` are wrong for the iPhone.
+They are not: `IT_LCD_TRACE=1` shows M68AP triple-buffering w1 across
+`0x0fe00000 -> 0x0f400000 -> 0x0f496000`, the same three bases, and
+`[LCD] Retained kernel enabled scanout at 0x0f496000` fires on every wake.
+
+Practical consequence for the packaged app: **none blocking.** Once
+`iPhone 2G.app` is rebuilt on c5ea96a7e1 it will auto-lock and wake like the
+iPod. (The bundle at the time of writing predates the commit and therefore
+still shows the original charging-battery/epoch-clock symptoms.) One loose
+end worth a look, seen once and not reproduced across four later boots: a
+boot that panicked at `IOIpodUSBDevice::start`, the same driver the commit
+message names.
+
+---
 
 ## Session log — 2026-07-26 (T6 idle CPU SOLVED: /var was missing the OS's own skeleton; T7b Home button fixed)
 

@@ -39,6 +39,7 @@ Use `add_build_argument()` so every tool spells the option the same way.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import firmware_profiles
@@ -129,16 +130,35 @@ def describe(build: str) -> str:
             f"FIL {profile.fil_signature:#x})")
 
 
+NAMED = ("ipsw", "root", "data", "iboot", "iboot_sb", "nor", "nand", "pack",
+         "provenance")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Show the canonical artifact layout for a build.")
     add_build_argument(parser)
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable, for shell consumers")
     args = parser.parse_args()
     paths = get(args.build)
+
+    if args.json:
+        import json
+        json.dump({
+            "build": paths.build,
+            "version": paths.version,
+            "epoch": paths.epoch,
+            "dir": str(paths.dir),
+            "bootrom": str(paths.bootrom),
+            **{name: str(getattr(paths, name)) for name in NAMED},
+        }, sys.stdout, indent=2)
+        print()
+        raise SystemExit(0)
+
     print(describe(args.build))
     print(f"  dir      {paths.dir}")
-    for name in ("ipsw", "root", "data", "iboot", "iboot_sb", "nor", "nand",
-                 "pack", "provenance"):
+    for name in NAMED:
         path = getattr(paths, name)
         print(f"  {name:<9}{path.relative_to(REPO)}"
               f"{'' if path.exists() else '   (missing)'}")

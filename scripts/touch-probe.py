@@ -25,8 +25,8 @@ Examples
 --------
   # does tapping Safari in the dock do anything on the iPhone?
   scripts/touch-probe.py --board m68ap --nand /tmp/.../nand \\
-      --iboot m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin \\
-      --nor m68ap-artifacts/stage/nor_m68ap.bin \\
+      --iboot m68ap-artifacts/builds/4A102/iboot-sb.bin \\
+      --nor m68ap-artifacts/builds/4A102/nor.bin \\
       --tap 200,437 --logs /tmp/touchprobe
 
   # same question on the iPod, which is the known-good control

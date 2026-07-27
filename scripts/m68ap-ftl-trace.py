@@ -39,10 +39,14 @@ DEFAULT_QEMU = REPO / "build-ipod11" / "qemu-system-arm"
 DEFAULT_PLUGIN = (REPO / "build-ipod11" / "contrib" / "plugins" /
                   "libm68ap-ftl-trace.dylib")
 DEFAULT_BOOTROM = IPOD_FILES / "bootrom_s5l8900"
-DEFAULT_IBOOT = REPO / "m68ap-artifacts" / "extracted" / "iboot_204_m68ap.bin"
+# 4A102 by name, not by default: this tracer's expected-hash constant below
+# was measured against 1.1.4's FTL metadata, so it is genuinely 1.1.4-specific
+# rather than merely defaulting to it.
+DEFAULT_IBOOT = (REPO / "m68ap-artifacts" / "builds" / "4A102" / "ipsw" /
+                 "extracted" / "iboot_204_m68ap.bin")
 DEFAULT_TEMPLATE = IPOD_FILES / "nor_n45ap.bin"
-DEFAULT_CONTAINERS = (REPO / "m68ap-artifacts" / "extracted" /
-                      "nor-containers")
+DEFAULT_CONTAINERS = (REPO / "m68ap-artifacts" / "builds" / "4A102" / "ipsw" /
+                      "extracted" / "nor-containers")
 
 EXPECTED_FTL_META_SHA256 = (
     "4877ba691c75b2134949c3e5a048700dc627d04ba0d65be842382c45519b7e3c")

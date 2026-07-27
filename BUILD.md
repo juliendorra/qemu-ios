@@ -441,29 +441,32 @@ IPOD_QEMU=/path/to/build/qemu-system-arm python3 scripts/ipod-acceptance-test.py
 
 ## Part 3b — A bundle for a DIFFERENT iPhone OS version
 
-`package-iphone-app.sh` can build a bundle from scratch and pin it to any 1.x
-firmware. Two things vary per version and both must be passed: the iBoot build
-(1.0/1.0.x ship iBoot-159, 1.1.x iBoot-204) and the **security epoch** — M68AP
-defaults to 1.1.4's epoch 3, and booting 1.0's epoch-0 images under it wedges in
-iBoot with an *empty* serial log, which looks exactly like a hang.
+`package-iphone-app.sh` builds a bundle for any 1.x firmware. Name the build
+with `--firmware` and everything that varies per version — the iBoot (1.0/1.0.2
+ship iBoot-159, 1.1.x iBoot-204), the NOR, the NAND, and the **security
+epoch** — is resolved together from `m68ap-artifacts/builds/<BUILD>/`.
+
+That grouping is the point: booting 1.0's epoch-0 images under M68AP's old
+default epoch 3 wedges in iBoot with an *empty* serial log, which looks exactly
+like a hang. Resolving them from one place makes the mismatch unrepresentable.
 
 ```bash
-scripts/package-iphone-app.sh --create \
+scripts/package-iphone-app.sh --create --firmware 1A543a \
     --app "/Applications/iPhone 2G (iOS 1.0).app" \
-    --name "iPhone 2G (iOS 1.0)" \
-    --nand  m68ap-artifacts/stage-1.0/nand \
-    --iboot m68ap-artifacts/stage-1.0/iboot_159_m68ap_sbpatch.bin \
-    --nor   m68ap-artifacts/stage-1.0/nor_m68ap.bin \
-    --epoch 0
+    --name "iPhone 2G (iOS 1.0)"
 ```
+
+(The flag is `--firmware` rather than `--build` only because `--build` already
+means "rebuild the engine" in this script. Every Python tool uses `--build`.)
 
 `--create` builds the skeleton from `packaging/iphone-2g/Info.plist.in` (plus
 `--bundle-id` and an optional `--icon`), so no existing bundle is needed. The
 epoch is written to `Contents/Resources/iphone_files/epoch` and the launcher
 appends `,epoch=N` to the machine options when that file is present.
 
-Pass `--stage DIR` to take the iBoot/NOR defaults from a different staging
-directory instead of naming them individually.
+`--iboot`, `--nor`, `--nand` and `--epoch` still override individual pieces
+when experimenting. The artifact layout itself is documented in
+[`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md).
 
 ## Part 3 — Building the iPhone 2G (M68AP) app bundle
 
@@ -525,14 +528,17 @@ expects: `bootrom_s5l8900`, `iboot_204_m68ap.bin`, `nor_m68ap.bin`, `nand/`.
 build, installed under the plain name:
 
 ```bash
-cp m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin \
+FW=m68ap-artifacts/builds/4A102          # or 1A543a, 1C28, 3A109a
+cp $FW/iboot-sb.bin \
    "/Applications/iPhone 2G.app/Contents/Resources/iphone_files/iboot_204_m68ap.bin"
-cp m68ap-artifacts/appdbg/bootrom_s5l8900 \
+cp m68ap-artifacts/shared/bootrom_s5l8900 \
    "/Applications/iPhone 2G.app/Contents/Resources/iphone_files/bootrom_s5l8900"
 ```
 
-and the NAND must be a **generated** tree (`build-m68ap-nand.py`, e.g.
-`m68ap-artifacts/stage/nand-m68ap-fresh`), not an N45AP dump.
+and the NAND must be a **generated** tree (`$FW/nand`, from
+`build-m68ap-homescreen-nand.py --build <BUILD>`), not an N45AP dump. The
+per-build layout is documented in
+[`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md).
 
 ### 2b. One-command packaging (recommended)
 
@@ -540,9 +546,9 @@ Both bundles have an end-to-end packaging script. They are the supported path;
 the manual steps below remain for understanding and for repair work.
 
 ```bash
-scripts/package-ipod-app.sh   --build          # /Applications/iPod Touch.app
-scripts/package-iphone-app.sh --build          # /Applications/iPhone 2G.app
-scripts/package-iphone-app.sh --verify-only    # audit an installed bundle
+scripts/package-ipod-app.sh   --build                        # iPod Touch.app
+scripts/package-iphone-app.sh --build --firmware 4A102       # iPhone 2G.app
+scripts/package-iphone-app.sh --verify-only                  # audit a bundle
 ```
 
 `package-iphone-app.sh` also GENERATES the guest image it installs, via

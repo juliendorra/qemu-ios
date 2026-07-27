@@ -2,10 +2,20 @@
 #
 # Full packaging for "iPhone 2G.app" (M68AP) — one command, end to end.
 #
-#   scripts/package-iphone-app.sh [--app PATH] [--qemu PATH] [--build]
+#   scripts/package-iphone-app.sh --firmware BUILD
+#                                 [--app PATH] [--qemu PATH] [--build]
 #                                 [--nand PATH] [--keep-nand] [--verify-only]
 #                                 [--create [--name N] [--bundle-id ID] [--icon F]]
-#                                 [--stage DIR] [--iboot F] [--nor F] [--epoch N]
+#                                 [--iboot F] [--nor F] [--epoch N]
+#
+# --firmware names the iPhone OS build (1A543a, 1C28, 3A109a, 4A102) and is
+# REQUIRED when firmware is installed: it resolves the iBoot, NOR, NAND and the
+# security EPOCH together from m68ap-artifacts/builds/<BUILD>/, so a bundle
+# cannot pair one firmware's images with another's epoch. See
+# M68AP_BUILD_LAYOUT.md.
+#
+# (It is spelled --firmware, not --build, only because --build already means
+# "rebuild the engine" here. Every python tool in the tree uses --build.)
 #
 # Steps: (optionally build) -> install engine + launcher + bundled dylibs ->
 # GENERATE the home-screen NAND from the staged artifacts -> install the M68AP
@@ -35,8 +45,7 @@ REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 APP="/Applications/iPhone 2G.app"
 QEMU="$REPO/build-ipod11/qemu-system-arm"
-STAGE="$REPO/m68ap-artifacts/stage"
-APPDBG="$REPO/m68ap-artifacts/appdbg"
+FIRMWARE=""
 NAND_SRC=""
 IBOOT_SRC=""
 NOR_SRC=""
@@ -54,7 +63,7 @@ while [[ $# -gt 0 ]]; do
         --app) APP="$2"; shift 2 ;;
         --qemu) QEMU="$2"; shift 2 ;;
         --nand) NAND_SRC="$2"; shift 2 ;;
-        --stage) STAGE="$2"; shift 2 ;;
+        --firmware) FIRMWARE="$2"; shift 2 ;;
         --iboot) IBOOT_SRC="$2"; shift 2 ;;
         --nor) NOR_SRC="$2"; shift 2 ;;
         --epoch) EPOCH="$2"; shift 2 ;;
@@ -72,6 +81,27 @@ done
 
 say() { printf '\n== %s\n' "$*"; }
 FW="$APP/Contents/Resources/iphone_files"
+
+# Resolve every per-build path from one place. Requiring --firmware here is
+# what stops a bundle shipping 1.0's iBoot with 1.1.4's epoch.
+if [[ $VERIFY_ONLY -eq 0 ]]; then
+    if [[ -z "$FIRMWARE" ]]; then
+        echo "--firmware BUILD is required (1A543a, 1C28, 3A109a, 4A102)" >&2
+        echo "see M68AP_BUILD_LAYOUT.md" >&2
+        exit 2
+    fi
+    fw_path() {
+        python3 -c "import sys,json;print(json.load(sys.stdin)['$1'])" \
+            <<< "$FW_JSON"
+    }
+    FW_JSON="$(python3 "$SCRIPT_DIR/m68ap_paths.py" --build "$FIRMWARE" --json)"
+    BUILD_DIR="$(fw_path dir)"
+    BOOTROM_SRC="$(fw_path bootrom)"
+    : "${IBOOT_SRC:=$(fw_path iboot_sb)}"
+    : "${NOR_SRC:=$(fw_path nor)}"
+    : "${EPOCH:=$(fw_path epoch)}"
+    say "firmware $FIRMWARE (iPhone OS $(fw_path version)), epoch $EPOCH"
+fi
 
 if [[ $VERIFY_ONLY -eq 0 ]]; then
     if [[ $DO_BUILD -eq 1 ]]; then
@@ -111,7 +141,8 @@ if [[ $VERIFY_ONLY -eq 0 ]]; then
     if [[ -z "$NAND_SRC" ]]; then
         TMP_NAND="$(mktemp -d "${TMPDIR:-/tmp}/m68ap-nand.XXXXXX")/nand"
         say "generating the home-screen NAND (this is the slow part)"
-        python3 "$SCRIPT_DIR/build-m68ap-homescreen-nand.py" --out "$TMP_NAND"
+        python3 "$SCRIPT_DIR/build-m68ap-homescreen-nand.py" \
+            --build "$FIRMWARE" --out "$TMP_NAND"
         NAND_SRC="$TMP_NAND"
     else
         say "using the NAND you supplied: $NAND_SRC"
@@ -140,9 +171,9 @@ if [[ $VERIFY_ONLY -eq 0 ]]; then
     # The launcher loads the iBoot under its plain name whatever its build, so
     # a 1.0 bundle carries iBoot-159 here; --epoch is what stops it wedging
     # (M68AP defaults to 1.1.4's epoch 3, and 1.0's images are epoch 0).
-    cp "${IBOOT_SRC:-$STAGE/iboot_204_m68ap_sbpatch.bin}" "$FW/iboot_204_m68ap.bin"
-    cp "$APPDBG/bootrom_s5l8900"            "$FW/bootrom_s5l8900"
-    cp "${NOR_SRC:-$STAGE/nor_m68ap.bin}"   "$FW/nor_m68ap.bin"
+    cp "$IBOOT_SRC"   "$FW/iboot_204_m68ap.bin"
+    cp "$BOOTROM_SRC" "$FW/bootrom_s5l8900"
+    cp "$NOR_SRC"     "$FW/nor_m68ap.bin"
     if [[ -n "$EPOCH" ]]; then
         printf '%s\n' "$EPOCH" > "$FW/epoch"
         say "security epoch pinned to $EPOCH"

@@ -1,5 +1,15 @@
 # Running other iPhone OS 1.x builds on M68AP (1.0 / 1.0.x / 1.1.x)
 
+> **Artifact paths moved (2026-07-27).** Commands quoted below use the old
+> layout — `m68ap-artifacts/stage/` (which was 1.1.4), `stage-1.0/`,
+> `extracted/`. Every build now lives in `m68ap-artifacts/builds/<BUILD>/` with
+> version-neutral filenames, and every tool takes an explicit `--build`. The
+> quoted commands are kept as the dated record of what was run; to re-run them
+> today, translate the paths using
+> [`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md) — usually
+> `--build <BUILD>` replaces the path arguments entirely.
+
+
 > Evaluation written 2026-07-25. Every table entry marked **measured** was read
 > out of the real IPSW on this machine, not taken from a wiki.
 >

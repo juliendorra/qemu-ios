@@ -20,9 +20,7 @@ Example
         --timeout 600 --interval 15 --logs /tmp/probe-n45ap
 
     python3 scripts/boot-frame-probe.py --board m68ap \
-        --iboot-m68ap m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin \
-        --nor-m68ap   m68ap-artifacts/stage/nor_m68ap.bin \
-        --nand-m68ap  m68ap-artifacts/stage/nand-m68ap-fresh \
+        --build 4A102 \
         --stabilize-root-domain \
         --timeout 600 --interval 15 --logs /tmp/probe-m68ap
 """

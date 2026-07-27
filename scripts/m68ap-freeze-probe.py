@@ -9,9 +9,7 @@ visible alongside "is the CPU moving".
 
 Example:
     python3 scripts/m68ap-freeze-probe.py \
-        --iboot-m68ap m68ap-artifacts/stage/iboot_204_m68ap_sbpatch.bin \
-        --nor-m68ap   m68ap-artifacts/stage/nor_m68ap.bin \
-        --nand-m68ap  m68ap-artifacts/stage/nand-m68ap-fresh \
+        --build 4A102 \
         --boot-wait 160 --samples 40 --interval 2 --logs /tmp/m68ap-freeze
 """
 from __future__ import annotations

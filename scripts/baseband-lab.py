@@ -55,14 +55,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lab_workspace import Workspace, prune_runs, require_free_bytes, NAND_TREE_BYTES
+import m68ap_paths
 
 REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get("IPOD_APP", "/Applications/iPod Touch.app/Contents"))
 DEFAULT_QEMU = REPO / "build-ipod11" / "qemu-system-arm"
-DEFAULT_BOOTROM = REPO / "m68ap-artifacts" / "appdbg" / "bootrom_s5l8900"
-DEFAULT_IBOOT = REPO / "m68ap-artifacts" / "stage" / "iboot_204_m68ap_sbpatch.bin"
-DEFAULT_NOR = REPO / "m68ap-artifacts" / "stage" / "nor_m68ap.bin"
-DEFAULT_NAND = REPO / "m68ap-artifacts" / "stage" / "nand-m68ap-fresh"
+DEFAULT_BOOTROM = m68ap_paths.BOOTROM
+# The iBoot/NOR/NAND defaults come from --build (see resolve_build); the lab
+# used to hardcode m68ap-artifacts/stage/, which WAS iPhone OS 1.1.4.
+DEFAULT_IBOOT = DEFAULT_NOR = DEFAULT_NAND = None
 SGOLD2D = REPO / "scripts" / "sgold2d.py"
 
 FB_BASES = {"iboot_0x0fe00000": 0x0FE00000,
@@ -168,7 +169,8 @@ class Instance:
                 os.unlink(p)
         self.serial.write_bytes(b"")
         machine = (f"iPhone-2G,bootrom={self.args.bootrom},"
-                   f"iboot={self.args.iboot},nand={nand}")
+                   f"iboot={self.args.iboot},nand={nand}"
+                   f",epoch={self.args.epoch}")
         cmd = [str(self.args.qemu), "-M", machine, "-m", "1G",
                "-pflash", str(nor),
                "-L", str(APP / "Resources" / "pc-bios"),
@@ -361,6 +363,7 @@ def main() -> int:
     ap.add_argument("--nor", type=Path, default=DEFAULT_NOR)
     ap.add_argument("--nand", type=Path, default=DEFAULT_NAND)
     ap.add_argument("--logs", type=Path, required=True)
+    m68ap_paths.add_build_argument(ap)
     ap.add_argument("--max-wall", type=float, default=600,
                     help="hard per-instance wall-clock cap (s)")
     ap.add_argument("--stall-secs", type=float, default=90,
@@ -389,6 +392,17 @@ def main() -> int:
     ap.add_argument("--pc-samples", type=int, default=8)
     ap.add_argument("--tail-lines", type=int, default=40)
     args = ap.parse_args()
+
+    # Fill whatever was not given explicitly from this build's directory, and
+    # carry its security epoch: booting a firmware under another's wedges in
+    # iBoot with an empty serial log.
+    paths = m68ap_paths.get(args.build)
+    paths.require("iboot_sb", "nor", "nand")
+    args.iboot = args.iboot or paths.iboot_sb
+    args.nor = args.nor or paths.nor
+    args.nand = args.nand or paths.nand
+    args.epoch = paths.epoch
+    print(f"[baseband-lab] {m68ap_paths.describe(args.build)}")
 
     for p in (args.qemu, args.bootrom, args.iboot, args.nor, args.nand):
         if not Path(p).exists():
