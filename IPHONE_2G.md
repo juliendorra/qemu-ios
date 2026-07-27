@@ -172,8 +172,9 @@ flash images, and the PMU's real I2C bus (i2c0 on M68AP). The last of those was 
 ADM/FMC firmware blob the kernel uploads (1.0 uploads `CalmADMFMCFirmware-14`,
 1.1.x `-17`) and which keeps its page number at a different offset.
 
-Details, measurements, dead ends and the test plan:
-[`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md).
+Measurements and the test plan: [`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md).
+The bring-up process, wrong turns included:
+[`IOS_1_0_BRINGUP_CASE_STUDY.md`](IOS_1_0_BRINGUP_CASE_STUDY.md).
 
 ## Historical NAND provenance and route decision
 

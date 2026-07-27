@@ -807,6 +807,10 @@ It does not fall back: IOKit retries `AppleS5L8900XADMFMC::start` forever
 each time). Removed. If this is revisited, the driver has to be made to *decline
 the match* rather than fail its start.
 
+> The *process* — every wrong turn, rabbit hole and escape — is written up in
+> [`IOS_1_0_BRINGUP_CASE_STUDY.md`](IOS_1_0_BRINGUP_CASE_STUDY.md). This file
+> keeps the measurements.
+
 ## Result: iPhone OS 1.0.2 reaches the home screen
 
 Six emulator fixes, in the order they were hit:
