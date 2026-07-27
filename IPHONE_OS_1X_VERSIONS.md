@@ -683,12 +683,15 @@ order, with the evidence needed to resume each:
    like, and it was never 1.0-only: 1.1.4 issues it too. Every page it carried
    was being dropped, on every version. `0x100` is a bank inventory with
    nothing to do. See "ADM `0x400` is WriteMultiple" below.
-4. **A guest-written NAND will not boot again** (new, and pre-existing — it
-   reproduces with `0x400` dropped, so WriteMultiple did not cause it). With
-   `IT_NAND_WRITABLE=1`, a second boot from the previous run's `stage/nand`
-   wedges in iBoot with zero serial lines. Nothing persists across a restart
-   today. Evidence and the A/B in "Separate, pre-existing: a written NAND will
-   not boot again" below.
+4. **A guest-written NAND stops booting once enough has been written** (new,
+   and pre-existing — it reproduces with `0x400` dropped, so WriteMultiple did
+   not cause it). Small write volumes DO survive a restart on every target
+   tested; past a few hundred pages, M68AP 1.0 wedges in iBoot and 1.1.4 panics
+   after FTL init. Narrowed on 1.0 to the three pages the single-page write
+   path puts on the FTL context section, with five candidate causes killed by
+   measurement. `scripts/nand-persistence-probe.py` reproduces and bisects it
+   in one command. Full evidence in "Separate, pre-existing: a written NAND
+   will not boot again" below.
 5. **Installed 1.1.4/1.1.1 bundles predate this session's fixes** — notably the
    PMU bus, which is what makes them show the big charging battery. Repackaging
    picks that up, and they will then idle-sleep like real devices (correct);
@@ -1185,6 +1188,26 @@ bytes belong to the model — at start-up data3 holds the bank chip-ID table —
 its spare**. Fixed to take the record and zero the rest, which is both what the
 guest wrote and what the pristine image's own pages look like. It does not fix
 the reboot.
+
+##### Scope across the targets
+
+Measured with the probe. "short" is a boot A stopped once the guest has
+committed pages; "long" carries it through the sleep, or simply runs until the
+write count is in the hundreds.
+
+| target | short boot A | long boot A | how boot B fails |
+|---|---|---|---|
+| M68AP 1.0 / 1A543a | **boots** (326 pages) | **fails** (391-405 pages) | wedges in iBoot, 0 serial lines |
+| M68AP 1.1.4 / 4A102 | **boots** (200 pages) | **fails** (712 pages) | kernel runs, `FIL/BUF/VFL/FTL [OK]`, then **panics** into the remote debugger — 4130 serial lines |
+| M68AP 1.0.2 / 1C28 | not tested | not tested | artifacts absent from this tree (IPSW-derived, never committed) |
+| M68AP 1.1.1 / 3A109a | not tested | not tested | same |
+| N45AP iPod | **boots** (116 and 488 pages) | not reproduced | — its boot A never reached a sleep |
+
+Two things this changes. It is **not a 1.0 problem and not an iBoot problem** —
+1.1.4 gets all the way through FTL init and then panics, which is a different
+symptom of the same inconsistent media. And it is **not strictly about the
+sleep** — 1.1.4 never slept; it just wrote enough (712 pages) to restructure
+something. The sleep matters on 1.0 only because that is when its FTL commits.
 
 ##### Where to pick it up
 
