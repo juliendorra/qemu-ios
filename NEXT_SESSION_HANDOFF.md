@@ -140,13 +140,24 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
 
 * **T1/T2** — model the MBX (swap completion + 2D) and drop
   `LK_ENABLE_MBX2D=0`.
-* **The M68AP kernel framebuffers stay black for a long time.** Found while
-  fixing the boot logo (2026-07-27): 110 s in, with SpringBoard already
-  running, both `0x0f400000` and `0x0f496000` were still 0.0% non-black. The
-  logo now correctly stays up for that whole window, so it is no longer
-  *visible* as a black screen — which makes it easier to miss. Reproduce with
-  `fb-snapshot.py --board m68ap --build 4A102 --boot-wait 60 --samples 6
-  --sample-interval 10`.
+* ~~**The M68AP kernel framebuffers stay black for a long time.**~~
+  **NOT AN ISSUE — I measured the wrong artifact (corrected 2026-07-27).**
+  The observation was real (110 s in, `0x0f400000` and `0x0f496000` both 0.0%
+  with SpringBoard running) but it was taken against
+  `m68ap-artifacts/builds/<BUILD>/nand`, the **plain** NAND, whose own
+  provenance reads `"root and data HFS+ partitions placed; GPT/MBR
+  synthesised"`. The three things M68AP needs to render at all — the lockdownd
+  activation patch, `LK_ENABLE_MBX2D=0`, and the reference-shaped data ark —
+  are applied by `build-m68ap-homescreen-nand.py`, which only
+  `package-iphone-app.sh` runs. The plain NAND was never going to render.
+
+  On the bundle, sampled every 8 s: logo at t=10 and t=18, and by **t=26 s**
+  both kernel buffers are at ~74% with the screen at 69.75%. Clean handoff.
+
+  **The general trap:** `builds/<BUILD>/nand` and the bundle's NAND are not the
+  same artifact, and only the latter is expected to render. Judge anything
+  about rendering on the bundle — which is ground rule 1 above, and this is
+  what ignoring it looks like.
 * **Bundles predate the boot-logo fix.** Both the NOR builder change and the
   LCD window change are needed; the installed `/Applications/iPhone 2G*.app`
   bundles carry neither, and their `nor.bin` must be regenerated (not just the

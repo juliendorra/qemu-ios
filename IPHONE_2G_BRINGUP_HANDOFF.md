@@ -3179,10 +3179,13 @@ Two things seen while verifying that are NOT caused by these fixes, and are
 open:
 - An intermittent `panic(cpu 0 ...)` inside `IOIpodUSBDevice::start` on 1.1.4;
   the immediately following identical run reached SpringBoard with no panic.
-- On M68AP the kernel framebuffers at 0x0f400000/0x0f496000 were still fully
-  black 110s in, with SpringBoard already running. The logo stays up for that
-  whole window (which is the intended behaviour), but the home screen taking
-  that long to reach the framebuffer is worth its own look.
+- ~~On M68AP the kernel framebuffers were still fully black 110s in.~~
+  **Retracted the same day: the wrong artifact was measured.** That run used
+  `m68ap-artifacts/builds/<BUILD>/nand`, the plain NAND, which carries none of
+  the render recipe (activation patch, `LK_ENABLE_MBX2D=0`, data ark) — those
+  are applied only by `build-m68ap-homescreen-nand.py` during bundle
+  packaging. On the bundle the kernel buffers reach ~74% by **t=26 s**. The
+  plain NAND not rendering is its normal behaviour, not a defect.
 
 ---
 
