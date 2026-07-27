@@ -10,6 +10,14 @@
 #define NAND_BYTES_PER_PAGE 2048
 #define NAND_BYTES_PER_SPARE 64
 
+/*
+ * The ADM hands the spare over in 12-byte records, one per page, packed in the
+ * data3 section -- the same 0xc-byte record the model writes back as a read
+ * completion (logical page, status, and the 0xff FTL mark at byte 10). The
+ * on-media spare area is 64 bytes; everything past the record is padding.
+ */
+#define NAND_ADM_SPARE_RECORD 0xc
+
 #define NAND_CHIP_ID 0xA514D3AD
 
 #define NAND_FMCTRL0  0x0
@@ -56,6 +64,19 @@ typedef struct ITNandState {
     uint32_t banks_to_read[512]; // used when in multiple page read mode
     uint32_t pages_to_read[512]; // used when in multiple page read mode
     bool is_writing;
+    /*
+     * Multi-page write (ADM command 0x400, the WriteMultiple the FIL
+     * advertises). Like the multi-page READ above, the guest primes one
+     * descriptor and then streams every page through the single FIFO, so the
+     * target bank/page and the spare have to be swapped in at each 2 KiB
+     * boundary rather than taken from the FMADDR registers.
+     */
+    bool writing_multiple_pages;
+    uint32_t cur_page_writing;
+    uint32_t num_pages_writing;
+    uint32_t banks_to_write[512];
+    uint32_t pages_to_write[512];
+    uint8_t spares_to_write[512][NAND_ADM_SPARE_RECORD];
     QemuMutex lock;
     char *nand_path;
     bool pack_checked;
@@ -68,5 +89,6 @@ typedef struct ITNandState {
 } ITNandState;
 
 void nand_set_buffered_page(ITNandState *s, uint32_t page);
+void nand_begin_multi_write(ITNandState *s, uint32_t num_pages);
 
 #endif

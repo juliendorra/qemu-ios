@@ -475,6 +475,105 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                             adm_write_completion_records(s, num_pages);
                         }
                         break;
+                    case 0x400:
+                        /*
+                         * WriteMultiple -- the write counterpart of 0x200's
+                         * read-multiple, and NOT the flush/standby it looks
+                         * like from where it appears in the log.
+                         *
+                         * It shows up immediately before every sleep because
+                         * that is when the FTL commits its dirty pages, so
+                         * dropping it (which this model did, as "Unrecognized
+                         * ADM command: 1024") threw away exactly the writes
+                         * the guest cared most about keeping. The FIL
+                         * advertises ReadMultiple / ReadScattered /
+                         * WriteMultiple at init; 0x200 / 0x300 / 0x400 are
+                         * those three. Both firmware blobs issue it -- this
+                         * was never a 1.0-only gap.
+                         *
+                         * Measured shape (IT_ADM_UNK / IT_NAND_WRITE, iPhone
+                         * OS 1.0, blob -14; 1.1.4 with blob -17 is identical
+                         * at its own base):
+                         *   +0x28  page count (4, 0xc, 0x10 seen)
+                         *   page_off  the BASE page, repeated once per bank
+                         *   +0x44  the bank bytes, 00 01 02 03
+                         *   data3  one 0xc-byte spare record per page
+                         *
+                         * The descriptor carries only num_banks page entries,
+                         * not `count` of them: on a 12- and a 16-page command
+                         * the first four words differed while entries 4..7
+                         * stayed byte-identical, i.e. those are stale from an
+                         * earlier command. Reading them as a per-page list
+                         * sent every entry past the eighth to bank0/page0 --
+                         * the FIL signature page. So the layout is 0x200's:
+                         * bank = i % num_banks, page = base + i / num_banks.
+                         * The page sequence confirms it -- a 16-page write at
+                         * base 26514 is followed by one at 26522, which under
+                         * a page-per-entry reading would have rewritten pages
+                         * the same command had just programmed.
+                         */
+                        num_pages = adm_read_be16(s, cmdbase + 0x28);
+                        if (num_pages == 0 ||
+                            num_pages > ARRAY_SIZE(
+                                s->nand_state->pages_to_write)) {
+                            qemu_log_mask(LOG_GUEST_ERROR,
+                                          "iPod ADM: invalid write page count "
+                                          "%u\n", num_pages);
+                            break;
+                        }
+                        page = adm_read_be32(s, cmdbase + page_off);
+                        if (page == 0) {
+                            /*
+                             * Page 0 of bank 0 holds the FIL signature the
+                             * whole WMR stack keys off. The FTL never targets
+                             * it, so a zero base means the descriptor was not
+                             * understood -- drop the command rather than
+                             * program over the signature.
+                             */
+                            qemu_log_mask(LOG_GUEST_ERROR,
+                                          "iPod ADM: write-multiple with base "
+                                          "page 0, ignored\n");
+                            break;
+                        }
+                        for (int i = 0; i < num_pages; i++) {
+                            s->nand_state->pages_to_write[i] =
+                                page + i / s->nand_state->num_banks;
+                            s->nand_state->banks_to_write[i] =
+                                i % s->nand_state->num_banks;
+                            /*
+                             * Copy the spares NOW: the page data itself
+                             * arrives later through the FIFO, and data3 is the
+                             * guest's own buffer to reuse in the meantime.
+                             */
+                            address_space_read(
+                                &s->downstream_as,
+                                s->data3_sec_addr +
+                                    i * NAND_ADM_SPARE_RECORD,
+                                MEMTXATTRS_UNSPECIFIED,
+                                s->nand_state->spares_to_write[i],
+                                NAND_ADM_SPARE_RECORD);
+                        }
+                        if (getenv("IT_NAND_WRITE")) {
+                            fprintf(stderr,
+                                    "[ADM-WRITEMULTI] %u pages from bank0/page "
+                                    "%u across %u banks\n", num_pages, page,
+                                    s->nand_state->num_banks);
+                        }
+                        nand_begin_multi_write(s->nand_state, num_pages);
+                        break;
+                    case 0x100:
+                        /*
+                         * Bank inventory, issued once per boot right after the
+                         * firmware upload and before any page traffic. Nothing
+                         * to do: it carries no page count, no bank and no page
+                         * list (measured with IT_ADM_UNK), and the chip-ID
+                         * table it asks about is already in data3 -- the model
+                         * puts it there on the ADM_CTRL == 3 start-up. 1.1.x
+                         * issues it too and has always proceeded past it with
+                         * this model doing nothing, which is the evidence that
+                         * "nothing" is the right answer rather than a gap.
+                         */
+                        break;
                     case 0x500:
                         // writing a page
                         bank = adm_read_u8(
@@ -505,8 +604,63 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
                                          NAND_BYTES_PER_SPARE, 0);
                         s->nand_state->fmdnum = NAND_BYTES_PER_PAGE;
                         s->nand_state->is_writing = true;
+                        s->nand_state->writing_multiple_pages = false;
                         break;
                     default:
+                        /*
+                         * IT_ADM_UNK=1: dump the command window for a command
+                         * this model does not implement.
+                         *
+                         * IT_ADM_DIFF needs the kick index up front, which is
+                         * no use for 0x400 -- it is issued immediately before
+                         * a sleep, hundreds of kicks in and at no fixed count.
+                         * Trigger on the command itself instead, and show the
+                         * whole descriptor (base..base+0x60), the page-number
+                         * window and the head of data3, so it is visible which
+                         * fields the guest bothered to populate.
+                         */
+                        if (getenv("IT_ADM_UNK")) {
+                            static unsigned n;
+                            if (n++ < 8) {
+                                uint8_t w[0x60];
+                                fprintf(stderr,
+                                        "[ADM-UNK] #%u cmd 0x%x cmdbase=%s "
+                                        "count=0x%04x bank=0x%02x\n",
+                                        n, cmd,
+                                        page_off == 0x444 ? "fw14" : "fw17",
+                                        adm_read_be16(s, cmdbase + 0x28),
+                                        adm_read_u8(s, cmdbase + 0x44));
+                                address_space_read(&s->downstream_as, cmdbase,
+                                                   MEMTXATTRS_UNSPECIFIED, w,
+                                                   sizeof(w));
+                                for (int r = 0; r < 6; r++) {
+                                    fprintf(stderr, "   cmd+%02x:", r * 16);
+                                    for (int k = 0; k < 16; k++) {
+                                        fprintf(stderr, " %02x",
+                                                w[r * 16 + k]);
+                                    }
+                                    fprintf(stderr, "\n");
+                                }
+                                address_space_read(&s->downstream_as,
+                                                   cmdbase + page_off,
+                                                   MEMTXATTRS_UNSPECIFIED, w,
+                                                   0x20);
+                                fprintf(stderr, "   page+00:");
+                                for (int k = 0; k < 0x20; k++) {
+                                    fprintf(stderr, " %02x", w[k]);
+                                }
+                                fprintf(stderr, "\n");
+                                address_space_read(&s->downstream_as,
+                                                   s->data3_sec_addr,
+                                                   MEMTXATTRS_UNSPECIFIED, w,
+                                                   0x20);
+                                fprintf(stderr, "   data3 +00:");
+                                for (int k = 0; k < 0x20; k++) {
+                                    fprintf(stderr, " %02x", w[k]);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
                         printf("Unrecognized ADM command: %d\n", cmd);
                         break;
                 }

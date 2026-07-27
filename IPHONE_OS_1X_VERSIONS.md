@@ -678,11 +678,18 @@ order, with the evidence needed to resume each:
    Now: screenout 2.173% from t=4 s on N45AP, 1.1.4 and 1.0 alike. Derivation,
    dead ends and traps in `IPHONE_2G_BRINGUP_HANDOFF.md` and
    `M68AP_RENDER_HANDOFF.md` §4.
-3. **ADM commands `0x400` and `0x100` unimplemented.** `0x400` is issued
-   immediately before *every* sleep (13× per 300 s run); `0x100` once per boot,
-   and 1.1.x issues it too, apparently harmlessly. The field map for both
-   firmware layouts is already derived — see the table above.
-4. **Installed 1.1.4/1.1.1 bundles predate this session's fixes** — notably the
+3. ~~**ADM commands `0x400` and `0x100` unimplemented.**~~ **SOLVED
+   2026-07-27** — `0x400` is **WriteMultiple**, not the flush/standby it looked
+   like, and it was never 1.0-only: 1.1.4 issues it too. Every page it carried
+   was being dropped, on every version. `0x100` is a bank inventory with
+   nothing to do. See "ADM `0x400` is WriteMultiple" below.
+4. **A guest-written NAND will not boot again** (new, and pre-existing — it
+   reproduces with `0x400` dropped, so WriteMultiple did not cause it). With
+   `IT_NAND_WRITABLE=1`, a second boot from the previous run's `stage/nand`
+   wedges in iBoot with zero serial lines. Nothing persists across a restart
+   today. Evidence and the A/B in "Separate, pre-existing: a written NAND will
+   not boot again" below.
+5. **Installed 1.1.4/1.1.1 bundles predate this session's fixes** — notably the
    PMU bus, which is what makes them show the big charging battery. Repackaging
    picks that up, and they will then idle-sleep like real devices (correct);
    iBoot-204 parks properly so their wake should stay fast.
@@ -1017,6 +1024,134 @@ itself.)
 Bank values confirm the decode: the low byte of the bank word cycles
 `…00 → …01 → …02 → …03` in both.
 
+### ADM `0x400` is WriteMultiple (2026-07-27)
+
+`0x400` was logged as `Unrecognized ADM command: 1024` and guessed above to be
+a flush/sync/standby, because it lands immediately before every sleep. **It is
+a page WRITE** — the third of the three operations `_FILInit` advertises:
+
+| ADM cmd | FIL operation |
+|---|---|
+| `0x200` | ReadMultiple |
+| `0x300` | ReadScattered (and the single-page read) |
+| `0x400` | **WriteMultiple** |
+| `0x500` | single-page write |
+
+It appears before a sleep because that is when the FTL commits its dirty pages.
+So the model was not missing a hint to power down — it was **throwing away
+exactly the writes the guest most wanted kept**, silently.
+
+**This was never a 1.0-only gap.** 1.1.4 issues `0x400` too (once per 240 s
+run, 12 pages committed); 1.0 issues it far more often only because it
+sleep-cycles. Every version has been losing these writes.
+
+#### The descriptor, and the trap in it
+
+Captured with `IT_ADM_UNK=1`, which dumps the command window for any command
+the model does not implement — `IT_ADM_DIFF` is no use here because it wants
+the kick index up front and `0x400` arrives hundreds of kicks in, at no fixed
+count. Layout is the same under both blobs, each at its own base/`page_off`:
+
+| offset | meaning |
+|---|---|
+| `+0x24` | command (`0x400`) |
+| `+0x28` | page count — 4, 0xc, 0x10, 0x14 seen |
+| `+0x2c` | `0xc`, constant: the spare-record size |
+| `+0x44` | bank bytes, `00 01 02 03` |
+| `page_off` | the **base** page, repeated once per bank |
+| data3 | one `0xc`-byte spare record per page, packed |
+
+The spare records are the same 12-byte shape the model already writes back as
+read completions (byte 10 = `0xff` FTL mark). They must be copied at kick time:
+the page data arrives afterwards through the FIFO, and data3 is the guest's own
+buffer to reuse meanwhile.
+
+**The trap:** `page_off` looks like a per-page list — for a 16-page command it
+holds eight plausible page numbers. It is not. Decoding it that way (first
+implementation, measured) sent every entry past the eighth to **bank0/page0**,
+the FIL signature page: 24 of 52 multi-page writes in a 300 s run went there.
+The give-away is that on a 12-page and a 16-page command the first four words
+differ while entries 4..7 stay byte-identical — those four are stale from an
+earlier command. Only `num_banks` entries are ever current, exactly as on the
+`0x200` read path.
+
+So the real rule is `0x200`'s, which is what makes reads and writes agree:
+
+```
+bank = i % num_banks
+page = base + i / num_banks
+```
+
+Confirmed independently by the page sequence: a 16-page write at base 26514
+covers 26514..26517 across four banks, and the next command starts at 26522. A
+page-per-entry reading would have had that same command consume 26514..26529,
+so the follow-up would be reprogramming pages it had just written — which no
+FTL does.
+
+`count` really is a page count, not a byte or sector count: the guest streams
+exactly `count * 2048` bytes through the FIFO (FMDNUM lands on 0 at entry
+`count-1`), and data3 holds `count` consecutive spare records, their logical
+page numbers incrementing by one per entry.
+
+#### `0x100` is a bank inventory, and correctly does nothing
+
+Measured with the same tool: no page count, no bank, no page list, all-zero
+descriptor. The chip-ID table it asks about is already in data3 — the model
+puts it there on the `ADM_CTRL == 3` start-up. 1.1.x has always issued it and
+always proceeded with this model doing nothing, which is the evidence that
+"nothing" is right rather than a second gap. It is now a documented no-op
+instead of an `Unrecognized ADM command` line.
+
+#### What it took in the model, and what was measured after
+
+`hw/arm/ipod_touch_nand.c` could only write one page per transfer: FMDNUM was
+read as an absolute offset into a 2 KiB buffer, and the flush was inline in the
+FIFO handler. A multi-page write streams every page through that same FIFO, so
+the page index now comes from the offset *within* the current page and the
+bank/page/spare are swapped in at each 2 KiB boundary — the mirror image of
+what the multi-page read path already did.
+
+Verified (`IT_NAND_WRITABLE=1 IT_NAND_WRITE=1`, `scripts/fb-snapshot.py`):
+
+- 1.0 / 1A543a, 300 s: 52 pages committed across 13 `0x400` commands, striping
+  26514..26517 over banks 0-3, spares consecutive, **zero** page-0 writes, no
+  WMR/FTL/VFL errors, home screen at 59.0 % non-black.
+- 1.1.4 / 4A102, 260 s: 12 pages committed, SpringBoard reached — no regression
+  on the version that was already working.
+- `Unrecognized ADM command` no longer appears in either.
+
+#### Separate, pre-existing: a written NAND will not boot again
+
+Found while trying to prove the writes survive a reboot, and **not caused by
+this change** — it reproduces identically with `0x400` dropped. Re-booting from
+a NAND directory a writable run has written to (`--nand-m68ap <prev>/stage/nand`)
+wedges in iBoot: Apple logo at 75 % non-black, **zero** serial lines, then
+`OOCSHDWN` / "Application processor awaiting power loss". The kernel never
+starts.
+
+A/B, both with `IT_NAND_WRITABLE=1`, 1.0 / 1A543a:
+
+| run | fresh NAND | reboot from its own written NAND |
+|---|---|---|
+| `0x400` implemented | `BSD root`, home screen 59.0 % | wedged in iBoot, 0 serial lines |
+| `0x400` dropped | `BSD root`, home screen 59.0 % | wedged in iBoot, 0 serial lines |
+
+So the damage comes from the pre-existing single-page (`0x500`) write path or
+from the writable model generally, not from WriteMultiple. Worth knowing before
+chasing it: ~98 pages *per bank* differ from pristine after a 300 s run, and
+most of them **overwrite pages that already held data** — which a real NAND
+cannot do without erasing the block first, and which the model has no erase
+operation to represent. Nothing in the tree has ever booted from a
+guest-written NAND before, because in the default read-only mode every write
+lands in a `<page>_new.page` file that is never read back.
+
+Two traces stay in the tree for this: `IT_ADM_UNK=1` (descriptor dump for any
+unimplemented command) and `IT_NAND_WRITE=1` (every committed page with its
+spare and FMDNUM, counted separately for single and multi-page writes — a
+shared cap hides the handful of multi-page ones behind thousands of singles,
+which is exactly what happened the first time this was measured).
+
+
 ### Sleep and wake on 1.0 — sleep is correct, and wake works
 
 An earlier revision of this section framed the 1.0 idle-sleep as a defect and
@@ -1111,6 +1246,9 @@ chase.
 | `0x100` (256) | 4 | once per boot at init; 1.1.x issues it too, apparently harmlessly |
 
 `0x400` sitting on the pre-sleep path makes it the first thing to implement.
+
+**Both are implemented now — and the "flush/standby" guess above was wrong.**
+See "ADM `0x400` is WriteMultiple" below.
 
 **Tried and reverted:** adding the adapter-present bits
 (`MBCS1_ADPPRES|ADPOK`) alongside the USB ones. `ext` stayed 0, the sleeps

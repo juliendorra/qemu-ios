@@ -304,6 +304,76 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
     }
 }
 
+/*
+ * Commit whatever is in the page buffer to the currently buffered bank/page.
+ * Factored out of the FIFO handler because a multi-page write has to do this
+ * once per 2 KiB rather than once per transfer.
+ */
+static void nand_flush_buffered_page(ITNandState *s)
+{
+    char filename[200];
+    FILE *f;
+
+    qemu_mutex_lock(&s->lock);
+    qemu_mutex_unlock(&s->lock);
+    sprintf(filename, "%s/bank%d/%d%s.page", s->nand_path,
+            s->buffered_bank, s->buffered_page,
+            nand_writable() ? "" : "_new");
+    f = fopen(filename, "wb");
+    if (f == NULL) { hw_error("Unable to read file!"); }
+    nand_note_write(s->buffered_bank, s->buffered_page);
+    fwrite(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
+    fwrite(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
+    fclose(f);
+
+    if (getenv("IT_NAND_WRITE")) {
+        /*
+         * Separate counters per mode, deliberately: single-page writes run
+         * into the thousands during boot and a shared cap hides the handful of
+         * multi-page ones entirely -- which is exactly what happened the first
+         * time this was measured.
+         */
+        static unsigned n[2];
+        unsigned *cnt = &n[s->writing_multiple_pages ? 1 : 0];
+        if ((*cnt)++ < 200) {
+            fprintf(stderr, "[NAND-WRITE] bank%u page %u spare %08x %08x "
+                    "mark 0x%02x (multi %d, %u/%u, fmdnum %u)\n",
+                    s->buffered_bank, s->buffered_page,
+                    ldl_le_p(s->page_spare_buffer),
+                    ldl_le_p(s->page_spare_buffer + 4),
+                    s->page_spare_buffer[0xa], s->writing_multiple_pages,
+                    s->cur_page_writing, s->num_pages_writing, s->fmdnum);
+        }
+    }
+}
+
+/* Point the write at entry `idx` of the multi-page descriptor. */
+static void nand_begin_write_page(ITNandState *s, uint32_t idx)
+{
+    set_bank(s, s->banks_to_write[idx]);
+    /*
+     * Loads the existing contents, which the incoming 2 KiB then overwrites in
+     * full -- but it is also what sets buffered_bank/buffered_page, which the
+     * flush above writes to. It refreshes page_spare_buffer from the media, so
+     * the guest's spare has to go in AFTER it, not before.
+     */
+    nand_set_buffered_page(s, s->pages_to_write[idx]);
+    memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
+    memcpy(s->page_spare_buffer, s->spares_to_write[idx],
+           NAND_ADM_SPARE_RECORD);
+}
+
+void nand_begin_multi_write(ITNandState *s, uint32_t num_pages)
+{
+    s->writing_multiple_pages = true;
+    s->reading_multiple_pages = false;
+    s->num_pages_writing = num_pages;
+    s->cur_page_writing = 0;
+    s->fmdnum = num_pages * NAND_BYTES_PER_PAGE;
+    s->is_writing = true;
+    nand_begin_write_page(s, 0);
+}
+
 static uint64_t itnand_read(void *opaque, hwaddr addr, unsigned size)
 {
     ITNandState *s = (ITNandState *) opaque;
@@ -426,6 +496,29 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             s->fmanum = val;
             break;
         case NAND_CMD:
+            /*
+             * IT_NAND_CMDS=1: which NAND opcodes the guest actually issues.
+             * The model only ever acts on ID/READ/READSTATUS, so anything else
+             * -- an ERASE above all -- is accepted here and then silently
+             * dropped, and the guest's picture of the media diverges from the
+             * model's without a single error being reported.
+             */
+            if (getenv("IT_NAND_CMDS")) {
+                static uint32_t seen[16], counts[16], nseen;
+                uint32_t i;
+                for (i = 0; i < nseen && seen[i] != val; i++) {
+                }
+                if (i == nseen && nseen < 16) {
+                    seen[nseen++] = val;
+                }
+                if (i < 16) {
+                    counts[i]++;
+                    if (counts[i] <= 2 || counts[i] % 4096 == 0) {
+                        fprintf(stderr, "[NAND-CMD] 0x%02x n=%u\n",
+                                (uint32_t)val, counts[i]);
+                    }
+                }
+            }
             s->cmd = val;
             break;
         case NAND_FMDNUM:
@@ -442,6 +535,36 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 return;
             }
 
+            if (s->writing_multiple_pages) {
+                /*
+                 * FMDNUM counts the WHOLE transfer down here, exactly as it
+                 * does on the multi-page read path, so the word index has to
+                 * come from the offset within the current page -- the absolute
+                 * value would run off the end of the buffer on page 2.
+                 */
+                uint32_t page_offset = s->fmdnum % NAND_BYTES_PER_PAGE;
+
+                if (page_offset == 0) {
+                    page_offset = NAND_BYTES_PER_PAGE;
+                }
+                ((uint32_t *)s->page_buffer)
+                    [(NAND_BYTES_PER_PAGE - page_offset) / 4] = val;
+                s->fmdnum -= 4;
+
+                if (s->fmdnum % NAND_BYTES_PER_PAGE == 0) {
+                    nand_flush_buffered_page(s);
+                    s->cur_page_writing++;
+                    if (s->fmdnum == 0 ||
+                        s->cur_page_writing >= s->num_pages_writing) {
+                        s->is_writing = false;
+                        s->writing_multiple_pages = false;
+                    } else {
+                        nand_begin_write_page(s, s->cur_page_writing);
+                    }
+                }
+                break;
+            }
+
             //printf("Setting offset %d: %d\n", s->fmdnum, (NAND_BYTES_PER_PAGE - s->fmdnum) / 4);
             ((uint32_t *)s->page_buffer)[(NAND_BYTES_PER_PAGE - s->fmdnum) / 4] = val;
             s->fmdnum -= 4;
@@ -449,23 +572,7 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             if(s->fmdnum == 0) {
                 // we're done!
                 s->is_writing = false;
-
-                // flush the page buffer to the disk
-                //printf("Flushing page %d, bank %d\n", s->buffered_page, s->buffered_bank);
-                qemu_mutex_lock(&s->lock);
-                qemu_mutex_unlock(&s->lock);
-                {
-                    char filename[200];
-                    sprintf(filename, "%s/bank%d/%d%s.page", s->nand_path,
-                            s->buffered_bank, s->buffered_page,
-                            nand_writable() ? "" : "_new");
-                    FILE *f = fopen(filename, "wb");
-                    if (f == NULL) { hw_error("Unable to read file!"); }
-                    nand_note_write(s->buffered_bank, s->buffered_page);
-                    fwrite(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
-                    fwrite(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
-                    fclose(f);
-                }
+                nand_flush_buffered_page(s);
             }
             break;
         case NAND_RSCTRL:
