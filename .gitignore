@@ -22,6 +22,12 @@ GTAGS
 !scripts/iphone-data-abort-hook.patch
 *.gcov
 /build-ipod/
+/build-ipod11/
+/build-release/
+
+# Offline build inputs reconstituted by the QEMU 11 port (see QEMU_11_PORT.md):
+# a vendored tomli for meson, and the meson subprojects fetched by hand.
+/.build-pydeps/
 
 # iPhone 2G (M68AP) local artifacts: IPSW, decrypted Apple images, generated
 # NOR/NAND trees, provenance. Never commit (see AGENTS.md firmware policy).
