@@ -237,6 +237,14 @@ Cache Storage), worker lifecycle, canvas display target, and the input bridge
   SpringBoard, the out-of-tree [qemu-wasm](https://github.com/ktock/qemu-wasm)
   JIT becomes a requirement rather than an optimization. That is the next
   go/no-go signal.
+  One lever exists on the guest side: SpringBoard currently composites in
+  SOFTWARE (`LK_ENABLE_MBX2D=0`) because the MBX is a stub, so that work is
+  guest ARM instructions running through the interpreter. Modelling MBX 2D
+  would move it into compiled wasm — a bigger win under TCI than natively.
+  Unmeasured; sequencing and how to measure it are in
+  [`MBX_HANDOFF.md`](MBX_HANDOFF.md) §4-5. It is NOT a substitute for the
+  TCI-vs-JIT decision, and should not be attempted alongside the display
+  bridge.
 - **`crypto.subtle` has no streaming digest**, so the loader hashes the whole
   300 MiB pack in memory. Acceptable on desktop; revisit for constrained hosts.
 

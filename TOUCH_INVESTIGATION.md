@@ -290,6 +290,10 @@ that class should be classified as expected before any measurement is taken.
 
 ---
 
+Related: the display path's remaining hacks, and why the same kext-symbols
+approach that cracked this should work there, are in
+[`MBX_HANDOFF.md`](MBX_HANDOFF.md).
+
 ## Dead ends and mistakes
 
 Recorded so nobody spends the time twice.

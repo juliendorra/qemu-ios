@@ -11,6 +11,14 @@
 > ([`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md)), so commands quoted below
 > need their paths translated.
 
+> **2026-07-28 — MBX has its own handoff now.** The PowerVR MBX stub is what
+> the TVOut swap-device window and the `LK_ENABLE_MBX2D=0` guest plist edit
+> both stand on (tasks T1/T2). What is known, what is already ruled out, how it
+> interacts with the browser port, and where to start are collected in
+> [`MBX_HANDOFF.md`](MBX_HANDOFF.md). Touch across all three app bundles is
+> fixed and written up in
+> [`TOUCH_INVESTIGATION.md`](TOUCH_INVESTIGATION.md).
+
 The sections below remain the record of the 2026-07-26 session.
 
 Both problems the previous handoff carried are addressed in this session:
