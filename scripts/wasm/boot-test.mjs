@@ -61,6 +61,13 @@ await Module({
   preRun: [(mod) => {
     mod.FS.mkdir('/fw');
     mod.FS.mkdir('/fw/nand');
+    // The bank directories must exist even with a packed, read-only NAND:
+    // nand_flush_buffered_page() opens <nand>/bank<N>/<page>_new.page for
+    // WRITING on every guest page write and hw_error()s -- aborting the whole
+    // emulator -- if the directory is missing. fb-snapshot.py and the app
+    // launcher both create them; this harness did not, which aborted a boot
+    // moments after it mounted the root filesystem.
+    for (let bank = 0; bank < 8; bank++) mod.FS.mkdir(`/fw/nand/bank${bank}`);
     for (const [dst, src] of files) {
       const data = readFileSync(src);
       mod.FS.writeFile(dst, data);

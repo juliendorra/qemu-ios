@@ -116,9 +116,25 @@ build, so a tree cannot be moved under the wrong firmware.
 | 1A543a (1.0) | yes | **yes, 215.6 MiB pack, 106,858 pages** | **yes — 59.04% non-black, 2026-07-27** |
 | 1C28 (1.0.2) | **yes** (decrypted 2026-07-27) | no | booted natively during bring-up, not packaged |
 | 3A109a (1.1.1) | no | no | booted natively during bring-up, not packaged |
-| 4A102 (1.1.4) | yes | yes, 300.3 MiB pack, 148,812 pages | yes — 73.95% non-black |
+| 4A102 (1.1.4) | yes | **NO — must be regenerated** (see below) | yes — 74.3% non-black, from the packaged bundle's NAND |
 
 Notes:
+
+- **4A102 has no product NAND in the layout (2026-07-28).** The migration filed
+  `stage/nand-m68ap-fresh` at `builds/4A102/nand`; that tree is valid but was
+  built from an **unpatched** root, so it boots and renders nothing (framebuffer
+  0.0% against the real NAND's 74.3%). It has been renamed to
+  `nand-prepack-not-product`, leaving the canonical path empty — a missing
+  artifact fails loudly, a wrong one boots to a black screen. Regenerate with
+  `build-m68ap-homescreen-nand.py --build 4A102`. The verified 1.1.4 NAND
+  currently lives only in `/Applications/iPhone 2G (iOS 1.1.4).app`.
+- **A product NAND now says so.** `build-m68ap-nand.py --recipe` records the
+  recipe in `nand-provenance.json`, and the home-screen recipe stamps
+  `"recipe": "home-screen"`. Check that field before trusting a tree:
+
+  ```sh
+  python3 -c "import json;print(json.load(open('<nand>/nand-provenance.json')).get('recipe'))"
+  ```
 
 - **1.0 has no `data.dmg`.** Its /var is built from the root filesystem's own
   `/private/var` template and sized at the stated 24 MiB default. That size is

@@ -69,6 +69,16 @@ shifts with host speed — and single-stepping makes the guest clock *fly*,
 moving the bug. Add `-icount shift=3` for a repeatable timer/interrupt timeline
 that matches the fast path. Reproduce the bug under `-icount` first, then debug.
 
+The WebAssembly port is the worked example, and it sharpens the rule: on a
+~13x slower engine the guest saw its own driver `start()` calls taking 16-23
+SECONDS and took timeout paths that panicked the kernel. The panic point moves
+with the shift, which is how you tell a timeout from a bad value. Note the
+direction -- a HIGHER shift means MORE virtual ns per instruction, i.e. a
+guest that believes it is on a SLOWER CPU. The S5L8900 is 412 MHz
+(~2.4 ns/instruction), so `shift=1` is the faithful setting for this SoC and
+`shift=3` already presents a machine 3x slower than the hardware. See
+BROWSER_WASM_STATUS.md.
+
 **Breakpoints / external debuggers (last resort, and note the traps):**
 
 - No cross-`gdb` is installed by default, and hand-rolling a gdb-remote (RSP)

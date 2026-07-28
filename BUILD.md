@@ -21,6 +21,14 @@ tracked in [`QEMU_11_PORT.md`](QEMU_11_PORT.md).
 
 ## Prerequisites
 
+> **OpenSSL is no longer required by the S5L8900 device models** (2026-07-28).
+> The AES and SHA1 engines and the 8900 image decryptor now use glib's
+> `GChecksum` and QEMU's own `crypto/aes.h`, because OpenSSL does not
+> cross-compile to wasm64 for the browser port. The `openssl@3` flags below are
+> kept for QEMU's own optional crypto; nothing in `hw/arm/ipod_touch*` needs
+> them. See [`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md) and
+> [`BROWSER_WASM_STATUS.md`](BROWSER_WASM_STATUS.md).
+
 ### Homebrew packages
 
 ```bash

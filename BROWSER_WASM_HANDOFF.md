@@ -196,6 +196,12 @@ native regression baseline is for.
 
 ## W6 — Copy-on-write overlay
 
+**Now a hard requirement, not a nicety.** `nand_flush_buffered_page()` calls
+`hw_error()` when it cannot open a page file for writing, which aborts the
+whole emulator. In a browser there is no filesystem to write to at all, so the
+first guest write after the root filesystem mounts would kill the page. This
+was observed for real (as a harness bug) on 2026-07-28.
+
 Guest writes currently have nowhere to go in the browser. Keyed by
 `(basePackSHA256, bank, page)`, full 2,112-byte records, batched and flushed on
 program completion / pause / page-hide. Requirements and tests are in the plan.
@@ -209,6 +215,20 @@ HFS signature of zero and drop into recovery.
 `catalog.json`, per-version cache namespaces keyed by digest, honest download
 sizes (the prefetch working set, not the pack size), offline warm boot, and
 switching versions cheaply enough that comparing them is the point.
+
+## W7a — Regenerate 4A102's product NAND
+
+`builds/4A102/nand` does not exist: what the migration filed there was built
+from an unpatched root and rendered nothing, so it was renamed to
+`nand-prepack-not-product`. The verified 1.1.4 NAND currently lives only inside
+`/Applications/iPhone 2G (iOS 1.1.4).app`.
+
+```sh
+scripts/build-m68ap-homescreen-nand.py --build 4A102   # ~1.2 GiB of scratch
+```
+
+Then re-measure its working set, since the numbers recorded for 1.1.4 came from
+the bundle's NAND.
 
 ## W8 — Package the remaining versions
 
@@ -267,6 +287,14 @@ only steps 3–5.
 | `scripts/wasm/analyze-nand-trace.py` | cold-boot working set + prefetch list |
 | `IT_NAND_TRACE_PAGES=<path>` | records page fetches (`hw/arm/ipod_touch_nand.c`) |
 
+## Triage rule
+
+**Every wasm-only failure so far has had a cause outside the wasm build**: the
+virtual clock (twice), a wrong NAND at the canonical path, and a missing
+directory in the test harness. No defect has yet been found in the device
+model, in QEMU's Emscripten support, or in TCI's correctness. Suspect
+environment, clock, and harness before suspecting the port.
+
 ## Do not repeat these
 
 - **Don't grep serial for "SpringBoard"** to decide a boot worked — it is never
@@ -277,6 +305,16 @@ only steps 3–5.
   3× (6% vs the real 16.4%).
 - **Don't treat `libffi`/`ASYNCIFY_IMPORTS=ffi_call_js` as JIT plumbing** — it is
   TCI's own helper-call path (`tcg/tci.c`).
+- **Don't run the wasm build without `-icount shift=1`** — the guest takes
+  timeout paths and panics, and the panic moves as you change the shift.
+- **Don't stage a NAND without its `bank0..bank7` directories.** Even a packed,
+  read-only NAND needs them: `nand_flush_buffered_page()` opens
+  `<nand>/bank<N>/<page>_new.page` for writing on every guest page write and
+  `hw_error()`s — killing the emulator — if the directory is missing. This
+  aborted a run seconds after it mounted the root filesystem.
+- **Don't trust `builds/<BUILD>/nand` without checking its provenance
+  `recipe` field.** A tree built from an unpatched root boots and renders
+  nothing; only `"recipe": "home-screen"` is the product NAND.
 - **Don't expect byte-reproducible packs across rebuilds**: `hdiutil` stamps
   timestamps into the HFS images, so `hfs_sha256` changes even when the recipe
   does not. Reproducibility is at the level of the recipe.

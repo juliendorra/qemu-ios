@@ -144,13 +144,67 @@ loudly, wrong boots to a black screen. Fixed three ways:
   answerable from the tree itself;
 - the migration script records why that mapping is wrong.
 
-### Also fixed: `fb-snapshot.py` could not verify anything
+### Every failure so far has had a cause OUTSIDE the wasm build
 
-Its QMP socket lived in `/tmp`, which is swept during long runs: the socket
-vanished mid-boot and the failure surfaced as a bare `FileNotFoundError` that
-read like a guest hang. It now uses `/var/tmp` and waits for the socket with an
-explanatory error. This had been blocking every home-screen verification
-attempt.
+Worth stating plainly, because it changes how the next failure should be
+triaged. Four separate symptoms all looked like "the WebAssembly port is
+broken", and none of them were:
+
+| symptom | actual cause |
+| --- | --- |
+| `AppleS5L8900XUSBWrangler` null dereference | wall-clock virtual time → guest timeout path |
+| `IOIpodUSBDevice::start` panic | the same, at a different threshold |
+| black framebuffer, 0% non-black | a NAND built from an unpatched root at the canonical path |
+| emulator `abort()` shortly after `BSD root` | the **test harness** had not created the NAND bank directories |
+
+**No defect has yet been found in the device model, in QEMU's Emscripten
+support, or in TCI's correctness.** The only code change the port has required
+is removing OpenSSL. Triage the next wasm-only symptom as environment, clock,
+or harness before suspecting the port.
+
+### Dead end: the harness abort after `BSD root`
+
+`nand_flush_buffered_page()` opens `<nand>/bank<N>/<page>_new.page` for WRITING
+on every guest page write, and calls `hw_error()` — which aborts the entire
+emulator — when that open fails. `boot-test.mjs` created `/fw/nand` but not the
+eight bank directories, so the first guest write after the root filesystem
+mounted killed the run. `fb-snapshot.py` and `ipod-app-launcher.sh` both create
+them; the harness now does too.
+
+**This is a hard requirement for W6, not just a harness fix.** In a browser
+there is no filesystem to write to at all, so that path must be replaced by the
+copy-on-write overlay. Leaving it as-is means the first guest write aborts the
+emulator in the page.
+
+### Dead end: `-lnodefs.js` / NODEFS
+
+Two attempts (LDFLAGS environment, then `--extra-ldflags`) both left the
+emitted module stubbing NODEFS out with "no longer included by default". QEMU's
+`configs/meson/emscripten.txt` sets its own link arguments; the flag reaches
+`config-meson.cross` but not the effective link. Abandoned: MEMFS is what the
+browser needs anyway, and staging 301.5 MiB into it costs 0.7 s.
+
+### Native-build improvements this work produced
+
+The browser port paid for itself in the native tree three times over:
+
+- **OpenSSL is no longer needed by the S5L8900 device models.** SHA1 goes
+  through glib (already a hard QEMU dependency) and AES through QEMU's own
+  `crypto/aes.h` plus `include/hw/arm/ipod_touch_aes_cbc.h`. One less external
+  dependency for every build, native included.
+- **`fb-snapshot.py` can verify again.** Its QMP socket lived in `/tmp`, which
+  is swept during long runs; the socket vanished mid-boot and the failure
+  surfaced as a bare `FileNotFoundError` that read like a guest hang. Now
+  `/var/tmp`, and it waits for the socket with an explanatory error. This had
+  been silently breaking home-screen verification for every board.
+- **NAND provenance can now answer "is this the product NAND?"**
+  `build-m68ap-nand.py --recipe` records the recipe, and the home-screen recipe
+  stamps `"recipe": "home-screen"`. Before this, a tree built from an unpatched
+  root was indistinguishable from the real one until you booted it and saw a
+  black screen.
+
+`-icount` also stopped being advice and became a measured requirement — see
+AGENTS.md, which now points here for the worked example.
 
 ---
 
