@@ -211,6 +211,26 @@ if [[ "${S5L8900_HTTPS_BRIDGE:-1}" != "0" ]]; then
 fi
 
 
+# Deterministic virtual time on the iPhone profiles.
+#
+# Without -icount, QEMU_CLOCK_VIRTUAL follows wall clock while the guest runs
+# slower than real hardware, so iPhone OS sees its own driver start() calls
+# taking many SECONDS and takes timeout paths a real device never takes. The
+# visible symptom is an intermittent hang at the Apple logo: a null dereference
+# inside IOIpodUSBDevice::start / AppleS5L8900XUSBWrangler. Measured on the
+# 1.1.4 bundle, 2026-07-28: 1 panic in 3 boots without icount, 0 in 4 with it.
+#
+# N45AP is deliberately left alone -- it does not hit this, and its verified
+# sleep/wake results were all measured in real time. Set S5L8900_ICOUNT=0 to
+# opt out, or to another shift to experiment.
+QEMU_ICOUNT=()
+if [[ "$PROFILE" == "iphone-2g" ]]; then
+    ICOUNT_SHIFT="${S5L8900_ICOUNT:-1}"
+    if [[ "$ICOUNT_SHIFT" != "0" ]]; then
+        QEMU_ICOUNT=(-icount "shift=$ICOUNT_SHIFT")
+    fi
+fi
+
 QEMU_DIAGNOSTICS=(-serial null)
 DEBUG="${S5L8900_DEBUG:-${IPOD_TOUCH_DEBUG:-0}}"
 if [[ "$DEBUG" == "1" ]]; then
@@ -236,6 +256,7 @@ fi
     -m 1G \
     -pflash "$NOR" \
     -L "$RESOURCES/pc-bios" \
+    "${QEMU_ICOUNT[@]}" \
     "${QEMU_DIAGNOSTICS[@]}" \
     "$@"
 status=$?

@@ -320,7 +320,7 @@ under which QEMU never calls `gfx_update` and every touch is refused; it reports
 `home-wedge-probe.py`, which attach a display client. A negative from a harness
 that cannot produce a positive is not evidence.
 
-### ROOT CAUSE of the HOME wedge: the model raises the wrong LCD interrupt bit
+### The HOME wedge: what the mask means (and a WRONG root cause, retracted)
 
 `IT_FB_TRACE=1` now also reports the vsync state once a second
 (`refresh_timer_tick`), because the MMIO trace suppresses a register after its
@@ -357,3 +357,29 @@ that bit instead of/in addition to bit 0, and re-run
 `app-button-probe.py --board m68ap-10` — steps 3 and 4 should start passing.
 Verify 1.1.4 and the iPod, which currently pass step 3, do not regress: they may
 simply keep bit 0 enabled and would be unaffected either way.
+
+
+---
+
+## Boot reliability: the Apple-logo hang is a virtual-time artifact (2026-07-28)
+
+**Symptom:** the iPhone bundles intermittently never get past the Apple logo.
+Measured on the shipped 1.1.4 bundle: **1 panic in 3 boots**, at
+`IOIpodUSBDevice::start` on `AppleS5L8900XIpodHAL`.
+
+**Cause,** from the parallel wasm work the same evening: without `-icount`,
+`QEMU_CLOCK_VIRTUAL` follows wall clock while the guest runs slower than real
+hardware, so iPhone OS sees its own driver `start()` calls taking many SECONDS
+and takes timeout paths a real device never takes.
+
+**Fix, shipped:** `ipod-app-launcher.sh` now passes `-icount shift=1` for the
+`iphone-2g` profile. Measured after: **0 panics in 4 boots**, and the LCD
+readiness gate arms. Opt out with `S5L8900_ICOUNT=0`, or set another shift.
+
+N45AP is deliberately left alone. It does not hit this, and its verified
+sleep/wake results were all measured in real time; changing its clock model
+would invalidate them for no benefit.
+
+**Regression-checked before shipping:** the 1.0 bundle is unchanged with icount
+(`1_open_app` PASS 97.10%, `2_touch_in_app` PASS 35.63%, steps 3/4 fail exactly
+as before), so this buys boot reliability without disturbing what worked.
