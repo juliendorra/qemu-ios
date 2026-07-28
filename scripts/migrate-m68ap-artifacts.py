@@ -48,9 +48,13 @@ MOVES: list[tuple[str, str, str | None]] = [
     ("stage/iboot_204_m68ap.bin", "builds/4A102/iboot.bin", None),
     ("stage/iboot_204_m68ap_sbpatch.bin", "builds/4A102/iboot-sb.bin", None),
     ("stage/nor_m68ap.bin", "builds/4A102/nor.bin", None),
-    # The product NAND is the FULL tree; `stage/nand` is a 37-page
-    # metadata-only diagnostic that predates it and keeps its own name.
-    ("stage/nand-m68ap-fresh", "builds/4A102/nand", "4A102"),
+    # NOT builds/4A102/nand: `nand-m68ap-fresh` is a full tree but was built
+    # from an UNPATCHED root, so it boots and renders nothing. Filing it at the
+    # canonical path made every consumer silently use a black-screen NAND --
+    # worse than a missing one, which fails loudly. The product NAND for a
+    # build is whatever `build-m68ap-homescreen-nand.py --build <B>` produces,
+    # and it now stamps "recipe": "home-screen" into its provenance.
+    ("stage/nand-m68ap-fresh", "builds/4A102/nand-prepack-not-product", "4A102"),
     ("stage/nand", "builds/4A102/nand-metadata-only", "4A102"),
     ("iPhone1,1_1.1.4_4A102_Restore.ipsw",
      "builds/4A102/ipsw/iPhone1,1_1.1.4_4A102_Restore.ipsw", None),

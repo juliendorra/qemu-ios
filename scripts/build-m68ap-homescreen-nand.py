@@ -388,6 +388,10 @@ def main() -> int:
          "--out", out, "--active-banks", "4",
          "--bbt", "production", "--hfs", root, "--data-hfs", data,
          "--device", PATHS.profile.device, "--build", PATHS.build,
+         # Stamped into nand-provenance.json: without it, a tree built from an
+         # unpatched root is indistinguishable from this one and boots to a
+         # black screen instead of the home screen.
+         "--recipe", "home-screen",
          # The product ships a PACKED NAND: the launcher clones the tree on
          # every start, and cloning 100k+ page files takes minutes where the
          # single pack file is instant (BUILD.md). The browser port consumes

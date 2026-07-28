@@ -52,7 +52,18 @@ class QMP:
     """Minimal QMP client. Structured JSON avoids the HMP readline echo that
     mangles rapid socket writes."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, wait: float = 20.0):
+        # Wait for the socket rather than assuming it is there: QEMU may still
+        # be starting, and a bare FileNotFoundError here reads like a guest
+        # failure when it is really a race or a swept directory.
+        deadline = time.time() + wait
+        while not os.path.exists(path) and time.time() < deadline:
+            time.sleep(0.25)
+        if not os.path.exists(path):
+            raise SystemExit(
+                f"QMP socket never appeared at {path}.\n"
+                "The guest may have exited, or the directory was cleaned "
+                "mid-run. Check stderr.log in the logs directory.")
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.connect(path)
         self.buf = b""
@@ -188,8 +199,14 @@ def main() -> int:
     shutil.copy2(src_nor, staged_nor)
 
     # AF_UNIX sun_path is capped at ~104 bytes on macOS, so the socket cannot
-    # live under the (long) scratchpad logs dir; use a short /tmp name.
-    sock_path = f"/tmp/fbsnap-{args.board}-{os.getpid()}.sock"
+    # live under the (long) scratchpad logs dir; use a short name.
+    #
+    # /var/tmp, NOT /tmp: on a long run (boot-wait of several minutes) the
+    # socket disappeared from /tmp while QEMU was still running, and the
+    # connect then failed with a bare FileNotFoundError that looked like a
+    # guest hang. /var/tmp is not swept.
+    sock_dir = "/var/tmp" if os.path.isdir("/var/tmp") else "/tmp"
+    sock_path = f"{sock_dir}/fbsnap-{args.board}-{os.getpid()}.sock"
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     serial = args.logs / "serial.log"

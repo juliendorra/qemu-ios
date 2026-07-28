@@ -237,6 +237,27 @@ def build_ftl_meta_page() -> bytes:
         struct.pack_into("<H", page, logcxt_tbl_off + i * LOGCXT_ENTRY_SIZE + 4,
                          0xFFFF)                                 # aLOGCxtTable[i].wVbn
 
+    # FTLCtrlBlock[3] (+0x312) and FTLCtrlPage (+0x318). Field names and
+    # offsets from openiBoot's plat-s5l8900/includes/s5l8900/ftl.h, whose
+    # struct FTLCxt matches this page field-for-field.
+    #
+    # Leaving these zero is what made a written NAND unbootable. FTLCtrlPage is
+    # the FTL's APPEND CURSOR into the control block: it saves a new context at
+    # ++FTLCtrlPage. At zero, the very first save -- which iPhone OS 1.0 does
+    # on its way into sleep -- lands at page 1 of the block, straight over the
+    # 18 mapping tables written just below, and the FTL meta at the block's
+    # last page still points its adwMapTablePtrs at them. The next cold boot
+    # then reads a context header where it expects a mapping table: 1.0 wedges
+    # in iBoot with no serial output at all, 1.1.4 gets through FTL init and
+    # panics. Parking the cursor past the tables the format actually wrote
+    # sends the first save to page 19, where it belongs.
+    #
+    # FTLCtrlBlock is the set of blocks the FTL rotates between when one fills;
+    # all-zero named block 0 three times over.
+    struct.pack_into("<3H", page, 0x312, FTL_CXT_SECTION_START,
+                     FTL_CXT_SECTION_START + 1, FTL_CXT_SECTION_START + 2)
+    struct.pack_into("<I", page, 0x318, MAX_NUM_OF_MAP_TABLES)
+
     struct.pack_into("<I", page, BYTES_PER_PAGE - 8, 0x46560000)
     struct.pack_into("<i", page, BYTES_PER_PAGE - 4, -0x46560001)
     return bytes(page)
@@ -508,6 +529,12 @@ def main() -> None:
                              "the profile's board)")
     parser.add_argument("--pack", action="store_true",
                         help="also run pack-ipod-nand.py after the tree validates")
+    parser.add_argument("--recipe", default=None,
+                        help="name of the recipe that produced the input "
+                             "filesystems, recorded in provenance. Without it "
+                             "a tree cannot be told apart from one built with "
+                             "an unpatched root, which boots to a BLACK SCREEN "
+                             "rather than failing.")
     args = parser.parse_args()
 
     profile = firmware_profiles.get(args.build)
@@ -579,6 +606,7 @@ def main() -> None:
             "data_hfs_sha256": (
                 sha256_file(args.data_hfs) if args.data_hfs else None),
         },
+        "recipe": args.recipe,
         "guest_file_modifications": (
             "none (metadata-only)" if args.hfs is None
             else ("root and data HFS+ partitions placed; GPT/MBR synthesised"

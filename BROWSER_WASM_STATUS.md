@@ -62,26 +62,75 @@ than an option — consistent with Infinite Mac measuring qemu-wasm *faster* tha
 hand-ported C emulators. Re-check whether the backend has merged upstream
 before committing to carrying the patch set.
 
-### A real divergence: the USB PHY race
+### Guest-visible time must be decoupled: run with `-icount`
 
-The wasm and native serial logs are **identical line for line** through driver
-matching. Then, at 126.4 s, the wasm run gets an event native never produces:
+Without it the guest sees its own driver `start()` calls taking **16944 ms,
+22818 ms, 19703 ms** — because `QEMU_CLOCK_VIRTUAL` follows wall clock while
+TCI runs the guest 13× slower. The kernel then takes timeout paths that no real
+device ever takes, and panicked with a null dereference in
+`AppleS5L8900XUSBWrangler` right after the USB PHY registered.
+
+With `-icount shift=3` the same drivers report **539 / 513 / 544 ms** and that
+panic is gone. `scripts/wasm/boot-test.mjs` takes `IT_ICOUNT=<shift>`.
+
+**The browser build should always run with icount.** TCI will always be far
+slower than native, so every timeout-sensitive driver is exposed without it.
+This is the repo's own standing advice (AGENTS.md, "Determinism — use
+`-icount`") arriving in a new context.
+
+*Correction to an earlier claim in this session:* the wrangler's
+`phyRegistered` event was described as something "native never produces". That
+was measured against a native log that was itself booting the wrong NAND (see
+below) and never reached the relevant stage. Against a correct boot, native
+produces `phyRegistered` too. The divergence was never the event — only the
+panic.
+
+### Still blocked: a wasm-only panic in `IOIpodUSBDevice::start`
+
+With icount **and** the verified home-screen NAND, the boot now gets much
+further — through the USB PHY, the network stack, the LCD — and then:
 
 ```
-AppleS5L8900XUSBWrangler::phyRegistered PHY 0xc0a98300 notified us of availability
-kernel abort type 4: fault_type=0x1, fault_addr=0x0
-panic(cpu 0 caller 0xC00638CC)
+IOIpodUSBDevice::start
+panic(cpu 0 caller 0xC012D963):
 ```
 
-and then loops on the panic. `phyRegistered` appears **zero** times in the
-native log: natively the PHY is already available when the wrangler starts, so
-that late-notification path is never taken. Under TCI the guest is ~13× slower
-while QEMU's timers are not, so the relative ordering of device-model events
-and guest progress changes — a classic emulation-speed-dependent race, and the
-first behavioural difference the browser build has exposed.
+Native runs the same driver at the same point and simply continues
+(`Registering: ../usb-device/AppleS5L8900XIpodHAL/IOIpodUSBDevice`), reaching
+the home screen at 74.3% non-black. The panic message is empty, which is
+unusual and worth chasing.
 
-This is a blocker independent of performance: it must be fixed (or the timing
-decoupled, e.g. `-icount`) before a browser boot can reach SpringBoard.
+This is now the single blocker between the wasm build and a browser home
+screen. Next step: symbolise the panic backtrace against 4A102's kernelcache
+(the repo's documented loop, DEVICE_BRINGUP_PLAYBOOK.md) to find what inside
+`start()` faults, and compare the guest-visible USB OTG register reads against
+native.
+
+### The trap that cost this session two wrong conclusions
+
+`m68ap-artifacts/builds/4A102/nand` was **not** the home-screen NAND. The
+migration filed `stage/nand-m68ap-fresh` there; it is a full, valid tree built
+from an *unpatched* root, so it boots and renders **nothing** (kernel
+framebuffer 0.0%). Every wasm boot test today used it, and the native
+comparison run used it too — which is how `phyRegistered` looked wasm-only.
+
+A wrong NAND at the canonical path is worse than a missing one: missing fails
+loudly, wrong boots to a black screen. Fixed three ways:
+
+- the tree was renamed to `nand-prepack-not-product`, so the canonical path is
+  now empty and fails loudly until the recipe regenerates it;
+- `build-m68ap-nand.py` gained `--recipe`, and the product recipe stamps
+  `"recipe": "home-screen"` into `nand-provenance.json`, so the question is
+  answerable from the tree itself;
+- the migration script records why that mapping is wrong.
+
+### Also fixed: `fb-snapshot.py` could not verify anything
+
+Its QMP socket lived in `/tmp`, which is swept during long runs: the socket
+vanished mid-boot and the failure surfaced as a bare `FileNotFoundError` that
+read like a guest hang. It now uses `/var/tmp` and waits for the socket with an
+explanatory error. This had been blocking every home-screen verification
+attempt.
 
 ---
 
