@@ -498,38 +498,6 @@ static void mv8686_stage_eeprom(MV8686State *c, const uint8_t *req,
     memcpy(p, c->mac, sizeof(c->mac));
     c->eeprom_len = sizeof(c->eeprom);
 
-    /*
-     * iPhone OS 1.0 asks a DIFFERENT question here, and the size of the
-     * request is what distinguishes the two (IPOD_SDIO_TRACE diff,
-     * WIFI_SDIO_NOTES.md):
-     *
-     *   1.1.4  16 bytes  14 00 00 00 00 00 00 02 ...   Apple readEEPROM
-     *   1.0    32 bytes  [le32 type][le32 addr][le32 len][le32 cksum]
-     *                    01 00 00 00 | 00 10 00 c0 | 00 02 00 00 | e9 6b 48 26
-     *
-     * The second is a Marvell-style download-request descriptor -- "512 bytes
-     * for 0xc0001000". Answering it with the fixed 0x800-byte Apple record
-     * stream made 1.0 abandon the bootstrap and retry from the top forever
-     * (helper-boot x20, EEPROM read x0, per boot), which userland reports as
-     * "AppleMRVL868x: ERROR - Unable to verify main program."
-     *
-     * So honour the length the request carries. The record stream itself is
-     * unchanged -- it is still what the driver parses -- it is just delivered
-     * in the size that was asked for.
-     */
-    if (req && req_len >= MV8686_DL_REQUEST_LEN) {
-        uint32_t want = le32(req + 8);
-        if (want > 0 && want <= sizeof(c->eeprom)) {
-            c->eeprom_len = want;
-            mv_trace("download descriptor: type=%u addr=0x%08x len=%u "
-                     "(answering with %u bytes, not %zu)",
-                     le32(req), le32(req + 4), want,
-                     want, sizeof(c->eeprom));
-        } else {
-            mv_trace("download descriptor: implausible length %u; "
-                     "falling back to %zu", want, sizeof(c->eeprom));
-        }
-    }
 
     c->dl_state = MV8686_EEPROM_READ;
     /* no further host writes expected before the read */
@@ -592,7 +560,48 @@ bool mv8686_io_rw_extended(MV8686State *c, bool write, uint8_t fn,
             return true;
         }
         if (write && c->dl_state == MV8686_EEPROM_CMD) {
-            /* the 16-byte EEPROM read request from the helper */
+            /*
+             * Two different questions arrive here, distinguished by size.
+             *
+             * 1.1.x writes Apple's 16-byte readEEPROM command and then reads
+             * the record stream back: that is where it gets its calibration.
+             *
+             * 1.0 writes a 32-byte Marvell download descriptor instead --
+             * [le32 type][le32 addr][le32 len][le32 cksum], measured as
+             * 1 / 0xc0001000 / 512 / 0x26486be9 -- and never reads anything,
+             * because it takes calibration from the DEVICE TREE, not from the
+             * card (scripts/m68ap_dt_radio.py). So for 1.0 there is no EEPROM
+             * stage at all: the descriptor opens the MAIN FIRMWARE download.
+             *
+             * Staging an EEPROM response here left the model parked in
+             * EEPROM_READ forever. 1.0's firmware writes then fell through to
+             * the generic packet handler, DL_MAIN was never entered, and the
+             * scratch pair never became 0xFEDC -- which is exactly what its
+             * verifier polls for. Disassembled from 1A543a's kernelcache
+             * (WIFI_SDIO_NOTES.md): the check after "Loading Main Program" is
+             * a 100-iteration, 1 ms poll of registers 0x34/0x35 for 0xFEDC,
+             * and failing it prints "ERROR - Unable to verify main program."
+             */
+            /*
+             * Match 1.0's descriptor by SHAPE, not just "not 16 bytes". An
+             * earlier version keyed on `len >= 32` and that was too greedy: it
+             * also swallowed a 1.1.4 write, and 1.1.4 then never rendered its
+             * home screen (the LCD readiness gate never armed). Require the
+             * exact size AND a plausible descriptor: type 1, a non-zero
+             * destination address, and a length that fits our staging buffer.
+             */
+            if (len == MV8686_DL_REQUEST_LEN && le32(buf) == 1 &&
+                le32(buf + 4) != 0 &&
+                le32(buf + 8) > 0 && le32(buf + 8) <= sizeof(c->eeprom)) {
+                mv_trace_hex("download descriptor", buf, len);
+                mv_trace("1.0 flow: skipping the EEPROM stage, entering "
+                         "main-firmware download");
+                c->eeprom_delivered = true;   /* nothing to deliver */
+                c->dl_state = MV8686_DL_MAIN;
+                c->fn1[FN1_RD_BASE] = 0x00;
+                c->fn1[FN1_RD_BASE + 1] = 0x08;   /* req_size 0x800 */
+                return true;
+            }
             mv_trace_hex("eeprom request", buf, len);
             mv8686_stage_eeprom(c, buf, len);
             return true;

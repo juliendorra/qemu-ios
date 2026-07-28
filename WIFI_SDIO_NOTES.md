@@ -414,3 +414,77 @@ every other generated-image edit.
 **Still true, and still the honest limit:** these are *fabricated* calibration
 bytes. They satisfy the driver's sanity check; they are not real RF calibration
 and nothing in the emulated radio consumes them.
+
+### SOLVED by static analysis (2026-07-28): 1.0's verifier polls 0x34/0x35 for 0xFEDC
+
+Guess-and-boot had failed twice, so this was read out of 1A543a's kernelcache.
+
+**Dead end #5 was wrong, and that is why nobody had read this code before.** It
+concluded the kext references its strings PC-relatively so a byte search cannot
+find them. The strings ARE referenced by absolute literals; the earlier search
+used the wrong `__PRELINK` skew. The real mapping, from the Mach-O load
+commands: `__PRELINK vmaddr=0xc0222000 fileoff=0x1fb000`, so the skew is
+**0xC0027000** — not the 0xC0000000 or 0xC009F000 that were tried. With it, each
+log string has exactly one literal pointer and the function falls out
+immediately.
+
+The download path, at VA 0xc038aa50 (ARM, not Thumb):
+
+```
+0xc038aa74  "Loading Bootstrapper"
+0xc038aa84  bl 0xc0380234        loadHelper()
+0xc038aa94  "Loading Main Program"
+0xc038aaa0  bl 0xc038a70c        loadMainProgram()   -- SUCCEEDS
+0xc038aab4  bl 0xc03801b4        verify()            -- returns 0
+0xc038aac4  "ERROR - Unable to verify main program."
+```
+
+So the download itself was never the problem: a *separate* verifier fails. And
+`verify()` is trivial:
+
+```
+r4 = 0x64                        100 attempts
+loop: read16(card, reg 0x34) -> compare against literal 0xFEDC
+      IODelay(1 ms); if --r4 == 0 return 0
+```
+
+It polls **registers 0x34/0x35 for 0xFEDC** — `MV_FIRMWARE_OK`, the same marker
+1.1.x uses, which `ipod_touch_mv8686.c` already sets. It sets it only in
+`MV8686_DL_MAIN`, and 1.0 never reached that state: its 32-byte descriptor left
+the model parked in `EEPROM_READ` waiting for a read that never comes, so 1.0's
+firmware writes fell through to the generic packet handler and scratch stayed
+whatever the EEPROM staging had put there.
+
+**The fix is one state transition.** 1.0 does not want an EEPROM stage at all —
+it has its calibration from the device tree — so its descriptor *opens the main
+download*: on a 32-byte descriptor, skip staging and go straight to `DL_MAIN`.
+Measured on the shipped 1.0 bundle:
+
+```
+AppleMRVL868x: Loading Main Program
+AppleMRVL868x: Firmware loadded.          (Apple's typo)
+  Firmware Version: 0x092e0000
+IO80211Interface::attach(AppleMRVL868x)
+```
+
+helper-boots 23 -> 2, "Unable to verify" 22 -> 0.
+
+**Match the descriptor by SHAPE, not by size alone.** A first version keyed on
+`len >= 32` and that also swallowed a 1.1.4 write — 1.1.4 then never rendered
+its home screen (the LCD readiness gate never armed). The guard now requires the
+exact size AND type 1 AND a non-zero destination AND a sane length. 1.1.4
+re-tested identical to the pre-change baseline.
+
+**And this retires the touch regression.** Filling the device tree's radio
+properties used to kill 1.0's touch; the cause was the retry loop, not the MAC.
+With the download fixed the loop is gone and the fill is safe — `1_open_app`
+PASS 97.11%, `2_touch_in_app` PASS 35.63%, Wi-Fi up, on the same boot. The fill
+is on by default again, but ONLY for the 1.0 family: 1.1.x reads calibration
+from the card and needs nothing from the device tree.
+
+**Do not fill all three `local-mac-address` properties.** The third sits after
+`uart3` — Bluetooth. Filling it wedged 1.1.4 at
+`com.apple.BTServer: bluetooth power is now ON` with a black framebuffer: a zero
+MAC was the only thing stopping the Bluetooth stack from attempting a bring-up
+this emulator cannot answer. Only the Wi-Fi node's MAC is filled, identified
+structurally as the last one before `tx-calibration`.

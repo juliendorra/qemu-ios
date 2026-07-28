@@ -161,20 +161,20 @@ def main():
     parser.add_argument("--containers", required=True,
                         help="directory of <type>.img2c from extract-m68ap-images.py")
     parser.add_argument("--out", required=True, help="output nor_m68ap.bin")
-    # OFF by default: filling these BREAKS TOUCH on iPhone OS 1.0. Measured
-    # 2026-07-28 with scripts/app-button-probe.py --board m68ap-10, one variable
-    # (same NAND, same engine, only the device-tree properties differ):
-    #     filled:   1_open_app FAIL 0.00%   2_touch_in_app FAIL
-    #     reverted: 1_open_app PASS 97.11%  2_touch_in_app PASS 35.45%
-    # It was added to get iPhone OS 1.0's Wi-Fi driver past its calibration and
-    # MAC checks, which it does -- but 1.0's Wi-Fi still fails at the next gate
-    # anyway (the SDIO main-firmware download, WIFI_SDIO_DEADENDS.md #7), so the
-    # flag currently buys nothing and costs touch. Do not turn it on again
-    # without re-running app-button-probe.py on 1.0.
-    parser.add_argument("--fill-radio-properties", action="store_true",
-                        help="fill the device tree's zeroed tx-calibration and "
-                             "local-mac-address (BREAKS TOUCH on iPhone OS 1.0 "
-                             "-- see scripts/m68ap_dt_radio.py)")
+    # ON by default again, as of the SDIO download fix. The history is worth
+    # keeping because it is the whole argument for why this is now safe:
+    # filling these once broke touch on iPhone OS 1.0, because a valid MAC got
+    # the Wi-Fi driver past its checks and into a main-firmware download the
+    # SDIO model could not satisfy -- a hot retry loop (23 helper-boots/boot)
+    # that starved the multitouch path. The loop was the cause, not the MAC.
+    # With the download fixed (mv8686 routes 1.0's 32-byte descriptor straight
+    # to DL_MAIN), measured on the same probe:
+    #     1_open_app PASS 97.10%   2_touch_in_app PASS 35.66%   Firmware loaded
+    parser.add_argument("--no-fill-radio-properties", dest="fill_radio_properties",
+                        action="store_false",
+                        help="leave the device tree's tx-calibration and "
+                             "local-mac-address zeroed; iPhone OS 1.0 then has "
+                             "no Wi-Fi (see scripts/m68ap_dt_radio.py)")
     args = parser.parse_args()
 
     if not os.path.exists(args.template):

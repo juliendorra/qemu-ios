@@ -118,14 +118,31 @@ def fill(blob: bytearray) -> list[str]:
         changed.append(f"{CALIBRATION_PROPERTY.decode()} @{value:#x}: "
                        f"{length} bytes of synthetic calibration")
 
-    index = 0
-    for value, length in _properties(blob, MAC_PROPERTY):
-        if length != len(MAC_BASE) or not _is_all_same(blob[value:value + length]):
-            continue
-        mac = bytes(MAC_BASE[:-1]) + bytes([(MAC_BASE[-1] + index) & 0xFF])
-        blob[value:value + length] = mac
-        changed.append(f"{MAC_PROPERTY.decode()} @{value:#x}: "
-                       f"{':'.join(f'{b:02x}' for b in mac)}")
-        index += 1
+    # ONLY the Wi-Fi node's MAC. The device tree has three `local-mac-address`
+    # properties -- one early (ethernet), one in the Wi-Fi node beside
+    # `tx-calibration`, and one just after `uart3`, which is BLUETOOTH.
+    #
+    # Filling all three wedged iPhone OS 1.1.4's boot: it reached launchd and
+    # stopped with `com.apple.BTServer: bluetooth power is now ON` as its last
+    # serial line, never rendering a home screen (kernel framebuffer 0.0%
+    # non-black across six samples). A zero MAC is what had been keeping the
+    # Bluetooth stack from trying to come up over uart3; handing it one starts
+    # a bring-up this emulator has no baseband-side answer for.
+    #
+    # The Wi-Fi node's is the only one anything here needs, so it is the only
+    # one filled. It is identified structurally -- the last MAC property before
+    # `tx-calibration`, i.e. the one in the same node -- not by a hardcoded
+    # offset, because the offsets differ per build.
+    cal_sites = [v for v, _ in _properties(blob, CALIBRATION_PROPERTY)]
+    if cal_sites:
+        candidates = [(v, ln) for v, ln in _properties(blob, MAC_PROPERTY)
+                      if v < cal_sites[0] and ln == len(MAC_BASE)]
+        if candidates:
+            value, length = candidates[-1]
+            if _is_all_same(blob[value:value + length]):
+                blob[value:value + length] = MAC_BASE
+                changed.append(f"{MAC_PROPERTY.decode()} @{value:#x} "
+                               f"(Wi-Fi node): "
+                               f"{':'.join(f'{b:02x}' for b in MAC_BASE)}")
 
     return changed
