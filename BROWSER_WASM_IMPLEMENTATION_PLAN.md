@@ -13,9 +13,15 @@
 >
 > **Revised 2026-07-27.** Delivery is decided: prepared assets, self-hosted, no
 > source-loaded first run. The product is a **version picker** — iPhone OS 1.0,
-> 1.0.2, 1.1.1 and 1.1.4 side by side — with **1.0 first**. Asset delivery is
-> redesigned around chunking and compression following
+> 1.0.2, 1.1.1 and 1.1.4 side by side. Asset delivery is redesigned around
+> chunking and compression following
 > [Infinite Mac](https://infinitemac.org)'s measured approach.
+>
+> **Revised 2026-07-28 — 1.1.4 ships first, not 1.0.** The goal is a booting,
+> usable iPhone 2G on **iPhone OS 1.1.4** in a browser: fast to start (chunked
+> assets) and running at **real-time speed**. 1.0 follows once its outstanding
+> button problems are fixed (in progress in a separate session). 1.1.4 is also
+> the most exercised build here and the one whose home screen is verified.
 
 ## Status and decision
 
@@ -29,16 +35,21 @@ emulator as of 2026-07-26 (`IPHONE_OS_1X_VERSIONS.md`):
 
 | Build | Version | iBoot | Epoch | FIL signature | Native status |
 | --- | --- | --- | --- | --- | --- |
-| `1A543a` | **1.0** | 159 | 0 | `000C` | home screen — **first browser target** |
+| `1A543a` | **1.0** | 159 | 0 | `000C` | home screen; second browser target (button issues outstanding) |
 | `1C28` | 1.0.2 | 159 | 0 | `000C` | home screen |
 | `3A109a` | 1.1.1 | 204 | 2 | `200C` | home screen |
-| `4A102` | 1.1.4 | 204 | 3 | `300C` | home screen; the most exercised build |
+| `4A102` | **1.1.4** | 204 | 3 | `300C` | home screen — **first browser target**, most exercised |
 
-**1.0 ships first.** It is the museum-accurate target, its bootloader
-generation (iBoot-159, plaintext 8900 containers, epoch 0) is shared with 1.0.2,
-and its kernel has *no* TVOut swap device — the single hardest fix in the 1.1.4
-bring-up has nothing to hook in 1.0. Ordering after that follows bootloader
-generation: 1.0 → 1.0.2 (same iBoot), then 1.1.1 → 1.1.4 (iBoot-204).
+**1.1.4 ships first** (decided 2026-07-28). It is the most exercised build in
+this tree, its home screen is verified, and it is the one the browser port has
+actually been booting. 1.0 has outstanding button problems being fixed
+separately; it follows once those land, and its bootloader generation
+(iBoot-159, plaintext 8900 containers, epoch 0) is shared with 1.0.2, so the two
+come together. Order: **1.1.4 → 1.0 → 1.0.2 → 1.1.1**.
+
+The earlier argument for 1.0-first still holds on its merits — museum accuracy,
+and no TVOut swap device to work around — and is kept here because it is why
+1.0 remains the second target rather than the last.
 
 **iPod touch 1G (N45AP) is secondary** — worth having, scheduled after the
 iPhone versions ship. The machine, tooling, and frontend stay board-agnostic and
@@ -82,8 +93,12 @@ set is required to build for the browser.
 
 ## Goals
 
-- Boot the same M68AP/iPhone1,1 stacks as the native emulator — 1.0 first, then
-  1.0.2, 1.1.1 and 1.1.4 — and keep N45AP/iPod1,1 bootable from the same build.
+- Boot the same M68AP/iPhone1,1 stacks as the native emulator — 1.1.4 first,
+  then 1.0, 1.0.2 and 1.1.1 — and keep N45AP/iPod1,1 bootable from the same
+  build.
+- **Run at real-time speed.** This is a requirement, not an aspiration: it is
+  why the WebAssembly TCG backend (the JIT) is being adopted instead of
+  shipping the interpreter.
 - Reach a usable SpringBoard with display, touch, Home, Power, sleep, and wake.
 - Run all guest code on the visitor's computer inside the browser sandbox.
 - Boot a chosen version with no interaction beyond choosing it, and make
@@ -239,7 +254,7 @@ before the visitor chooses:
 ```json
 {
   "schemaVersion": 1,
-  "default": "m68ap-10-v1",
+  "default": "m68ap-114-v1",
   "versions": [
     {
       "id": "m68ap-10-v1",

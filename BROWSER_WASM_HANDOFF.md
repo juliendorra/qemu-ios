@@ -6,8 +6,14 @@ and measured; [`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](BROWSER_WASM_IMPLEMENTATIO
 is the design of record. This file is the to-do list, with the traps that cost
 time the first time round.
 
-**Goal:** iPhone 2G, iPhone OS 1.0 first, then 1.0.2 / 1.1.1 / 1.1.4 as a
-version picker, served as prepared chunked assets from our own origin.
+**Goal:** a booting, usable iPhone 2G on **iPhone OS 1.1.4** in a browser —
+fast to start (chunked assets) and running at **real-time speed**. Then 1.0
+(once its button problems are fixed in the parallel session), then 1.0.2 and
+1.1.1 as a version picker. Assets are prepared here and served from our own
+origin.
+
+Real-time speed is a stated requirement, not an aspiration: it is why the
+WebAssembly JIT backend is being adopted rather than shipping TCI.
 
 ---
 

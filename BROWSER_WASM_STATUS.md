@@ -7,9 +7,11 @@ this file records what is actually built and proven.
 > **Starting a session? Read [`BROWSER_WASM_HANDOFF.md`](BROWSER_WASM_HANDOFF.md)**
 > — the ordered next steps, their acceptance criteria, and the traps.
 
-**Target:** iPhone 2G (M68AP), executed entirely in the viewer's browser, as a
-picker across iPhone OS 1.0 / 1.0.2 / 1.1.1 / 1.1.4 — **1.0 first**. Assets are
-prepared offline here and self-hosted. iPod touch (N45AP) comes after.
+**Target:** iPhone 2G (M68AP) running **iPhone OS 1.1.4**, in a browser: fast to
+start (chunked assets) and running at **real-time speed**. Then 1.0, once its
+button problems are fixed elsewhere, followed by 1.0.2 and 1.1.1 as a version
+picker. Assets are prepared offline here and self-hosted. iPod touch (N45AP)
+comes after.
 
 ---
 
