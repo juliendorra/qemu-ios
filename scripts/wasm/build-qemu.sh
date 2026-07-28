@@ -53,7 +53,6 @@ jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 configure_args=(
     --static
     --cpu=wasm64
-    --wasm64-32bit-address-limit
     --target-list="$WASM_TARGET_LIST"
     # The JIT build drops --enable-tcg-interpreter: with tcg/wasm64 present,
     # meson selects the WebAssembly TCG backend instead. Set IT_WASM_TCI=1 to
@@ -75,6 +74,15 @@ configure_args=(
     # string, so a value containing a space must carry its own quoting.
     "--extra-ldflags='-lnodefs.js -lworkerfs.js'"
 )
+
+# -sMEMORY64=2 keeps the address space at 32 bits, which the 128 MiB guest never
+# approaches and which is kinder to browser memory limits. The WebAssembly TCG
+# backend upstream defaults to the FULL 64-bit mode (-sMEMORY64=1) though, and
+# its EM_JS glue encodes pointers differently between the two, so
+# IT_WASM_MEMORY64_FULL=1 selects the mode the backend is developed against.
+if [ -z "${IT_WASM_MEMORY64_FULL:-}" ]; then
+    configure_args+=(--wasm64-32bit-address-limit)
+fi
 
 if [ "$backend" = docker ]; then
     if ! docker image inspect "$WASM_BUILDER_IMAGE" >/dev/null 2>&1; then

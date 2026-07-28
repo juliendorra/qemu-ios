@@ -83,13 +83,31 @@ The backend's `EM_JS` glue encodes pointers and table indices differently in
 Emscripten's 32-bit-address-limit mode, selected by `WASM64_MEMORY64_2`. Their
 tree sets it from a meson option; our 11.0.2 handles the limit in `configure`
 (`--wasm64-32bit-address-limit` → `-sMEMORY64=2`) and never passed the define.
-The glue used the wrong encoding, handed `WebAssembly.Module` an empty view,
-and threw. `configure` now defines it whenever `-sMEMORY64=2` is in effect.
+`configure` now defines it whenever `-sMEMORY64=2` is in effect.
 
-Note what this failure *proves*: the JIT was live and compiling translation
+**That define was necessary but NOT the cause — the error is unchanged with it
+applied.** Recorded here rather than quietly deleted, because the wrong
+diagnosis is instructive: it was inferred by reading the macro and reported as
+settled before the rebuild confirmed it. Two candidates remain:
+
+1. **Memory mode.** We build `-sMEMORY64=2`; the backend is developed against
+   the full 64-bit mode. `IT_WASM_MEMORY64_FULL=1 scripts/wasm/build-qemu.sh`
+   builds `-sMEMORY64=1` to test exactly this. *(Being measured.)*
+2. **A 10.2.50 → 11.0.2 structural mismatch.** The backend reads a
+   `WasmTBHeader` out of the translation block's code buffer. If anything about
+   `tb_ptr` or the code-buffer layout changed between those versions,
+   `wasm_size` would be read from the wrong offset — and an empty buffer is
+   exactly what that looks like. This would be a genuine port issue rather than
+   a flag.
+
+The failure fires ~1.1 s in, consistent with either: `instantiate_wasm` is
+called the first time a translation block passes the backend's 1,500-execution
+threshold, which the bootrom's loops reach almost immediately.
+
+Note what the failure *does* prove: the JIT is live and compiling translation
 blocks. It is the first failure in the whole port that is a genuine integration
-defect rather than environment, clock, or harness — and it was still on our
-side of the line, not a defect in the backend.
+defect rather than environment, clock, or harness — and it is still on our side
+of the line, not a defect in the backend.
 
 ### Two self-inflicted build failures worth not repeating
 
