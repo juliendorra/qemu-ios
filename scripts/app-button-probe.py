@@ -61,6 +61,20 @@ FB_W, FB_H, FB_BYTES = 320, 480, 320 * 480 * 4
 FB_BASES = (0x0FE00000, 0x0F400000, 0x0F496000)
 
 # Per-bundle defaults: the app bundle, and an icon that reliably opens an app.
+# Coordinate of the modal's Dismiss button, per board, or None.
+#
+# iPhone OS 1.1.4 puts up an educational "Edit Home Screen" alert on FIRST
+# LAUNCH -- and every launch is a first launch here, because the launcher clones
+# a pristine NAND each time (read-only NAND means state resets). It is not a
+# touch-and-hold artifact. Until it is dismissed no icon can be tapped, so a
+# probe that ignores it never opens an app and every later step measures a
+# dialog. 1.0 has no such modal.
+DISMISS = {
+    "m68ap-114": (160, 324),
+    "m68ap-10": None,
+    "n45ap": None,
+}
+
 BOARDS = {
     "n45ap":    ("/Applications/iPod Touch.app",            (222, 145)),
     "m68ap-114": ("/Applications/iPhone 2G (iOS 1.1.4).app", (277, 258)),
@@ -328,10 +342,23 @@ def main() -> int:
             step("0_pre_tap", lambda: tap(q, px, py, 0.3), 4,
                  lambda d, b, a, seg: True, "informational")
 
-        step("1_open_app", lambda: tap(q, *icon, 0.3), WAIT_OPEN,
-             lambda d, b, a, seg: d > 20,
+        dismiss = DISMISS.get(args.board)
+        if dismiss:
+            print(f"dismissing the first-launch modal at {dismiss} ...")
+            tap(q, *dismiss, 0.12)
+            time.sleep(WAIT_TOUCH)
+
+        # Require the screen to actually become APP-LIKE, not merely to change.
+        # A launch replaces the home grid, so the lit fraction moves a long way
+        # (1.0: 45.4 -> 99.2, iPod: 29.9 -> 99.9); a modal sitting over the home
+        # screen barely moves it (1.1.4: 69.61 -> 69.55) yet still changed 25.76%
+        # of pixels and passed a bare `d > 20`. That false PASS is how this probe
+        # once reported 1.1.4 unable to return to SpringBoard when a human could
+        # do it by hand.
+        step("1_open_app", lambda: tap(q, *icon, 0.12), WAIT_OPEN,
+             lambda d, b, a, seg: d > 20 and abs(lit(a) - lit(b)) > 8,
              "tapping an icon must open something")
-        step("2_touch_in_app", lambda: tap(q, 160, 423, 0.3), WAIT_TOUCH,
+        step("2_touch_in_app", lambda: tap(q, 160, 423, 0.12), WAIT_TOUCH,
              lambda d, b, a, seg: d > 2,
              "touch must still work with an app frontmost")
         step("3_home_returns", lambda: key(q, "h"), WAIT_HOME,

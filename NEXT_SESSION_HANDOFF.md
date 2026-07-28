@@ -505,7 +505,7 @@ done
 Anything that prints a shell error instead of boot output is broken for the user
 before QEMU is even involved.
 
-### CORRECTION: the in-app HOME failure is a BOARD problem, not a 1.0 problem
+### WITHDRAWN: "the in-app HOME failure is a BOARD problem"
 
 `09fdcb46f2` concluded "Only iPhone OS 1.0 fails". That was measured with the
 brightness-heuristic `grab()` (see above), which cannot see a transition to a
@@ -517,9 +517,22 @@ dimmer screen. Re-measured with the fixed capture and `IT_PROBE_WAIT=8`:
 | iPhone OS 1.0 | PASS 97.11% | PASS 35.95% | **FAIL 0.00%** | FAIL | — |
 | iPhone OS 1.1.4 | PASS 25.76% | FAIL 0.32% | **FAIL 0.04%** | PASS | PASS |
 
-**Both M68AP builds fail the same step; the iPod passes it.** So the
-discriminator is the BOARD, not the OS version, and any search through iPhone OS
-1.0's userland is looking in the wrong place.
+**This table was wrong about 1.1.4, and so was the conclusion drawn from it.**
+1.1.4 never opened an app in that run: iPhone OS 1.1.4 shows an educational
+"Edit Home Screen" modal on FIRST LAUNCH, and every launch here is a first
+launch because the launcher clones a pristine NAND each time. The modal sits
+over the home screen until dismissed, so the icon tap did nothing, and steps 2-5
+measured a dialog. The modal changed 25.76% of pixels, which sailed past step
+1's bare `d > 20` verdict.
+
+With the modal dismissed first, **1.1.4 passes all five steps**, including
+`3_home_returns` at 97.00% (lit 98.8 -> 47.4). A human doing it by hand always
+knew this; the probe did not. `DISMISS` in `app-button-probe.py` now handles it,
+and step 1 additionally requires the screen to become APP-LIKE (a lit-fraction
+move > 8) so a modal can never satisfy it again.
+
+So the original framing stands: **only iPhone OS 1.0 fails, on the same board
+that 1.1.4 passes.**
 
 What is measured about the M68AP HOME press, with an app frontmost:
 
@@ -545,3 +558,46 @@ polls, a different pin for the same logical button, or a level/edge expectation
 the pulse model does not meet. Diff the two boards' GPIO traffic across the
 press (`IT_GPIO_TRACE=1`), not their SYSIC traffic, which is already known to
 match.
+
+
+## The definitive HOME-from-an-app comparison (2026-07-29)
+
+Same board, same engine, same harness, modal handled, `IT_PROBE_WAIT=8`. This is
+the measurement every earlier conclusion about this bug should have been based
+on.
+
+```
+1.1.4 (WORKS)                                 1.0 (FAILS)
+  keycode=35                                    keycode=35
+  rd INTSTAT  group 1 = 0x00000100              rd INTSTAT  group 1 = 0x00000100
+  rd INTLEVEL group 1 = 0x00000000              rd INTLEVEL group 1 = 0x00000000
+  ACK INTSTAT group 1 = 0x00000100              ACK INTSTAT group 1 = 0x00000100
+  rd INTSTAT  group 1 = 0x00000000              rd INTSTAT  group 1 = 0x00000000
+  keycode=163  (+ the same four lines)          keycode=163  (+ the same four lines)
+  [LCD] w1 base <- 0x0f496000                   -- nothing --
+  [LCD] w1 base <- 0x0fe00000                   -- nothing --
+  [LCD] w1 base <- 0x0f400000                   -- nothing --
+  ...compositor animates back to SpringBoard    ...next event is the probe's POWER press
+```
+
+**The kernel-visible interrupt handling is byte-identical**, INTLEVEL=0 included.
+1.1.4 then drives the display; 1.0 does nothing and returns to the idle WFI loop
+(PC 0xc005a2ec, CPSR 0x600000d3).
+
+Ruled out by measurement, so do not re-do these:
+
+* **The pin.** Both device trees encode `function-button_menu` identically --
+  `...4f495047 0016 0000 0001 0000`, i.e. GPIO 0x1600 / IRQ 0x28. Only the
+  phandle differs. The model's hardcoded pin is right for both.
+* **INTLEVEL.** Publishing the real pin level instead of a constant 0 changed
+  nothing (tried, reverted).
+* **The interrupt path.** Raised, read, ACKed, re-read -- identical on both, and
+  matching the iPod's shape.
+* **The display/presenter.** Runs 1:1 with the guest frame timer on the cocoa
+  path; the earlier "presenter stops" was a VNC-harness artifact.
+
+So the difference is entirely in what iPhone OS 1.0 does with an
+already-acknowledged button while an app is frontmost. The next probe has to see
+into that: PC-sample DURING the press rather than after it (the after-state is
+just the idle loop), or find where 1.0's kernel posts the button event and check
+whether it posts at all.
