@@ -356,6 +356,27 @@ static void lcd_refresh(void *opaque)
                                lcd->invalidate,
                                draw_line, NULL,
                                &first, &last);
+    /*
+     * IT_FB_TRACE: what the presenter actually decided. The guest can be
+     * painting perfectly while the HOST window stays frozen -- that is a
+     * different failure from "the guest stopped drawing", and only this
+     * distinguishes them. first < 0 means dirty tracking found nothing to
+     * repaint, so no dpy_gfx_update is issued and the window keeps whatever
+     * it last showed.
+     */
+    if (it_fb_trace_enabled()) {
+        static uint32_t calls, silent;
+        calls++;
+        if (first < 0) {
+            silent++;
+        }
+        if (calls % LCD_REFRESH_RATE_FREQUENCY == 0) {
+            fprintf(stderr, "[FB] present t=%us base=0x%08x first=%d last=%d "
+                    "silent=%u/%u\n", calls / LCD_REFRESH_RATE_FREQUENCY,
+                    lcd_scanout_base(lcd), first, last, silent, calls);
+        }
+    }
+
     if (first >= 0) {
         dpy_gfx_update(lcd->con, 0, first, width, last - first + 1);
     }

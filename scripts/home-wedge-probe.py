@@ -57,6 +57,7 @@ def main() -> int:
     ap.add_argument("--board", choices=("m68ap-10", "m68ap-114", "n45ap"),
                     required=True)
     ap.add_argument("--logs", type=Path, default=Path("/tmp/home-wedge"))
+    ap.add_argument("--app")
     ap.add_argument("--samples", type=int, default=40)
     ap.add_argument("--vnc-port", type=int, default=5970)
     ap.add_argument("--gate-timeout", type=int, default=420)
@@ -64,6 +65,8 @@ def main() -> int:
 
     btn = _load("appbuttonprobe", REPO / "scripts" / "app-button-probe.py")
     app, icon = btn.BOARDS[args.board]
+    if args.app:
+        app = args.app
     args.logs.mkdir(parents=True, exist_ok=True)
     logp = args.logs / "qemu.log"
     qmp_path = f"/tmp/home-wedge-{os.getpid()}.sock"
@@ -118,6 +121,23 @@ def main() -> int:
                 if part.startswith("PSR="):
                     cpsr = part[4:]
             report["samples"].append({"i": i, "pc": pc, "cpsr": cpsr})
+        # Is the home screen actually RENDERED but not scanned out? The LCD
+        # scans out whatever w1_framebuffer_base points at; if SpringBoard
+        # repainted into one of the other buffers and the base was never
+        # re-pointed, a scanout-following probe reads "nothing happened".
+        # Dump all three candidate bases and measure them.
+        for name, addr in (("iboot", 0x0fe00000), ("kern0", 0x0f400000),
+                           ("kern1", 0x0f496000)):
+            raw = args.logs / f"fb_{name}.raw"
+            q.cmd("pmemsave", {"val": addr, "size": 320 * 480 * 4,
+                               "filename": str(raw)})
+            d = raw.read_bytes()
+            nz = sum(1 for i in range(0, len(d), 4)
+                     if d[i] or d[i + 1] or d[i + 2])
+            pct = 100.0 * nz / (len(d) // 4)
+            report.setdefault("fb_after_home", {})[name] = round(pct, 2)
+            print(f"  {name} @{addr:#x}: {pct:6.2f}% non-black")
+
         (args.logs / "report.json").write_text(json.dumps(report, indent=2))
 
         from collections import Counter

@@ -383,3 +383,59 @@ would invalidate them for no benefit.
 **Regression-checked before shipping:** the 1.0 bundle is unchanged with icount
 (`1_open_app` PASS 97.10%, `2_touch_in_app` PASS 35.63%, steps 3/4 fail exactly
 as before), so this buys boot reliability without disturbing what worked.
+
+### The HOME "freeze" is PRESENTATION, not the guest (2026-07-28, late)
+
+Two measurements settle what H actually does on iPhone OS 1.0.
+
+**1. The guest returns to SpringBoard.** `home-wedge-probe.py` now dumps all
+three framebuffer bases after the press. Every one reads 45.56% non-black --
+the home screen's signature (the app is 99.1%) -- and rendering
+`fb_kern0.raw` to PNG shows the **full home screen, all twelve icons and the
+dock**. HOME works. The app tears down and SpringBoard repaints.
+
+**2. The host presenter stops running.** With `IT_FB_TRACE=1`, `lcd_refresh`
+(the `gfx_update` callback, i.e. what actually pushes pixels to the window) now
+reports how often it runs and whether dirty tracking gave it anything. In one
+full probe run:
+
+```
+vsync   t= counter reached 37     <- the guest's frame timer, alive throughout
+present t= counter reached  1     <- the presenter ran ~60 times, then stopped
+```
+
+The guest-side frame timer ticked ~37x longer than the host presenter ran. A
+window repainted ~60 times in a multi-minute run is, to a user, frozen. So the
+freeze is on the HOST side of the display, not in iPhone OS.
+
+**This also explains the "touch is blocked" half of the report**: touch is very
+likely working -- the user is tapping a home screen the window is not showing.
+
+### The probe's screen capture is unsound for this test
+
+`app-button-probe.py`'s `grab()` returns *"the liveliest of the three
+framebuffer bases"* -- the one with the most non-black pixels. That silently
+fails whenever the NEW screen is DIMMER than stale content left in another
+buffer:
+
+* 1.0 step 3 is app (99.1% lit) -> home (45.4%), i.e. dimmer. Any buffer still
+  holding the app wins, and the step reports `0.00% changed` even when the
+  transition happened.
+* 1.1.4's home screen is 69.5% lit; if its app is dimmer than that, `grab`
+  keeps returning the home buffer and `1_open_app` reports a false FAIL. That
+  is the most likely explanation for 1.1.4 "regressing" at step 1 today, and it
+  should be re-checked before anyone bisects engine commits looking for it.
+
+**Fix the measurement before trusting any button verdict.** `grab()` should read
+the CURRENT SCANOUT (`w1_framebuffer_base`, falling back to w2 -- the model's
+own `lcd_scanout_base()` rule), not a brightness heuristic. Steps also need
+longer waits under `-icount`, which slows the guest in wall-clock terms: a run
+today had every step land one action late (`4_power_sleeps` "passing" with a
+97% change that was actually the app finally opening).
+
+### Where to look next
+
+The presenter is driven by the display backend's refresh, so the question is why
+`gfx_update` stops being requested for this console. Check whether it is the
+VNC harness (client stops asking) or QEMU's console refresh throttling, then
+confirm against the iPod, which passes every step with the same LCD model.
