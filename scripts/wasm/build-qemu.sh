@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-build="$repo/$WASM_BUILD_DIR"
+build="$repo/${WASM_BUILD_DIR}${IT_WASM_TCI:+-tci}"
 mkdir -p "$build"
 jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 
@@ -55,7 +55,10 @@ configure_args=(
     --cpu=wasm64
     --wasm64-32bit-address-limit
     --target-list="$WASM_TARGET_LIST"
-    --enable-tcg-interpreter
+    # The JIT build drops --enable-tcg-interpreter: with tcg/wasm64 present,
+    # meson selects the WebAssembly TCG backend instead. Set IT_WASM_TCI=1 to
+    # go back to the interpreter for comparison.
+    ${IT_WASM_TCI:+--enable-tcg-interpreter}
     --disable-tools
     --disable-docs
     --disable-werror
