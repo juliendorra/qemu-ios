@@ -54,10 +54,14 @@ static uint64_t s5l8900_sha1_read(void *opaque, hwaddr offset, unsigned size)
                 // lazy compute the final hash by inspecting the last eight bytes of the buffer, which contains the length of the input data.
                 uint64_t data_length = swapLong(((uint64_t *)s->buffer)[s->buffer_ind / 8 - 1]) / 8;
 
-                SHA_CTX ctx;
-                SHA1_Init(&ctx);
-                SHA1_Update(&ctx, s->buffer, data_length);
-                SHA1_Final(s->hashout, &ctx);
+                /* glib rather than OpenSSL: glib is already a hard QEMU
+                 * dependency and cross-compiles to wasm64, while OpenSSL does
+                 * not build for the browser target at all. Same digest. */
+                gsize digest_len = sizeof(s->hashout);
+                GChecksum *sha1 = g_checksum_new(G_CHECKSUM_SHA1);
+                g_checksum_update(sha1, s->buffer, data_length);
+                g_checksum_get_digest(sha1, s->hashout, &digest_len);
+                g_checksum_free(sha1);
                 s->hash_computed = true;
             }
 

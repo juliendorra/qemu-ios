@@ -5,7 +5,6 @@
 #include "hw/core/platform-bus.h"
 #include "exec/hwaddr.h"
 #include "system/memory.h"
-#include <openssl/sha.h>
 
 #define TYPE_IPOD_TOUCH_SHA1                "ipodtouch.sha1"
 OBJECT_DECLARE_SIMPLE_TYPE(S5L8900SHA1State, IPOD_TOUCH_SHA1)
@@ -31,7 +30,6 @@ typedef struct S5L8900SHA1State {
     uint8_t hashout[0x14];
     bool hw_buffer_dirty;
     bool hash_computed;
-    SHA_CTX ctx;
 } S5L8900SHA1State;
 
 #endif

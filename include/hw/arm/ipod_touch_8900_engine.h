@@ -4,7 +4,7 @@
 #include "qemu/osdep.h"
 #include "exec/hwaddr.h"
 #include "system/memory.h"
-#include <openssl/aes.h>
+#include "hw/arm/ipod_touch_aes_cbc.h"
 
 typedef struct {
 	unsigned char magic[ 4 ];
@@ -96,7 +96,7 @@ static void s5l8900_8900_engine_write(void *opaque, hwaddr offset, uint64_t valu
 	data_current = 0;
 	while(data_current < data_len)
 	{
-		AES_cbc_encrypt(inbuf + data_current, intbuf, AES_BLOCK_SIZE, &aes_decrypt_key, iv, 0);
+		it_aes_cbc(inbuf + data_current, intbuf, AES_BLOCK_SIZE, &aes_decrypt_key, iv, 0);
 		memcpy(outbuf + data_current, intbuf, AES_BLOCK_SIZE);
 		data_current = data_current + AES_BLOCK_SIZE;
 	}

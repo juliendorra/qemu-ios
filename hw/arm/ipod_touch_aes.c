@@ -52,7 +52,8 @@ static void s5l8900_aes_write(void *opaque, hwaddr offset, uint64_t value, unsig
             cpu_physical_memory_read((aesop->inaddr - 0x80000000), inbuf,
                                      aesop->insize);
 
-            AES_cbc_encrypt(inbuf, buf, aesop->insize, &aesop->decryptKey, (uint8_t *)aesop->ivec, aesop->operation);
+            it_aes_cbc(inbuf, buf, aesop->insize, &aesop->decryptKey,
+                       (uint8_t *)aesop->ivec, aesop->operation);
 
             cpu_physical_memory_write((aesop->outaddr - 0x80000000), buf, aesop->insize);
             memset(aesop->custkey, 0, 0x20);

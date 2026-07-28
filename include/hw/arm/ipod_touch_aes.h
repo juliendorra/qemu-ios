@@ -5,7 +5,7 @@
 #include "hw/core/platform-bus.h"
 #include "exec/hwaddr.h"
 #include "system/memory.h"
-#include <openssl/aes.h>
+#include "hw/arm/ipod_touch_aes_cbc.h"
 
 #define TYPE_IPOD_TOUCH_AES                "ipodtouch.aes"
 OBJECT_DECLARE_SIMPLE_TYPE(S5L8900AESState, IPOD_TOUCH_AES)

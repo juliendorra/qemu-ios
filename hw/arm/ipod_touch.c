@@ -20,7 +20,6 @@
 #include "chardev/char.h"
 #include "ui/input.h"
 #include "hw/arm/ipod_touch_baseband.h"
-#include <openssl/aes.h>
 
 // Global pointer to machine state for wake assist timer access from key handler
 IPodTouchMachineState *g_ipod_touch_nms = NULL;
