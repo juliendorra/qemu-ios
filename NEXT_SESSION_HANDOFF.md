@@ -242,3 +242,80 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
   epoch, iBoot, FIL signature, root FS) and the open-issue list.
 * `IPHONE_2G_BRINGUP_HANDOFF.md` — long-form log.
 * `BUILD.md` §2b — one-command packaging for both bundles.
+
+---
+
+## The in-app HOME wedge on iPhone OS 1.0 — localised (2026-07-28, later session)
+
+**Not an ignored button, and not a spin. The guest goes IDLE and never wakes.**
+That is a different bug from the one the earlier entry describes, and it
+explains why the interrupt-path investigation correctly found nothing wrong.
+
+The user's report is the thing that reframed it: *"I open an app, once H is
+pressed it doesn't work, and touch is blocked too."* HOME does not do nothing —
+it takes the system somewhere it cannot leave.
+
+### What the sequence actually does
+
+Reproduced with `app-button-probe.py --board m68ap-10` plus
+`S5L8900_DEBUG=1 IT_MT_TRACE=1 IT_SYSIC_TRACE=1 IT_LCD_TRACE=1`:
+
+1. **The interrupt is delivered and acknowledged.** SYSIC group 1 bit 8
+   (IRQ 0x28): read INTSTAT → read INTLEVEL → ACK → re-read, twice, once for
+   press and once for release. Confirms the earlier finding.
+2. **The guest reacts, and the app really does close.**
+   `IOCoreSurfaceRootUserClient::attach`, then the app's
+   `IOMobileFramebufferUserClient::detach` and
+   `IOCoreSurfaceRootUserClient::detach`. HOME *works*; the teardown succeeds.
+3. **Then everything stops at once.** The LCD window base had been flipping
+   0x0f496000 → 0x0fe00000 → 0x0f400000 continuously; the last flip is the line
+   immediately before the keypress and there is never another. `[MT] frame
+   consumed` stops at the same moment — which is exactly the "touch is blocked
+   too" the user saw.
+
+### Where the CPU is
+
+`scripts/home-wedge-probe.py` (new) repeats the sequence and PC-samples over
+QMP. 40 samples after the press:
+
+```
+  c005a2ec  x32   CPSR 0x600000d3   (SVC, I=1 F=1)
+  c0060654  x5    64-bit counter read, hi/lo consistency loop -- timekeeping
+  c0060658  x2
+  c0435474  x1
+```
+
+0xc005a2ec is inside the kernel **idle** path, not SpringBoard:
+
+```
+  c005a2e4  mcr  p15, #0, r4, c7, c10, #4    DSB
+  c005a2e8  mcr  p15, #0, r4, c7, c0,  #4    WAIT FOR INTERRUPT
+  c005a2ec  subs r3, r3, #1                  <-- 80% of samples
+  c005a2f0  bne  #0xc005a2ec                 bounded delay, r3 starts at 0x4b0
+```
+
+So the system is parked at WFI with interrupts and FIQs masked, cycling a short
+delay. Nothing is runnable. This is a **missing wakeup**, not a deadlock and not
+a livelock: SpringBoard tore the app down, went idle, and no event ever arrives
+to make it repaint the home screen.
+
+### The lead worth taking next
+
+What should wake it is the obvious question, and the strongest candidate is a
+**display/vsync interrupt that our LCD model stops delivering** once the app's
+framebuffer client detaches. The evidence that points there is the coincidence
+in (3): base flips and touch consumption stop on the same line, and both are
+downstream of the compositor being scheduled. Check whether the LCD raises a
+periodic IRQ at all, whether it stops at the detach, and compare against 1.1.4
+and the iPod, which pass this step.
+
+Ruled out already, so do not re-do them: interrupt delivery/ACK (measured
+byte-identical to the iPod), the button model itself, and — from the same
+session — the device-tree radio properties, which cause a *different* touch
+failure by a different mechanism (see TOUCH_INVESTIGATION.md).
+
+**Harness rule, learned expensively.** `touch-probe.py` runs `-display none`,
+under which QEMU never calls `gfx_update` and every touch is refused; it reports
+`no-response` for known-good bundles. Use `app-button-probe.py` or
+`home-wedge-probe.py`, which attach a display client. A negative from a harness
+that cannot produce a positive is not evidence.
