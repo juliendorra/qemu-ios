@@ -271,6 +271,113 @@ static void z1_prepare_report_response(IPodTouchMultitouchState *s, uint8_t repo
     s->out_buffer[len + 5] = checksum & 0xFF;
 }
 
+/*
+ * iPhone OS 1.0 fetches a frame WITHOUT sending a command byte.
+ *
+ * 1.1.4's driver polls 0x64/0x65 for the length and then reads it with 0x68.
+ * 1.0's AppleMultitouchSPI (root fs 1A543a) instead calls
+ * deviceReadResultData(len), which is a plain full-duplex read: the MOSI bytes
+ * are whatever was left in its transmit buffer (measured: 46 46 46 46 46 ff ff
+ * ff), and only MISO matters. readOneFrameOfData() does it twice -- first an
+ * 8-byte read for the pending length, then a read of length+1 for the frame.
+ *
+ * Both replies use the same 0xAA framing the command path already produces:
+ * byte 0 = 0xAA, then the payload, then a big-endian 16-bit sum of every
+ * payload byte. Nothing about the packet layout differs between the two
+ * firmwares -- only the absence of the command byte -- so both helpers below
+ * emit exactly what the 0x64/0x65 and 0x68 branches emit.
+ *
+ * Without this, the leading garbage byte hit z1_transfer()'s default arm,
+ * which sets buf_size = 1, so every following byte was re-read as another
+ * "command". The driver saw an all-zero reply, decided the controller was
+ * wedged, and re-uploaded the Zephyr firmware -- forever. Touch never worked
+ * on 1.0 at all.
+ */
+#define MT_Z1_CMD_UNSOLICITED 0xFE  /* internal: a read with no command byte */
+
+static bool z1_is_command(uint8_t value)
+{
+    switch(value) {
+        case MT_Z1_CMD_BL_PACKET:
+        case MT_Z1_CMD_BL_VERIFY:
+        case MT_Z1_CMD_BL_EXECUTE:
+        case MT_Z1_CMD_IFACE_VERSION:
+        case MT_Z1_CMD_REPORT_INFO:
+        case MT_Z1_CMD_GET_REPORT:
+        case MT_Z1_CMD_FRAME_NOP1:
+        case MT_Z1_CMD_FRAME_NOP2:
+        case MT_Z1_CMD_FRAME_READ:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static uint16_t z1_pending_frame_len(IPodTouchMultitouchState *s)
+{
+    if(!s->next_frame) {
+        return 0;
+    }
+    return sizeof(MTFrameHeader) + sizeof(FingerData) + 2;
+}
+
+/*
+ * The length announcement deviceGetResultLength() reads: an 8-byte
+ * transaction of which only the first five bytes are parsed,
+ *
+ *     AA  len_hi  len_lo  ck_hi  ck_lo   -- ck = len_hi + len_lo
+ *
+ * NOTE this is NOT where 1.1.4's 0x64/0x65 poll carries the length (bytes
+ * 4/5, checksum 6/7). Same 0xAA framing, different offsets, so the two paths
+ * cannot share a builder. Disassembly, 1A543a AppleMultitouchSPI +0x2750:
+ * `ldrb rx[1]; ldrb rx[2]; orr r12, r3, r2 lsl #8` for the length, then
+ * `add r1, r2, r3` versus `orr` of rx[3]/rx[4] for the checksum.
+ *
+ * The driver also rejects a length above the max packet size it learned from
+ * the interface-version reply (MT_Z1_MAX_PACKET_SIZE), which our 54 clears.
+ */
+static void z1_prepare_frame_length_reply(IPodTouchMultitouchState *s)
+{
+    uint16_t frame_len = z1_pending_frame_len(s);
+    uint16_t checksum;
+
+    s->buf_size = 8;
+    memset(s->out_buffer, 0, s->buf_size);
+    s->out_buffer[0] = MT_Z1_REPLY_OK;
+    s->out_buffer[1] = (frame_len >> 8) & 0xFF;
+    s->out_buffer[2] = frame_len & 0xFF;
+    checksum = (s->out_buffer[1] + s->out_buffer[2]) & 0xFFFF;
+    s->out_buffer[3] = (checksum >> 8) & 0xFF;
+    s->out_buffer[4] = checksum & 0xFF;
+}
+
+// the frame itself, identical to the 0x68 reply: the driver asks for len + 1
+static void z1_prepare_frame_reply(IPodTouchMultitouchState *s)
+{
+    uint16_t payload_len = sizeof(MTFrameHeader) + sizeof(FingerData);
+    uint16_t checksum = 0;
+
+    if(!s->next_frame) {
+        s->buf_size = 4;
+        memset(s->out_buffer, 0, s->buf_size);
+        s->out_buffer[0] = MT_Z1_REPLY_OK;
+        return;
+    }
+
+    s->buf_size = payload_len + 3;
+    memset(s->out_buffer, 0, s->buf_size);
+    s->out_buffer[0] = MT_Z1_REPLY_OK;
+    memcpy(s->out_buffer + 1, &s->next_frame->frame_packet.header,
+           sizeof(MTFrameHeader));
+    memcpy(s->out_buffer + 1 + sizeof(MTFrameHeader),
+           &s->next_frame->finger_data, sizeof(FingerData));
+    for(int i = 0; i < payload_len; i++) {
+        checksum += s->out_buffer[1 + i];
+    }
+    s->out_buffer[payload_len + 1] = (checksum >> 8) & 0xFF;
+    s->out_buffer[payload_len + 2] = checksum & 0xFF;
+}
+
 static const uint8_t z1_verify_pattern[4] = { 0x05, 0x00, 0x00, 0x06 };
 
 /*
@@ -340,7 +447,31 @@ static uint32_t z1_transfer(IPodTouchMultitouchState *s, uint32_t value)
         return 0;
     }
 
-    if(s->cur_cmd == 0) {
+    /* A read with no command byte (iPhone OS 1.0). Only taken while a frame is
+     * actually in flight, so a genuinely unknown command still reaches the
+     * default arm below, and 1.1.4 -- which pads with zeroes and always leads
+     * with a real command -- is untouched. */
+    if(s->cur_cmd == 0 && !z1_is_command((uint8_t)value) &&
+       (s->next_frame || s->z1_frame_len_sent)) {
+        s->cur_cmd = MT_Z1_CMD_UNSOLICITED;
+        mt_trace_cmd("Z1", MT_Z1_CMD_UNSOLICITED);
+        free(s->out_buffer);
+        free(s->in_buffer);
+        s->out_buffer = malloc(MT_Z1_MAX_PACKET_SIZE + 0x10);
+        s->in_buffer = malloc(MT_Z1_MAX_PACKET_SIZE + 0x10);
+        s->buf_ind = 0;
+        s->in_buffer_ind = 0;
+
+        if(s->z1_frame_len_sent) {
+            z1_prepare_frame_reply(s);
+            MT_TRACE("Z1 unsolicited frame read (%u bytes)\n", s->buf_size);
+        } else {
+            z1_prepare_frame_length_reply(s);
+            MT_TRACE("Z1 unsolicited length read -> %u\n",
+                     z1_pending_frame_len(s));
+        }
+    }
+    else if(s->cur_cmd == 0) {
         // start a new command
         s->cur_cmd = value;
         mt_trace_cmd("Z1", (uint8_t)value);
@@ -482,6 +613,19 @@ static uint32_t z1_transfer(IPodTouchMultitouchState *s, uint32_t value)
         else if(s->cur_cmd == MT_Z1_CMD_FRAME_READ && s->next_frame &&
                 s->buf_size > 4) {
             ipod_touch_multitouch_consume_frame(s);
+        }
+        else if(s->cur_cmd == MT_Z1_CMD_UNSOLICITED) {
+            if(s->z1_frame_len_sent) {
+                /* the frame itself has now been handed over */
+                s->z1_frame_len_sent = false;
+                if(s->next_frame && s->buf_size > 4) {
+                    ipod_touch_multitouch_consume_frame(s);
+                }
+            } else if(s->buf_size == 8) {
+                /* only announce a payload the driver can actually come back
+                 * for; a zero length means "nothing pending" */
+                s->z1_frame_len_sent = s->next_frame != NULL;
+            }
         }
 
         // we're done with the command
@@ -1090,6 +1234,7 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
     s->z1_raw_upload = false;
     s->z1_raw_sum = 0;
     s->z1_verify_matched = 0;
+    s->z1_frame_len_sent = false;
 
     if (s->sysic) {
         int grp = s->zephyr1 ? MT_ATN_INT_GROUP_Z1 : MT_ATN_INT_GROUP_Z2;

@@ -199,6 +199,7 @@ typedef struct IPodTouchMultitouchState {
     bool zephyr1;
     uint32_t z1_upload_cksum;   // checksum of the last bootloader upload
     bool z1_raw_upload;         // inside the raw main-firmware upload stream
+    bool z1_frame_len_sent;     // 1.0 took the length; the frame read is next
     uint32_t z1_raw_sum;
     uint8_t z1_verify_matched;  // bytes matched of the 05 00 00 06 verify pattern
     uint8_t z1_verify_resp[4];
