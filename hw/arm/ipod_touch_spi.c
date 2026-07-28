@@ -66,8 +66,23 @@ static void apple_spi_update_cs(S5L8900SPIState *s)
 {
     BusState *b = BUS(s->spi);
     BusChild *kid = QTAILQ_FIRST(&b->children);
+
+    /* IT_SPI_CS_TRACE=1: does this guest drive chip-select at all? The whole
+     * transaction-framing workaround (R_RXCNT reaching 0) exists only because
+     * the answer was measured to be "no". Re-measure before trusting it. */
+    if (getenv("IT_SPI_CS_TRACE")) {
+        static uint32_t n;
+        fprintf(stderr, "[SPI%d] CS write #%u -> %s (R_PIN=0x%08x)\n",
+                s->base, ++n, (REG(s, R_PIN) & R_PIN_CS) ? "high" : "low",
+                REG(s, R_PIN));
+    }
     if (kid) {
-        // TODO GPIO not properly setup yet
+        /* Not forwarded to the peripheral. Measured 2026-07-27: the guest
+         * writes R_PIN once per transaction but ONLY ever 0x00000000 -- it
+         * asserts and never deasserts -- and it re-asserts between the two
+         * halves of a split 0xEA frame read. So forwarding CS would mark the
+         * same boundaries the R_RXCNT framing in apple_spi_run() already
+         * marks; it is fidelity, not a fix. See ipod_touch_multitouch.c. */
         //qemu_set_irq(qdev_get_gpio_in_named(kid->child, SSI_GPIO_CS, 0), (REG(s, R_PIN) & R_PIN_CS) != 0);
     }
 }

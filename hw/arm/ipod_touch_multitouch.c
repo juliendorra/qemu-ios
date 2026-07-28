@@ -763,8 +763,17 @@ static uint32_t mt_transfer_inner(SSIPeripheral *dev, uint32_t value)
  *
  * The controller supplies the boundary: R_RXCNT is the length the driver
  * asked for, and reaching 0 ends the transfer (measured: a 16-byte read is 4
- * runs of an 8-byte FIFO, completing when RXCNT hits 0). Chip-select would be
- * the textbook signal, but this guest never drives it (0 edges measured).
+ * runs of an 8-byte FIFO, completing when RXCNT hits 0).
+ *
+ * Chip-select would be the textbook signal. An earlier note here claimed the
+ * guest never drives it; that is WRONG (IT_SPI_CS_TRACE=1, 2026-07-27): the
+ * iPod driver writes R_PIN once per transaction, 84 times in a two-minute
+ * boot. It only ever ASSERTS, though -- every write is 0x00000000, never the
+ * deassert -- so CS gives a start-of-transaction marker, not an edge pair.
+ * Wiring it up would draw the boundary in exactly the same places RXCNT does
+ * (measured across an 0xEA frame read: one CS write before the 16-byte length
+ * part, another before the 59-byte payload part), so it would neither fix nor
+ * worsen the split-read problem below. It is fidelity, not a bug fix.
  *
  * Protocol state that legitimately spans transactions is preserved:
  * `frame_data_pending` (the EB length reply and the frame read are two
