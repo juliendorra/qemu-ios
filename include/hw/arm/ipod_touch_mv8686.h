@@ -38,8 +38,15 @@ typedef enum {
     MV8686_FW_READY,        /* mailbox is live */
 } MV8686DlState;
 
-/* the driver's EEPROM read request is a fixed 16 bytes */
+/* iPhone OS 1.1.x's EEPROM read request is a fixed 16 bytes. iPhone OS 1.0
+ * sends a 32-byte Marvell download descriptor instead -- see
+ * mv8686_stage_eeprom() and WIFI_SDIO_NOTES.md. */
 #define MV8686_EEPROM_CMD_LEN   16
+/* 1.0's descriptor: [le32 type][le32 addr][le32 len][le32 cksum], zero-padded
+ * to 32 bytes on the wire. The LENGTH is the discriminator -- 1.1.x's request
+ * is exactly 16 bytes and its word at +8 is zero, so keying off the words
+ * would misread it. */
+#define MV8686_DL_REQUEST_LEN   32
 #define MV8686_EEPROM_LEN       2048
 
 typedef struct MV8686State {

@@ -208,3 +208,55 @@ stream of `[u16 type][u16 size][data]`.
 Note the rules engine cannot express arbitrary binary today — `sgold2_unescape()`
 handles only `\r \n \t \\`, so a raw-byte transport needs a `\xNN` escape added
 to `hw/arm/ipod_touch_baseband.c` first.
+
+## 7. Answering 1.0's download descriptor: honouring the length is NOT enough (2026-07-28)
+
+Follow-on from the trace diff in WIFI_SDIO_NOTES.md, which established that
+iPhone OS 1.0 sends a 32-byte Marvell descriptor
+(`[le32 type][le32 addr][le32 len][le32 cksum]` = type 1, 0xc0001000, 512,
+0x26486be9) where 1.1.x sends Apple's 16-byte `readEEPROM` command, and that
+`mv8686_stage_eeprom()` ignored the request bytes entirely and always answered
+with the fixed 0x800-byte record stream.
+
+**Attempt 1 — honour the length.** Branch on request length (32 vs 16), parse
+the descriptor, and stage exactly the 512 bytes it asks for. Implemented and
+KEPT: the model now logs
+
+```
+[mv8686] download descriptor: type=1 addr=0xc0001000 len=512 (answering with 512 bytes, not 2048)
+```
+
+which is how the rest of this was measured. **It does not fix 1.0.** Result over
+a boot: helper-boot x23, descriptor x22, **EEPROM read x0**, handshake x0,
+"Unable to verify main program" x22 — the identical retry loop. The host writes
+its descriptor and then never issues the read at all, so the size of what we
+staged was never the thing standing in the way.
+
+**Attempt 2 — advertise the staged length in RD_BASE.** Reasoning: dead end #4
+established that RD_BASE is the card's download-request size and that the host
+waits for it to match; after staging, the model sets RD_BASE to 0 ("no further
+writes expected"), which is right for 1.1.x. So for the descriptor path,
+advertise 512 there instead and let 1.0 see that 512 bytes are waiting.
+**Also fails** — helper-boot x5, descriptor x4, read x0 in the same window.
+**REVERTED**, because an unvalidated guess in the device model is worse than
+none: it would have looked like intent to the next reader.
+
+**What this narrows.** The blocker is not the response *size* and not RD_BASE.
+1.0 writes the descriptor and then waits for something the model never does. The
+remaining candidates, none tested:
+
+* the descriptor is the CARD's request being echoed, and 1.0 expects to *write*
+  512 bytes of payload next rather than read anything (the flow would then be
+  write-descriptor → write-data, not write-request → read-response);
+* readiness is signalled by a card interrupt (`H_INT_DNLD` / `FN1_STATUS`
+  DL_RDY) that the EEPROM path does not raise;
+* `0x26486be9` in word 3 is a checksum the host expects echoed or acknowledged
+  somewhere before it proceeds.
+
+**Method note, and the reason this is filed as a dead end rather than continued:
+guess-and-boot has now failed twice at ~5 minutes per cycle, exactly as it did
+for the iBoot XDRV format (#6).** The next step should be static: disassemble
+`AppleMRVL868x::loadMainProgram` / the helper-download path in 1.0's
+kernelcache, or diff it against 1.1.4's, and read what the host actually waits
+on. Note #5 in this file — the kext references its strings PC-relatively, so a
+byte search for them will not find the function; that needs ARM-aware analysis.

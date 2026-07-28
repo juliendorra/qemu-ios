@@ -233,6 +233,10 @@ static void mv8686_wake_timer(void *opaque)
 /* --- firmware command handling ------------------------------------- */
 
 static uint16_t le16(const uint8_t *p) { return p[0] | (p[1] << 8); }
+static uint32_t le32(const uint8_t *p)
+{
+    return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 static void put_le16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
 static void put_le32(uint8_t *p, uint32_t v)
 {
@@ -493,6 +497,39 @@ static void mv8686_stage_eeprom(MV8686State *c, const uint8_t *req,
     *p++ = 0x00; *p++ = 0x05;
     memcpy(p, c->mac, sizeof(c->mac));
     c->eeprom_len = sizeof(c->eeprom);
+
+    /*
+     * iPhone OS 1.0 asks a DIFFERENT question here, and the size of the
+     * request is what distinguishes the two (IPOD_SDIO_TRACE diff,
+     * WIFI_SDIO_NOTES.md):
+     *
+     *   1.1.4  16 bytes  14 00 00 00 00 00 00 02 ...   Apple readEEPROM
+     *   1.0    32 bytes  [le32 type][le32 addr][le32 len][le32 cksum]
+     *                    01 00 00 00 | 00 10 00 c0 | 00 02 00 00 | e9 6b 48 26
+     *
+     * The second is a Marvell-style download-request descriptor -- "512 bytes
+     * for 0xc0001000". Answering it with the fixed 0x800-byte Apple record
+     * stream made 1.0 abandon the bootstrap and retry from the top forever
+     * (helper-boot x20, EEPROM read x0, per boot), which userland reports as
+     * "AppleMRVL868x: ERROR - Unable to verify main program."
+     *
+     * So honour the length the request carries. The record stream itself is
+     * unchanged -- it is still what the driver parses -- it is just delivered
+     * in the size that was asked for.
+     */
+    if (req && req_len >= MV8686_DL_REQUEST_LEN) {
+        uint32_t want = le32(req + 8);
+        if (want > 0 && want <= sizeof(c->eeprom)) {
+            c->eeprom_len = want;
+            mv_trace("download descriptor: type=%u addr=0x%08x len=%u "
+                     "(answering with %u bytes, not %zu)",
+                     le32(req), le32(req + 4), want,
+                     want, sizeof(c->eeprom));
+        } else {
+            mv_trace("download descriptor: implausible length %u; "
+                     "falling back to %zu", want, sizeof(c->eeprom));
+        }
+    }
 
     c->dl_state = MV8686_EEPROM_READ;
     /* no further host writes expected before the read */
