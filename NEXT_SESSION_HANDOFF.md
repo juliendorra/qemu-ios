@@ -19,6 +19,41 @@
 > fixed and written up in
 > [`TOUCH_INVESTIGATION.md`](TOUCH_INVESTIGATION.md).
 
+> **2026-07-28 — OPEN: on iPhone OS 1.0, Home and Power do nothing while an
+> app is frontmost.** They work on SpringBoard (P sleeps, H wakes to the lock
+> screen, slide-to-unlock works). Open an app and both go dead. Only surfaced
+> now because touch on 1.0 was broken until today, so nobody had ever opened an
+> app there; whether 1.1.4 shares it is UNVERIFIED.
+>
+> Reproduced headlessly (no display client), so it is not a UI artifact:
+> * in-app touch still works — tapping Settings changes 97% of the frame, a row
+>   inside it 35%, frames consumed each time;
+> * both key events reach `ipod_touch_key_event` (`IT_KEY_TRACE=1`, two events
+>   per press — down and up);
+> * the POWER path completes all the way INTO the guest: `[PMU] ONKEY pressed`,
+>   INT2 set, `nIRQ assert`, the guest READS INT1/INT2 (so its PMU ISR runs),
+>   `nIRQ de-assert` — and the panel still never sleeps, no `[LCD] Merlot panel
+>   entered sleep`;
+> * it is not a slow handshake: 60 s after HOME the screen is still the app
+>   (0.39% vs the in-app frame, 97% vs the home screen).
+>
+> So delivery and servicing are fine and the guest simply takes no action. Not
+> yet done, in order: `IT_GPIO_TRACE` to confirm the Home GPIO IRQ is raised
+> and acked while an app is frontmost; the same probe on 1.1.4 as a control
+> (attempted twice, both runs invalid — see the disk note); and PC-sampling
+> with `scripts/m68ap-freeze-probe.py` to see whether SpringBoard's button
+> handling runs at all on the press. Probe used:
+> `scratchpad/btnprobe.py` / `btnwait.py` pattern — drive the bundle through
+> its LAUNCHER, never `nand=<bundle>/...`.
+>
+> **Disk hazard, active.** This machine sits at ~100% full with 1-2 GiB free.
+> The iphone-2g launcher clones a 302 MB NAND per launch into `$TMPDIR` and
+> only removes it on a clean exit, so every killed run leaks one. Two 1.1.4
+> measurements this session were silently wrong because of it (the boot never
+> reached the touch gate and every diff read 0.0%). Check
+> `df -h /System/Volumes/Data` before a run and
+> `rm -rf $TMPDIR/s5l8900-nand.*` after.
+
 The sections below remain the record of the 2026-07-26 session.
 
 Both problems the previous handoff carried are addressed in this session:
