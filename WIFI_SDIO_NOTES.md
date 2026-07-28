@@ -348,11 +348,58 @@ costs nothing elsewhere.
 `SD8686_HELPER` 2140 B, 1.1.4 wants 123048 B / 2432 B -- and
 `ipod_touch_mv8686.c` completes the boot handshake on one specific event: the
 host reading `FN1_SCRATCH + 1` after the main download (`mv8686_fn1_read`,
-`dl_state == MV8686_DL_MAIN && c->main_bytes`). 1.0 evidently verifies the
-loaded program differently. This is the same shape as the 1.0-vs-1.1.4 divergence
-already found in the multitouch path (TOUCH_INVESTIGATION.md): the older build
-speaks an earlier variant of the same protocol. Next step is an `IPOD_SDIO_TRACE`
-capture of 1.0's download phase compared against 1.1.4's, not more guessing.
+`dl_state == MV8686_DL_MAIN && c->main_bytes`).
+
+### The IPOD_SDIO_TRACE diff (2026-07-28): 1.0's download request is a different shape
+
+Both builds booted with `IPOD_SDIO_TRACE=1`. The divergence is at the FIRST
+request after the helper boots, and everything downstream follows from it.
+
+```
+1.1.4  helper booted (2432 bytes); RD_BASE=16 for EEPROM cmd
+       eeprom request len=16: 14 00 00 00 00 00 00 02 00 00 00 00 00 00 00 00
+       eeprom read: delivered 2048 of 2048 bytes
+       firmware boot handshake complete (main 124928 bytes)   -> "Firmware loaded."
+
+1.0    helper booted (2140 bytes); RD_BASE=16 for EEPROM cmd
+       eeprom request len=32: 01 00 00 00 00 10 00 c0 00 02 00 00 e9 6b 48 26 ...
+       (no read, no handshake -- helper re-boots, forever)
+```
+
+Counted over a full boot: 1.1.4 does helper-boot x1, request x1, EEPROM read x1,
+handshake x1. **1.0 does helper-boot x20, request x19, EEPROM read x0,
+handshake x0** — a pure retry loop.
+
+1.0's 32-byte request decodes as four little-endian words:
+
+| word | value | reading |
+|---|---|---|
+| 0 | `0x00000001` | command / type |
+| 1 | `0xc0001000` | destination ADDRESS in SDRAM |
+| 2 | `0x00000200` | LENGTH — 512 bytes |
+| 3 | `0x26486be9` | checksum or magic |
+
+So it is not Apple's `readEEPROM` command at all. It is a classic Marvell-style
+**download-request descriptor** — "send me 512 bytes for 0xc0001000" — where
+1.1.4 sends the 16-byte Apple EEPROM command documented above.
+
+The model does not distinguish them: in `MV8686_EEPROM_CMD` state it calls
+`mv8686_stage_eeprom()`, which *ignores the request bytes entirely*, stages the
+fixed 2048-byte Apple record stream, and advertises 0x800 in scratch 0x34/0x35.
+1.0 asked for 512 bytes at an address and gets a 2048-byte answer to a question
+it did not ask, so it abandons the bootstrap and retries from the top.
+
+Same shape as the multitouch divergence (TOUCH_INVESTIGATION.md): the older
+build speaks an earlier variant of the same protocol, and the model was written
+against the newer one. `MV8686_EEPROM_CMD_LEN` is hardcoded 16
+(`include/hw/arm/ipod_touch_mv8686.h`), which is 1.1.4's number.
+
+**Concrete fix to try:** in the `MV8686_EEPROM_CMD` branch, branch on the
+request length — 16 keeps today's behaviour; 32 should be read as
+`[type][addr][len][cksum]` and answered with exactly `len` bytes (512), with
+scratch set to that length rather than 0x800. Note 1.0 wrote its request even
+though RD_BASE advertised 16, so unlike 1.1.4 it does not gate on RD_BASE
+matching its own request size — dead end #4's rule is 1.1.4-specific too.
 
 **Where this belongs permanently.** The NOR is generated
 (`scripts/build-m68ap-nor.py`), so the property fill belongs there, applied to
