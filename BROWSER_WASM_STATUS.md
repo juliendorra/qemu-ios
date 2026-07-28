@@ -85,7 +85,7 @@ below) and never reached the relevant stage. Against a correct boot, native
 produces `phyRegistered` too. The divergence was never the event — only the
 panic.
 
-### Still blocked: a wasm-only panic in `IOIpodUSBDevice::start`
+### Both panics were the clock, and `shift=1` clears them
 
 With icount **and** the verified home-screen NAND, the boot now gets much
 further — through the USB PHY, the network stack, the LCD — and then:
@@ -100,11 +100,31 @@ Native runs the same driver at the same point and simply continues
 the home screen at 74.3% non-black. The panic message is empty, which is
 unusual and worth chasing.
 
-This is now the single blocker between the wasm build and a browser home
-screen. Next step: symbolise the panic backtrace against 4A102's kernelcache
-(the repo's documented loop, DEVICE_BRINGUP_PLAYBOOK.md) to find what inside
-`start()` faults, and compare the guest-visible USB OTG register reads against
-native.
+**Resolved by using a faithful clock rate.** The panic point tracks the virtual
+clock, which is how we know these are guest timeouts rather than bad values out
+of the device models:
+
+| icount | ns per instruction | outcome |
+| --- | --- | --- |
+| none | wall clock | USB wrangler null-deref (`caller 0xC00638CC`) |
+| `shift=5` | 32 (~31 MIPS) | same null-deref |
+| `shift=3` | 8 (~125 MIPS) | passes it; panics in `IOIpodUSBDevice::start` |
+| **`shift=1`** | **2 (~500 MHz)** | **both panics gone** |
+
+`shift=1` printed `Registering: ../usb-device/AppleS5L8900XIpodHAL/IOIpodUSBDevice`
+— the same line native prints — and continued. **No device-model change was
+needed.**
+
+Note the direction is counter-intuitive: a HIGHER shift means more virtual
+nanoseconds per instruction, i.e. a guest that believes it is running on a
+SLOWER CPU. The real S5L8900 is 412 MHz ≈ 2.4 ns/instruction, so `shift=1` is
+the faithful setting; `shift=3` already presents a machine ~3× slower than the
+hardware iPhone OS was written for.
+
+The cost is wall clock: at `shift=1` the guest executes 4× more instructions per
+virtual millisecond than at `shift=3`. Under TCI that is slow. **Another
+argument that the JIT is required** — a ~10× faster engine makes the faithful
+clock rate affordable.
 
 ### The trap that cost this session two wrong conclusions
 

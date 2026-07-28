@@ -18,8 +18,11 @@ version picker, served as prepared chunked assets from our own origin.
   and Brotli'd (215.6 MiB raw pack). See [`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md).
 - **Toolchain: installed and proven.** Emscripten 4.0.10 natively, no Docker.
   zlib, libffi and pixman cross-compile to wasm64.
-- **Blocked:** glib did not finish (host disk full), so **no browser build of
-  QEMU has ever been produced**. Everything after W1 is unstarted.
+- **The browser build EXISTS and RUNS** (2026-07-28): `build-wasm/qemu-system-arm.wasm`,
+  53 MB, boots iPhone OS 1.1.4 through iBoot-204.3.14 and the Darwin kernel
+  under Node. W1 is done and W2 is measured.
+- **Blocked on one guest panic** inside `IOIpodUSBDevice::start`, which native
+  passes. See W2a.
 
 ---
 
@@ -37,10 +40,16 @@ Violating any of these silently wastes a session.
 
 ---
 
-## W1 — Finish the toolchain and get a wasm binary
+## W1 — Toolchain and wasm binary — DONE (2026-07-28)
 
-**Blocked on disk only.** Nothing here is known to be hard; it has simply never
-run to completion.
+`scripts/wasm/build-deps.sh glib` then `scripts/wasm/build-qemu.sh` produce
+`build-wasm/qemu-system-arm.{js,wasm}`. What it took is recorded in
+`BROWSER_WASM_STATUS.md`; the one structural change was **removing OpenSSL from
+the device model** (it does not cross-compile to wasm64), replaced with glib's
+`GChecksum` and QEMU's own `crypto/aes.h` plus a CBC helper.
+
+Original notes follow, kept because the "expect real work here" list was
+accurate.
 
 ```sh
 scripts/wasm/build-deps.sh glib      # ~1-2 GiB, the only missing dependency
@@ -84,6 +93,40 @@ evidence the *JIT* is viable, and says nothing about the interpreter.
 
 **Re-check upstream first:** if the wasm backend has merged since, this stops
 being patch-carrying and becomes a version bump.
+
+## W2a — The remaining boot blocker, and the icount rule
+
+**Always run the browser build with `-icount`.** Without it the guest sees its
+own driver `start()` calls taking 16-22 SECONDS, because `QEMU_CLOCK_VIRTUAL`
+follows wall clock while TCI runs ~13x slower than native. The kernel then takes
+timeout paths no real device takes and panics.
+
+The panic point tracks the virtual clock rate, which is how we know these are
+timeouts and not bad device-model values:
+
+| icount | ns per instruction | outcome |
+| --- | --- | --- |
+| none | wall clock | USB wrangler null-deref (`caller 0xC00638CC`) |
+| `shift=5` | 32 (~31 MIPS) | same null-deref |
+| `shift=3` | 8 (~125 MIPS) | passes it; panics in `IOIpodUSBDevice::start` (`0xC012D963`) |
+| `shift=1` | 2 (~500 MHz) | closest to the real 412 MHz S5L8900; **clears BOTH panics** |
+
+**Higher shift means a SLOWER guest**, which is the opposite of what one
+reaches for instinctively. The real S5L8900 is 412 MHz ≈ 2.4 ns/instruction, so
+`shift=1` is the faithful setting and `shift=3` already presents a machine ~3x
+slower than the hardware the OS was written for.
+
+The cost is wall clock: at `shift=1` the guest executes 4x more instructions per
+virtual millisecond than at `shift=3`, so a boot takes correspondingly longer
+under TCI. **This is another argument that the JIT is required** — with a ~10x
+faster engine, the faithful clock rate becomes affordable.
+
+`scripts/wasm/boot-test.mjs` takes `IT_ICOUNT=<shift>` and `IT_NAND_PACK=<path>`.
+
+`shift=1` cleared the `IOIpodUSBDevice` panic: the wasm boot printed
+`Registering: ../usb-device/AppleS5L8900XIpodHAL/IOIpodUSBDevice`, exactly as
+native does, and carried on. **Use `shift=1`.** No device-model change was
+needed for either panic — only an honest clock.
 
 ## W3 — A pack-access seam in the NAND model
 
