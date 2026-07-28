@@ -211,3 +211,75 @@ the shelved baseband telephony stack, or an activation/SpringBoard bypass
 needed" conclusion: telephony (or a bypass) IS on the path to a usable
 M68AP UI, even though the WiFi *driver* itself is board-agnostic and works.
 See `IPHONE_2G_BRINGUP_HANDOFF.md`.
+
+---
+
+## iPhone OS 1.0 has NO Wi-Fi: it wants calibration from the DEVICE TREE, not the card (2026-07-28)
+
+**Symptom.** On the 1.0 bundle Settings shows "Wi-Fi — No Wi-Fi", greyed out,
+and no "Select a Wi-Fi Network" sheet ever appears when Safari loads a page.
+1.1.4 and the iPod are fine. The Wi-Fi model is board-agnostic and unchanged,
+so the difference is entirely in what each OS asks for.
+
+**The two driver paths, from matched captures** (same launcher, same flags,
+`S5L8900_DEBUG=1`; the fb-snapshot logs are useless for this because they start
+after iBoot):
+
+```
+1.1.4 (works)                           1.0 (fails)
+  AppleMRVL868x::probe                    AppleMRVL868x::probe
+  AppleMRVL868x: probe                    -- nothing --
+  AppleMRVL868x: Loading Bootstrapper     -- nothing --
+  AppleMRVL868x: Reading EEPROM data      -- nothing --
+  AppleMRVL868x: Starting                 AppleMRVL868x: Starting
+  IO80211Interface::attach                AppleMRVL868x: Invalid calibration
+                                                        data in device tree.
+                                          start(SDIODeviceNub) <2> failed
+```
+
+**1.0's driver validates the device-tree calibration BEFORE it will bootstrap
+the card.** It never loads the bootstrapper and never issues the EEPROM read —
+so the `tx-calibration` record this model supplies over SDIO (the 128-byte
+non-uniform payload in `mv8686_stage_eeprom()`) is never even requested. 1.1.4's
+driver is the other design: it bootstraps the chip and reads calibration from
+the card's own EEPROM, which is exactly the path the model implements. The iPod
+behaves like 1.1.4 and has no baseband at all.
+
+**Where the device-tree copy is supposed to come from: the BASEBAND.** Both
+iBoots carry the feature — `strings` on 1A543a's and 4A102's `iboot-sb.bin`
+both hit `Installing WIFI Calibration`, and in iBoot-159 it sits at 0x1a358
+directly between `Read %d bytes from nvram in %ld usec.` (0x1a2f0) and
+`Radio NVRAM Entries:` (0x1a318). That is the uart1 conversation already
+documented in IPHONE_2G_BRINGUP_HANDOFF.md: iBoot's `AT+xdrv=9,1,0;` radio-NVRAM
+read, which our stub answers `+XDRV: 9,1,0,0,NULL` — **zero bytes**. Hence
+1.1.4's own log line, `Read 0 bytes from nvram in 1000397 usec.` (a 1 s
+timeout), immediately followed by `Installing WIFI Calibration` installing
+nothing usable. 1.1.4 does not care; 1.0 does.
+
+Both device trees declare the same properties (`calibration`, `tx-calibration`,
+`local-mac-address` are present in 1A543a's and 4A102's `DeviceTree.m68ap.bin`),
+so this is not a DT schema difference — the property is there and empty.
+
+**Not the cause, checked:** the SysCfg region is byte-identical between the two
+bundles' NORs, so this is not a SysCfg difference. (The 1.0 NOR does carry far
+fewer IMG2 containers than 1.1.4's — `dtre` only, versus dtre/batC/logo/nsrv/
+batl/batL/recm — which is worth a look on its own, but the calibration does not
+come from a NOR container.)
+
+**Open link, stated honestly:** that the 1.0 DT property is empty *because* the
+radio NVRAM came back NULL is inferred, not measured. iBoot-159 logs almost
+nothing in our setup (its output stops after `Reading 8900 header`), so the
+absence of `Installing WIFI Calibration` from the 1.0 capture is NOT evidence it
+skipped the step. What is measured is that the driver rejects whatever is
+there.
+
+**Cheapest experiment for whoever picks this up.** The rules mechanism already
+exists: `IT_BASEBAND_RULES` + `scripts/baseband-rules/*.rules`, where
+`eager.rules` line 3 currently answers
+`at+xdrv=9,1,` with `+XDRV: 9,1,0,{int},NULL`. Replace the `NULL` with a
+real-shaped radio-NVRAM payload carrying a WiFi calibration record whose CRC
+satisfies iBoot (it prints `WIFI Calibration Data (crc %u)`), boot 1.0, and see
+whether `Invalid calibration data in device tree` goes away. If it does, the fix
+belongs in the baseband stub, not in the Wi-Fi model. Note the record must not
+be all-0x00 or all-0xff — the same uniformity check that
+`mv8686_stage_eeprom()` already works around applies here.
