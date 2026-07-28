@@ -31,6 +31,30 @@ them can tell they did not come from a real device. They exist to satisfy a
 sanity check -- nothing in the emulated radio consumes them, and they are not
 real RF calibration.
 
+**OFF BY DEFAULT, AND IT MUST STAY THAT WAY UNTIL SOMEONE RE-MEASURES.**
+`build-m68ap-nor.py` only calls this under `--fill-radio-properties`, because
+filling `local-mac-address` **BREAKS TOUCH on iPhone OS 1.0**. Measured
+2026-07-28 with `scripts/app-button-probe.py --board m68ap-10`, one variable at
+a time, same NAND and same engine throughout:
+
+    nothing filled                     1_open_app PASS 97.11%   touch PASS
+    tx-calibration only                1_open_app PASS 97.11%   touch PASS
+    tx-calibration + Wi-Fi MAC         1_open_app FAIL  0.00%   touch DEAD
+    everything filled (shipped, bad)   1_open_app FAIL  0.00%   touch DEAD
+
+So the calibration half is harmless and the MAC half is the problem -- and it is
+specifically the MAC on the **Wi-Fi node** (the one beside `tx-calibration`),
+not the `ethernet` or the post-`uart3` Bluetooth one.
+
+Inferred mechanism, NOT directly measured: with a zero MAC the Wi-Fi driver
+bails out once ("MAC Address is all 00's", start <2> failed) and stops. With a
+valid MAC it gets past that check and into the main-firmware download, which the
+SDIO model cannot satisfy for 1.0 (WIFI_SDIO_DEADENDS.md #7) -- a permanent hot
+retry loop, measured at 23 helper-boots and 22 "Unable to verify main program"
+per boot. The loop is the plausible reason touch stops being serviced. Whoever
+fixes the download gate should re-test this: if the loop is what kills touch,
+the MAC becomes safe the moment the loop is gone.
+
 Values are deterministic so that rebuilding a NOR twice gives identical bytes.
 """
 from __future__ import annotations

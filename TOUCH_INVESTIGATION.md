@@ -390,3 +390,51 @@ session scratchpad. The essentials:
 
 Useful control: the Home key (`send-key h`) changes ~69 % of the iPod's
 framebuffer, which proves the UI is alive and isolates the failure to touch.
+
+---
+
+## Regression and revert (2026-07-28): a device-tree edit for Wi-Fi killed 1.0's touch
+
+**Reported by the user after a repackage**, not by a test: "the repackaged iOS
+1.0 app has buttons and touch not working". They were right, and it was mine.
+
+**What caused it.** Chasing iPhone OS 1.0's dead Wi-Fi (WIFI_SDIO_NOTES.md), I
+filled the device tree's zeroed `tx-calibration` and `local-mac-address`
+properties in the NOR, which gets 1.0's `AppleMRVL868x` past its calibration and
+MAC checks. It also kills touch. Isolated with
+`scripts/app-button-probe.py --board m68ap-10`, one variable at a time, same
+NAND and same engine throughout:
+
+| device tree | 1_open_app | 2_touch_in_app |
+|---|---|---|
+| nothing filled | **PASS** 97.11% | **PASS** 35.45% |
+| `tx-calibration` only | **PASS** 97.11% | **PASS** 35.49% |
+| `tx-calibration` + **Wi-Fi node's MAC** | FAIL 0.00% | FAIL |
+| everything filled *(what shipped)* | FAIL 0.00% | FAIL |
+
+So the calibration half is harmless; the **MAC on the Wi-Fi node** is the whole
+regression. Reverted: the fill is now opt-in behind
+`build-m68ap-nor.py --fill-radio-properties`, every artifact NOR was restored to
+zeros, both bundles were re-installed and re-signed, and the shipped 1.0 app
+re-tested **PASS / PASS** on steps 1 and 2.
+
+**Steps 3 and 4 (HOME returns, POWER sleeps) fail in every row above,
+including the clean one.** That is the separate, pre-existing in-app button bug
+recorded the same day in `09fdcb46f2` — not part of this regression, and not
+fixed by the revert.
+
+**Two method failures worth more than the fix.**
+
+1. **I shipped a firmware change without running the touch probe.** The device
+   tree is not a Wi-Fi file; it is the file every driver reads. A change there
+   needs the whole interaction suite, not the subsystem you were thinking about.
+2. **My first A/B "cleared" the change, wrongly.** I ran `touch-probe.py`, got
+   `verdict: no-response` for BOTH the filled and reverted NOR, and concluded my
+   change was innocent. Both verdicts were harness artifacts: `touch-probe.py`
+   runs `-display none`, and under it QEMU never calls `gfx_update` so **every**
+   touch is refused — the trap `09fdcb46f2` had documented hours earlier, and
+   which `app-button-probe.py` exists to avoid. The tell was there and I missed
+   it: the same run said `no-response` for 1.1.4, whose touch is known to work.
+   **A negative result from a harness that cannot produce a positive one is not
+   evidence.** Sanity-check any interaction probe against a known-good bundle
+   before trusting what it says about a suspect one.
