@@ -31,29 +31,20 @@ them can tell they did not come from a real device. They exist to satisfy a
 sanity check -- nothing in the emulated radio consumes them, and they are not
 real RF calibration.
 
-**OFF BY DEFAULT, AND IT MUST STAY THAT WAY UNTIL SOMEONE RE-MEASURES.**
-`build-m68ap-nor.py` only calls this under `--fill-radio-properties`, because
-filling `local-mac-address` **BREAKS TOUCH on iPhone OS 1.0**. Measured
-2026-07-28 with `scripts/app-button-probe.py --board m68ap-10`, one variable at
-a time, same NAND and same engine throughout:
+**ON by default for the 1.0 family only** (`build-m68ap-nor.py`, opt out with
+`--no-fill-radio-properties`). 1.1.x reads calibration from the card and needs
+nothing from the device tree, so it is not filled there.
 
-    nothing filled                     1_open_app PASS 97.11%   touch PASS
-    tx-calibration only                1_open_app PASS 97.11%   touch PASS
-    tx-calibration + Wi-Fi MAC         1_open_app FAIL  0.00%   touch DEAD
-    everything filled (shipped, bad)   1_open_app FAIL  0.00%   touch DEAD
+This once BROKE TOUCH on 1.0, and the reason it no longer does is worth keeping.
+A valid MAC got the Wi-Fi driver past its checks and into a main-firmware
+download the SDIO model could not satisfy -- a hot retry loop (23 helper-boots
+per boot) that starved the multitouch path. The loop was the cause, not the MAC.
+With the download fixed (`ipod_touch_mv8686.c` routes 1.0's 32-byte descriptor
+straight to `DL_MAIN`; WIFI_SDIO_NOTES.md), measured on the shipped bundle:
 
-So the calibration half is harmless and the MAC half is the problem -- and it is
-specifically the MAC on the **Wi-Fi node** (the one beside `tx-calibration`),
-not the `ethernet` or the post-`uart3` Bluetooth one.
+    1_open_app PASS 97.11%   2_touch_in_app PASS 35.63%   Firmware loadded.
 
-Inferred mechanism, NOT directly measured: with a zero MAC the Wi-Fi driver
-bails out once ("MAC Address is all 00's", start <2> failed) and stops. With a
-valid MAC it gets past that check and into the main-firmware download, which the
-SDIO model cannot satisfy for 1.0 (WIFI_SDIO_DEADENDS.md #7) -- a permanent hot
-retry loop, measured at 23 helper-boots and 22 "Unable to verify main program"
-per boot. The loop is the plausible reason touch stops being serviced. Whoever
-fixes the download gate should re-test this: if the loop is what kills touch,
-the MAC becomes safe the moment the loop is gone.
+If the download path ever regresses, expect touch to go with it.
 
 Values are deterministic so that rebuilding a NOR twice gives identical bytes.
 """
