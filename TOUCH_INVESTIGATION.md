@@ -227,8 +227,13 @@ The only thing it costs is that it *looks* like dead touch: a modal covers the
 icons, so taps do nothing until Dismiss is tapped. That is worth knowing when
 triaging a "touch stopped working" report — check the screenshot first.
 
-If it is ever worth removing, the route is to bake the dismissed state into the
-shipped image, not to chase persistence. Groundwork already done:
+**Do not hack it out of the image.** The alert is part of what distinguishes
+1.1.4 from 1.0 — 1.0 has no home-screen rearranging and no such alert — and
+seeing it on first boot is historically accurate behaviour worth preserving.
+The bundles show what these firmwares actually did. Decided 2026-07-28.
+
+For the record, since it will look like a loose end otherwise, these were the
+attempts and none of them landed in a shipped image:
 
 Every launch of the 1.1.4 bundle comes up with SpringBoard's `REORDER_INFO`
 alert covering the home screen, so taps on icons do nothing until Dismiss is
@@ -250,8 +255,34 @@ What was established:
   suppress it, so either those are not the gate for this particular alert or
   the injection did not land where SpringBoard reads.
 
-Neither is worth pursuing for its own sake. The workaround is one tap on
-Dismiss.
+The plist injection was built in a **throwaway** NAND tree — a symlink to the
+bundle's `nand.pack` plus empty bank dirs — so no shipped pack was ever
+modified (`nand.pack` still hashes to the value its extract manifest recorded).
+The throwaway tree is deleted. There is no hardcoded dismissal anywhere.
+
+Nothing here is worth pursuing. The workaround, if you want past the alert, is
+one tap on Dismiss.
+
+### Never point QEMU at a bundle's shipped NAND
+
+Probing the M68AP bundles by invoking `qemu-system-arm` directly with
+`nand=<bundle>/Contents/Resources/iphone_files/nand` **bypasses the launcher's
+per-launch clone**, so the guest's page writes land in the shipped image:
+`bank<N>/<page>_new.page` files that then become part of every later launch's
+starting state. 560 such pages were written across the two iPhone bundles this
+way before it was noticed, and removed afterwards (`nand.pack` itself is only
+ever read, so it stayed byte-identical).
+
+Either drive the bundle through its launcher, or clone the NAND first
+(`cp -Rc`) and point QEMU at the clone. To check a bundle is clean:
+
+```bash
+find "/Applications/iPhone 2G (iOS 1.1.4).app" -name "*_new.page" | wc -l
+```
+
+Zero is correct — the bundles ship `nand.pack` plus **empty** bank dirs. The
+iPod bundle is different by design: it is not staged, its NAND is patched in
+place, and guest writes there are normal.
 
 **The lesson**, and the reason this is written down: a read-only NAND makes
 "state that should persist doesn't" the *default*, not a symptom. Anything in
@@ -313,7 +344,13 @@ looked like a boot failure. Run one at a time when a result matters.
 persistence experiment, a kext/strings hunt for the gating default, and a
 plist injection through the NAND overlay tooling. All of it was answered up
 front by "the bundle clones a pristine NAND every launch", which makes
-non-persisting first-run state the expected outcome. See the section below.
+non-persisting first-run state the expected outcome -- and the alert is a real
+difference between 1.1.4 and 1.0 that should stay visible anyway. See below.
+
+**Probing a bundle by pointing QEMU at its shipped NAND.** That skips the
+launcher's per-launch clone, so guest writes accumulate in the shipped image
+and change what every later launch starts from. 560 stray pages across the two
+iPhone bundles before it was caught. See below.
 
 ## Reproduction
 
