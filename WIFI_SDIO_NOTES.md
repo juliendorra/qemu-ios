@@ -283,3 +283,61 @@ whether `Invalid calibration data in device tree` goes away. If it does, the fix
 belongs in the baseband stub, not in the Wi-Fi model. Note the record must not
 be all-0x00 or all-0xff — the same uniformity check that
 `mv8686_stage_eeprom()` already works around applies here.
+
+### SOLVED (2026-07-28): two zero-filled device-tree properties, no baseband work needed
+
+The section above proposed fixing this in the baseband stub. **That was the
+wrong direction, and the question "why does 1.1.4 work then?" is what exposed
+it.** 1.1.4 gets exactly the same NULL radio NVRAM and its Wi-Fi is fine —
+proved by booting 1.1.4 with `silent.rules`, a baseband that answers *nothing*:
+`Loading Bootstrapper` → `Reading EEPROM data` → `Starting` → attaches. So the
+device-tree calibration is not what makes Wi-Fi work; it is only what 1.0's
+driver *gates* on. Feeding iBoot a real radio NVRAM would have been a large
+detour to fix a check, not a dependency.
+
+The actual state of the properties, read straight out of both DeviceTree blobs:
+
+```
+1A543a   tx-calibration    len=1024   all-zero
+4A102    tx-calibration    len=1024   all-zero      <- identical
+both     local-mac-address len=6      all-zero  (x3 nodes)
+```
+
+Both firmwares ship the same empty properties. 1.1.4 never looks; 1.0 checks
+and refuses. The rejection is the *same uniformity rule* the SDIO model already
+works around in `mv8686_stage_eeprom()` — "all 0x00 or all 0xff is invalid".
+
+**The fix: fill them.** The device tree sits in the NOR `dtre` container in
+plaintext (`tx-calibration` is at 0x139c4 in the 1.0 NOR), and nothing verifies
+it at that granularity, so patching the property in place is enough. Done on a
+NOR *copy* and booted with `S5L8900_NOR=`, 1.0 clears both gates in turn:
+
+```
+tx-calibration := non-uniform 1024 bytes
+  -> "Invalid calibration data in device tree."  GONE
+  -> new gate: "AppleMRVL868x: MAC Address is all 00's."
+local-mac-address := 02:1a:11:e0:86:86+n  (locally administered, per node)
+  -> AppleMRVL868x: Starting
+     IO80211Controller::attachInterfaceWithMacAddress called!
+     IO80211Interface::attach(AppleMRVL868x)
+     IONetworkStack::attach(IO80211Interface)
+     AppleMRVL868x: Ethernet address 02:1a:11:e0:86:87
+```
+
+Confirmed in a clean `fb-snapshot.py` run with the patched NOR: the interface
+attaches AND the home screen still renders normally, so the DT edit costs
+nothing elsewhere.
+
+**Where this belongs permanently.** The NOR is generated
+(`scripts/build-m68ap-nor.py`), so the property fill belongs there, applied to
+every build — it is harmless for 1.1.4/1.1.1 (which ignore the DT copy) and it
+also gives them a real MAC in the device tree instead of zeros. It is NOT a
+guest-image modification: it fills firmware fields that on real hardware are
+populated from the phone's own radio NVRAM, which an emulator has no source
+for. The synthetic values must stay obviously synthetic (locally administered
+MAC, non-uniform calibration) and be declared in the firmware provenance like
+every other generated-image edit.
+
+**Still true, and still the honest limit:** these are *fabricated* calibration
+bytes. They satisfy the driver's sanity check; they are not real RF calibration
+and nothing in the emulated radio consumes them.
