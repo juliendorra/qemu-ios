@@ -504,3 +504,44 @@ done
 ```
 Anything that prints a shell error instead of boot output is broken for the user
 before QEMU is even involved.
+
+### CORRECTION: the in-app HOME failure is a BOARD problem, not a 1.0 problem
+
+`09fdcb46f2` concluded "Only iPhone OS 1.0 fails". That was measured with the
+brightness-heuristic `grab()` (see above), which cannot see a transition to a
+dimmer screen. Re-measured with the fixed capture and `IT_PROBE_WAIT=8`:
+
+| board | 1_open_app | 2_touch_in_app | 3_home_returns | 4_power | 5_home_wakes |
+|---|---|---|---|---|---|
+| iPod (N45AP) | PASS | PASS | **PASS 98.47%** | PASS | PASS |
+| iPhone OS 1.0 | PASS 97.11% | PASS 35.95% | **FAIL 0.00%** | FAIL | — |
+| iPhone OS 1.1.4 | PASS 25.76% | FAIL 0.32% | **FAIL 0.04%** | PASS | PASS |
+
+**Both M68AP builds fail the same step; the iPod passes it.** So the
+discriminator is the BOARD, not the OS version, and any search through iPhone OS
+1.0's userland is looking in the wrong place.
+
+What is measured about the M68AP HOME press, with an app frontmost:
+
+* The IRQ is raised, read, INTLEVEL-read, ACKed and re-read -- group 1 bit 8
+  (IRQ 0x28), press and release, byte-identical in shape to the iPod's.
+* The guest then does **nothing**: no LCD register writes, no client teardown,
+  no framebuffer change in any of the three buffers, for 64 s.
+* The iPod in the same situation starts writing LCD registers (`0x020`, `0x00c`,
+  `0x0d8`...) in the very next lines after the keypress.
+
+**Tried and rejected: publishing the pin level in INTLEVEL.** The model never
+set `gpio_int_level`, so every guest read "released" even on a press -- a real
+infidelity, and the obvious candidate for "IRQ arrives, nothing happens".
+Implemented it (mirror `gpio_state` into the level register on press/release)
+and it changed nothing: `3_home_returns` still 0.00%. **Reverted** rather than
+left in as an unvalidated guess.
+
+Next, given the board framing: the M68AP HOME button is on its own pin and IRQ
+(`c187fb682d`, `c50c158e01` -- button_menu, IRQ 0x28, group 1 bit 8, not the
+iPod's). The iPod works with the same kernel-visible sequence, so what differs
+is what ELSE the M68AP guest expects to see around that pin -- a second GPIO it
+polls, a different pin for the same logical button, or a level/edge expectation
+the pulse model does not meet. Diff the two boards' GPIO traffic across the
+press (`IT_GPIO_TRACE=1`), not their SYSIC traffic, which is already known to
+match.
