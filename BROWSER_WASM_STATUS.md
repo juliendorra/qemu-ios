@@ -15,6 +15,109 @@ comes after.
 
 ---
 
+## Session — 2026-07-28 (later): grafting the WebAssembly JIT
+
+TCI is ~13× slower than native and the product needs real-time speed, so the
+out-of-tree WebAssembly TCG backend moved from "option" to "requirement". This
+records how it was adopted, including the wrong turns.
+
+### False start: "the JIT is on an old QEMU, so grafting means crossing the refactor"
+
+The first assessment looked at `ktock/qemu-wasm`'s **default** branch, found
+QEMU **8.2.0** with the pre-rename TCG layout (`tcg/arm`, `tcg/i386`,
+`tcg/mips`), and concluded that adopting it meant porting a backend across the
+QEMU 10.x TCG rework — days of expert work, possibly justifying a rewrite.
+
+**That was wrong, and cheap to have checked.** The repository has 22 branches.
+Enumerating them and reading each `VERSION` takes one command:
+
+| branch | QEMU | backend |
+| --- | --- | --- |
+| `master` | 8.2.0 | `tcg/wasm32` |
+| `dev-e` | 9.2.92 | `tcg/wasm32` |
+| `bench64` | 10.2.50 | none (benchmark branch) |
+| **`wasm64-tcg-b`** | **10.2.50** | **`tcg/wasm64`** |
+
+`wasm64-tcg-b` is based on the development line that *became* 11.0, and its
+`tcg/` layout is **identical** to ours (`aarch64 loongarch64 mips64 ppc64
+riscv64 s390x sparc64 tci x86_64`). The backend is therefore written against
+essentially our interface.
+
+**Lesson: check every branch and its `VERSION` before judging a port's cost.**
+Judging an upstream by its default branch nearly turned a copy job into a
+rewrite.
+
+### The right path: copy 9 files, then fix what upstream guards on TCI
+
+The backend is `tcg/wasm64/` plus `tcg/wasm64.{c,h}` — 9 files, ~118 KB,
+~4,000 lines. Everything else it needs was **already upstream in 11.0.2**:
+`os-wasm.c`, `coroutine-wasm.c`, the `wasm64` cpu in `configure`, and the
+emscripten cross file's `ALLOW_TABLE_GROWTH` / `addFunction` exports, which
+exist for precisely this backend.
+
+The integration work was five hooks, all the same shape — upstream guards
+things on `CONFIG_TCG_INTERPRETER`, and the wasm backend needs the same
+treatment because it behaves like TCI in those respects:
+
+1. `meson.build` — delete upstream's `error('WebAssembly host requires
+   --enable-tcg-interpreter')`. That check exists only because upstream has no
+   wasm backend.
+2. `tcg/meson.build` — build `wasm64.c` and link libffi on an emscripten host.
+3. `include/tcg/helper-info.h` — libffi declarations and the `ffi_cif` field.
+   Without it: `use of undeclared identifier 'ffi_cif'`.
+4. `tcg/tcg.c` — four guards (`typecode_to_ffi`, the ffi layout macros, both
+   `tcg_qemu_tb_exec` sites).
+5. `include/tcg/tcg.h` — `tcg_qemu_tb_exec` must be declared a **function**.
+   Like TCI, the backend supplies its own dispatcher rather than a pointer to a
+   generated host prologue, so the pointer declaration collided with it.
+
+### The one real integration defect: `WASM64_MEMORY64_2`
+
+First run threw:
+
+```
+WebAssembly.Module(): BufferSource argument is empty
+```
+
+The backend's `EM_JS` glue encodes pointers and table indices differently in
+Emscripten's 32-bit-address-limit mode, selected by `WASM64_MEMORY64_2`. Their
+tree sets it from a meson option; our 11.0.2 handles the limit in `configure`
+(`--wasm64-32bit-address-limit` → `-sMEMORY64=2`) and never passed the define.
+The glue used the wrong encoding, handed `WebAssembly.Module` an empty view,
+and threw. `configure` now defines it whenever `-sMEMORY64=2` is in effect.
+
+Note what this failure *proves*: the JIT was live and compiling translation
+blocks. It is the first failure in the whole port that is a genuine integration
+defect rather than environment, clock, or harness — and it was still on our
+side of the line, not a defect in the backend.
+
+### Two self-inflicted build failures worth not repeating
+
+**Never regenerate a cross build outside its toolchain environment.** When
+ninja reported a stale `build.ninja`, running `meson --internal regenerate` by
+hand from inside `build-wasm` re-probed dependencies without
+`PKG_CONFIG_PATH` pointing at the wasm sysroot. Meson found **host Homebrew**
+libraries and enabled curl, zstd and libssh for a WebAssembly build:
+
+```
+-I/opt/homebrew/opt/zstd/include -I/opt/homebrew/Cellar/libssh/0.11.3/include
+../block/curl.c:35:10: fatal error: 'curl/curl.h' file not found
+```
+
+`scripts/wasm/build-qemu.sh --configure` exists so that environment is always
+set; use it. A correct reconfigure reports `Run-time dependency libcurl found:
+NO (tried pkgconfig)`.
+
+**A QEMU build directory symlinks `scripts/`.** Leaving the shell inside
+`build-wasm` and running `./scripts/wasm/build-qemu.sh` still *resolves* — but
+the script computes the repo root from its own path and concludes the root is
+`build-wasm`, then reports `native toolchain missing; run
+scripts/wasm/setup-toolchain.sh` even though the toolchain is present and
+intact. A misleading error with an unrelated remedy; always invoke it from the
+repository root.
+
+---
+
 ## Session — 2026-07-28: QEMU RUNS IN WEBASSEMBLY
 
 **`build-wasm/qemu-system-arm.wasm` exists (53 MB) and boots iPhone OS 1.1.4's

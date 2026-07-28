@@ -134,6 +134,43 @@ faster engine, the faithful clock rate becomes affordable.
 native does, and carried on. **Use `shift=1`.** No device-model change was
 needed for either panic — only an honest clock.
 
+## W2b — The WebAssembly JIT (grafted 2026-07-28)
+
+TCI cannot deliver real-time speed, which the goal now requires, so the
+out-of-tree backend is being adopted. **Graft, do not reimplement** — and note
+which branch:
+
+`ktock/qemu-wasm` branch **`wasm64-tcg-b`** is QEMU **10.2.50**, the line that
+became 11.0, and its `tcg/` layout is identical to ours. The default branch
+(`master`) is 8.2.0 with the pre-rename layout and would mean crossing the
+QEMU 10.x TCG rework; judging the repo by its default branch nearly turned a
+copy job into a rewrite.
+
+```sh
+git fetch --depth=1 --no-tags https://github.com/ktock/qemu-wasm wasm64-tcg-b
+git checkout FETCH_HEAD -- tcg/wasm64 tcg/wasm64.c tcg/wasm64.h
+```
+
+Plus five hooks, all already applied on the `wasm-jit-graft` branch: remove
+upstream's "WebAssembly host requires --enable-tcg-interpreter" error, build
+`wasm64.c` with libffi in `tcg/meson.build`, and extend three
+`CONFIG_TCG_INTERPRETER` guards (`helper-info.h`, `tcg.c` ×4, `tcg.h`) with
+`|| defined(EMSCRIPTEN)` — the backend calls helpers through libffi and supplies
+its own `tcg_qemu_tb_exec` dispatcher, exactly as TCI does.
+
+**And one define that is easy to miss:** `-DWASM64_MEMORY64_2` whenever
+`-sMEMORY64=2` (`--wasm64-32bit-address-limit`) is in effect. The backend's
+`EM_JS` glue encodes pointers differently in that mode; without it the first
+compiled block throws `WebAssembly.Module(): BufferSource argument is empty`.
+Now handled in `configure`.
+
+`IT_WASM_TCI=1 scripts/wasm/build-qemu.sh` still builds the interpreter, into
+`build-wasm-tci`, for A/B comparison.
+
+**Status:** builds and links (53,555,377 B vs TCI's 53,238,248), executes, and
+reaches `WebAssembly.Module()`. The speed measurement against TCI is the next
+step and the one that decides whether real-time is reachable.
+
 ## W3 — A pack-access seam in the NAND model
 
 `nand_read_packed_page()` in `hw/arm/ipod_touch_nand.c` binary-searches a
@@ -321,6 +358,20 @@ environment, clock, and harness before suspecting the port.
 - **Don't trust `builds/<BUILD>/nand` without checking its provenance
   `recipe` field.** A tree built from an unpatched root boots and renders
   nothing; only `"recipe": "home-screen"` is the product NAND.
+- **Don't run `meson`, `ninja` or `configure` on the wasm build by hand.** A
+  reconfigure outside the toolchain environment re-probes dependencies without
+  the wasm sysroot's `PKG_CONFIG_PATH`, finds **host Homebrew** libraries, and
+  enables curl/zstd/libssh for a WebAssembly build — which then fails on
+  `curl/curl.h`. Always go through `scripts/wasm/build-qemu.sh [--configure]`.
+  A correct reconfigure says `libcurl found: NO (tried pkgconfig)`.
+- **Don't invoke the build scripts from inside `build-wasm`.** QEMU build
+  directories symlink `scripts/`, so the command resolves but computes the repo
+  root as the build directory and reports `native toolchain missing` — a
+  misleading error pointing at an unrelated remedy. Run from the repo root.
+- **Don't judge an upstream by its default branch.** `ktock/qemu-wasm`'s master
+  is QEMU 8.2.0; the branch we needed (`wasm64-tcg-b`) is 10.2.50 with our exact
+  TCG layout. Enumerate branches and read each `VERSION` before estimating a
+  port.
 - **Don't expect byte-reproducible packs across rebuilds**: `hdiutil` stamps
   timestamps into the HFS images, so `hfs_sha256` changes even when the recipe
   does not. Reproducibility is at the level of the recipe.

@@ -8,6 +8,20 @@ The plan of record is [`BROWSER_WASM_IMPLEMENTATION_PLAN.md`](../../BROWSER_WASM
 current, dated state is in [`BROWSER_WASM_STATUS.md`](../../BROWSER_WASM_STATUS.md);
 the ordered next steps are in [`BROWSER_WASM_HANDOFF.md`](../../BROWSER_WASM_HANDOFF.md).
 
+## Always build through these scripts
+
+Not as a style preference — two failures came from stepping around them:
+
+- Running `meson`/`ninja` directly re-probes dependencies **without** the wasm
+  sysroot's `PKG_CONFIG_PATH`, so meson finds host Homebrew libraries and
+  enables curl, zstd and libssh for a WebAssembly build. It then fails
+  compiling `block/curl.c`. A correct configure reports
+  `Run-time dependency libcurl found: NO (tried pkgconfig)`.
+- A QEMU build directory symlinks `scripts/`, so invoking these from inside
+  `build-wasm/` resolves but makes the script compute the repo root as the
+  build directory. It then reports `native toolchain missing` even though the
+  toolchain is present. **Run them from the repository root.**
+
 ## Docker is optional
 
 QEMU's upstream CI builds the wasm target in a container. That container exists
