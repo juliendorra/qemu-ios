@@ -30,6 +30,8 @@ of naming the build.
 m68ap-artifacts/
   shared/
     bootrom_s5l8900        SoC-wide; the same silicon on every S5L8900
+    nor_n45ap.bin          N45AP device dump; the NOR builder's SysCfg/geometry
+                           template. NOT per-build, and NOT regenerable.
   builds/
     1A543a/                iPhone OS 1.0
       ipsw/                the retail IPSW and images extracted from it
@@ -132,3 +134,30 @@ Notes:
 - HFS images are not bit-reproducible: `hdiutil` records timestamps, so two runs
   of the same recipe produce different `hfs_sha256` values. Reproducibility is
   at the level of *the recipe*, not of the bytes.
+
+
+## The two irreplaceable inputs in `shared/`
+
+Neither is committed (they are Apple firmware, `.gitignore`d with the rest of
+`m68ap-artifacts/`), and neither can be rebuilt from anything else in this tree.
+**Keep copies off this machine.**
+
+* `bootrom_s5l8900` — burned into the SoC.
+* `nor_n45ap.bin` — a real iPod touch NOR. `build-m68ap-nor.py` takes its
+  SysCfg block and overall geometry and rewrites only the image-store region,
+  so without it no M68AP NOR can be built at all.
+
+`nor_n45ap.bin` earned its place here the hard way (2026-07-28). It used to live
+in an untracked `data/` directory that the docs and the build script both named
+— and that directory was gone, so a from-scratch NOR rebuild was impossible.
+The only surviving copy was inside `/Applications/iPod Touch.app`, which is a
+build *output* (repackaging rewrites it) and which N45AP maps **in place**, so a
+guest write could have silently altered a build input. Nothing recorded which
+template a given NOR had been built from, either.
+
+Now: the script defaults to `shared/nor_n45ap.bin` and prints the template's
+sha256 on every run, so a NOR can be traced to the dump it came from. The
+current one is
+`9f86a537c19c0193e72e52e60d127f4991eca813b037ff833a1ed1ab9c7dad00`.
+Verified by rebuilding 1A543a's NOR from scratch and getting a byte-identical
+result to the shipped artifact.

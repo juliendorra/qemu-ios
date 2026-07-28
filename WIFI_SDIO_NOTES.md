@@ -284,7 +284,7 @@ belongs in the baseband stub, not in the Wi-Fi model. Note the record must not
 be all-0x00 or all-0xff — the same uniformity check that
 `mv8686_stage_eeprom()` already works around applies here.
 
-### SOLVED (2026-07-28): two zero-filled device-tree properties, no baseband work needed
+### PARTLY FIXED (2026-07-28): two zero-filled device-tree properties -- but a THIRD gate follows
 
 The section above proposed fixing this in the baseband stub. **That was the
 wrong direction, and the question "why does 1.1.4 work then?" is what exposed
@@ -324,9 +324,35 @@ local-mac-address := 02:1a:11:e0:86:86+n  (locally administered, per node)
      AppleMRVL868x: Ethernet address 02:1a:11:e0:86:87
 ```
 
-Confirmed in a clean `fb-snapshot.py` run with the patched NOR: the interface
-attaches AND the home screen still renders normally, so the DT edit costs
-nothing elsewhere.
+**CORRECTION -- 1.0 Wi-Fi is still NOT working.** I first read only the head of
+the driver's log, saw the attach lines, and called this solved. It is not: a few
+lines further down 1.0 enters a permanent retry loop,
+
+```
+AppleMRVL868x: Loading Main Program
+AppleMRVL868x: ERROR - Unable to verify main program.
+AppleMRVL868x: Failed to load firmware, trying again.
+```
+
+which was present in every one of those runs (36 occurrences in the first,
+200 in the fb-snapshot run) and is absent from 1.1.4, where the same step reads
+`Firmware loaded.` / `Firmware Version: 46.0.0.p9 (0x092e0000)`. So the device-
+tree fix is real and clears gates 1 and 2 -- calibration, then MAC -- and the
+interface does attach with an Ethernet address, but the card's **main firmware
+download** is a third, independent gate that the SDIO model does not satisfy for
+1.0. The home screen still renders normally with the patched NOR, so the DT edit
+costs nothing elsewhere.
+
+**The third gate, and why it is a separate problem.** The two builds ask for
+*different firmware blobs* -- 1.0 wants `SD8686_FIRMWARE` 122608 B /
+`SD8686_HELPER` 2140 B, 1.1.4 wants 123048 B / 2432 B -- and
+`ipod_touch_mv8686.c` completes the boot handshake on one specific event: the
+host reading `FN1_SCRATCH + 1` after the main download (`mv8686_fn1_read`,
+`dl_state == MV8686_DL_MAIN && c->main_bytes`). 1.0 evidently verifies the
+loaded program differently. This is the same shape as the 1.0-vs-1.1.4 divergence
+already found in the multitouch path (TOUCH_INVESTIGATION.md): the older build
+speaks an earlier variant of the same protocol. Next step is an `IPOD_SDIO_TRACE`
+capture of 1.0's download phase compared against 1.1.4's, not more guessing.
 
 **Where this belongs permanently.** The NOR is generated
 (`scripts/build-m68ap-nor.py`), so the property fill belongs there, applied to

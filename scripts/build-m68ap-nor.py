@@ -17,17 +17,40 @@ security epoch".
 Policy: takes user-supplied firmware at run time; commits nothing derived from
 Apple firmware.
 
+The template is a DEVICE DUMP -- Apple firmware, so it is never committed, the
+same policy as the IPSWs. That makes it an undeclared build input, and it bit:
+`data/nor_n45ap.bin` (which this docstring used to name) was an untracked local
+directory that got deleted, after which no M68AP NOR could be rebuilt from
+scratch on this machine. The only surviving copy was inside a shipped .app --
+a directory the tooling treats as an OUTPUT and rewrites on every packaging
+run, and which N45AP maps IN PLACE so a guest write could silently alter it.
+
+So the template now lives beside the boot ROM in `m68ap-artifacts/shared/`,
+which is the existing home for inputs that are not per-build, and this script
+defaults to it and prints its sha256 so a NOR can be traced back to the dump it
+came from. Keep a copy off this machine: it cannot be regenerated.
+
 Usage:
   python3 scripts/build-m68ap-nor.py \
-      --template data/nor_n45ap.bin \
       --containers <extract-out>/nor-containers \
       --out iphone_files/nor_m68ap.bin
+  # --template defaults to m68ap-artifacts/shared/nor_n45ap.bin
 """
 import argparse
+import hashlib
 import os
 import struct
 import sys
 import zlib
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import m68ap_dt_radio
+
+# Not per-build, like the boot ROM: one SoC-era device dump serves every M68AP
+# firmware. See the docstring for why it lives here and not in data/.
+DEFAULT_TEMPLATE = (Path(__file__).resolve().parent.parent /
+                    "m68ap-artifacts" / "shared" / "nor_n45ap.bin")
 
 # Image-store region in the 1 MiB NOR: the first container starts here, and the
 # SysCfg block sits well above the last one. These match the observed N45AP
@@ -132,14 +155,25 @@ def promote_loadable(container, stride):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--template", required=True,
-                        help="a real N45AP NOR to source SysCfg/geometry from")
+    parser.add_argument("--template", default=str(DEFAULT_TEMPLATE),
+                        help=f"a real N45AP NOR to source SysCfg/geometry from "
+                             f"(default: {DEFAULT_TEMPLATE})")
     parser.add_argument("--containers", required=True,
                         help="directory of <type>.img2c from extract-m68ap-images.py")
     parser.add_argument("--out", required=True, help="output nor_m68ap.bin")
     args = parser.parse_args()
 
-    nor = bytearray(open(args.template, "rb").read())
+    if not os.path.exists(args.template):
+        sys.exit(f"NOR template not found: {args.template}\n"
+                 f"This is a device dump and is never committed -- see this "
+                 f"script's docstring. A copy also ships inside the iPod "
+                 f"bundle at Contents/Resources/ipod_files/nor_n45ap.bin.")
+    template_bytes = open(args.template, "rb").read()
+    # Print the template hash: it is the one build input with no other record,
+    # so without this a NOR cannot be traced back to the dump it came from.
+    print(f"template {args.template}")
+    print(f"  sha256 {hashlib.sha256(template_bytes).hexdigest()}")
+    nor = bytearray(template_bytes)
     nor_size = len(nor)
 
     # Blank the old image store region (leave the LLB region and SysCfg intact).
@@ -156,6 +190,18 @@ def main():
         container = open(path, "rb").read()
         if container[:4] != b"2gmI":
             sys.exit(f"{path}: not an IMG2 container")
+        # The device tree ships its radio properties zero-filled; on real
+        # hardware iBoot fills them from the baseband's radio NVRAM, which we
+        # have no source for. iPhone OS 1.0's Wi-Fi driver validates them and
+        # refuses to start on all-zero, so fill them here -- before the header
+        # CRC is recomputed below. Harmless for 1.1.x (which reads calibration
+        # from the card's EEPROM instead) and it gives every build a real MAC
+        # in the device tree. See scripts/m68ap_dt_radio.py.
+        if container[4:8][::-1] == b"dtre":
+            container = bytearray(container)
+            for note in m68ap_dt_radio.fill(container):
+                print(f"  dtre: filled {note}")
+            container = bytes(container)
         # Every container starts on a 0x40 boundary, so the distance to the next
         # header is just this container's length rounded up to ALIGN -- that is
         # the allocation the +0x18 walk stride has to advertise.
