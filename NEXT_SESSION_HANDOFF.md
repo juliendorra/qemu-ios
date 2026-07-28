@@ -25,45 +25,37 @@
 > now because touch on 1.0 was broken until today, so nobody had ever opened an
 > app there; whether 1.1.4 shares it is UNVERIFIED.
 >
-> **UPDATE 2026-07-28: it is not 1.0-specific — all THREE bundles do it.**
-> Same probe, same result on iPod Touch (N45AP), iPhone OS 1.1.4 and 1.0: open
-> an app, and Home and Power both stop working. So this is a general bug in the
-> model, not a firmware difference, and every sleep/wake result to date was
-> measured from SpringBoard where it works.
+> **UPDATE 2026-07-28 (2) — the "all three bundles" claim was WRONG, and so
+> was the harness that produced it.** Re-measured with `scripts/app-button-probe.py`:
 >
-> Also ruled out: it is NOT a display artifact. After HOME, ALL THREE
-> framebuffer bases (0x0FE00000, 0x0F400000, 0x0F496000) still contain the
-> app's screen, so SpringBoard genuinely did not switch — it is not a case of
-> the scanout window failing to follow.
+> | board | open app | touch in app | HOME returns | POWER sleeps |
+> |---|---|---|---|---|
+> | iPod Touch (N45AP) | PASS | PASS | **PASS** | **PASS** |
+> | iPhone OS 1.1.4 | PASS | PASS | **PASS** | **PASS** |
+> | iPhone OS 1.0 | PASS | PASS | **FAIL** | **FAIL** |
 >
-> Reproduced headlessly (no display client), so it is not a UI artifact:
-> * in-app touch still works — tapping Settings changes 97% of the frame, a row
->   inside it 35%, frames consumed each time;
-> * both key events reach `ipod_touch_key_event` (`IT_KEY_TRACE=1`, two events
->   per press — down and up);
-> * the POWER path completes all the way INTO the guest: `[PMU] ONKEY pressed`,
->   INT2 set, `nIRQ assert`, the guest READS INT1/INT2 (so its PMU ISR runs),
->   `nIRQ de-assert` — and the panel still never sleeps, no `[LCD] Merlot panel
->   entered sleep`;
-> * it is not a slow handshake: 60 s after HOME the screen is still the app
->   (0.39% vs the in-app frame, 97% vs the home screen).
+> So it IS 1.0-specific, exactly as first reported. The earlier "all three"
+> result came from pressing buttons with QMP `send-key`; with that, POWER does
+> not sleep the device even from SpringBoard, where it demonstrably works. A
+> held press — key down, 150 ms, key up, the form `lock-unlock-probe.py` has
+> always used — makes the iPod and 1.1.4 pass every step.
 >
-> So delivery and servicing are fine and the guest simply takes no action. Not
-> yet done, in order: `IT_GPIO_TRACE` to confirm the Home GPIO IRQ is raised
-> and acked while an app is frontmost; the same probe on 1.1.4 as a control
-> (attempted twice, both runs invalid — see the disk note); and PC-sampling
-> with `scripts/m68ap-freeze-probe.py` to see whether SpringBoard's button
-> handling runs at all on the press. Probe used:
-> `scratchpad/btnprobe.py` / `btnwait.py` pattern — drive the bundle through
-> its LAUNCHER, never `nand=<bundle>/...`.
+> **What is ruled out for 1.0, measured (`IT_SYSIC_TRACE=1`):** the interrupt
+> path is not the problem. Home raises the right group and bit (group 1 bit 8 =
+> IRQ 0x28, the M68AP menu IRQ), the guest reads INTSTAT, reads INTLEVEL, ACKs,
+> and re-reads — and the WORKING iPod produces a byte-identical conversation
+> (its own group 1 bit 14 = IRQ 0x2E). Delivery, servicing and acknowledgement
+> are all fine on both. INTLEVEL always reading 0 is NOT the discriminator: the
+> iPod reads it too and still works.
 >
-> **Disk hazard, active.** This machine sits at ~100% full with 1-2 GiB free.
-> The iphone-2g launcher clones a 302 MB NAND per launch into `$TMPDIR` and
-> only removes it on a clean exit, so every killed run leaks one. Two 1.1.4
-> measurements this session were silently wrong because of it (the boot never
-> reached the touch gate and every diff read 0.0%). Check
-> `df -h /System/Volumes/Data` before a run and
-> `rm -rf $TMPDIR/s5l8900-nand.*` after.
+> So the divergence is above the interrupt controller — in what iPhone OS 1.0's
+> kernel/SpringBoard does with an already-acknowledged button event while an
+> app is frontmost. Next: PC-sample 1.0 during the press
+> (`scripts/m68ap-freeze-probe.py`), and read 1.0's SpringBoard menu-button path
+> — its kexts keep full C++ symbols, the trick that cracked the multitouch
+> protocol (see TOUCH_INVESTIGATION.md).
+>
+> Reproduce: `scripts/app-button-probe.py --board m68ap-10 --logs /tmp/x`
 
 The sections below remain the record of the 2026-07-26 session.
 

@@ -7,6 +7,37 @@ static void gpio_irq_auto_lower(void *opaque)
     qemu_irq_lower(info->sysic->gpio_irqs[info->group]);
 }
 
+/*
+ * IT_SYSIC_TRACE=1: the GPIO interrupt-controller conversation.
+ *
+ * The GPIO trace in ipod_touch_gpio.c shows pin-level MMIO, which cannot
+ * answer the question that matters for a button: was the interrupt RAISED,
+ * did the guest READ the status, and did it ACK. Buttons are raised from
+ * ipod_touch_key_event(); everything else happens here.
+ *
+ * Repeats collapse per (direction, group): the first 24 print, then every
+ * 4096th, so a polling guest cannot bury a single button edge.
+ */
+static void sysic_trace(const char *what, uint8_t group, uint32_t value)
+{
+    static int enabled = -1;
+    static uint32_t counts[8][GPIO_NUMINTGROUPS];
+
+    if (enabled < 0) {
+        enabled = getenv("IT_SYSIC_TRACE") != NULL;
+    }
+    if (!enabled || group >= GPIO_NUMINTGROUPS) {
+        return;
+    }
+    uint32_t slot = (uint32_t)(what[0] + what[1]) & 7;
+    uint32_t n = ++counts[slot][group];
+    if (n > 24 && (n & 0xFFF) != 0) {
+        return;
+    }
+    fprintf(stderr, "[SYSIC] %s group %u = 0x%08x (n=%u)\n",
+            what, group, value, n);
+}
+
 static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
 {
     IPodTouchSYSICState *s = (IPodTouchSYSICState *) opaque;
@@ -28,11 +59,16 @@ static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
         case GPIO_INTLEVEL ... (GPIO_INTLEVEL + GPIO_NUMINTGROUPS * 4):
         {
             uint8_t group = (addr - GPIO_INTLEVEL) / 4;
+            /* NOTE nothing in this model ever SETS gpio_int_level, so this
+             * always reads 0. If a guest consults it to tell press from
+             * release, it is being told "released" every time. */
+            sysic_trace("rd INTLEVEL", group, s->gpio_int_level[group]);
             return s->gpio_int_level[group];
         }
         case GPIO_INTSTAT ... (GPIO_INTSTAT + GPIO_NUMINTGROUPS * 4):
         {
             uint8_t group = (addr - GPIO_INTSTAT) / 4;
+            sysic_trace("rd INTSTAT", group, s->gpio_int_status[group]);
             return s->gpio_int_status[group];
         }
         case GPIO_INTEN ... (GPIO_INTEN + GPIO_NUMINTGROUPS * 4):
@@ -75,6 +111,7 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
         {
             uint8_t group = (addr - GPIO_INTSTAT) / 4;
 
+            sysic_trace("ACK INTSTAT", group, (uint32_t)val);
             // acknowledge the interrupts and clear the corresponding bits
             s->gpio_int_status[group] = s->gpio_int_status[group] & ~val;
 
@@ -85,12 +122,16 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
         case GPIO_INTEN ... (GPIO_INTEN + GPIO_NUMINTGROUPS * 4):
         {
             uint8_t group = (addr - GPIO_INTEN) / 4;
+            sysic_trace("wr INTEN", group, (uint32_t)val);
             s->gpio_int_enabled[group] = val;
             break;
         }
         case GPIO_INTTYPE ... (GPIO_INTTYPE + GPIO_NUMINTGROUPS * 4):
         {
             uint8_t group = (addr - GPIO_INTTYPE) / 4;
+            /* Stored and never consulted: the model delivers the same edge
+             * whatever trigger type the guest asked for. */
+            sysic_trace("wr INTTYPE", group, (uint32_t)val);
             s->gpio_int_type[group] = val;
             break;
         }
