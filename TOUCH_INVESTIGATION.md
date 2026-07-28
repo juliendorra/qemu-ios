@@ -280,9 +280,27 @@ Either drive the bundle through its launcher, or clone the NAND first
 find "/Applications/iPhone 2G (iOS 1.1.4).app" -name "*_new.page" | wc -l
 ```
 
-Zero is correct — the bundles ship `nand.pack` plus **empty** bank dirs. The
-iPod bundle is different by design: it is not staged, its NAND is patched in
-place, and guest writes there are normal.
+The iPod bundle is different by design: it is not staged, its NAND is patched
+in place, and guest writes there are normal.
+
+**Correction (2026-07-28) — do NOT blindly delete override pages from an
+iPhone bundle.** A bundle produced by the CURRENT
+`scripts/package-iphone-app.sh` is self-contained: the activation patch and
+data ark are baked into `nand.pack`, so zero override pages is correct and it
+boots to an activated SpringBoard. An OLDER bundle may not be — the 1.1.4
+bundle here carried 84 pages written by some earlier in-place boot, and those
+pages held state its pack lacked. Deleting them left a bundle that hung at
+early kernel 3/3, and a single in-place re-boot regenerated pages that let it
+boot but only as far as the **activation screen** ("Connect to iTunes").
+
+So: leave them alone unless you know the bundle came from the current
+pipeline, and if you do remove them, verify the bundle still reaches an
+activated home screen. The repair is a repackage, which regenerates the pack
+with activation included:
+
+```bash
+scripts/package-iphone-app.sh --firmware 4A102
+```
 
 **The lesson**, and the reason this is written down: a read-only NAND makes
 "state that should persist doesn't" the *default*, not a symptom. Anything in

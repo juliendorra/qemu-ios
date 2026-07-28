@@ -25,6 +25,17 @@
 > now because touch on 1.0 was broken until today, so nobody had ever opened an
 > app there; whether 1.1.4 shares it is UNVERIFIED.
 >
+> **UPDATE 2026-07-28: it is not 1.0-specific — all THREE bundles do it.**
+> Same probe, same result on iPod Touch (N45AP), iPhone OS 1.1.4 and 1.0: open
+> an app, and Home and Power both stop working. So this is a general bug in the
+> model, not a firmware difference, and every sleep/wake result to date was
+> measured from SpringBoard where it works.
+>
+> Also ruled out: it is NOT a display artifact. After HOME, ALL THREE
+> framebuffer bases (0x0FE00000, 0x0F400000, 0x0F496000) still contain the
+> app's screen, so SpringBoard genuinely did not switch — it is not a case of
+> the scanout window failing to follow.
+>
 > Reproduced headlessly (no display client), so it is not a UI artifact:
 > * in-app touch still works — tapping Settings changes 97% of the frame, a row
 >   inside it 35%, frames consumed each time;
