@@ -23,6 +23,66 @@ the live bring-up state.
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
 
+## Session log — 2026-07-28 (M68AP bundles now trust the HTTPS-bridge CA; and 1.1.4 panics at USB start)
+
+**Done.** The iPhone bundles were starting the launcher's TLS bridge (their own
+ports 18543/18542) while the guest trusted none of the certificates it minted:
+string-searching the shipped packs for the CA subject gave `iPod Touch.app` 4
+hits and both iPhone bundles 0. Fixed by giving the M68AP its own route to the
+same trust store instead of porting the iPod's:
+
+* `scripts/guest_trust_store.py` — the guest-side half of
+  `ipod-nand-trust-ca.py`, factored out: the `tsettings` row format, the exact
+  schema assertion, the DER subject extraction. Verified that 1A543a (1.0) and
+  4A102 (1.1.4) ship the *identical* store — same `CREATE TABLE` text, same 110
+  factory rows, same as N45AP — so one code path covers all of them.
+* `scripts/build-m68ap-homescreen-nand.py` step **3/5** injects the row while
+  the root image is still a mounted filesystem, next to the activation patch
+  and the `LK_ENABLE_MBX2D=0` edit. In place, no extra 280 MB copy, because
+  this disk lives near 100 % full.
+* The iPod's page-level reconstruction is NOT ported and must not be: it exists
+  only because a device-dump NAND cannot be regenerated.
+
+**Where the CA comes from, and why generation time is the right moment.** The
+CA is per host and per profile. For the iPhone, generation time *is* install
+time: `package-iphone-app.sh` regenerates the NAND on every run, and takes the
+CA from the same state directory the launcher uses
+(`~/Library/Application Support/S5L8900 HTTPS Bridge/iphone-2g`), reusing an
+existing CA rather than minting one. `install-ipod-app-engine.sh` could not do
+it even if we wanted: it runs *before* the NAND exists. The cost is that a
+bundle is only fully functional on the machine that packaged it — elsewhere the
+bridge fails closed. `package-iphone-app.sh --verify-only` now checks both that
+a bridge CA is in the pack and that its sha256 matches this host's, recorded as
+`recipe.bridge_ca_sha256` in `nand-provenance.json`.
+
+**Measured.** Regenerated 4A102: `nand.pack` now has 4 hits for the CA subject,
+the same count as the iPod's working bundle, and the store went 110 → 111
+roots. The 1A543a run reached and completed the same step on the real 1.0 root
+filesystem (110 → 111) before `pack-ipod-nand.py` died on `ENOSPC`; its NAND
+was not finished.
+
+**Not verified, and why.** Neither bundle was repackaged and neither was booted
+to the home screen with the new NAND. Two reasons, both environmental:
+
+1. **1.1.4 panics before SpringBoard on this tree, independently of this
+   change.** `IOIpodUSBDevice::start` on `AppleS5L8900XIpodHAL`, then
+   `panic(cpu 0 caller 0xC012D963)` with an empty message, at the same serial
+   line in every run. Reproduced on the *pre-existing, untouched*
+   `builds/4A102/nand` with the repo engine, and on the new NAND with the
+   bundle's own shipped engine — so it is not the trust-store edit. Prime
+   suspect, unconfirmed: `172a3b7cce` ("Drop the USB-charger-present hack"),
+   which removed `MBCS1 = USBPRES|USBOK` at init for M68AP; that commit
+   re-verified 1.0's home screen but not 1.1.4's. Left alone deliberately —
+   adjacent defect, not this task.
+2. The disk hit 100 % (a concurrent session was running the 1.1.4 bundle and
+   holding a staged NAND), so the 1.0 NAND could not be finished and no bundle
+   was rewritten while another session was using it.
+
+To finish: free space, then
+`scripts/package-iphone-app.sh --firmware 4A102` and
+`scripts/package-iphone-app.sh --app "/Applications/iPhone 2G (iOS 1.0).app" --firmware 1A543a`,
+then browse an HTTPS site through the launcher.
+
 ## Session log — 2026-07-27 (the bundle firmware manifest described artifacts that were long gone — FIXED)
 
 **Status: fixed** (`a923e44ab2`). No runtime impact: this is a record-keeping

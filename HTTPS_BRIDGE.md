@@ -8,12 +8,43 @@ SQLite `tsettings` table stores SHA-1 of the DER certificate, DER Subject
 contents, a fixed empty trust-settings plist, and the DER certificate. The
 original image contains 110 anchors.
 
-`scripts/ipod-nand-trust-ca.py` reconstructs the HFSX volume from NAND pages,
-inserts one exact-format anchor row, compares pre/post fsck findings, and
-writes only changed pages back. It uses filesystem start VPN 206851 and maps
-each VPN as bank `vpn % 8`, page `vpn // 8`. A manifest and per-page backups
-make it reversible. Run it only on a staged NAND; the app installer enforces
-that ordering and packs the result before changing the bundle.
+`scripts/guest_trust_store.py` owns the guest-side half: what an anchor row
+looks like, and how to add one to a mounted root filesystem. It asserts the
+exact `CREATE TABLE` text before writing, so a firmware with a different
+Security.framework fails loudly instead of getting a row it will not read.
+Both devices ship the same store — 1A543a (1.0) and 4A102 (1.1.4) each have
+the identical schema and the same 110 factory rows as the iPod's N45AP image.
+
+The two boards reach that store by different routes, because their NANDs come
+from different places:
+
+* **N45AP (iPod)** — `scripts/ipod-nand-trust-ca.py`. The iPod ships a real
+  device dump that cannot be regenerated, so the tool reconstructs the HFSX
+  volume from NAND pages, inserts the row, compares pre/post fsck findings,
+  and writes only changed pages back. It uses filesystem start VPN 206851 and
+  maps each VPN as bank `vpn % 8`, page `vpn // 8`. A manifest and per-page
+  backups make it reversible. Run it only on a staged NAND;
+  `install-ipod-app-engine.sh` enforces that ordering and packs the result
+  before changing the bundle.
+* **M68AP (iPhone)** — `scripts/build-m68ap-homescreen-nand.py`, step 3/5. The
+  iPhone's NAND is *built* on every packaging run, so the row goes in while the
+  root filesystem is still an ordinary mounted image, next to the activation
+  patch and the `LK_ENABLE_MBX2D=0` edit. None of the iPod's page-level
+  reconstruction applies (and would not work: an M68AP NAND has the real
+  two-partition root+data layout). `--no-bridge-ca` opts out; `--ca-cert` and
+  `--https-state` override where the certificate comes from.
+
+**The CA is per host and per profile**, and the M68AP path bakes it in at NAND
+*generation* time rather than at engine-install time. That is sound because for
+the iPhone the two are the same moment: `package-iphone-app.sh` regenerates the
+NAND every run, and it takes the CA from the same state directory the launcher
+will use (`.../S5L8900 HTTPS Bridge/iphone-2g`), reusing an existing CA rather
+than minting a new one. The consequence is that an M68AP bundle is only fully
+functional on the machine that packaged it: copied elsewhere, HTTPS through the
+bridge fails closed (Safari refuses the leaf) — re-run `package-iphone-app.sh`
+there. `package-iphone-app.sh` verifies both halves of this, checking that the
+shipped `nand.pack` contains a bridge CA at all and that its sha256 (recorded
+in `nand-provenance.json` as `recipe.bridge_ca_sha256`) is this host's.
 
 The per-install CA and reusable RSA leaf key live by default under
 `~/Library/Application Support/S5L8900 HTTPS Bridge/<profile>/`. Private keys

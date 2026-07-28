@@ -22,7 +22,15 @@ What it applies, and why each part is needed
    otherwise composites through the PowerVR MBX, which the emulator only
    stubs, and SpringBoard tight-polls forever. devos50's iPod image ships the
    same setting. (Shortcut: the clean fix is to model MBX 2D — task T2.)
-3. **Reference-shaped data ark** (`--profile reference-reg`) — key names and
+3. **HTTPS-bridge CA in the guest trust store** — the launcher starts a local
+   TLS bridge for this bundle (ports 18543/18542), but Safari rejects every
+   certificate it mints unless the bridge's root is trusted. The iPod gets the
+   same row via `ipod-nand-trust-ca.py`; that tool's NAND plumbing cannot be
+   reused here (it reconstructs a single-partition device dump page by page,
+   and this NAND is generated with the real two-partition layout), so the row
+   goes in while the root image is still a mounted filesystem. Only the public
+   certificate is read. Disable with `--no-bridge-ca`.
+4. **Reference-shaped data ark** (`--profile reference-reg`) — key names and
    TYPES read off the iPod's own activated device: CFBooleans where a naive
    ark writes CFNumbers, plus the international/SIM/timezone keys without
    which the device has never been "set up" and shows connect-to-iTunes.
@@ -40,6 +48,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import plistlib
@@ -52,6 +61,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lab_workspace import (NAND_TREE_BYTES, ROOT_HFS_BYTES, DATA_HFS_BYTES,
                            attached, human, require_free_bytes)
 
+import guest_trust_store
+import ipod_tls_common
 import m68ap_paths
 
 REPO = Path(__file__).resolve().parent.parent
@@ -76,6 +87,16 @@ ARK_PROFILE = "reference-reg"
 SEED_DATABASES = [True]
 SB_PLIST = "System/Library/LaunchDaemons/com.apple.SpringBoard.plist"
 
+# Where ipod-app-launcher.sh keeps this profile's bridge CA. The default MUST
+# match the launcher's, because a NAND that trusts some other CA is a NAND
+# whose HTTPS bridge silently does not work.
+BRIDGE_PROFILE = "iphone-2g"
+BRIDGE_STATE_DIR = (Path.home() / "Library" / "Application Support" /
+                    "S5L8900 HTTPS Bridge" / BRIDGE_PROFILE)
+# sha256 of the injected CA certificate, for the provenance sidecar. None when
+# --no-bridge-ca.
+BRIDGE_CA_SHA256 = [None]
+
 
 def run(cmd, **kw):
     print("  $", " ".join(str(c) for c in cmd), flush=True)
@@ -85,7 +106,7 @@ def run(cmd, **kw):
 def patched_root(work: Path) -> Path:
     out = work / "root-patched.img"
     if not out.exists():
-        print("[1/4] lockdownd activation patch")
+        print("[1/5] lockdownd activation patch")
         run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "patch",
              "--root-hfs", root_hfs(), "--out", out])
     return out
@@ -95,7 +116,7 @@ def with_software_compositing(root: Path, work: Path) -> Path:
     out = work / "root-mbx2d.img"
     if out.exists():
         return out
-    print("[2/4] SpringBoard LK_ENABLE_MBX2D=0 (software compositing)")
+    print("[2/5] SpringBoard LK_ENABLE_MBX2D=0 (software compositing)")
     tmp = work / "root-mbx2d.tmp.img"      # hdiutil types images by extension
     shutil.copy2(root, tmp)
     with attached(tmp, readonly=False) as mnt:
@@ -108,6 +129,55 @@ def with_software_compositing(root: Path, work: Path) -> Path:
     tmp.rename(out)
     root.unlink(missing_ok=True)           # intermediate; disk is scarce here
     return out
+
+
+def bridge_ca_certificate(state_dir: Path, explicit: Path | None) -> Path:
+    """Return the public certificate to trust, generating the CA if needed.
+
+    With no --ca-cert this calls the launcher's own generator against the
+    launcher's own state directory, so the CA baked into the NAND is the one
+    the bridge will present at run time. `ensure_ca` reuses an existing CA and
+    only mints one when the directory is empty, so re-packaging does not
+    invalidate a bundle built earlier on this host.
+    """
+    if explicit is not None:
+        return explicit
+    paths = ipod_tls_common.ensure_ca(state_dir)
+    return paths["ca_der"]
+
+
+def with_bridge_ca(root: Path, work: Path, ca_cert: Path | None,
+                   state_dir: Path, enabled: bool) -> Path:
+    """Add the HTTPS-bridge root to the guest's system trust store.
+
+    Edited IN PLACE, unlike the steps around it: the root image here is already
+    a private intermediate, and this machine's disk is routinely near full, so
+    a third 280 MB copy buys nothing. A marker file carries the resume
+    behaviour the other steps get from their output filename.
+    """
+    if not enabled:
+        print("[3/5] HTTPS-bridge CA: SKIPPED (--no-bridge-ca); Safari will "
+              "reject the bridge's certificates")
+        return root
+    print("[3/5] HTTPS-bridge CA -> guest system trust store")
+    certificate_path = bridge_ca_certificate(state_dir, ca_cert)
+    certificate, subject = guest_trust_store.load_ca_certificate(
+        certificate_path, work)
+    sha256 = hashlib.sha256(certificate).hexdigest()
+    BRIDGE_CA_SHA256[0] = sha256
+    marker = work / "bridge-ca.sha256"
+    if marker.exists() and marker.read_text().strip() == sha256:
+        print("      (already injected in this work directory)")
+        return root
+    print(f"      CA: {certificate_path}")
+    with attached(root, readonly=False) as mnt:
+        changed, rows = guest_trust_store.inject_into_volume(
+            mnt, certificate, subject)
+        print(f"      {'added to' if changed else 'already in'} "
+              f"{guest_trust_store.TRUST_STORE.name}: {rows} trusted roots")
+    marker.write_text(sha256 + "\n")
+    print(f"      CA sha256: {sha256}")
+    return root
 
 
 def without_addressbook(root: Path, work: Path, drop: bool) -> Path:
@@ -132,7 +202,7 @@ def without_addressbook(root: Path, work: Path, drop: bool) -> Path:
     out = work / "root-noab.img"
     if out.exists():
         return out
-    print("[2b/4] removing com.apple.AddressBook (SHORTCUT -- see T6)")
+    print("[3b/5] removing com.apple.AddressBook (SHORTCUT -- see T6)")
     tmp = work / "root-noab.tmp.img"
     shutil.copy2(root, tmp)
     with attached(tmp, readonly=False) as mnt:
@@ -168,7 +238,7 @@ def data_partition(work: Path) -> Path:
     out = work / "data-var.img"
     if out.exists():
         return out
-    print(f"[3/4] data partition: /var from the root template + "
+    print(f"[4/5] data partition: /var from the root template + "
           f"{ARK_PROFILE!r} ark")
     ark = work / "data_ark.plist"
     run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "build-dataark",
@@ -228,12 +298,24 @@ def declare_recipe(out: Path, args) -> None:
         steps.append("AddressBook databases pre-created")
     if args.drop_addressbook:
         steps.append("com.apple.AddressBook REMOVED (--drop-addressbook)")
-    manifest["recipe"] = {
+    recipe = {
         "constructor": "build-m68ap-homescreen-nand.py",
         "build": PATHS.build,
         "version": PATHS.version,
         "steps": steps,
     }
+    # The CA sha256 is what lets packaging (and a human) tell whether this NAND
+    # trusts the bridge CA that is actually on this host, rather than one from
+    # another machine whose private key nobody here holds.
+    if BRIDGE_CA_SHA256[0] is not None:
+        steps.insert(2, "local HTTPS-bridge CA added to the system trust store "
+                        "(Security.framework/TrustStore.sqlite3)")
+        recipe["bridge_ca_sha256"] = BRIDGE_CA_SHA256[0]
+        recipe["bridge_ca_profile"] = BRIDGE_PROFILE
+    else:
+        steps.insert(2, "HTTPS-bridge CA NOT added (--no-bridge-ca): the "
+                        "launcher's TLS bridge will be rejected by Safari")
+    manifest["recipe"] = recipe
     base = manifest.get("guest_file_modifications", "")
     manifest["guest_file_modifications"] = (
         f"{base}; plus the home-screen recipe (see `recipe`)" if base
@@ -260,7 +342,21 @@ def main() -> int:
     ap.add_argument("--drop-addressbook", action="store_true",
                     help="remove com.apple.AddressBook instead of seeding its "
                          "database (last-resort fallback; costs Contacts)")
+    ap.add_argument("--no-bridge-ca", action="store_true",
+                    help="do NOT trust the local HTTPS bridge's root. Safari "
+                         "then rejects every certificate the bridge mints.")
+    ap.add_argument("--ca-cert", type=Path,
+                    help="public CA certificate to trust (PEM or DER). "
+                         "Default: the launcher's own, from --https-state.")
+    ap.add_argument("--https-state", type=Path, default=None,
+                    help=f"HTTPS bridge state directory the CA is taken from "
+                         f"(default: {BRIDGE_STATE_DIR}, i.e. the one "
+                         f"ipod-app-launcher.sh uses for {BRIDGE_PROFILE})")
     args = ap.parse_args()
+
+    state_dir = (args.https_state
+                 or Path(os.environ.get("S5L8900_HTTPS_STATE_DIR", "")
+                         or BRIDGE_STATE_DIR))
 
     global PATHS
     PATHS = m68ap_paths.get(args.build)
@@ -279,10 +375,12 @@ def main() -> int:
 
     SEED_DATABASES[0] = not args.no_seed_databases
     root = with_software_compositing(patched_root(work), work)
+    root = with_bridge_ca(root, work, args.ca_cert, state_dir,
+                          not args.no_bridge_ca)
     root = without_addressbook(root, work, args.drop_addressbook)
     data = data_partition(work)
 
-    print("[4/4] building the NAND tree")
+    print("[5/5] building the NAND tree")
     # --build carries the FIL/WMR signature word, which is firmware-keyed:
     # 000C for 1.0/1.0.2, 200C for 1.1.1, 300C for 1.1.4. Hardcoding it here
     # was what pinned this recipe to one firmware.

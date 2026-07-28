@@ -247,6 +247,25 @@ check "launcher stages NAND per launch" \
       "$(grep -l 'S5L8900_STAGE_NAND' "$APP/Contents/MacOS/"* 2>/dev/null | head -1)"
 check "signature valid" "$(codesign --verify --deep --strict "$APP" 2>&1 >/dev/null && echo y)"
 
+# The HTTPS bridge is only useful if the guest trusts the root the bridge signs
+# with, and that root is per-host and per-profile (~/Library/Application
+# Support/S5L8900 HTTPS Bridge/iphone-2g). Two separate things can go wrong and
+# both are silent at run time -- Safari just refuses the site -- so check both:
+# that a bridge CA is present in the shipped pack at all, and that it is the
+# sha256 of the CA THIS host will actually present.
+HTTPS_STATE="${S5L8900_HTTPS_STATE_DIR:-$HOME/Library/Application Support/S5L8900 HTTPS Bridge/iphone-2g}"
+check "guest trusts a bridge CA" \
+      "$(grep -aq 'S5L8900 HTTPS Bridge Root' "$FW/nand/nand.pack" 2>/dev/null && echo y || true)"
+check "trusted CA is this host's" "$(python3 - "$FW/nand/nand-provenance.json" \
+        "$HTTPS_STATE/bridge-ca.der" <<'EOF' 2>/dev/null || true
+import hashlib, json, sys
+recipe = json.load(open(sys.argv[1])).get("recipe", {})
+want = recipe.get("bridge_ca_sha256")
+have = hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+print("y" if want == have else "")
+EOF
+)"
+
 if [[ $fail -ne 0 ]]; then
     echo; echo "packaging INCOMPLETE" >&2; exit 1
 fi

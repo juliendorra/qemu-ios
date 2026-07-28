@@ -554,9 +554,19 @@ scripts/package-iphone-app.sh --verify-only                  # audit a bundle
 
 `package-iphone-app.sh` also GENERATES the guest image it installs, via
 `scripts/build-m68ap-homescreen-nand.py` — the lockdownd activation patch,
-`LK_ENABLE_MBX2D=0`, and the reference-shaped data ark, i.e. the exact
-combination measured to reach the home screen. Packaging can therefore not
-drift from the verified configuration.
+`LK_ENABLE_MBX2D=0`, the local HTTPS-bridge CA, and the reference-shaped data
+ark, i.e. the exact combination measured to reach the home screen. Packaging
+can therefore not drift from the verified configuration.
+
+**The HTTPS-bridge CA is per host**, so an iPhone bundle is only fully
+functional on the machine that packaged it — copied elsewhere, HTTPS through
+the local TLS bridge fails closed and re-running `package-iphone-app.sh` on that
+machine fixes it. Injection happens at NAND-generation time (there is no other
+moment: `install-ipod-app-engine.sh` runs *before* the NAND exists), which for
+the iPhone is the same thing as install time because every packaging run
+regenerates the NAND from the same state directory the launcher uses. The
+`--verify-only` audit checks that the shipped pack trusts *this* host's CA. See
+HTTPS_BRIDGE.md.
 
 **Ship a PACKED NAND — this is a correctness requirement, not an optimisation.**
 The launcher clones the M68AP NAND on every launch (the kernel needs a clean
