@@ -266,6 +266,13 @@ check "signature valid" "$(codesign --verify --deep --strict "$APP" 2>&1 >/dev/n
 HTTPS_STATE="${S5L8900_HTTPS_STATE_DIR:-$HOME/Library/Application Support/S5L8900 HTTPS Bridge/iphone-2g}"
 check "guest trusts a bridge CA" \
       "$(grep -aq 'S5L8900 HTTPS Bridge Root' "$FW/nand/nand.pack" 2>/dev/null && echo y || true)"
+# Portability: the CA the guest trusts must travel INSIDE the bundle, or the app
+# only works on the machine that packaged it.
+check "bundle carries its CA (portable)" \
+      "$([[ -f "$APP/Contents/Resources/https-bridge-ca/bridge-ca.key" ]] && echo y)"
+check "bundled CA matches the guest's" \
+      "$(cmp -s "$APP/Contents/Resources/https-bridge-ca/bridge-ca.der" \
+                "$HTTPS_STATE/bridge-ca.der" && echo y)"
 check "trusted CA is this host's" "$(python3 - "$FW/nand/nand-provenance.json" \
         "$HTTPS_STATE/bridge-ca.der" <<'EOF' 2>/dev/null || true
 import hashlib, json, sys

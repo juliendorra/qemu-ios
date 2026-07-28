@@ -142,14 +142,20 @@ codesign --force -s - "$STAGE/qemu-system-arm"
 # directory and therefore this profile's CA). Nothing to patch here -- and
 # nothing CAN be patched here, because this step runs BEFORE
 # package-iphone-app.sh generates the NAND.
+
+# Generate (or reuse) this profile's bridge CA for BOTH boards -- the iPod
+# injects it into the staged NAND right below, the iPhone's NAND generator
+# reads the same state directory later.
+CA_PEM="$(python3 "$SCRIPT_DIR/ipod_tls_common.py" --state "$HTTPS_STATE_DIR")"
+CA_DER="$HTTPS_STATE_DIR/bridge-ca.der"
+CA_KEY="$HTTPS_STATE_DIR/bridge-ca.key"
+if [[ ! -f "$CA_PEM" || ! -f "$CA_DER" || ! -f "$CA_KEY" ]]; then
+    echo "HTTPS bridge CA generation failed" >&2
+    exit 1
+fi
+
 if [[ "$PROFILE" == "ipod-touch" ]]; then
     ditto "$NAND_INPUT" "$STAGE/nand"
-    CA_PEM="$(python3 "$SCRIPT_DIR/ipod_tls_common.py" --state "$HTTPS_STATE_DIR")"
-    CA_DER="$HTTPS_STATE_DIR/bridge-ca.der"
-    if [[ ! -f "$CA_PEM" || ! -f "$CA_DER" ]]; then
-        echo "HTTPS bridge CA generation failed" >&2
-        exit 1
-    fi
     python3 "$SCRIPT_DIR/ipod-nand-restore-dns.py" --nand "$STAGE/nand"
     python3 "$SCRIPT_DIR/ipod-nand-trust-ca.py" \
         --nand "$STAGE/nand" --ca-cert "$CA_DER"
@@ -168,6 +174,35 @@ chmod 644 "$CONTENTS/Resources/ipod-https-proxy.py" \
 if [[ "$PROFILE" == "ipod-touch" ]]; then
     ditto "$STAGE/nand" "$SOURCE_NAND"
 fi
+# Ship the bridge CA INSIDE the bundle, private key included.
+#
+# Without this the app is host-bound: the guest's trust store carries the CA of
+# whichever machine packaged it, and a copied bundle's TLS bridge fails closed
+# with no user-serviceable fix (re-packaging needs the repo, the IPSW-derived
+# artifacts and a build toolchain -- not something the recipient of a copied app
+# can do). The launcher seeds its state directory from here.
+#
+# Shipping a CA private key is normally wrong, and is safe HERE for reasons that
+# must keep holding: this root is trusted ONLY by the emulated guest's
+# TrustStore.sqlite3, never by the host keychain, and ipod-https-proxy.py binds
+# 127.0.0.1 only. Treat the key as public -- anyone holding the app holds it.
+# NEVER add this certificate to a macOS keychain.
+BUNDLE_CA_DIR="$CONTENTS/Resources/https-bridge-ca"
+mkdir -p "$BUNDLE_CA_DIR"
+cp "$CA_KEY" "$BUNDLE_CA_DIR/bridge-ca.key"
+cp "$CA_PEM" "$BUNDLE_CA_DIR/bridge-ca.pem"
+cp "$CA_DER" "$BUNDLE_CA_DIR/bridge-ca.der"
+chmod 600 "$BUNDLE_CA_DIR/bridge-ca.key"
+chmod 644 "$BUNDLE_CA_DIR/bridge-ca.pem" "$BUNDLE_CA_DIR/bridge-ca.der"
+cat > "$BUNDLE_CA_DIR/README.txt" <<'CAREADME'
+This directory holds the local HTTPS bridge's root certificate AND its private
+key, so that copying this app to another Mac keeps the bridge working.
+
+Treat the key as PUBLIC. It is trusted only by the emulated device's own trust
+store; macOS does not trust it and must not be made to. Do NOT add
+bridge-ca.pem to a keychain, and do not reuse this key for anything else.
+CAREADME
+
 cp "$SCRIPT_DIR/ipod-app-launcher.sh" "$TARGET_LAUNCHER"
 chmod 755 "$TARGET_LAUNCHER"
 printf '%s\n' "$PROFILE" > "$CONTENTS/Resources/s5l8900-profile"

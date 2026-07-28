@@ -543,6 +543,12 @@ per-build layout is documented in
 
 ### 2b. One-command packaging (recommended)
 
+> **Copying a packaged .app to another Mac?** Read
+> [APP_PORTABILITY.md](APP_PORTABILITY.md) first. The emulator travels fine;
+> the HTTPS bridge needs OpenSSL 3 and a real python3 on the target machine,
+> and an ad-hoc-signed bundle trips Gatekeeper. That file lists every blocker
+> with the measurement behind it and what a fix would take.
+
 Both bundles have an end-to-end packaging script. They are the supported path;
 the manual steps below remain for understanding and for repair work.
 

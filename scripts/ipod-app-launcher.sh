@@ -154,6 +154,27 @@ if [[ "${S5L8900_HTTPS_BRIDGE:-1}" != "0" ]]; then
     done
     mkdir -p "$HTTPS_STATE_DIR"
     chmod 700 "$HTTPS_STATE_DIR"
+    # The CA the GUEST trusts was baked into its NAND at packaging time, so the
+    # bridge must sign with that exact CA -- not with whatever this host happens
+    # to have generated. The bundle therefore carries the CA (key included) and
+    # it wins. Without this the app is host-bound: copy it to another Mac and
+    # every HTTPS site fails, because the locally generated CA is not the one in
+    # the guest's trust store.
+    BUNDLE_CA="$RESOURCES/https-bridge-ca"
+    if [[ -f "$BUNDLE_CA/bridge-ca.der" ]]; then
+        if ! cmp -s "$BUNDLE_CA/bridge-ca.der" "$HTTPS_STATE_DIR/bridge-ca.der"; then
+            cp "$BUNDLE_CA/bridge-ca.key" "$HTTPS_STATE_DIR/bridge-ca.key"
+            cp "$BUNDLE_CA/bridge-ca.pem" "$HTTPS_STATE_DIR/bridge-ca.pem"
+            cp "$BUNDLE_CA/bridge-ca.der" "$HTTPS_STATE_DIR/bridge-ca.der"
+            chmod 600 "$HTTPS_STATE_DIR/bridge-ca.key"
+            chmod 644 "$HTTPS_STATE_DIR/bridge-ca.pem" \
+                      "$HTTPS_STATE_DIR/bridge-ca.der"
+            # Cached leaves were signed by the previous CA and would now fail
+            # to chain. The leaf KEY is just an RSA key and stays.
+            rm -rf "$HTTPS_STATE_DIR/leaf-certificates"
+            echo "Installed this bundle's HTTPS bridge CA into $HTTPS_STATE_DIR" >&2
+        fi
+    fi
     echo "Starting local HTTPS compatibility bridge; TLS metadata only is logged." >&2
     echo "Do not enter credentials into sites you do not intend to intercept." >&2
     # Try a few port pairs, then boot WITHOUT the bridge rather than refusing

@@ -1,5 +1,9 @@
 # Transparent HTTPS bridge
 
+> **Moving an app to another Mac:** [APP_PORTABILITY.md](APP_PORTABILITY.md).
+> The CA now travels inside the bundle, so the certificate half is solved; the
+> bridge still needs OpenSSL 3 and a working python3 on the target machine.
+
 ## Trust store and CA injection
 
 iPhone OS 1 reads factory anchors from
@@ -34,17 +38,26 @@ from different places:
   two-partition root+data layout). `--no-bridge-ca` opts out; `--ca-cert` and
   `--https-state` override where the certificate comes from.
 
-**The CA is per host and per profile**, and the M68AP path bakes it in at NAND
-*generation* time rather than at engine-install time. That is sound because for
+**The CA travels inside the app bundle** (`Contents/Resources/https-bridge-ca/`,
+private key included), so a copied app keeps working. `install-ipod-app-engine
+.sh` writes it there for both profiles and the launcher seeds its state
+directory from it on every start, wiping the cached leaves when the CA changes
+— the bundle's CA always wins over anything the host generated. The key is
+public by construction; it is trusted only by the emulated guest, never by
+macOS, and the proxy binds loopback only. **Never add it to a macOS keychain.**
+See [APP_PORTABILITY.md](APP_PORTABILITY.md).
+
+**The CA is generated per host and per profile**, and the M68AP path bakes it
+into the NAND at *generation* time rather than at engine-install time. That is sound because for
 the iPhone the two are the same moment: `package-iphone-app.sh` regenerates the
 NAND every run, and it takes the CA from the same state directory the launcher
 will use (`.../S5L8900 HTTPS Bridge/iphone-2g`), reusing an existing CA rather
-than minting a new one. The consequence is that an M68AP bundle is only fully
-functional on the machine that packaged it: copied elsewhere, HTTPS through the
-bridge fails closed (Safari refuses the leaf) — re-run `package-iphone-app.sh`
-there. `package-iphone-app.sh` verifies both halves of this, checking that the
-shipped `nand.pack` contains a bridge CA at all and that its sha256 (recorded
-in `nand-provenance.json` as `recipe.bridge_ca_sha256`) is this host's.
+than minting a new one. Packaging then copies that same CA into the bundle (see
+above), which is what stops "generated on this host" from meaning "works only on
+this host". `package-iphone-app.sh` verifies the chain end to end: the shipped
+`nand.pack` contains a bridge CA, the bundle carries its key, the bundled CA is
+the one the NAND trusts, and its sha256 matches this host's (recorded in
+`nand-provenance.json` as `recipe.bridge_ca_sha256`).
 
 **Every future iPhone packaging run gets this automatically.** Injection is the
 default in `build-m68ap-homescreen-nand.py` (`--no-bridge-ca` is an opt-out, and
@@ -55,14 +68,15 @@ even when a NAND built elsewhere is supplied with `--nand`.
 
 ```
   ok   guest trusts a bridge CA          # the pack contains a bridge root
+  ok   bundle carries its CA (portable)  # ...and the key travels with the app
+  ok   bundled CA matches the guest's    # ...and it is the one the NAND trusts
   ok   trusted CA is this host's         # ...and its sha256 is this host's
 ```
 
-The one way to end up mismatched is to delete the state directory (a fresh CA
-is then minted while the shipped NAND still trusts the old one). Packaging
-catches it; the launcher does not, so the symptom would be certificate errors
-in Safari. `scripts/package-iphone-app.sh --verify-only` diagnoses it in a
-second, and re-packaging fixes it.
+Deleting the state directory used to be a way to end up silently mismatched (a
+fresh CA minted while the shipped NAND still trusts the old one). It no longer
+is: the launcher re-seeds the state directory from the bundle on every start.
+`--verify-only` still diagnoses a stale bundle in a second.
 
 The per-install CA and reusable RSA leaf key live by default under
 `~/Library/Application Support/S5L8900 HTTPS Bridge/<profile>/`. Private keys
