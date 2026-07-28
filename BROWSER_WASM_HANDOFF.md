@@ -134,6 +134,40 @@ faster engine, the faithful clock rate becomes affordable.
 native does, and carried on. **Use `shift=1`.** No device-model change was
 needed for either panic — only an honest clock.
 
+### Cross-check from the native side (2026-07-28, later the same day)
+
+**The icount rule is not a wasm workaround — it is a correctness fix for the
+emulator generally, and it fixed a user-visible native bug.**
+
+A user reported the shipped `iPhone 2G (iOS 1.1.4).app` intermittently never
+getting past the Apple logo. Reproduced on the native bundle: **1 panic in 3
+boots**, at `IOIpodUSBDevice::start` — the same panic this section describes,
+with no TCI anywhere. `-icount shift=1` cleared it: **0 panics in 4 boots**, and
+the LCD readiness gate armed. `ipod-app-launcher.sh` now passes
+`-icount shift=1` for the `iphone-2g` profile (`S5L8900_ICOUNT=0` opts out);
+N45AP is left alone, since it does not hit this and its sleep/wake results were
+all measured in real time.
+
+Two things that follow, both useful here:
+
+* **The intermittency is the proof.** Native is only *sometimes* slow enough to
+  cross the driver's timeout — it depends on host load, and today's runs were
+  competing with several parallel probes. A timeout theory predicts exactly
+  that; a bad-device-value theory does not. So the diagnosis in this section is
+  now confirmed from a second, independent direction.
+* **"Real-time speed" has a number, and icount is what makes it measurable.**
+  At `shift=1` one virtual second is 2^-1 ns per instruction = **5x10^8 guest
+  instructions**. Real time therefore means sustaining ~500M guest instructions
+  per wall-clock second. Measure the ratio (guest virtual seconds per wall
+  second), not boot duration — with icount those are different quantities, and
+  only the ratio answers "is it real-time". Worth checking what NATIVE achieves
+  before setting the JIT's target: if native TCG is already below 1.0, the bar
+  for the JIT is set by that gap, not by TCI's 13x alone.
+
+Nothing above changes the conclusion of this section. `shift=1` remains the
+faithful setting, and the wall-clock cost of it is an argument about engine
+speed (TCI vs JIT), not about icount.
+
 ## W2b — The WebAssembly JIT (grafted 2026-07-28)
 
 TCI cannot deliver real-time speed, which the goal now requires, so the
