@@ -23,7 +23,7 @@ the live bring-up state.
 > tools + exact reproduction commands, ranked next steps, and the traps).
 > This file remains the long-form log of every run and trace.
 
-## Session log — 2026-07-28 (M68AP bundles now trust the HTTPS-bridge CA; and 1.1.4 panics at USB start)
+## Session log — 2026-07-28 (M68AP bundles now trust the HTTPS-bridge CA — SHIPPED; and 1.1.4 panics at USB start)
 
 **Done.** The iPhone bundles were starting the launcher's TLS bridge (their own
 ports 18543/18542) while the guest trusted none of the certificates it minted:
@@ -61,27 +61,97 @@ roots. The 1A543a run reached and completed the same step on the real 1.0 root
 filesystem (110 → 111) before `pack-ipod-nand.py` died on `ENOSPC`; its NAND
 was not finished.
 
-**Not verified, and why.** Neither bundle was repackaged and neither was booted
-to the home screen with the new NAND. Two reasons, both environmental:
+**Shipped.** Both iPhone bundles now carry it — 4 hits each for the CA subject
+in `Contents/Resources/iphone_files/nand/nand.pack`, the same count as the
+iPod's working bundle, and both `--verify-only` checks green:
 
-1. **1.1.4 panics before SpringBoard on this tree, independently of this
-   change.** `IOIpodUSBDevice::start` on `AppleS5L8900XIpodHAL`, then
-   `panic(cpu 0 caller 0xC012D963)` with an empty message, at the same serial
-   line in every run. Reproduced on the *pre-existing, untouched*
-   `builds/4A102/nand` with the repo engine, and on the new NAND with the
-   bundle's own shipped engine — so it is not the trust-store edit. Prime
-   suspect, unconfirmed: `172a3b7cce` ("Drop the USB-charger-present hack"),
-   which removed `MBCS1 = USBPRES|USBOK` at init for M68AP; that commit
-   re-verified 1.0's home screen but not 1.1.4's. Left alone deliberately —
-   adjacent defect, not this task.
-2. The disk hit 100 % (a concurrent session was running the 1.1.4 bundle and
-   holding a staged NAND), so the 1.0 NAND could not be finished and no bundle
-   was rewritten while another session was using it.
+```
+  ok   guest trusts a bridge CA
+  ok   trusted CA is this host's
+```
 
-To finish: free space, then
-`scripts/package-iphone-app.sh --firmware 4A102` and
-`scripts/package-iphone-app.sh --app "/Applications/iPhone 2G (iOS 1.0).app" --firmware 1A543a`,
-then browse an HTTPS site through the launcher.
+Neither bundle gained a `*_new.page` (`find <bundle>/Contents/Resources/
+iphone_files -name '*_new.page' | wc -l` → 0 for both). The 1237 dirty pages
+in each bundle's *stale* `ipod_files/` directory are from 2026-07-27 and
+unrelated — see `c1cdb59e63`; those directories are dead weight the launcher
+never reads and should be deleted separately.
+
+### What was tried, and what turned out not to matter
+
+* **Porting `ipod-nand-trust-ca.py` — rejected before writing code, correctly.**
+  Its page-level reconstruction assumes the iPod's single-partition device
+  dump. That is not a portability bug to fix, it is the whole reason the tool
+  exists: a device-dump NAND cannot be regenerated, so it has to be edited in
+  place. The iPhone's NAND is *built*, so the same result comes from an
+  ordinary file edit on a mounted volume.
+* **Assuming the two firmwares share a trust store — checked instead.** Mounted
+  1A543a's and 4A102's `root.img` read-only and dumped `sqlite_master`: byte
+  identical `CREATE TABLE` text, 110 rows each, matching N45AP. Had they
+  differed, `validate_store()` would now fail loudly rather than write a row
+  the OS ignores. Worth the two minutes; 1.0's Security.framework is a
+  different binary (231 236 bytes vs 222 188) and could easily have differed.
+* **A third 280 MB image copy for the CA step — dropped.** The neighbouring
+  steps each `shutil.copy2` the root image so they can resume from their output
+  filename. On a disk that sits at 99 % that is a real cost, and it bit: the
+  first 1A543a run died at `pack-ipod-nand.py` with `ENOSPC`. The CA step edits
+  in place and uses a `bridge-ca.sha256` marker file for the same resume
+  behaviour.
+* **`fb-snapshot.py` as the home-screen check for 1.1.4 — a dead end, but an
+  informative one.** See below.
+
+### Dead end: 1.1.4 panics at USB start, and it is not this change
+
+`IOIpodUSBDevice::start` on `AppleS5L8900XIpodHAL`, then
+`panic(cpu 0 caller 0xC012D963)` with an empty message, at the same serial line
+in every run, no kernel framebuffer (`kernel_0x0f400000` 0.0 % non-black across
+all samples; the 2.17 % on the scanout is iBoot's logo).
+
+The 2×2 that exonerates the trust-store edit:
+
+| NAND | engine | result |
+|---|---|---|
+| new, CA-injected | repo `build-ipod11` | panic, line 1282 |
+| **pre-existing, untouched `builds/4A102/nand`** | repo `build-ipod11` | **panic, line 1282** |
+| new, CA-injected | the bundle's own shipped engine | panic, line 1289 |
+
+The middle row is the one that matters: a NAND this work never touched panics
+identically. Prime suspect, **unconfirmed and deliberately not chased**:
+`172a3b7cce` ("Drop the USB-charger-present hack") removed
+`MBCS1 = USBPRES|USBOK` at init for M68AP, and a driver called
+`IOIpodUSBDevice` panicking at `start` is exactly where a guest that now reads
+"no external power" would notice. That commit re-verified 1.0's home screen but
+not 1.1.4's. Separate task.
+
+**Consequence for this work:** 1.1.4's home screen could not be re-checked, so
+the "a bad trust-store edit breaks more than TLS" guard rests on 1.0 — which is
+adequate, because it boots the same recipe through the same code path on the
+same root-filesystem layout, and it **passes**:
+
+```
+scripts/fb-snapshot.py --board m68ap --build 1A543a \
+    --nand-m68ap /tmp/ca-nand-1A543a --boot-wait 200 --samples 8
+-> kernel_0x0f400000: 59.033% non-black, stable across all 8 samples
+```
+
+59.03 % is the same figure `172a3b7cce` measured for 1.0's home screen before
+any of this, and rendering the dump confirms it: full SpringBoard, all twelve
+icons plus the dock. **Read the kernel base, not the scanout** — the scanout
+samples are 0.003 % because the panel auto-slept, which is the standing
+"black screen is scanout, not SpringBoard" artefact and not a regression.
+
+### Traps hit
+
+* **The disk.** It reached 100 % mid-run and kept *falling* after deletions —
+  because a concurrent session was running three emulators, one holding a
+  301 MB staged NAND under `/var/folders`. Check `pgrep -fl qemu-system-arm`
+  before blaming your own footprint, and do not kill what you find; those are
+  someone else's runs. `find <tree> -name '*.page' -delete` on a finished NAND
+  reclaims ~300 MB and leaves `nand.pack` + the bank dirs, which is exactly
+  what `package-iphone-app.sh --nand` consumes.
+* **`package-iphone-app.sh` prints "iPhone 2G (iOS 1.1.4).app is ready"
+  whatever `--app` you passed** — a hardcoded string in the closing heredoc.
+  Cosmetic, but it makes a 1.0 packaging run look like it targeted the wrong
+  bundle. Not fixed here.
 
 ## Session log — 2026-07-27 (the bundle firmware manifest described artifacts that were long gone — FIXED)
 

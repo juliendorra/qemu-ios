@@ -46,6 +46,24 @@ there. `package-iphone-app.sh` verifies both halves of this, checking that the
 shipped `nand.pack` contains a bridge CA at all and that its sha256 (recorded
 in `nand-provenance.json` as `recipe.bridge_ca_sha256`) is this host's.
 
+**Every future iPhone packaging run gets this automatically.** Injection is the
+default in `build-m68ap-homescreen-nand.py` (`--no-bridge-ca` is an opt-out, and
+`package-iphone-app.sh` never passes it), and it is enforced rather than merely
+attempted: the two checks below fail packaging outright — `exit 1`,
+"packaging INCOMPLETE" — so a bundle cannot silently ship without the trust, not
+even when a NAND built elsewhere is supplied with `--nand`.
+
+```
+  ok   guest trusts a bridge CA          # the pack contains a bridge root
+  ok   trusted CA is this host's         # ...and its sha256 is this host's
+```
+
+The one way to end up mismatched is to delete the state directory (a fresh CA
+is then minted while the shipped NAND still trusts the old one). Packaging
+catches it; the launcher does not, so the symptom would be certificate errors
+in Safari. `scripts/package-iphone-app.sh --verify-only` diagnoses it in a
+second, and re-packaging fixes it.
+
 The per-install CA and reusable RSA leaf key live by default under
 `~/Library/Application Support/S5L8900 HTTPS Bridge/<profile>/`. Private keys
 are mode 0600 and never enter the repository, app bundle, or guest. Only the

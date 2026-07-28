@@ -35,6 +35,16 @@
 #                                       devos50's iPod image ships it too
 #   * reference-shaped data ark       — key names/types mirrored from a real
 #                                       activated device; no Apple material
+#   * HTTPS-bridge CA in the guest    — ALWAYS, no flag needed: the launcher
+#     trust store                       starts a TLS bridge for this bundle and
+#                                       Safari rejects its certificates unless
+#                                       the root is trusted. Taken from the same
+#                                       state dir the launcher uses, so it is
+#                                       per HOST: a bundle copied to another Mac
+#                                       fails closed until re-packaged there.
+#                                       The two checks at the end of this script
+#                                       FAIL packaging if it is absent or is
+#                                       some other machine's CA.
 #
 # Idempotent: re-running upgrades the bundle in place.
 
