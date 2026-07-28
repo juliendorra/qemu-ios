@@ -30,7 +30,7 @@ Usage
 
   # 4. boot it (the tree is throwaway: the model may write into it)
   S5L8900_STAGE_NAND=0 S5L8900_NAND=/tmp/nand-test IT_NAND_WRITABLE=1 \\
-      "/Applications/iPhone 2G.app/Contents/MacOS/iPod Touch"
+      "/Applications/iPhone 2G (iOS 1.1.4).app/Contents/MacOS/iPod Touch"
 """
 from __future__ import annotations
 

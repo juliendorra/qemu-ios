@@ -21,7 +21,7 @@ mysterious boot failure.
 Firmware is never committed: web/public/assets/ is git-ignored.
 
 Examples:
-    scripts/wasm/stage-assets.py --from-app "/Applications/iPhone 2G.app" \\
+    scripts/wasm/stage-assets.py --from-app "/Applications/iPhone 2G (iOS 1.1.4).app" \\
         --board m68ap --firmware 1.1.4 --set-id m68ap-114-v1
 
     scripts/wasm/stage-assets.py --board m68ap --firmware 1.1.4 \\

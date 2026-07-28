@@ -184,7 +184,7 @@ bundle selects its board and default artifact directory with:
 ```bash
 scripts/install-ipod-app-engine.sh \
     /path/to/qemu-system-arm \
-    "/Applications/iPhone 2G.app" \
+    "/Applications/iPhone 2G (iOS 1.1.4).app" \
     iphone-2g
 ```
 
@@ -485,7 +485,7 @@ paths to `@executable_path/../Frameworks`, and signs):
 ```bash
 scripts/install-ipod-app-engine.sh \
     build-ipod11/qemu-system-arm \
-    "/Applications/iPhone 2G.app" \
+    "/Applications/iPhone 2G (iOS 1.1.4).app" \
     iphone-2g
 ```
 
@@ -493,8 +493,8 @@ scripts/install-ipod-app-engine.sh \
 shared, so only the profile file decides the board:
 
 ```bash
-cp -R "/Applications/iPod Touch.app" "/Applications/iPhone 2G.app"
-printf 'iphone-2g\n' > "/Applications/iPhone 2G.app/Contents/Resources/s5l8900-profile"
+cp -R "/Applications/iPod Touch.app" "/Applications/iPhone 2G (iOS 1.1.4).app"
+printf 'iphone-2g\n' > "/Applications/iPhone 2G (iOS 1.1.4).app/Contents/Resources/s5l8900-profile"
 ```
 
 If you clone, and you replace the QEMU binary with a fresh local build, you
@@ -502,7 +502,7 @@ If you clone, and you replace the QEMU binary with a fresh local build, you
 paths (`/opt/homebrew/...`) and will not run on another machine:
 
 ```bash
-APP="/Applications/iPhone 2G.app"; BIN="$APP/Contents/MacOS/qemu-system-arm"
+APP="/Applications/iPhone 2G (iOS 1.1.4).app"; BIN="$APP/Contents/MacOS/qemu-system-arm"
 cp build-ipod11/qemu-system-arm "$BIN"
 for dep in $(otool -L "$BIN" | awk '/\/opt\/homebrew/{print $1}'); do
     install_name_tool -change "$dep" \
@@ -519,7 +519,7 @@ nothing *depends* on a Homebrew path.)
 ### 2. Install the M68AP firmware
 
 ```bash
-python3 scripts/install-iphone-firmware.py --app "/Applications/iPhone 2G.app"
+python3 scripts/install-iphone-firmware.py --app "/Applications/iPhone 2G (iOS 1.1.4).app"
 ```
 
 This fills `Contents/Resources/iphone_files/` with the names the launcher
@@ -531,9 +531,9 @@ build, installed under the plain name:
 ```bash
 FW=m68ap-artifacts/builds/4A102          # or 1A543a, 1C28, 3A109a
 cp $FW/iboot-sb.bin \
-   "/Applications/iPhone 2G.app/Contents/Resources/iphone_files/iboot_204_m68ap.bin"
+   "/Applications/iPhone 2G (iOS 1.1.4).app/Contents/Resources/iphone_files/iboot_204_m68ap.bin"
 cp m68ap-artifacts/shared/bootrom_s5l8900 \
-   "/Applications/iPhone 2G.app/Contents/Resources/iphone_files/bootrom_s5l8900"
+   "/Applications/iPhone 2G (iOS 1.1.4).app/Contents/Resources/iphone_files/bootrom_s5l8900"
 ```
 
 and the NAND must be a **generated** tree (`$FW/nand`, from
@@ -587,8 +587,8 @@ opt out. N45AP keeps the historical in-place behaviour.
 If you cloned an older bundle, reinstall the launcher so it carries this rule:
 
 ```bash
-cp scripts/ipod-app-launcher.sh "/Applications/iPhone 2G.app/Contents/MacOS/iPod Touch"
-codesign --force --deep --sign - "/Applications/iPhone 2G.app"
+cp scripts/ipod-app-launcher.sh "/Applications/iPhone 2G (iOS 1.1.4).app/Contents/MacOS/iPod Touch"
+codesign --force --deep --sign - "/Applications/iPhone 2G (iOS 1.1.4).app"
 ```
 
 (The launcher filename stays `iPod Touch` — it is the bundle's
@@ -599,9 +599,9 @@ re-sign.)
 ### 4. Run and verify
 
 ```bash
-open "/Applications/iPhone 2G.app"
+open "/Applications/iPhone 2G (iOS 1.1.4).app"
 # or, with serial output for debugging:
-S5L8900_DEBUG=1 "/Applications/iPhone 2G.app/Contents/MacOS/iPod Touch" -display none \
+S5L8900_DEBUG=1 "/Applications/iPhone 2G (iOS 1.1.4).app/Contents/MacOS/iPod Touch" -display none \
     -serial "file:/tmp/i2g.log"
 grep -c "SpringBoard\[" /tmp/i2g.log     # >0 == reached SpringBoard
 ```
