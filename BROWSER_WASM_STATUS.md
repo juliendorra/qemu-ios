@@ -154,6 +154,43 @@ With both hooks wired, the emulator runs past the trap and drives the machine
 model (`[PMU] RESUME_STATUS read`), i.e. the JIT is compiling and executing
 translation blocks for real.
 
+### Measured: the JIT is at least 13.6× faster than TCI
+
+Same page (`jit-smoke` vs `tci-smoke`), same artifacts, same `-icount shift=1`,
+same browser, **each run solo** — time to `[LCD] Merlot panel woke from sleep`:
+
+| engine | first Merlot landmark |
+| --- | --- |
+| **WebAssembly JIT** | **31.4 s** (second at 206.4 s) |
+| TCI | **not reached by 428 s** |
+
+So **≥13.6×**, and the true figure is larger because TCI had still not arrived
+when the run was stopped. That is the order-of-magnitude the real-time goal
+needs, and it matches Infinite Mac's independent finding that qemu-wasm beats
+hand-ported C emulators.
+
+**Two methodology errors were made getting this number, both caught:**
+
+1. **Comparing across icount settings.** The JIT run sitting at 206 s with no
+   iBoot banner looked like a slowdown against "TCI reached the banner at
+   12.7 s" — but that TCI figure was from a run with **no icount**, where the
+   guest's delay loops finish almost instantly because virtual time tracks wall
+   clock. At `shift=1` each 1 ms delay costs a full 500,000 instructions, and
+   iBoot is mostly waits. Different amounts of work; not comparable.
+2. **Running both engines at once.** The first A/B had the two pages in two
+   tabs competing for CPU, which halves each. Re-run one at a time.
+
+Before speculating further on the first, the obvious mechanism was checked and
+ruled out: icount does **not** push the backend back onto TCI. The compile
+decision in `wasm64.c` is a per-TB execution counter (`INSTANTIATE_NUM` 1500)
+with no icount interaction.
+
+**Caveat on what this measures.** Neither run reached the iBoot banner: the page
+is iBoot-only and `shift=1` makes its delay loops expensive. This is a
+landmark-to-landmark engine comparison, not a boot time. A boot-time number
+needs the NAND and a faster clock setting, and should be taken once the JIT
+completes a full boot.
+
 ### Testing wasm64: use a browser, not Node
 
 `-sMEMORY64=1` requires **Node v23** ("This emscripten-generated code requires

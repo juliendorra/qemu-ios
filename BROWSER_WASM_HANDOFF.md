@@ -201,9 +201,27 @@ Now handled in `configure`.
 `IT_WASM_TCI=1 scripts/wasm/build-qemu.sh` still builds the interpreter, into
 `build-wasm-tci`, for A/B comparison.
 
-**Status:** builds and links (53,555,377 B vs TCI's 53,238,248), executes, and
-reaches `WebAssembly.Module()`. The speed measurement against TCI is the next
-step and the one that decides whether real-time is reachable.
+**Two hooks the series adds that QEMU 11.0.2 does not have.** Both are invisible
+at compile and link time — an uncalled hook is just an unused static function —
+and both surface as runtime symptoms that look like codegen bugs:
+
+| hook | called from | symptom when missing |
+| --- | --- | --- |
+| `tcg_out_tb_end` | end of `tcg_gen_code`, after relocs | `WebAssembly.Module(): BufferSource argument is empty` |
+| `tcg_out_label_cb` | `tcg_out_label` | `RuntimeError: unreachable` inside a generated module |
+
+**Diff the hook surface first** when grafting any TCG backend across versions:
+
+```sh
+git show FETCH_HEAD:tcg/tcg.c | grep -oE "^static [a-z0-9_ ]+\**tcg_out_[a-z0-9_]+"
+```
+
+Both are wired under `#ifdef EMSCRIPTEN` so native builds stay bit-identical.
+
+**Status: working, and ≥13.6× faster than TCI.** Same page, same artifacts,
+same `-icount shift=1`, each run solo: the JIT reaches the first LCD landmark in
+**31.4 s** where TCI had not reached it by **428 s**. Next: a full boot with the
+NAND, then a boot-time number at a sensible clock setting.
 
 ## W3 — A pack-access seam in the NAND model
 
