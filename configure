@@ -502,6 +502,13 @@ case "$cpu" in
     ;;
   wasm64)
     CPU_CFLAGS="-m64 -sMEMORY64=$wasm64_memory64"
+    # The WebAssembly TCG backend's JS glue encodes pointers and table indices
+    # differently in Emscripten's 32-bit-address-limit mode, and selects that
+    # with WASM64_MEMORY64_2. Without it the generated module is handed an
+    # empty buffer and WebAssembly.Module() throws.
+    if test "$wasm64_memory64" = "2"; then
+      CPU_CFLAGS="$CPU_CFLAGS -DWASM64_MEMORY64_2"
+    fi
     ;;
 esac
 

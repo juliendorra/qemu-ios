@@ -9,7 +9,11 @@
 #ifndef TCG_HELPER_INFO_H
 #define TCG_HELPER_INFO_H
 
-#ifdef CONFIG_TCG_INTERPRETER
+/*
+ * The WebAssembly backend calls helpers through libffi exactly as TCI does,
+ * so it needs these declarations too.
+ */
+#if defined(CONFIG_TCG_INTERPRETER) || defined(EMSCRIPTEN)
 /*
  * MacOSX 15 uses an old version of libffi which contains
  *   #if FFI_GO_CLOSURES
@@ -60,7 +64,7 @@ struct TCGHelperInfo {
     const char *name;
 
     /* Used with g_once_init_enter. */
-#ifdef CONFIG_TCG_INTERPRETER
+#if defined(CONFIG_TCG_INTERPRETER) || defined(EMSCRIPTEN)
     ffi_cif *cif;
 #else
     uintptr_t init;
