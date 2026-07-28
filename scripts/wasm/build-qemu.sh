@@ -59,6 +59,18 @@ configure_args=(
     --disable-tools
     --disable-docs
     --disable-werror
+    # QEMU's emscripten cross file (configs/meson/emscripten.txt) sets its own
+    # link arguments, so these have to arrive through configure rather than the
+    # LDFLAGS environment variable, which it overrides.
+    #
+    # -lnodefs.js lets a Node run mount the real filesystem, which is how the
+    # emulator is booted headlessly for testing before the browser asset
+    # pipeline exists. -lworkerfs.js is its browser counterpart (read-only
+    # Blob/File access from a worker). Without them Emscripten stubs both out
+    # with "NODEFS is no longer included by default".
+    # NB the literal single quotes: run() evals this array flattened into one
+    # string, so a value containing a space must carry its own quoting.
+    "--extra-ldflags='-lnodefs.js -lworkerfs.js'"
 )
 
 if [ "$backend" = docker ]; then
@@ -89,6 +101,11 @@ else
     export PKG_CONFIG_PATH="$root/target/lib/pkgconfig"
     export EM_PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
     export CFLAGS="-O3 -pthread -DWASM_BIGINT"
+    # -lnodefs.js lets a Node run mount the real filesystem, which is how the
+    # emulator is booted headlessly for testing before the browser asset
+    # pipeline exists. -lworkerfs.js is its browser counterpart (read-only
+    # Blob/File access from a worker). Both are inert when unused; without
+    # them Emscripten stubs NODEFS out with "no longer included by default".
     export LDFLAGS="-sWASM_BIGINT -sASYNCIFY=1 -L$root/target/lib"
     run() { ( cd "$build" && eval "$1" ); }
 fi
@@ -102,8 +119,12 @@ if [ "$do_configure" = 1 ] || [ ! -f "$build/build.ninja" ]; then
     fi
 fi
 
-echo "==> building qemu-system-arm (wasm)"
-run "ninja -j$jobs qemu-system-arm"
+# Emscripten names the emitted target after the JS loader, not the bare
+# executable: ninja knows "qemu-system-arm.js" and building it also produces
+# the .wasm beside it. Asking for "qemu-system-arm" fails with
+# "unknown target ... did you mean 'qemu-system-arm.js'?".
+echo "==> building qemu-system-arm.js (wasm)"
+run "ninja -j$jobs qemu-system-arm.js"
 
 echo
 echo "artifacts:"

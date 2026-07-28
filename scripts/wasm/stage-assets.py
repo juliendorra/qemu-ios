@@ -135,6 +135,12 @@ def main() -> None:
         "--from-app", type=Path,
         help="packaged emulator .app to take all four artifacts from",
     )
+    parser.add_argument(
+        "--from-build", metavar="BUILD",
+        help="M68AP firmware build (1A543a, 1C28, 3A109a, 4A102): take all "
+             "four artifacts AND the security epoch from "
+             "m68ap-artifacts/builds/<BUILD>/. See M68AP_BUILD_LAYOUT.md",
+    )
     parser.add_argument("--bootrom", type=Path)
     parser.add_argument("--iboot", type=Path)
     parser.add_argument("--nor", type=Path)
@@ -154,6 +160,24 @@ def main() -> None:
         help="extra -M options, e.g. 'epoch=2' (comma separated)",
     )
     args = parser.parse_args()
+
+    # --from-build resolves the artifacts and the epoch together. The epoch is
+    # firmware-keyed (0 for 1.0/1.0.2, 2 for 1.1.1, 3 for 1.1.4) and staging a
+    # NAND without its matching epoch produces an asset set that wedges in
+    # iBoot with an empty serial log.
+    if args.from_build:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import m68ap_paths  # noqa: E402
+
+        paths = m68ap_paths.get(args.from_build)
+        paths.require("iboot_sb", "nor", "pack")
+        args.bootrom = args.bootrom or paths.bootrom
+        args.iboot = args.iboot or paths.iboot_sb
+        args.nor = args.nor or paths.nor
+        args.nand = args.nand or paths.pack
+        if not args.machine_args:
+            args.machine_args = f"epoch={paths.epoch}"
+        print(f"staging {m68ap_paths.describe(args.from_build)}")
 
     board = BOARDS[args.board]
     set_id = args.set_id or f"{args.board}-{args.firmware.replace('.', '')}-v1"
