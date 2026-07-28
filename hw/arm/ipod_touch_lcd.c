@@ -521,6 +521,27 @@ static void refresh_timer_tick(void *opaque)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
 
+    /*
+     * IT_FB_TRACE also reports the vsync state once a second. The MMIO trace
+     * above suppresses a register after its 8th access, which hides exactly
+     * the question that matters when the guest wedges: is the frame interrupt
+     * still being RAISED, and is the guest still ACKing it? A stuck-high
+     * int_status means the line never falls, so an edge-triggered consumer
+     * gets no further interrupts and simply never wakes -- which is what an
+     * idle-looping guest looks like from the outside.
+     */
+    if (it_fb_trace_enabled()) {
+        static uint32_t ticks;
+        if (++ticks % LCD_REFRESH_RATE_FREQUENCY == 0) {
+            fprintf(stderr, "[FB] vsync t=%us status=0x%08x mask=0x%08x "
+                    "irq=%d acked_since_last=%s\n",
+                    ticks / LCD_REFRESH_RATE_FREQUENCY,
+                    s->int_status, s->int_mask,
+                    (s->int_status & s->int_mask) != 0,
+                    s->int_status & 1 ? "NO (status still set)" : "yes");
+        }
+    }
+
     s->int_status |= 1;
     s5l8900_lcd_update_irq(s);
     lcd_update_input_ready(s);

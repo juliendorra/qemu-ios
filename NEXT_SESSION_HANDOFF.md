@@ -319,3 +319,41 @@ under which QEMU never calls `gfx_update` and every touch is refused; it reports
 `no-response` for known-good bundles. Use `app-button-probe.py` or
 `home-wedge-probe.py`, which attach a display client. A negative from a harness
 that cannot produce a positive is not evidence.
+
+### ROOT CAUSE of the HOME wedge: the model raises the wrong LCD interrupt bit
+
+`IT_FB_TRACE=1` now also reports the vsync state once a second
+(`refresh_timer_tick`), because the MMIO trace suppresses a register after its
+8th access and that hid exactly the question that mattered. After the HOME
+press, every second:
+
+```
+[FB] vsync t=41s status=0x00000001 mask=0x00003f00 irq=0 acked_since_last=NO
+```
+
+* `int_status` bit 0 is set — the model's refresh timer is alive and still
+  raising a frame interrupt every tick. The timer is free-running and re-arms
+  unconditionally, so "the vsync stopped" was the wrong hypothesis.
+* `int_mask` is **0x3f00 — bit 0 CLEAR**. The gate is
+  `qemu_set_irq(irq, (int_status & int_mask) != 0)`, so `0x1 & 0x3f00 == 0` and
+  **the line is never asserted**. `irq=0` every single tick.
+* Earlier in the same boot the guest had `mask = 0x3f01`, bit 0 set, which is
+  why the frame interrupt was delivered and the compositor ran.
+
+So during the app teardown iPhone OS 1.0 narrows the LCD interrupt mask from
+0x3f01 to 0x3f00, and from that moment our frame interrupt is masked out. The
+guest goes idle waiting for a frame interrupt that the model is signalling on a
+bit the guest is not listening to.
+
+**The likely model bug: `s->int_status |= 1` in `refresh_timer_tick` is the
+wrong bit.** A guest that deliberately enables bits 8..13 and disables bit 0,
+while still expecting frame callbacks, is telling us the real frame/vsync
+source is one of 8..13 and bit 0 is something else. Bit 0 happens to be enabled
+during early boot, which is why every result to date looked correct.
+
+Next step: identify which of bits 8..13 is the frame interrupt (the LCD
+register block at 0x14/0x18 and 1.0's `AppleH1CLCD` are the sources), raise
+that bit instead of/in addition to bit 0, and re-run
+`app-button-probe.py --board m68ap-10` — steps 3 and 4 should start passing.
+Verify 1.1.4 and the iPod, which currently pass step 3, do not regress: they may
+simply keep bit 0 enabled and would be unaffected either way.
