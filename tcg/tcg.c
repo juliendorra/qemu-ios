@@ -129,6 +129,19 @@ static void tcg_out_tb_start(TCGContext *s);
  * the correctness oracle -- are not perturbed at all.
  */
 static int tcg_out_tb_end(TCGContext *s);
+
+/*
+ * The second hook the series adds. The WebAssembly backend cannot branch to an
+ * arbitrary address: it compiles a TB into `loop { if (BLOCK_IDX <= n) {...} }`
+ * and branches by setting BLOCK_IDX. This callback is what opens a new block
+ * at each label and records the label -> block mapping.
+ *
+ * Without it no blocks are created, branches select an index no block matches,
+ * the loop body runs to completion, and control falls through to the
+ * OPC_UNREACHABLE guard after the loop -- "RuntimeError: unreachable" raised
+ * inside a generated module.
+ */
+static void tcg_out_label_cb(TCGContext *s, TCGLabel *l);
 #endif
 static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg1,
                        intptr_t arg2);
@@ -371,6 +384,9 @@ static void tcg_out_label(TCGContext *s, TCGLabel *l)
     tcg_debug_assert(!l->has_value);
     l->has_value = 1;
     l->u.value_ptr = tcg_splitwx_to_rx(s->code_ptr);
+#ifdef EMSCRIPTEN
+    tcg_out_label_cb(s, l);
+#endif
 }
 
 TCGLabel *gen_new_label(void)

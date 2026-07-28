@@ -113,13 +113,46 @@ grep once the right question was asked.
 Upstream's series instead adds a no-op to all nine backends; scoping it to the
 WebAssembly host keeps native builds — the correctness oracle — bit-identical.
 
-**Result:** the empty-buffer error is gone. Generated modules now compile,
-instantiate and execute. The next failure is one layer deeper: `RuntimeError:
-unreachable`, raised inside a *generated* module (`wasm://wasm/<hash>`), i.e.
-the code the JIT emitted falls through to the `OPC_UNREACHABLE` guard that
-`tcg_out_tb_end` places after the dispatch loop. That points at a codegen or
-dispatch-protocol difference between 10.2.50 and 11.0.2 rather than at
-integration, and is where the next session should pick up.
+**Result:** the empty-buffer error is gone. Generated modules compile,
+instantiate and execute — and then trapped one layer deeper with
+`RuntimeError: unreachable` raised *inside* a generated module
+(`wasm://wasm/<hash>`).
+
+### The second missing hook: `tcg_out_label_cb`
+
+Same class of bug, found by asking the same question. The WebAssembly backend
+cannot branch to an arbitrary address, so it compiles a TB into
+
+```
+loop { if (BLOCK_IDX <= 0) {…} if (BLOCK_IDX <= 1) {…} … }
+unreachable          ← only reached if the loop falls through
+```
+
+and branches by assigning `BLOCK_IDX`. **`tcg_out_label_cb` is what opens a new
+block at each label and records the label → block mapping.** In 10.2.50,
+`tcg_out_label()` calls it; in 11.0.2 it does not exist. So no blocks were
+created, branches selected an index no block matched, the body ran to
+completion, and control fell out of the loop into the guard.
+
+Rather than wait for the next crash, the remaining hooks were enumerated in one
+pass — extract every `static … tcg_out_*` declaration from both trees and diff:
+
+```sh
+git show FETCH_HEAD:tcg/tcg.c | grep -oE "^static [a-z0-9_ ]+\**tcg_out_[a-z0-9_]+" …
+```
+
+`tcg_out_label_cb` was the only one left. **Two hooks total, both invisible at
+compile and link time**, because a hook that is never called is just an unused
+static function.
+
+**Lesson for any future backend graft: diff the hook surface first.** A TCG
+backend integrates through a set of `tcg_out_*` callbacks; a series that adds
+new ones will link cleanly and fail at runtime in ways that look like codegen
+bugs.
+
+With both hooks wired, the emulator runs past the trap and drives the machine
+model (`[PMU] RESUME_STATUS read`), i.e. the JIT is compiling and executing
+translation blocks for real.
 
 ### Testing wasm64: use a browser, not Node
 
