@@ -85,29 +85,54 @@ tree sets it from a meson option; our 11.0.2 handles the limit in `configure`
 (`--wasm64-32bit-address-limit` → `-sMEMORY64=2`) and never passed the define.
 `configure` now defines it whenever `-sMEMORY64=2` is in effect.
 
-**That define was necessary but NOT the cause — the error is unchanged with it
-applied.** Recorded here rather than quietly deleted, because the wrong
-diagnosis is instructive: it was inferred by reading the macro and reported as
-settled before the rebuild confirmed it. Two candidates remain:
+**That define was necessary but NOT the cause — the error was unchanged with it
+applied.** Recorded rather than quietly deleted, because the wrong diagnosis is
+instructive: it was inferred by reading the macro and reported as settled before
+a rebuild confirmed it.
 
-1. **Memory mode.** We build `-sMEMORY64=2`; the backend is developed against
-   the full 64-bit mode. `IT_WASM_MEMORY64_FULL=1 scripts/wasm/build-qemu.sh`
-   builds `-sMEMORY64=1` to test exactly this. *(Being measured.)*
-2. **A 10.2.50 → 11.0.2 structural mismatch.** The backend reads a
-   `WasmTBHeader` out of the translation block's code buffer. If anything about
-   `tb_ptr` or the code-buffer layout changed between those versions,
-   `wasm_size` would be read from the wrong offset — and an empty buffer is
-   exactly what that looks like. This would be a genuine port issue rather than
-   a flag.
+**Memory mode was not the cause either.** `-sMEMORY64=1` (the mode the backend
+is developed against) fails identically. Testing that needed a browser, because
+full wasm64 requires **Node v23** and this host has 22.22.3 — see "Testing
+wasm64" below.
 
-The failure fires ~1.1 s in, consistent with either: `instantiate_wasm` is
-called the first time a translation block passes the backend's 1,500-execution
-threshold, which the bootrom's loops reach almost immediately.
+### The real cause: `tcg_out_tb_end` does not exist in QEMU 11.0.2
 
-Note what the failure *does* prove: the JIT is live and compiling translation
-blocks. It is the first failure in the whole port that is a genuine integration
-defect rather than environment, clock, or harness — and it is still on our side
-of the line, not a defect in the backend.
+The backend assembles its module in `tcg_out_tb_end()` — that function writes
+`h->wasm_ptr` and `h->wasm_size` into the TB header. `tcg_out_tb_end` is a
+backend hook **added by the patch series**: in 10.2.50 every backend defines it
+(a no-op returning 0 for the native ones), `tcg.c` forward-declares it and calls
+it after relocations are resolved.
+
+QEMU 11.0.2 has `tcg_out_tb_start` but **no `tcg_out_tb_end` anywhere** — not in
+`tcg.c`, not in any backend. So the wasm backend's generator was dead code:
+never called, `wasm_size` never written, and `WebAssembly.Module()` handed an
+empty view. Exactly the "structural mismatch" candidate, and findable in one
+grep once the right question was asked.
+
+**Fix:** declare and call the hook in `tcg/tcg.c`, guarded by `EMSCRIPTEN`.
+Upstream's series instead adds a no-op to all nine backends; scoping it to the
+WebAssembly host keeps native builds — the correctness oracle — bit-identical.
+
+**Result:** the empty-buffer error is gone. Generated modules now compile,
+instantiate and execute. The next failure is one layer deeper: `RuntimeError:
+unreachable`, raised inside a *generated* module (`wasm://wasm/<hash>`), i.e.
+the code the JIT emitted falls through to the `OPC_UNREACHABLE` guard that
+`tcg_out_tb_end` places after the dispatch loop. That points at a codegen or
+dispatch-protocol difference between 10.2.50 and 11.0.2 rather than at
+integration, and is where the next session should pick up.
+
+### Testing wasm64: use a browser, not Node
+
+`-sMEMORY64=1` requires **Node v23** ("This emscripten-generated code requires
+node v23.0.0"); browsers have supported memory64 for a while. `web/public/jit-smoke/`
+is a self-contained page that boots **iBoot only, no NAND** — enough to cross
+the backend's 1500-execution compile threshold in ~2 s — and reports PASS /
+FAIL / INCONCLUSIVE. Serve it with `scripts/wasm/serve.py` (the COOP/COEP
+headers are required) and open `/public/jit-smoke/`.
+
+Chrome plus Playwright/Patchright are available on this host, so the same page
+is the basis for an automated headless check; that is the right long-term
+harness for wasm64 work regardless of the Node version.
 
 ### Two self-inflicted build failures worth not repeating
 

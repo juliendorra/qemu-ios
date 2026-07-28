@@ -116,6 +116,20 @@ static void tcg_register_jit_int(const void *buf, size_t size,
 
 /* Forward declarations for functions declared and used in tcg-target.c.inc. */
 static void tcg_out_tb_start(TCGContext *s);
+#ifdef EMSCRIPTEN
+/*
+ * A backend hook that runs after relocations are resolved, added by the
+ * WebAssembly backend's patch series (upstream QEMU has tcg_out_tb_start but
+ * no _end). The wasm backend uses it to emit the finished module and record
+ * its pointer and size in the TB header; without the call its generator never
+ * runs and WebAssembly.Module() is handed an empty buffer.
+ *
+ * Upstream's series gives every backend a "nothing to do" implementation. Here
+ * it is scoped to the WebAssembly host instead, so native builds -- which are
+ * the correctness oracle -- are not perturbed at all.
+ */
+static int tcg_out_tb_end(TCGContext *s);
+#endif
 static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg1,
                        intptr_t arg2);
 static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg);
@@ -6760,6 +6774,14 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     if (!tcg_resolve_relocs(s)) {
         return -2;
     }
+
+#ifdef EMSCRIPTEN
+    /* The WebAssembly backend assembles its module here. See the declaration. */
+    i = tcg_out_tb_end(s);
+    if (i < 0) {
+        return i;
+    }
+#endif
 
 #ifndef CONFIG_TCG_INTERPRETER
     /* flush instruction cache */
