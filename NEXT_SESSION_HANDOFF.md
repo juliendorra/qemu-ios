@@ -439,3 +439,68 @@ The presenter is driven by the display backend's refresh, so the question is why
 `gfx_update` stops being requested for this console. Check whether it is the
 VNC harness (client stops asking) or QEMU's console refresh throttling, then
 confirm against the iPod, which passes every step with the same LCD model.
+
+### Errors I shipped in this session, and what each one cost
+
+Recorded because every one of them wasted the user's time, and three of them
+were the *same* mistake in different clothes: changing a shipped bundle without
+re-verifying the thing I had just changed.
+
+**1. An empty bash array killed the iPod app outright.** The icount change added
+`QEMU_ICOUNT=()` and expanded it as `"${QEMU_ICOUNT[@]}"`. macOS ships **bash
+3.2**, where expanding an EMPTY array under `set -u` is an "unbound variable"
+error. The iPhone profiles fill the array, so they worked and I tested only
+those; the iPod, which deliberately gets no icount, took the empty path and died
+before QEMU started:
+
+```
+/Applications/iPod Touch.app/Contents/MacOS/iPod Touch: line 255: QEMU_ICOUNT[@]: unbound variable
+```
+
+Fixed with the 3.2-safe guard `${QEMU_ICOUNT[@]+"${QEMU_ICOUNT[@]}"}`. **Rule:
+a launcher change is not tested until all three bundles have been launched.**
+The two-second check that would have caught it is the one at the end of this
+section.
+
+**2. Re-signing a bundle kills the copy the user is running.** Twice I ran
+`install-ipod-app-engine.sh` / `codesign --force` on a bundle while the user had
+it open. macOS SIGKILLs a process whose signed binary is replaced underneath it
+(`EXC_BAD_ACCESS`, `SIGKILL (Code Signature Invalid)`, `CODESIGNING / Invalid
+Page`), so the window vanishes with no dialog and no guest panic. It reads
+exactly like an emulator crash, and I first went looking for one. **Announce
+before touching `/Applications`, or work on a copy.**
+
+**3. Two confident root causes that were wrong.** "1.0 Wi-Fi SOLVED" (the driver
+was still failing further down the same log I had only read the head of), and
+"the model raises the wrong LCD interrupt bit" (disassembling `AppleH1CLCD`
+showed bit 0 IS the frame interrupt). Both are retracted in place above. **Read
+the whole log, and read the guest's code before naming a cause.**
+
+**4. A measurement that could not produce a positive.** `touch-probe.py` runs
+`-display none`, under which QEMU never calls `gfx_update` and every touch is
+refused. I used it to "clear" a change of having broken touch; it returned
+`no-response` for the filled NOR, the reverted NOR, AND for 1.1.4, whose touch
+was known to work. The third result was the disproof and I read past it.
+
+**5. A brightness heuristic that hid real transitions.** `app-button-probe.py`'s
+`grab()` returned "the liveliest of the three framebuffer bases". Any step where
+the new screen is DIMMER than stale content elsewhere reads as `0.00% changed` --
+which is 1.0's app->home step exactly. This produced a false "1.1.4 touch
+regressed today" that I reported to the user. Now fixed: `grab()` keeps all
+three buffers and `changed()` takes the largest per-base difference.
+
+**6. A finding that was an artifact of my own harness.** "The host presenter
+stops running" was measured under VNC. On the cocoa path the app actually uses,
+`present` and `vsync` counters run 1:1 (`present:8 vsync:8`). Retracted before
+it reached a fix. **Measure on the path the user runs.**
+
+### The check that catches most of this
+
+```bash
+for a in "iPod Touch" "iPhone 2G (iOS 1.0)" "iPhone 2G (iOS 1.1.4)"; do
+  "/Applications/$a.app/Contents/MacOS/iPod Touch" -display none & sleep 12
+  pkill -f qemu-system-arm
+done
+```
+Anything that prints a shell error instead of boot output is broken for the user
+before QEMU is even involved.

@@ -223,6 +223,12 @@ fi
 # N45AP is deliberately left alone -- it does not hit this, and its verified
 # sleep/wake results were all measured in real time. Set S5L8900_ICOUNT=0 to
 # opt out, or to another shift to experiment.
+# NOTE the guarded expansion at the call site:
+# ${QEMU_ICOUNT[@]+"${QEMU_ICOUNT[@]}"}. macOS ships bash 3.2, where expanding
+# an EMPTY array under `set -u` is an "unbound variable" error. The iPhone
+# profiles fill this array so they were fine; the iPod, which deliberately gets
+# no icount, hit the empty case and the app died at launch with
+# "QEMU_ICOUNT[@]: unbound variable" before QEMU ever started.
 QEMU_ICOUNT=()
 if [[ "$PROFILE" == "iphone-2g" ]]; then
     ICOUNT_SHIFT="${S5L8900_ICOUNT:-1}"
@@ -256,7 +262,7 @@ fi
     -m 1G \
     -pflash "$NOR" \
     -L "$RESOURCES/pc-bios" \
-    "${QEMU_ICOUNT[@]}" \
+    ${QEMU_ICOUNT[@]+"${QEMU_ICOUNT[@]}"} \
     "${QEMU_DIAGNOSTICS[@]}" \
     "$@"
 status=$?

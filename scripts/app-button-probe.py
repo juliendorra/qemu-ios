@@ -139,21 +139,42 @@ def key(q: QMP, name: str, hold: float = 0.15):
             time.sleep(hold)
 
 
-def grab(q: QMP, tmp: Path) -> bytes:
-    """The liveliest of the three framebuffer bases, straight from guest RAM."""
-    best = b""
+# Under -icount the guest runs slower in WALL CLOCK than it used to, so the
+# original 5/4/8/10 s waits started measuring before the transition finished --
+# a run today had every step land one action late, with 4_power_sleeps
+# "passing" on a 97% change that was really the app finally opening. Scale them
+# all with IT_PROBE_WAIT (default 2x).
+_W = float(os.environ.get("IT_PROBE_WAIT", "2"))
+WAIT_OPEN, WAIT_TOUCH, WAIT_HOME, WAIT_POWER = (5 * _W, 4 * _W, 8 * _W, 10 * _W)
+
+
+def grab(q: QMP, tmp: Path) -> list:
+    """ALL three framebuffer bases, straight from guest RAM.
+
+    This used to return only "the liveliest" base -- the one with the most
+    non-black pixels -- and that is unsound whenever the NEW screen is DIMMER
+    than stale content left in another buffer. iPhone OS 1.0's HOME step is
+    exactly that case (app 99.1% lit -> home screen 45.4%): any buffer still
+    holding the app won the brightness contest, so the step reported
+    "0.00% changed" while the transition had plainly happened. 1.1.4 hits it
+    the other way at step 1, its home screen being 69.5% lit.
+
+    Keeping all three and taking the LARGEST per-base change answers the
+    question the steps actually ask -- "did the screen change" -- without
+    needing to know which buffer is being scanned out at that instant.
+    """
+    out = []
     for base in FB_BASES:
         q.cmd("pmemsave", {"val": base, "size": FB_BYTES,
                            "filename": str(tmp)})
-        d = tmp.read_bytes()
-        if sum(1 for i in range(0, len(d), 4 * 997) if d[i] or d[i+1] or d[i+2]) \
-                > sum(1 for i in range(0, len(best), 4 * 997)
-                      if best[i] or best[i+1] or best[i+2]):
-            best = d
-    return best
+        out.append(tmp.read_bytes())
+    return out
 
 
-def changed(a: bytes, b: bytes) -> float:
+def changed(a, b) -> float:
+    """Largest change across the framebuffers (see grab)."""
+    if isinstance(a, list):
+        return max((changed(x, y) for x, y in zip(a, b)), default=0.0)
     n = min(len(a), len(b)) // 4
     c = sum(1 for i in range(0, n * 4, 4)
             if abs(a[i] - b[i]) > 12 or abs(a[i+1] - b[i+1]) > 12
@@ -161,7 +182,9 @@ def changed(a: bytes, b: bytes) -> float:
     return round(100.0 * c / n, 2) if n else 0.0
 
 
-def lit(d: bytes) -> float:
+def lit(d) -> float:
+    if isinstance(d, list):
+        return max((lit(x) for x in d), default=0.0)
     n = len(d) // 4
     c = sum(1 for i in range(0, n * 4, 4 * 97) if d[i] or d[i+1] or d[i+2])
     return round(100.0 * c / max(1, n // 97), 2)
@@ -181,7 +204,9 @@ def slept_verdict(d, before, after, seg) -> bool:
             or "Application processor awaiting power loss" in seg)
 
 
-def png(d: bytes, path: Path):
+def png(d, path: Path):
+    if isinstance(d, list):
+        d = max(d, key=lit)
     import struct, zlib
     rows = b""
     for y in range(FB_H):
@@ -303,16 +328,16 @@ def main() -> int:
             step("0_pre_tap", lambda: tap(q, px, py, 0.3), 4,
                  lambda d, b, a, seg: True, "informational")
 
-        step("1_open_app", lambda: tap(q, *icon, 0.3), 5,
+        step("1_open_app", lambda: tap(q, *icon, 0.3), WAIT_OPEN,
              lambda d, b, a, seg: d > 20,
              "tapping an icon must open something")
-        step("2_touch_in_app", lambda: tap(q, 160, 423, 0.3), 4,
+        step("2_touch_in_app", lambda: tap(q, 160, 423, 0.3), WAIT_TOUCH,
              lambda d, b, a, seg: d > 2,
              "touch must still work with an app frontmost")
-        step("3_home_returns", lambda: key(q, "h"), 8,
+        step("3_home_returns", lambda: key(q, "h"), WAIT_HOME,
              lambda d, b, a, seg: d > 20,
              "HOME must return to SpringBoard")
-        step("4_power_sleeps", lambda: key(q, "p"), 10, slept_verdict,
+        step("4_power_sleeps", lambda: key(q, "p"), WAIT_POWER, slept_verdict,
              "POWER must put the panel to sleep")
         slept = report["steps"][-1]["pass"]
         if slept:
