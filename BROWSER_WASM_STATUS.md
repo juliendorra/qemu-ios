@@ -13,6 +13,78 @@ prepared offline here and self-hosted. iPod touch (N45AP) comes after.
 
 ---
 
+## Session — 2026-07-28: QEMU RUNS IN WEBASSEMBLY
+
+**`build-wasm/qemu-system-arm.wasm` exists (53 MB) and boots iPhone OS 1.1.4's
+iBoot and Darwin kernel.** It then panics in a driver-matching race, and TCI is
+~13× slower than native. Both are quantified below.
+
+### What it took
+
+QEMU 11.0.2's Emscripten support accepted our configure line unchanged — no
+patches. Four things had to be fixed:
+
+1. **Wrong ninja target.** Emscripten names it `qemu-system-arm.js`; asking for
+   `qemu-system-arm` fails.
+2. **OpenSSL — the real blocker.** Four device files included `<openssl/aes.h>`
+   or `<openssl/sha.h>`, and OpenSSL does not cross-compile to wasm64. Three
+   uses were dead code; the two live ones now use what QEMU already ships —
+   glib's `GChecksum` for SHA1, `crypto/aes.h` plus a new
+   `include/hw/arm/ipod_touch_aes_cbc.h` for AES-CBC (QEMU has the cipher but
+   no CBC wrapper). The helper mirrors OpenSSL's `CRYPTO_cbc128_*` exactly,
+   including the trailing partial block and the in-place IV update. **This is a
+   portability fix, not a browser hack: the native build no longer needs
+   `-lcrypto` for these devices either.**
+3. **The 8900 engine's AES code lives in its header**, so grepping the `.c`
+   showed nothing and the first edit removed a declaration it needed. The native
+   build caught it immediately.
+4. **`-lnodefs.js` never reaches the link** — QEMU's `configs/meson/emscripten.txt`
+   overrides `LDFLAGS`, and even via `--extra-ldflags` the emitted module still
+   stubs NODEFS out. Unresolved; MEMFS is used instead, which is what the
+   browser needs anyway. Staging all 301.5 MiB into MEMFS takes **0.7 s**.
+
+### Measured: TCI is ~13× slower than native
+
+Same firmware (4A102), same host, same artifacts:
+
+| landmark | native | wasm (TCI) | ratio |
+| --- | --- | --- | --- |
+| iBoot-204.3.14 banner | 2.0 s | 12.7 s | 6.4× |
+| Darwin kernel version | 7.3 s | 84.7 s | 11.6× |
+| `USBWrangler::start starting` | 7.8 s | 103.9 s | 13.3× |
+| `AppleS5L8900XADM::attach` | 7.8 s | 105.1 s | 13.5× |
+
+**This is the go/no-go answer for TCI, and it is not encouraging.** A native
+boot to the home screen is on the order of 20-30 s, so 13× puts a browser cold
+boot in the several-minute range before any of the asset-loading work counts.
+The out-of-tree qemu-wasm JIT is therefore looking like a requirement rather
+than an option — consistent with Infinite Mac measuring qemu-wasm *faster* than
+hand-ported C emulators. Re-check whether the backend has merged upstream
+before committing to carrying the patch set.
+
+### A real divergence: the USB PHY race
+
+The wasm and native serial logs are **identical line for line** through driver
+matching. Then, at 126.4 s, the wasm run gets an event native never produces:
+
+```
+AppleS5L8900XUSBWrangler::phyRegistered PHY 0xc0a98300 notified us of availability
+kernel abort type 4: fault_type=0x1, fault_addr=0x0
+panic(cpu 0 caller 0xC00638CC)
+```
+
+and then loops on the panic. `phyRegistered` appears **zero** times in the
+native log: natively the PHY is already available when the wrangler starts, so
+that late-notification path is never taken. Under TCI the guest is ~13× slower
+while QEMU's timers are not, so the relative ordering of device-model events
+and guest progress changes — a classic emulation-speed-dependent race, and the
+first behavioural difference the browser build has exposed.
+
+This is a blocker independent of performance: it must be fixed (or the timing
+decoupled, e.g. `-icount`) before a browser boot can reach SpringBoard.
+
+---
+
 ## Session — 2026-07-27: delivery decided, assets measured
 
 - **Delivery model settled**: prepared offline, self-hosted, chunked and
