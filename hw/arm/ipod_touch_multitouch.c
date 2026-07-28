@@ -616,7 +616,18 @@ static uint32_t mt_transfer_inner(SSIPeripheral *dev, uint32_t value)
             s->buf_size = 16;
         }
         else if(value == MT_CMD_FRAME_READ) {
-            /* The direct EA path uses the original 75-byte frame. */
+            /* The direct EA path uses the original 75-byte frame.
+             *
+             * The frame is NOT consumed here. The iPod OS 1.x driver splits
+             * this one 75-byte reply across TWO SPI transactions -- 16 bytes
+             * for the length packet, then 59 for the payload (measured: TX
+             * headers `ea 01 00` and `ea 01 01`, RXCNT 16 then 59). Consuming
+             * at command start freed the frame while the driver still had the
+             * whole payload to fetch, so the second transaction read zeros and
+             * every touch was dropped. Consumption now happens where the frame
+             * has actually been handed over: either at the end of a full
+             * 75-byte read below, or in the payload path that
+             * transaction_end() arms. */
             s->buf_size = sizeof(MTFrame);
             if (s->next_frame) {
                 size_t data_size = sizeof(MTFramePacket) +
@@ -630,7 +641,6 @@ static uint32_t mt_transfer_inner(SSIPeripheral *dev, uint32_t value)
                     s->next_frame->checksum1;
                 s->out_buffer[sizeof(MTFrameLengthPacket) + data_size + 1] =
                     s->next_frame->checksum2;
-                ipod_touch_multitouch_consume_frame(s);
             } else {
                 /* The driver can poll the legacy frame command immediately
                  * after consuming an interrupt packet.  No queued frame is
@@ -727,6 +737,13 @@ static uint32_t mt_transfer_inner(SSIPeripheral *dev, uint32_t value)
         }
         //printf("Finished command 0x%02x\n", s->cur_cmd);
 
+        if (s->cur_cmd == MT_CMD_FRAME_READ && s->next_frame) {
+            /* A driver that clocked the whole 75-byte reply in one transaction
+             * now has the frame. The split readers are handed over in the
+             * payload path instead -- see transaction_end(). */
+            ipod_touch_multitouch_consume_frame(s);
+        }
+
         if(s->cur_cmd == 0x1E) {
             // make sure we return a success status on the next HBPP ACK
             s->hbpp_atn_ack_response[0] = 0x4A;
@@ -788,6 +805,24 @@ void ipod_touch_multitouch_transaction_end(IPodTouchMultitouchState *s)
         MT_TRACE("transaction ended mid-command 0x%02x at %u/%u - resetting\n",
                  s->cur_cmd, s->buf_ind, s->buf_size);
     }
+
+    /*
+     * ...except that one short 0xEA read is NOT an abandoned command. The iPod
+     * OS 1.x driver fetches a frame in two transactions: 16 bytes for the
+     * length packet, then 59 for the payload, one logical 75-byte reply split
+     * in half (it re-asserts chip-select between them, so no boundary signal
+     * can tell the two apart from the outside). Stopping at exactly the length
+     * packet means "the payload is still owed" -- arm the same handover the
+     * 0xEB path uses, and leave the frame queued so it is still there for it.
+     */
+    if (s->cur_cmd == MT_CMD_FRAME_READ &&
+        s->buf_size == sizeof(MTFrame) &&
+        s->buf_ind == sizeof(MTFrameLengthPacket) &&
+        s->next_frame) {
+        s->frame_data_pending = true;
+        MT_TRACE("0xEA length packet delivered; payload owed\n");
+    }
+
     s->cur_cmd = 0;
     s->buf_size = 0;
     s->buf_ind = 0;
