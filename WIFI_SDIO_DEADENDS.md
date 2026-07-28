@@ -150,3 +150,61 @@ build now associates, obtains `10.0.2.15` from SLIRP, and loads a host-served
 HTTP page in Safari. Modern HTTPS remains an application-layer limitation of
 the 2007 browser; an HTTP reverse proxy on the host is the practical bridge
 to contemporary TLS sites.
+
+## 6. Feeding iBoot a radio-NVRAM payload: the reply format is NOT the obvious one (2026-07-28)
+
+Goal: make 1.0's Wi-Fi work by answering iBoot's `AT+xdrv=9,1,0;` radio-NVRAM
+read with real calibration instead of `NULL`, so `Installing WIFI Calibration`
+has something to install (see WIFI_SDIO_NOTES.md for why 1.0 needs the
+device-tree copy and 1.1.4 does not).
+
+**Two things this DID establish, and they are worth keeping.**
+
+1. **iBoot-159 really does perform the read.** Traced with
+   `IT_BASEBAND_TRACE` on a 1.0 boot: `AT+xdrv=9,1,0;` at t=2.72 s and again at
+   t=4.72 s, each answered `+XDRV: 9,1,0,0,NULL`, then one `AT+cgsn;`. So the
+   "1.0 gets no calibration because the stub returns NULL" chain is measured at
+   the iBoot end now, not inferred. (1.0's iBoot prints almost nothing, which is
+   why this needed the uart trace rather than the serial log.)
+
+2. **1.1.4 is the instrumented oracle for this work.** Its iBoot-204 prints
+   `Read %d bytes from nvram in %ld usec.`, which is the only feedback signal
+   available; 1.0 prints nothing. So iterate the reply format against 1.1.4,
+   and only then check 1.0 for the driver message. The lab loop is
+   `IT_BASEBAND_RULES=<file>` + `S5L8900_DEBUG=1` on the bundle launcher;
+   the nvram read happens ~2.7 s into guest time, so a probe needs well under a
+   minute of boot, not a full run to SpringBoard.
+
+**What was falsified.** Baseline (`...,0,NULL`) is *accepted*: one 1 s retry
+cycle, then `Read 0 bytes` and iBoot moves on. Every attempt to put the payload
+after the fourth comma was *rejected* — iBoot re-asked at 1 Hz until its 5 s
+window expired:
+
+| reply after `+XDRV: 9,1,` | payload | result |
+|---|---|---|
+| `0,0,<hex>` | 64 B hex | 5.0 s of retries, `Read 0 bytes` |
+| `0,64,<hex>` (len = bytes) | 64 B hex | 5.0 s, `Read 0 bytes` |
+| `0,128,<hex>` (len = chars) | 64 B hex | 5.0 s, `Read 0 bytes` |
+| `0,0,"<hex>"` (quoted) | 64 B hex | 5.0 s, `Read 0 bytes` |
+| `{int},64,<hex>` | 64 B hex | 5.0 s, `Read 0 bytes` |
+| `0,8,<hex>` | **8 B hex** | **2.0 s**, `Read 0 bytes` |
+
+**The one real clue: the retry count tracks payload length** (NULL → 1 s, 8 B →
+2 s, 64 B → 5 s = the cap). iBoot is consuming the reply, not ignoring it, and
+something length-dependent goes wrong. Hex-after-the-comma is the wrong
+transport.
+
+**Stop guessing; disassemble.** The remaining hypotheses (raw bytes after the
+header line rather than comma-separated, a different field order, a chunked
+multi-block protocol) are cheap to state and expensive to test one boot at a
+time. The right next step is ARM analysis of iBoot-159 around the string
+literals already located: `+xdrv=9,1,` (0x1a2b0), `%s%d` (0x1a2a8),
+`radio_get_atreply(): TIMEOUT!` (0x1a27c), `Failed to read block %d out of the
+radio.` (0x1a2c4), `Read %d bytes from nvram` (0x1a2f0), `Radio NVRAM Entries:`
+(0x1a318), `  Type: 0x%04x  Size: 0x%04x  Purpose:` (0x1a330). That last one
+also gives the *store* format for free once the transport is known: a record
+stream of `[u16 type][u16 size][data]`.
+
+Note the rules engine cannot express arbitrary binary today — `sgold2_unescape()`
+handles only `\r \n \t \\`, so a raw-byte transport needs a `\xNN` escape added
+to `hw/arm/ipod_touch_baseband.c` first.
