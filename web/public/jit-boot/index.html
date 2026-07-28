@@ -1,0 +1,131 @@
+<!-- Full boot of iPhone OS 1.0 (1A543a) in the browser, with the WebAssembly
+     JIT and the real 215 MiB NAND pack.
+
+     Deliberately dumb about assets: it fetches the whole pack up front, which
+     is what the chunked loader (W4) exists to replace. The point here is only
+     to prove the engine boots the guest end to end.
+
+     Serve with scripts/wasm/serve.py (the COOP/COEP headers are required) and
+     open /public/jit-boot/. -->
+<style>
+  body { font: 13px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem;
+         background: #14161a; color: #d7dae0; }
+  h1 { font-size: 14px; margin: 0 0 .75rem; color: #9aa4b2; font-weight: 600; }
+  #state { padding: .5rem .75rem; border-radius: 4px; background: #22262e;
+           margin-bottom: .5rem; }
+  #marks { padding: .5rem .75rem; border-radius: 4px; background: #1b1f26;
+           margin-bottom: .75rem; white-space: pre; color: #8fd694; }
+  .ok   { border-left: 3px solid #4ac26b; }
+  .fail { border-left: 3px solid #e5534b; }
+  #log { white-space: pre-wrap; line-height: 1.4; }
+  .err { color: #e5a3a0; }
+</style>
+<h1>iPhone OS 1.0 — full boot, WebAssembly JIT</h1>
+<div id="state">loading…</div>
+<div id="marks">(no landmarks yet)</div>
+<div id="log"></div>
+<script type="module">
+  const logEl = document.getElementById('log');
+  const stateEl = document.getElementById('state');
+  const marksEl = document.getElementById('marks');
+  const t0 = performance.now();
+  const at = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(7);
+
+  // Landmarks in boot order. `hit` is filled with the elapsed seconds so the
+  // page itself is the measurement, readable without a debugger attached.
+  const LANDMARKS = [
+    ['iBoot banner',   t => t.includes('BUILD_TAG')],
+    ['kernel',         t => t.includes('Darwin Kernel Version')],
+    ['BSD root',       t => t.includes('BSD root:')],
+    ['launchd',        t => t.includes('BOOT_TIME')],
+    ['SpringBoard',    t => t.includes('SpringBoard')],
+  ];
+  const hit = new Map();
+  let failed = null;
+
+  function renderMarks() {
+    marksEl.textContent = LANDMARKS
+      .map(([name]) => `${hit.has(name) ? hit.get(name).padStart(8) : '       —'}  ${name}`)
+      .join('\n');
+  }
+  renderMarks();
+
+  function state(text, cls) { stateEl.textContent = text; stateEl.className = cls || ''; }
+
+  function line(text, cls) {
+    const el = document.createElement('div');
+    if (cls) el.className = cls;
+    el.textContent = `[${at()}s] ${text}`;
+    logEl.appendChild(el);
+    if (logEl.childElementCount > 300) logEl.firstElementChild.remove();
+    logEl.scrollIntoView({ block: 'end' });
+  }
+
+  function note(text) {
+    for (const [name, test] of LANDMARKS) {
+      if (!hit.has(name) && test(text)) {
+        hit.set(name, at());
+        renderMarks();
+        if (name === 'SpringBoard') state('SpringBoard reached', 'ok');
+      }
+    }
+    if (/panic\(|kernel abort|hardware error/.test(text)) {
+      failed = text.slice(0, 120);
+      state(`guest failure: ${failed}`, 'fail');
+    }
+  }
+
+  addEventListener('error', (e) => {
+    const msg = String(e.message || e.error);
+    failed = msg;
+    state(`emulator failure: ${msg.slice(0, 140)}`, 'fail');
+    line(`window error: ${msg}`, 'err');
+  });
+
+  const { default: Module } = await import('./qemu-system-arm.js');
+
+  const FILES = [
+    ['/fw/bootrom', 'bootrom'],
+    ['/fw/iboot.bin', 'iboot.bin'],
+    ['/fw/nor.bin', 'nor.bin'],
+    ['/fw/nand/nand.pack', 'nand.pack'],
+  ];
+
+  await Module({
+    arguments: [
+      // epoch 0 is 1.0's; -icount shift=1 presents ~500 MHz, close to the real
+      // 412 MHz S5L8900. Without it the guest takes timeout paths and panics.
+      '-M', 'iPhone-2G,bootrom=/fw/bootrom,iboot=/fw/iboot.bin,' +
+            'nand=/fw/nand,epoch=0',
+      '-m', '1G',
+      '-pflash', '/fw/nor.bin',
+      '-display', 'none',
+      '-serial', 'stdio',
+      '-icount', 'shift=1',
+    ],
+    preRun: [async (mod) => {
+      mod.FS.mkdir('/fw');
+      mod.FS.mkdir('/fw/nand');
+      // Required even for a packed, read-only NAND: the model opens
+      // <nand>/bank<N>/<page>_new.page for writing on every guest page write
+      // and hw_error()s -- killing the emulator -- if the directory is absent.
+      for (let b = 0; b < 8; b++) mod.FS.mkdir(`/fw/nand/bank${b}`);
+
+      let staged = 0;
+      for (const [dst, src] of FILES) {
+        state(`downloading ${src}…`);
+        const data = new Uint8Array(await (await fetch(src)).arrayBuffer());
+        mod.FS.writeFile(dst, data);
+        staged += data.length;
+        line(`staged ${src} (${(data.length / 1048576).toFixed(1)} MiB)`);
+      }
+      state(`booting — ${(staged / 1048576).toFixed(1)} MiB in MEMFS`);
+    }],
+    print: (t) => { note(t); line(t); },
+    printErr: (t) => {
+      if (/unsupported syscall/.test(t)) return;
+      note(t);
+      line(t, 'err');
+    },
+  });
+</script>

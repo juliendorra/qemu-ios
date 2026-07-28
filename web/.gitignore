@@ -8,5 +8,12 @@
 node_modules/
 /dist/
 
-# JIT smoke test: firmware + a 52 MB emulator build, staged by hand.
-/public/jit-smoke/
+# Browser test pages under public/*-smoke/ and public/jit-boot/ are SOURCE and
+# are committed. What is staged next to them is not: Apple firmware and a 52 MB
+# emulator build, both reproducible.
+/public/*/bootrom
+/public/*/iboot.bin
+/public/*/nor.bin
+/public/*/nand.pack
+/public/*/qemu-system-arm.js
+/public/*/qemu-system-arm.wasm

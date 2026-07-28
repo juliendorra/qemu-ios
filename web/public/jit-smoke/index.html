@@ -1,0 +1,113 @@
+<!-- JIT smoke test.
+     Boots far enough to make the WebAssembly TCG backend compile translation
+     blocks, WITHOUT the 226 MB NAND: iBoot's own loops pass the backend's
+     1500-execution threshold within a second or two. That is all this page is
+     for -- it answers "does instantiate_wasm() succeed?", not "does the guest
+     boot".
+
+     Runs in a browser rather than Node because -sMEMORY64=1 (the mode the
+     backend is developed against) needs Node v23; browsers have had memory64
+     for a while. Requires the COOP/COEP headers, so serve it with
+     scripts/wasm/serve.py. -->
+<style>
+  body { font: 13px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem;
+         background: #14161a; color: #d7dae0; }
+  h1 { font-size: 14px; margin: 0 0 .75rem; color: #9aa4b2; font-weight: 600; }
+  #verdict { padding: .5rem .75rem; border-radius: 4px; margin-bottom: .75rem;
+             background: #22262e; }
+  .ok   { border-left: 3px solid #4ac26b; }
+  .fail { border-left: 3px solid #e5534b; }
+  #log { white-space: pre-wrap; line-height: 1.45; }
+  .err { color: #e5a3a0; }
+</style>
+<h1>WebAssembly TCG backend — smoke test (iBoot only, no NAND)</h1>
+<div id="verdict">running…</div>
+<div id="log"></div>
+<script type="module">
+  const logEl = document.getElementById('log');
+  const verdictEl = document.getElementById('verdict');
+  const t0 = performance.now();
+  const at = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(6);
+
+  let instantiated = false;      // did the JIT compile a block successfully?
+  let bufferSourceError = false; // the failure this page exists to detect
+
+  function line(text, cls) {
+    const el = document.createElement('div');
+    if (cls) el.className = cls;
+    el.textContent = `[${at()}s] ${text}`;
+    logEl.appendChild(el);
+    if (logEl.childElementCount > 400) logEl.firstElementChild.remove();
+  }
+
+  function verdict(text, cls) {
+    verdictEl.textContent = text;
+    verdictEl.className = cls;
+  }
+
+  // A failing WebAssembly.Module() inside the backend surfaces as an unhandled
+  // error from the pthread, not as a rejected promise, so watch globally.
+  addEventListener('error', (e) => {
+    const msg = String(e.message || e.error);
+    if (msg.includes('BufferSource')) bufferSourceError = true;
+    line(`window error: ${msg}`, 'err');
+  });
+
+  const { default: Module } = await import('./qemu-system-arm.js');
+
+  const files = [
+    ['/fw/bootrom', 'bootrom'],
+    ['/fw/iboot.bin', 'iboot.bin'],
+    ['/fw/nor.bin', 'nor.bin'],
+  ];
+
+  try {
+    await Module({
+      arguments: [
+        '-M', 'iPhone-2G,bootrom=/fw/bootrom,iboot=/fw/iboot.bin,' +
+              'nand=/fw/nand,epoch=0',
+        '-m', '1G',
+        '-pflash', '/fw/nor.bin',
+        '-display', 'none',
+        '-serial', 'stdio',
+        '-icount', 'shift=1',
+      ],
+      preRun: [async (mod) => {
+        mod.FS.mkdir('/fw');
+        mod.FS.mkdir('/fw/nand');
+        for (let b = 0; b < 8; b++) mod.FS.mkdir(`/fw/nand/bank${b}`);
+        for (const [dst, src] of files) {
+          const data = new Uint8Array(await (await fetch(src)).arrayBuffer());
+          mod.FS.writeFile(dst, data);
+        }
+        line(`staged ${files.length} artifacts into MEMFS`);
+      }],
+      print: (t) => {
+        line(t);
+        // iBoot's banner means the CPU executed a great deal of code, which
+        // means the JIT threshold was crossed without throwing.
+        if (t.includes('BUILD_TAG') || t.includes('iBoot, Copyright')) {
+          instantiated = true;
+        }
+      },
+      printErr: (t) => {
+        if (/unsupported syscall/.test(t)) return;
+        if (String(t).includes('BufferSource')) bufferSourceError = true;
+        line(t, 'err');
+      },
+    });
+  } catch (e) {
+    line(`threw: ${e && e.message ? e.message : e}`, 'err');
+  }
+
+  if (bufferSourceError) {
+    verdict('FAIL — WebAssembly.Module() got an empty buffer. The backend ' +
+            'compiled a block but the module bytes never reached JS.', 'fail');
+  } else if (instantiated) {
+    verdict('PASS — iBoot ran to its banner with the JIT active and no ' +
+            'instantiation error.', 'ok');
+  } else {
+    verdict('INCONCLUSIVE — no instantiation error, but iBoot did not reach ' +
+            'its banner either. Read the log.', 'fail');
+  }
+</script>
