@@ -689,3 +689,50 @@ SpringBoard's menu-button path can be read directly the way `AppleMRVL868x` was;
 (b) find where 1.0's kernel posts the button HID event and confirm whether it
 posts at all -- the PC data says something runs, so the interesting question is
 what it decides.
+
+## ANSWERED: the HOME event never reaches SpringBoard on 1.0 (2026-07-29)
+
+`scripts/springboard-button-breakpoint.py` resolves
+`-[SpringBoard menuButtonDown:]` / `menuButtonUp:` from the build's own
+`SpringBoard` binary (old-ABI `__OBJC` metadata, no symbols needed), sets gdbstub
+breakpoints there, opens an app, and presses HOME. iPhone OS 1.x has no ASLR, so
+the link-time address is the runtime address.
+
+```
+1.0    IMP 0x6ae0 / 0x6bd8   ->  NO HIT in 90 s
+1.1.4  IMP 0x78dc / 0x79d4   ->  BREAKPOINT HIT: T05thread:01;
+```
+
+**The control is the point.** 1.1.4 hits, so the instrument can produce a
+positive, and 1.0's miss is a real negative -- not another harness artifact.
+
+So on 1.0 the chain is: GPIO IRQ raised -> kernel reads INTSTAT/INTLEVEL, ACKs
+(byte-identical to 1.1.4) -> **and SpringBoard's handler is never called.** The
+break is in the kernel's HID posting path, between acknowledging the interrupt
+and delivering a GSEvent to SpringBoard. Everything above it -- the handlers,
+their `SBSyncController` gates, the early-return ivar -- is innocent, because it
+never runs.
+
+### What the handlers look like (recorded so nobody re-reads them)
+
+Both builds are structurally identical, which is itself evidence the difference
+is below them:
+
+```
+-[SpringBoard menuButtonUp:]
+    ldrsb r3, [self, #0x40]            ; 1.1.4: #0x44
+    cmp   r3, #0 ; movne/strbne/popne  ; early-return ivar, swallows the up
+    [[SBSyncController sharedInstance] isRestoring]        -> return
+    [[SBSyncController sharedInstance] isResetting]        -> return
+    [[SBSyncController sharedInstance] isSoftwareUpdating] -> return
+    ...
+```
+
+### Where to look next
+
+The kernel side of the button path, on 1.0 versus 1.1.4. The IRQ is handled
+identically, so the divergence is in what the handler DOES with it -- which
+driver claims the interrupt and whether it posts an event. Both kernelcaches
+are readable with the technique that worked twice today (`__PRELINK` skew
+0xC0027000 for 1A543a; recompute it for 4A102 from its own load commands), and
+the strings to anchor on are in the button/HID kext rather than SpringBoard.
