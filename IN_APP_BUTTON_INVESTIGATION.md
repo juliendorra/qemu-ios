@@ -345,6 +345,31 @@ which means something is now waiting on an MBX completion that never arrives
 instead of busy-polling for it. The MBX region still has **no IRQ connected at
 all**, which is the other half of T1.
 
+### Cross-check from the BROWSER port (2026-07-30): same verdict, same signature
+
+The WebAssembly build was rebuilt onto this fix and driven from the page
+(`web/public/jit-boot/index.html?sweep=home`: launch an app, press Home, watch
+the framebuffer). It agrees with `app-button-probe.py` step for step:
+
+| | native | browser |
+| --- | --- | --- |
+| open an app | PASS 97.10% | PASS 45.6% -> **94.7%** |
+| Home returns | **FAIL 0.00%** | **FAIL** -- stays at 96.3% |
+
+Two things this adds rather than repeats:
+
+* **An independent confirmation that the guest now IDLES rather than spins.**
+  The browser page samples `QEMU_CLOCK_VIRTUAL` and reports guest-seconds per
+  wall-second; after the Home press it swings to **0.24-0.69** with the frame
+  counter frozen. Under `-icount` a high ratio means virtual time is being
+  WARPED FORWARD because the cpu is halted -- the signature of an idle guest. A
+  spinning guest shows a low, steady ratio (~0.02, as this boot did while
+  working). So "waiting on an MBX completion that never arrives" is visible from
+  a second, independent instrument.
+* **It is not a browser artifact.** The event path, the button mapping and the
+  press duration are all exercised end to end there, so the remaining failure is
+  confined to display/compositing on both hosts.
+
 ### Is the change 1.0-specific? No -- all three builds ship the same MBX code
 
 Checked statically against each build's own RELEASE kernelcache (the iPod's root

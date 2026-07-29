@@ -126,6 +126,62 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### Picking up an engine fix, and making that cheap (2026-07-30)
+
+The 1.0 in-app button work landed a device-model fix (`e79971b5e9`: MBX register
+`0x12C` now returns `0x140`, setting the bit `AppleMBX` spins on). Integrating it
+into the browser port was one incremental rebuild —
+`IT_WASM_MEMORY64_FULL=1 scripts/wasm/build-qemu.sh`, ~30 s, no reconfigure,
+because it is a plain source change.
+
+**Verified in the browser, and it reproduces the NATIVE result exactly.**
+`?sweep=home` drives the whole round trip from the page: launch an app, press
+Home, look for SpringBoard.
+
+| | native (`app-button-probe.py`) | browser (`?sweep=home`) |
+| --- | --- | --- |
+| open an app | PASS 97.1% | PASS — 45.6% → **94.7%** |
+| Home returns | **FAIL 0.00%** | **FAIL** — stays at 96.3% |
+
+So the browser is faithful: **no browser-specific regression, and the remaining
+failure is the one `IN_APP_BUTTON_INVESTIGATION.md` already attributes to the MBX
+gap (T1) — display/compositing, not the event path.** The browser also
+independently confirms that doc's "the guest is idle rather than spinning": the
+heartbeat shows `guestRatio` swinging to 0.24–0.69, which is the signature of a
+HALTED cpu (icount warps virtual time forward when idle), with the frame counter
+frozen. A spinning guest would show a low, steady ratio.
+
+#### The rebuild was easy; the DEPLOY was not, and that is now fixed
+
+Rebuilding was always one command. **Deploying was a manual copy of
+`qemu-system-arm.{js,wasm}` into the page directory**, done by hand five times in
+one session — and a stale copy silently gives you old-engine results, which is
+precisely the class of mistake this port keeps paying for (see the wrong NAND at
+the canonical path).
+
+Session B had already solved it and `web/.gitignore` already documented the
+intent, so the fix was to adopt the existing convention rather than invent one:
+**the viewer's artifacts are now symlinks**, exactly as `web/bench-b/`'s are.
+
+```
+web/public/jit-boot/qemu-system-arm.js   -> ../../../build-wasm/qemu-system-arm.js
+web/public/jit-boot/qemu-system-arm.wasm -> ../../../build-wasm/qemu-system-arm.wasm
+web/public/jit-boot/bootrom              -> ../../../m68ap-artifacts/shared/bootrom_s5l8900
+web/public/jit-boot/iboot.bin            -> ../../../m68ap-artifacts/builds/1A543a/iboot-sb.bin
+web/public/jit-boot/nor.bin              -> ../../../m68ap-artifacts/builds/1A543a/nor.bin
+```
+
+A rebuild is now live in the page immediately, with no copy step and no way to
+serve a stale engine. The `.gitignore` rules already cover these paths.
+
+`web/public/jit-boot/nand.pack` (216 MiB) stays only because `web/bench-b/`
+fetches it; the viewer no longer reads it.
+
+**Still not automatic, and worth knowing:** a change to
+`configs/meson/emscripten.txt` needs `--configure`, because meson reads a cross
+file's `[built-in options]` only at configure time. A plain rebuild is a silent
+no-op for those flags.
+
 ### Chunked delivery merged into the viewer — 18.57 MiB cold, 0 warm
 
 The last join between the two parallel sessions: the page that *paints* was

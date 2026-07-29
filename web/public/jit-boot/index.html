@@ -189,6 +189,12 @@
     // of GUEST time, which at a ratio of 0.018 is about 110 seconds of WALL
     // time. Any press sweep that starts tapping before that measures the gate,
     // not the press.
+    // [BTN] and ONKEY too: without them a headless run cannot tell "the button
+    // never reached the guest" from "it reached the guest and nothing happened",
+    // which is exactly the distinction the in-app HOME bug turns on.
+    if (/\[BTN\]|ONKEY/.test(text)) {
+      console.log(`[guest] ${text.trim()}`);
+    }
     if (/\[TOUCH\]|\[LCD\] (Touch input|Retained touch)/.test(text)) {
       console.log(`[guest] ${text.trim()}`);
       if (/Touch input ready|Retained touch input ready/.test(text)) {
@@ -638,6 +644,50 @@
     console.log('[sweep] no rung registered up to '
                 + SWEEP_WALL_MS[SWEEP_WALL_MS.length - 1] + 'ms');
   }
+  // ?sweep=home checks the thing the MBX fix (e79971b5e9) was for: on 1.0,
+  // pressing Home from INSIDE an app used to do nothing. SpringBoard was
+  // spinning on an AppleMBX register bit our stub never set, so it stopped
+  // delivering events after the first press. This drives the whole round trip
+  // -- launch an app, press Home, come back -- from the page, so the engine fix
+  // is verified in the browser rather than assumed to carry over.
+  async function runHomeCheck() {
+    await awaitTouchGate();
+    const home = nonBlackPct;
+    const [px, py] = SWEEP_TARGETS[0];
+    console.log(`[home] baseline=${home}% -- launching an app at (${px},${py})`);
+    tapWall(px, py, MIN_PRESS_MS);
+
+    // Wait for the app to fill the panel. The home screen sits at ~45% and an
+    // app at ~96-99%, so this is unambiguous.
+    let launched = false;
+    for (let i = 0; i < 20 && !launched; i++) {
+      await sleep(5000);
+      launched = nonBlackPct > 80;
+    }
+    console.log(`[home] launched=${launched} nonBlack=${nonBlackPct}%`);
+    if (!launched) {
+      sweepResult = { mode: 'home', launched: false, invalid: 'app never launched' };
+      report(true);
+      return;
+    }
+    const inApp = nonBlackPct;
+
+    console.log('[home] pressing Home from inside the app');
+    pressButton(BUTTON_HOME);
+    let returned = false;
+    for (let i = 0; i < 20 && !returned; i++) {
+      await sleep(5000);
+      // Back on SpringBoard: away from the app's ~96-99% and near the home
+      // screen's ~45%. A blank panel (<5%) would mean it slept, not returned.
+      returned = nonBlackPct > 5 && nonBlackPct < 70;
+    }
+    sweepResult = { mode: 'home', launched: true, inAppPct: inApp,
+                    afterHomePct: nonBlackPct, returned };
+    report(true);
+    console.log(`[home] RESULT returned=${returned} `
+                + `home=${home}% inApp=${inApp}% after=${nonBlackPct}%`);
+  }
+
   let sweepResult = null;
   const SWEEP_MODE = new URLSearchParams(location.search).get('sweep');
 
@@ -712,6 +762,7 @@
 
       if (SWEEP_MODE === '1') runSweep();
       else if (SWEEP_MODE === 'real') runVerify();
+      else if (SWEEP_MODE === 'home') runHomeCheck();
     },
     preRun: [async (mod) => {
       // preRun runs on the MAIN thread, so this is the Module whose exports
