@@ -336,13 +336,18 @@ second (`?nested=1` to see the failing arrangement). Use it before rebuilding
 the emulator for anything in this protocol.
 
 **A cold browser boot now reaches the SpringBoard HOME SCREEN from chunked
-assets:** first pixels 10 s, kernel 157 s, BSD root 170 s, **home screen 290 s**,
-verified at **45.2% non-black** in the kernel framebuffer (59.04% natively,
-~1.6% for the Apple logo). 507 chunk requests = **18.63 MiB** for a 215.6 MiB
+assets:** first pixels 12 s, kernel 156 s, BSD root 169 s, **home screen 252 s**,
+verified at **45.5% non-black** in the kernel framebuffer (59.04% natively,
+~1.6% for the Apple logo). 504 chunk requests = **18.57 MiB** for a 215.6 MiB
 pack, with a 97% hit rate in the emulator's chunk LRU. Warm pulls **0 bytes**.
 
-Speed, measured rather than inferred: **55.08 s of guest time in 441.7 s of
-wall clock — 12.5% of real time** at `-icount shift=1`.
+Speed, measured rather than inferred: **32.5 s of guest time in 315 s of wall
+clock — ~10% of real time** at `-icount shift=1`. That is the gap the
+real-time goal has to close.
+
+The **adaptive JIT threshold is now the default** (`adaptive=0` in
+`/fw/jit-tune` pins the old static behaviour): same boot, 252 s with zero
+evictions against 290 s with 72,000 evictions and 4,557 recompiles.
 
 Three things that boot needs, and each one was a stall until it was there:
 

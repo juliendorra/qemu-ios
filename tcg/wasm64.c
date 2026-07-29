@@ -92,7 +92,7 @@ static long jit_tunable(const char *env, const char *key, long fallback)
 }
 
 /*
- * ADAPTIVE THRESHOLD (adaptive=1 in /fw/jit-tune, off by default).
+ * ADAPTIVE THRESHOLD -- ON BY DEFAULT since 2026-07-29 (adaptive=0 disables).
  *
  * A boot and a running app want opposite settings. A boot is a long COLD TAIL
  * -- tens of thousands of blocks executed a few hundred times each -- and wants
@@ -109,6 +109,17 @@ static long jit_tunable(const char *env, const char *key, long fallback)
  *
  * Recomputed on each compile and each eviction, never per TB execution: the
  * hot path reads one int.
+ *
+ * Measured on full browser boots of iPhone OS 1.0, chunked, to the SpringBoard
+ * home screen:
+ *
+ *   static 100    home screen 290 s   evicted 72,000   recompiled 4,557
+ *   adaptive 100  home screen 258 s   evicted      0   recompiled     0
+ *
+ * and on the launchd landmark it turned a setting that twice went into the
+ * eviction-churn regime (692 s, 736 s) into one that cannot (143 s, 146 s).
+ * It has not been slower than the best static value in anything measured,
+ * which is why it is the default rather than an option.
  */
 static bool jit_adaptive;
 static int jit_threshold;          /* effective; == jit_instantiate_num when off */
@@ -969,7 +980,7 @@ static void init_wasm(void)
                                                         : INSTANTIATE_NUM_DEFAULT;
         jit_max_instances = (cap > 0 && cap <= MAX_INSTANCES) ? (int)cap
                                                               : MAX_INSTANCES;
-        jit_adaptive = jit_tunable("IT_WASM_JIT_ADAPTIVE", "adaptive", 0) != 0;
+        jit_adaptive = jit_tunable("IT_WASM_JIT_ADAPTIVE", "adaptive", 1) != 0;
         jit_threshold = jit_instantiate_num;
         fprintf(stderr, "[JIT] tuning: instantiate=%d max_instances=%d "
                 "adaptive=%d\n", jit_instantiate_num, jit_max_instances,

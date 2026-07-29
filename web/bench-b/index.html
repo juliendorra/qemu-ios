@@ -50,7 +50,8 @@
   const CHUNK_BASE = params.get('chunks') || '/chunked/1A543a/';
   const PREFETCH = params.get('prefetch') !== '0';
   const COLD = params.get('cold') === '1';           // drop the chunk cache
-  const ADAPTIVE = params.get('adaptive') === '1';   // scale the threshold
+  // Default ON, matching tcg/wasm64.c; ?adaptive=0 pins the static threshold.
+  const ADAPTIVE = params.get('adaptive') !== '0';
   // Echoed back in every report so the server can reject posts from another
   // page -- Session A's page posts to the same endpoint.
   const LABEL = params.get('label') || 'bench-b';

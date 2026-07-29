@@ -575,24 +575,37 @@ screen**, with the NAND arriving as 130,944-byte chunks over the network:
 
 | landmark | wall clock |
 | --- | --- |
-| first pixels | 10 s |
-| Darwin kernel | 157 s |
-| BSD root | 170 s |
-| **home screen** | **290 s** |
+| first pixels | 12 s |
+| Darwin kernel | 156 s |
+| BSD root | 169 s |
+| **home screen** | **252 s** |
 
 Verified the way this repo always verifies it — by pixels, not by serial:
-**45.2% non-black** in the kernel framebuffer after settling, against 59.04%
-natively and ~1.6% for the Apple logo. 507 chunk requests, **18.63 MiB** on the
+**45.5% non-black** in the kernel framebuffer after settling, against 59.04%
+natively and ~1.6% for the Apple logo. 504 chunk requests, **18.57 MiB** on the
 wire, for a 215.6 MiB pack.
 
 The emulator's own chunk cache reports `fetched=768 hits=23310` — a **97% hit
 rate** in the 64-slot LRU, 95.8 MiB of records consumed for 18.6 MiB
 downloaded, which is the read amplification the chunk size trades away.
 
-**Speed, honestly:** 55.08 s of guest virtual time in 441.7 s of wall clock, so
-the guest runs at **12.5% of real time** at `-icount shift=1`. That is the
-number the real-time goal has to move, and it is measured now rather than
-inferred.
+**Speed, honestly:** 32.5 s of guest virtual time in 315 s of wall clock, so
+the guest runs at **~10% of real time** at `-icount shift=1`. That is the number
+the real-time goal has to move, and it is measured now rather than inferred.
+
+**This run is what the defaults now do.** The adaptive threshold was switched on
+by default on the strength of it — the same boot, same build, differing only in
+that setting:
+
+| threshold | home screen | evicted | recompiled |
+| --- | --- | --- | --- |
+| static 100 | 290 s | 72,000 | 4,557 |
+| **adaptive (default)** | **252 s** | **0** | **0** |
+
+`adaptive=0` in `/fw/jit-tune` pins the old behaviour. Session A's page writes
+no tune file, so it gets the adaptive default too — measured better in
+everything tried, and it cannot enter the eviction-churn regime that cost two
+runs ten minutes each.
 
 ### Two things the full boot needed, and one that had to be measured to believe
 

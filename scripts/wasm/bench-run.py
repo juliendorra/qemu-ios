@@ -88,8 +88,9 @@ def main() -> None:
     parser.add_argument("--no-sw", action="store_true",
                         help="chunked mode: bypass the service worker and let "
                              "the emulator's XHRs hit the network directly")
-    parser.add_argument("--adaptive", action="store_true",
-                        help="scale the compile threshold with cap pressure")
+    parser.add_argument("--static-threshold", action="store_true",
+                        help="pin the compile threshold instead of scaling it "
+                             "with cap pressure (adaptive is the default)")
     parser.add_argument("--until", default="launchd",
                         help="stop once this landmark is reached "
                              "(iBoot banner/kernel/BSD root/launchd/SpringBoard)")
@@ -136,8 +137,8 @@ def main() -> None:
             query += "&cold=1"
         if args.no_prefetch:
             query += "&prefetch=0"
-        if args.adaptive:
-            query += "&adaptive=1"
+        if args.static_threshold:
+            query += "&adaptive=0"
         if args.no_sw:
             query += "&sw=0"
         if args.display:
