@@ -359,6 +359,47 @@ and it splits the question cleanly:
 - frame not consumed → the model queued a frame the driver never took, and the
   ATN/queue path is where to look.
 
+### First `IT_MT_TRACE=1` run (2026-07-29): the native harness takes NO touch
+
+Run with `scripts/touch-probe.py` (which gained `--build`, `--hold`, repeatable
+`--tap` and per-tap `[MT] frame consumed` counting for this), on 1.0, three taps
+in one boot with a writable NAND clone and `IT_MT_TRACE=1`:
+
+| tap | verdict | changed | frames consumed | ATN edges |
+| --- | --- | --- | --- | --- |
+| 45,67 (row 1) | `frame-never-consumed` | 0.00% | **0** | **1** |
+| 200,437 (dock) | `frame-never-consumed` | 0.00% | 0 | **0** |
+| 45,157 (row 2) | `frame-never-consumed` | 0.00% | 0 | **0** |
+
+`[LCD] Touch input ready` had fired and every tap was accepted by the LCD
+handler, so this is not the readiness gate.
+
+**This run does not answer the row-1 question — it invalidates itself as a
+control**, because y=157 is a coordinate that demonstrably launches an app in the
+browser and here it did nothing either. Something in this native configuration
+takes no touches at all.
+
+Two things it *does* establish:
+
+- **One lost frame silences the channel.** The first tap raised exactly one ATN
+  edge and was never consumed, and the two later taps raised **none** — which is
+  what `ipod_touch_multitouch_queue_frame()` does by construction: with
+  `next_frame` still occupied, later frames go to `deferred_frame` and no new
+  ATN edge is generated. So a driver that misses the first edge stops receiving
+  anything, silently.
+- **`-icount` is NOT the cause.** It was the prime suspect, because
+  `touch-probe.py` had `-icount shift=1` added the same day and touch had worked
+  in this tool before. A rerun with icount off behaved identically: 1 ATN edge,
+  0 frames consumed, 0.00% change. The suspicion was wrong and is recorded as
+  such. `--icount` is now an opt-in flag on the tool, defaulting off.
+
+**Next:** find out why the first frame is never consumed here, since that gates
+everything else. Candidates not yet excluded: `IT_M68AP_NO_BASEBAND=1` (which
+`touch-probe.py` sets by default), tapping too soon after the gate, and whether
+the Z1 firmware upload completed in this boot (`IT_MT_TRACE=1` logs the
+transitions). Only once a native tap is consumed at ALL does the row-1 versus
+near-the-extremes question become answerable natively.
+
 **Worth checking whether it is really "row 1" or "near the extremes".** `fy`
 0.860 is close to the top of the range while both working rows sit mid-panel
 (0.481–0.673). If the sensor coordinate space is narrower than the screen, the

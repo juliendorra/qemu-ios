@@ -411,15 +411,25 @@ scripts/wasm/analyze-nand-trace.py /tmp/boot.trace \
   m68ap-artifacts/builds/<BUILD>/nand/nand.pack --pages-per-chunk 62
 ```
 
-## W4a — The last join: chunked delivery in the VISIBLE page
+## W4a — The last join: chunked delivery in the VISIBLE page — DONE (2026-07-29)
 
-The page that paints still stages the whole pack; the page that streams chunks
-does not paint. Joining them is five calls and one reconfigure, written up as a
-pasteable brief in
-[`BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md`](BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md).
+**The viewer streams the NAND.** 18.57 MiB cold, **0 bytes warm**, home screen at
+249.5 s cold and 241.0 s warm — *faster* than the 215 MiB whole-pack path
+(268 s), so chunking is not a trade-off here. Verified by bytes at
+`/__chunk-stats`, and the cold figure matches Session B's independent
+measurement exactly: two different pages, same seam, same bytes.
 
-It belongs to whoever owns `web/public/*/index.html` — Session A — because that
-file is under active edit; the seam itself is done and measured.
+Done by following B's pasteable brief,
+[`BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md`](BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md),
+unchanged — nothing in B's files needed touching. The four load-bearing details
+are in that brief; the one bug worth repeating here is that the page's own byte
+readout must use **`bytesFromNetwork`**, not `bytesServed` (which counts cache
+hits, so a warm boot looks like it downloaded everything) and not a `bytes`
+field, which does not exist and reports zero forever through `??`.
+
+**A first visit costs ~19 MiB and a second costs nothing. What is still missing
+for an INSTANT boot is the snapshot, not the assets** — see W5a, which remains
+the one unbuilt piece of the "full boot from scratch, plus resume" goal.
 
 ## W5 — Display and input bridges — DONE (2026-07-29)
 

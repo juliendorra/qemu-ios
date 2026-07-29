@@ -126,6 +126,56 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### Chunked delivery merged into the viewer — 18.57 MiB cold, 0 warm
+
+The last join between the two parallel sessions: the page that *paints* was
+still staging the whole 215 MiB pack, while the page that *streamed chunks* did
+not paint. Session B's brief for this is
+[`BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md`](BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md);
+nothing in B's files needed changing.
+
+Measured in the viewer, headless with throttles off, verified **by bytes at the
+server** (`/__chunk-stats`) rather than by what the page believed:
+
+| | cold cache | warm cache | whole pack (best prior) |
+| --- | --- | --- | --- |
+| download | **18.57 MiB** | **0 bytes** | 215.6 MiB |
+| chunk requests | 504 | 0 (1137/1137 cache hits) | — |
+| first pixels | 0.8 s | 0.5 s | 1.0 s |
+| kernel | 156 s | 148 s | 138 s |
+| launchd | 195 s | 186 s | 170 s |
+| **home screen** (45.6% non-black) | **249.5 s** | **241.0 s** | 268 s |
+
+**Chunked is not a trade-off here — it is faster AND 11.6x smaller.** 18.57 MiB
+matches B's independently measured figure exactly, which is the cross-check that
+matters: two different pages, same seam, same bytes.
+
+Four things the brief was right to spell out, all load-bearing:
+
+- **The service worker must be CONTROLLING the page before the Module exists**,
+  or the first chunk requests bypass the cache.
+- **The PAGE owns the fetch worker**, not the emulator's thread — a nested
+  dedicated worker is serviced through its parent's context, and that parent is
+  the thread blocked in `Atomics.wait`.
+- **`overlay=ram` in `<nand>/nand-tune` is mandatory.** Without an overlay the
+  boot stalls after launchd for ever, and the file-backed writable mode is
+  *worse* than useless under `-sPROXY_TO_PTHREAD`: every MEMFS syscall is
+  proxied to the main thread, so the per-read `stat()` becomes a cross-thread
+  round trip.
+- **Await the prefetch.** A demand-faulted chunk costs the guest a full round
+  trip while it blocks.
+
+**One bug, mine, and it is the kind worth naming:** the page reported
+`chunks=0.00MiB` while the server had shipped 18.5 MiB, because `chunkStats()`
+returns `{hits, misses, bytesFromNetwork, bytesServed}` and the page read a
+`bytes` field that does not exist — silently, via `??`. Two lessons: an optional
+-chaining default will happily report zero forever, and **`bytesFromNetwork` is
+the field that answers "what did this visit cost"** — `bytesServed` counts cache
+hits, so a warm boot reported through it looks like it downloaded the lot.
+
+The whole-pack path is gone from the viewer, but `web/public/jit-boot/nand.pack`
+must stay on disk: `web/bench-b/` still fetches it.
+
 ### Guest time is far slower than wall time, and that breaks normal taps
 
 The first real click on an icon did nothing, and the log said why:

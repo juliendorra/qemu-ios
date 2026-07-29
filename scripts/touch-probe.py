@@ -45,6 +45,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import m68ap_paths  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get("IPOD_APP", "/Applications/iPod Touch.app/Contents"))
 IPOD_FILES = APP / "Resources" / "ipod_files"
@@ -103,7 +106,15 @@ class QMP:
 
 
 def tap(q: QMP, px: int, py: int, hold: float = 0.12):
-    """One finger down/up at a panel pixel, via the absolute pointer."""
+    """One finger down/up at a panel pixel, via the absolute pointer.
+
+    `hold` matters. The multitouch model reports motion at
+    MT_MOTION_REPORT_HZ (60) in GUEST time, so a press shorter than one report
+    interval can be delivered as an instantaneous down/up pair that the guest
+    never observes as a finger. 0.12 s is comfortable natively, where guest time
+    tracks wall time; under emulation slow enough that it does not (the browser
+    port runs at ~2% of real time), it is not.
+    """
     x = int(px / FB_W * 32768)
     y = int(py / FB_H * 32768)
     move = [{"type": "abs", "data": {"axis": "x", "value": x}},
@@ -162,13 +173,26 @@ def main() -> int:
     ap.add_argument("--iboot", type=Path)
     ap.add_argument("--nor", type=Path)
     ap.add_argument("--logs", type=Path, required=True)
-    ap.add_argument("--tap", default="200,437",
-                    help="panel pixel to tap, 'x,y' (default: dock slot 3)")
+    ap.add_argument("--tap", action="append", default=None,
+                    help="panel pixel to tap, 'x,y' (default 200,437 = dock "
+                         "slot 3; repeatable, and taps run in "
+                         "order in ONE boot, so put the expected no-op first "
+                         "-- a tap that works launches an app and there may be "
+                         "no way back)")
+    ap.add_argument("--hold", type=float, default=0.12,
+                    help="seconds to hold each tap")
+    m68ap_paths.add_build_argument(ap, required=False)
     ap.add_argument("--boot-wait", type=float, default=200)
     ap.add_argument("--settle", type=float, default=12,
                     help="seconds to wait after the tap before re-grabbing")
+    ap.add_argument("--icount", default=None,
+                    help="icount shift (e.g. 1). OFF by default -- it appears "
+                         "to suppress multitouch frame consumption; see the "
+                         "note in the source")
     ap.add_argument("--qemu", type=Path, default=QEMU)
     args = ap.parse_args()
+
+    taps = args.tap or ["200,437"]      # default: dock slot 3
 
     args.logs.mkdir(parents=True, exist_ok=True)
     grab.classify = _load_classifier()
@@ -183,20 +207,51 @@ def main() -> int:
     else:
         machine, iboot = "iPhone-2G", args.iboot
         nand, nor = args.nand, args.nor
+        bootrom, epoch = M68_BOOTROM, None
+        # --build fills the artifact paths AND the security epoch from the
+        # canonical layout. Without the epoch this tool could not boot anything
+        # but 1.1.4: a wrong epoch wedges iBoot with an EMPTY serial log, which
+        # looks exactly like a hang. Explicit paths still win.
+        if args.build:
+            paths = m68ap_paths.get(args.build)
+            paths.require("iboot_sb", "nor", "nand")
+            iboot = iboot or paths.iboot_sb
+            nor = nor or paths.nor
+            nand = nand or paths.nand
+            epoch = paths.epoch
+            if paths.bootrom:
+                bootrom = paths.bootrom
+            print(f"[touch-probe] {m68ap_paths.describe(args.build)}")
         if not (iboot and nand and nor):
-            ap.error("--iboot/--nand/--nor are required for m68ap")
+            ap.error("--iboot/--nand/--nor are required for m68ap "
+                     "(or pass --build)")
+
+    machine_str = f"{machine},bootrom={bootrom if args.board == 'm68ap' else M68_BOOTROM}," \
+                  f"iboot={iboot},nand={nand}"
+    if args.board == "m68ap" and epoch is not None:
+        machine_str += f",epoch={epoch}"
 
     cmd = [str(args.qemu),
-           "-M", f"{machine},bootrom={M68_BOOTROM},iboot={iboot},nand={nand}",
+           "-M", machine_str,
            "-m", "1G", "-pflash", str(nor), "-L", str(PC_BIOS),
            "-display", "none", "-serial", f"file:{serial}",
            "-qmp", f"unix:{qmp_path},server,nowait"]
+    # An honest clock stops the guest taking timeout paths and panicking
+    # (measured natively at 1 panic in 3 boots), so it is the right default for
+    # a BOOT. But it is off by default here, because it appears to break the
+    # thing this tool measures: with -icount shift=1 a run reached the home
+    # screen with `[LCD] Touch input ready` and then consumed ZERO multitouch
+    # frames from three taps, including a coordinate that demonstrably launches
+    # an app in the browser. Use --icount to reproduce that.
+    if args.icount:
+        cmd[1:1] = ["-icount", f"shift={args.icount}"]
     env = dict(os.environ)
     env.setdefault("IT_M68AP_NO_BASEBAND", "1")
     (args.logs / "command.txt").write_text(" ".join(cmd) + "\n")
     proc = subprocess.Popen(cmd, env=env, stdout=stderr.open("wb"),
                             stderr=subprocess.STDOUT)
-    result = {"board": args.board, "tap": args.tap}
+    result = {"board": args.board, "taps": taps, "hold_s": args.hold,
+              "results": []}
     try:
         time.sleep(args.boot_wait)
         q = QMP(qmp_path)
@@ -204,23 +259,52 @@ def main() -> int:
         result["before"] = {"fb": label, **kind}
         write_png(before, args.logs / "before.png")
 
-        px, py = (int(v) for v in args.tap.split(","))
-        tap(q, px, py)
-        time.sleep(args.settle)
+        prev = before
+        for i, spec in enumerate(taps):
+            px, py = (int(v) for v in spec.split(","))
+            mark = stderr.stat().st_size          # only read what THIS tap said
+            tap(q, px, py, hold=args.hold)
+            time.sleep(args.settle)
 
-        after, label2, kind2 = grab(q, args.logs / "after")
-        result["after"] = {"fb": label2, **kind2}
-        write_png(after, args.logs / "after.png")
-        result["changed_pct"] = diff_pct(before, after)
-        # The model prints this once a frame has been visibly stable; without
-        # it, taps are dropped by design and a "no change" verdict is moot.
+            after, label2, kind2 = grab(q, args.logs / f"after{i}")
+            write_png(after, args.logs / f"after{i}.png")
+            with stderr.open("rb") as fh:
+                fh.seek(mark)
+                fresh = fh.read().decode("utf-8", "replace")
+
+            # `[MT] frame consumed` is THE signal that the guest actually took
+            # the touch. Everything else -- ATN raised, bytes clocked, the LCD
+            # logging a mouse DOWN -- can be true while the driver drops the
+            # frame, which is exactly the case this probe exists to distinguish.
+            # Requires IT_MT_TRACE=1 in the environment.
+            consumed = [ln.strip() for ln in fresh.splitlines()
+                        if "frame consumed" in ln]
+            entry = {
+                "tap": spec,
+                "changed_pct": diff_pct(prev, after),
+                "fb": label2, **kind2,
+                "touch_delivered": "[TOUCH] mouse DOWN" in fresh,
+                "touch_refused": "Ignoring input until" in fresh,
+                "mt_frames_consumed": len(consumed),
+                "mt_consumed_events": consumed[:8],
+                "atn_edges": fresh.count("ATN edge"),
+            }
+            entry["verdict"] = (
+                "interactive" if entry["changed_pct"] >= 1.0 else
+                "input-gated" if entry["touch_refused"] else
+                "delivered-but-ignored" if entry["mt_frames_consumed"] else
+                "frame-never-consumed" if entry["touch_delivered"] else
+                "not-delivered")
+            result["results"].append(entry)
+            print(f"[touch-probe] tap {spec}: {entry['verdict']} "
+                  f"changed={entry['changed_pct']:.2f}% "
+                  f"consumed={entry['mt_frames_consumed']} "
+                  f"atn={entry['atn_edges']}", flush=True)
+            prev = after
+
         blob = stderr.read_text(errors="replace")
         result["input_ready"] = "Touch input ready" in blob
-        result["touch_delivered"] = "[TOUCH] mouse DOWN" in blob
-        result["verdict"] = (
-            "interactive" if result["changed_pct"] >= 1.0 else
-            "no-response" if result["touch_delivered"] else
-            "input-gated")
+        result["mt_trace_enabled"] = "ATN edge" in blob or "frame consumed" in blob
         q.close()
     finally:
         if proc.poll() is None:
@@ -233,7 +317,12 @@ def main() -> int:
 
     (args.logs / "touch-probe.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
-    print(f"\nPNGs: {args.logs}/before.png {args.logs}/after.png")
+    if not result.get("mt_trace_enabled"):
+        print("\nNOTE: no [MT] lines seen -- run with IT_MT_TRACE=1 for the "
+              "'frame consumed' verdict, which is the only signal that the "
+              "guest actually TOOK a touch.")
+    print(f"\nPNGs: {args.logs}/before.png "
+          + " ".join(f"{args.logs}/after{i}.png" for i in range(len(taps))))
     return 0
 
 

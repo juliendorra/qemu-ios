@@ -1,13 +1,13 @@
-<!-- Full boot of iPhone OS 1.0 (1A543a) in the browser, with the WebAssembly
-     JIT and the real 215 MiB NAND pack.
+<!-- Full boot of iPhone OS 1.0 (1A543a) in the browser: the WebAssembly JIT,
+     the panel painted from the guest framebuffer, touch and buttons, and the
+     NAND streamed as Brotli'd chunks instead of a 215 MiB up-front download.
 
-     Deliberately dumb about assets: it fetches the whole pack up front, which
-     is what the chunked loader (W4) exists to replace. The point here is to
-     prove the engine boots the guest end to end, paints the panel, and takes
-     touch.
+     Serve with scripts/wasm/serve.py -- the COOP/COEP headers are required for
+     SharedArrayBuffer, and the chunks are stored already-compressed so they
+     need the dev server's Content-Encoding: br. Then open /public/jit-boot/.
 
-     Serve with scripts/wasm/serve.py (the COOP/COEP headers are required) and
-     open /public/jit-boot/. -->
+     Verify the delivery by BYTES, not by belief: /__chunk-stats reports what
+     the server actually shipped. Expect ~18.5 MiB cold and ~0 warm. -->
 <title>iPhone OS 1.0 in the browser</title>
 <style>
   body { font: 13px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem;
@@ -76,6 +76,10 @@
   let moduleRef = null;  // the MAIN THREAD's Module -- see the note below
   let serialSeen = 0;    // bytes of guest serial already rendered
   let touchReady = false;  // the guest's input gate has armed
+  // bytesFromNetwork, NOT bytesServed: the latter counts cache hits too, so a
+  // warm boot would report the full working set and look like it downloaded it.
+  let chunkBytes = 0;
+  let chunkHits = 0, chunkMisses = 0;
 
   function renderMarks() {
     const rows = LANDMARKS.map(([name]) =>
@@ -112,6 +116,9 @@
       nonBlackPct,
       guestRatio: Number(guestRatio.toFixed(4)),
       guestMs: guestMs(),
+      chunkBytes,
+      chunkHits,
+      chunkMisses,
       sweep: sweepResult,
       failure: failed,
     });
@@ -128,9 +135,23 @@
   // A heartbeat, so a headless run says something every 15 s even before the
   // first landmark. Silence then means the page is genuinely wedged, which is
   // the distinction that was impossible to draw without it.
-  setInterval(() => {
+  //
+  // It also carries the chunk byte count, because that is the ONLY honest check
+  // on chunked delivery: the page believing it streamed is not evidence.
+  setInterval(async () => {
+    let bytes = '';
+    try {
+      const st = await chunkStats();
+      if (st) {
+        chunkBytes = st.bytesFromNetwork ?? 0;
+        chunkHits = st.hits ?? 0;
+        chunkMisses = st.misses ?? 0;
+        bytes = ` net=${(chunkBytes / 1048576).toFixed(2)}MiB`
+                + ` hit=${chunkHits}/${chunkHits + chunkMisses}`;
+      }
+    } catch (e) { /* the worker may not be controlling yet */ }
     console.log(`[bench] t=${at()}s frames=${frames} nonBlack=${nonBlackPct}%`
-                + ` guestRatio=${guestRatio.toFixed(4)}`
+                + ` guestRatio=${guestRatio.toFixed(4)}${bytes}`
                 + ` landmarks=${[...hit.keys()].join(',') || 'none'}`);
     report(true);
   }, 15000);
@@ -621,21 +642,42 @@
   const SWEEP_MODE = new URLSearchParams(location.search).get('sweep');
 
   // ---------------------------------------------------------------- boot ---
+  import { registerChunkWorker, loadManifest, stageChunkedNand,
+           prefetchBootSet, startChunkFetcher, chunkStats }
+    from '../../src/emulator/chunk-loader.js';
+
+  // 1A543a only, for now. The chunk set for 4A102 exists, but this page's
+  // bootrom/iBoot/NOR are 1.0's and the security epoch is firmware-keyed --
+  // booting 1.1.4's NAND against 1.0's epoch wedges iBoot with an EMPTY serial
+  // log, which looks exactly like a hang. A version picker needs those three
+  // artifacts staged per build first.
+  const BUILD = '1A543a';
+  const EPOCH = 0;
+
   const { default: Module } = await import('./qemu-system-arm.js');
 
+  // Only the small artifacts are still fetched whole; the NAND arrives as
+  // chunks, on demand, through the service worker.
   const FILES = [
     ['/fw/bootrom', 'bootrom'],
     ['/fw/iboot.bin', 'iboot.bin'],
     ['/fw/nor.bin', 'nor.bin'],
-    ['/fw/nand/nand.pack', 'nand.pack'],
   ];
+
+  // The service worker has to be CONTROLLING the page before the first chunk
+  // request, or those requests bypass the cache entirely.
+  state('registering the chunk worker…');
+  await registerChunkWorker('/sw.js');
+  const manifest = await loadManifest(`/chunked/${BUILD}/`);
+  line(`chunk manifest: ${manifest.hashes.length} chunks, `
+       + `${manifest.prefetch.length} in the boot set`);
 
   await Module({
     arguments: [
       // epoch 0 is 1.0's; -icount shift=1 presents ~500 MHz, close to the real
       // 412 MHz S5L8900. Without it the guest takes timeout paths and panics.
       '-M', 'iPhone-2G,bootrom=/fw/bootrom,iboot=/fw/iboot.bin,' +
-            'nand=/fw/nand,epoch=0',
+            `nand=/fw/nand,epoch=${EPOCH}`,
       '-m', '1G',
       '-pflash', '/fw/nor.bin',
       '-display', 'wasm',
@@ -650,6 +692,24 @@
       runtimeReady = true;
       line('runtime initialized; painting enabled');
       console.log('[bench] runtime initialized');
+
+      // THE PAGE owns the fetch worker, not the emulator's thread. A nested
+      // dedicated worker is serviced through its parent's context, and that
+      // parent is precisely the thread blocked in Atomics.wait waiting for the
+      // chunk -- so the fetch never completes. Measured: 10 s timeout when
+      // nested, 5 ms when the page owns it.
+      startChunkFetcher(moduleRef, {
+        script: manifest.fetcher || '/chunk-fetch-worker.js',
+        onError: (m) => {
+          line(`chunk fetch failed: ${m.url} — ${m.message}`, 'err');
+          console.warn('[bench] chunk fetch failed', m.url, m.message);
+        },
+      }).then(() => line('chunk fetcher running'))
+        .catch((e) => {
+          state(`chunk fetcher: ${e.message}`, 'fail');
+          line(`chunk fetcher: ${e.message}`, 'err');
+        });
+
       if (SWEEP_MODE === '1') runSweep();
       else if (SWEEP_MODE === 'real') runVerify();
     },
@@ -660,11 +720,6 @@
       fsRef = mod.FS;
       globalThis.__mod = mod;        // for poking at the module from the console
       mod.FS.mkdir('/fw');
-      mod.FS.mkdir('/fw/nand');
-      // Required even for a packed, read-only NAND: the model opens
-      // <nand>/bank<N>/<page>_new.page for writing on every guest page write
-      // and hw_error()s -- killing the emulator -- if the directory is absent.
-      for (let b = 0; b < 8; b++) mod.FS.mkdir(`/fw/nand/bank${b}`);
 
       let staged = 0;
       for (const [dst, src] of FILES) {
@@ -674,7 +729,30 @@
         staged += data.length;
         line(`staged ${src} (${(data.length / 1048576).toFixed(1)} MiB)`);
       }
-      state(`booting — ${(staged / 1048576).toFixed(1)} MiB in MEMFS`);
+
+      // The INDEX, not the pack: ~0.5 MiB instead of 215. This also creates
+      // /fw/nand and its bank0..bank7 directories, which are NOT optional even
+      // though nothing here is writable -- the model opens
+      // <nand>/bank<N>/<page>_new.page on a guest page write and hw_error()s,
+      // killing the emulator, if the directory is missing.
+      state('staging the chunk index…');
+      const idxBytes = await stageChunkedNand(mod.FS, manifest);
+      line(`staged chunk index (${((idxBytes || 0) / 1048576).toFixed(2)} MiB)`);
+
+      // Copy-on-write overlay in RAM. Without an overlay the boot stalls after
+      // launchd for ever. The FILE-backed writable mode is worse here than
+      // useless: under -sPROXY_TO_PTHREAD every MEMFS syscall is proxied to the
+      // main thread, so the per-read stat() becomes a cross-thread round trip
+      // and the boot stalls outright.
+      mod.FS.writeFile('/fw/nand/nand-tune', 'overlay=ram\n');
+
+      // Prefetch the recorded boot order, and AWAIT it: a demand-faulted chunk
+      // costs the guest a full network round trip while it blocks.
+      await prefetchBootSet(manifest, {
+        onProgress: (m) => state(`prefetching chunks ${m.done}/${m.total}…`),
+      });
+      state(`booting — ${(staged / 1048576).toFixed(1)} MiB of images + `
+            + `${manifest.prefetch.length} chunks prefetched`);
     }],
     print: (t) => { note(t); line(t); },
     printErr: (t) => {
