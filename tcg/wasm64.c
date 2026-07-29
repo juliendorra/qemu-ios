@@ -704,8 +704,20 @@ static uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
  *
  * If this limit is reached and a new instance is required, older instances are
  * removed to allow creation of new ones without exceeding the browser's limit.
+ *
+ * Raised from upstream's 12000 (2026-07-29). Hitting the cap is far worse than
+ * it sounds: can_add_instance() then returns false, so the JIT stops compiling
+ * ENTIRELY and every newly-hot block runs interpreted, while reclaim waits on
+ * a JS FinalizationRegistry that may not run for a long time. An iPhone OS 1.0
+ * boot saturated 12000 during driver matching and then made no further
+ * progress for ~500 s.
+ *
+ * This is a heuristic guard against a browser limit, not the limit itself.
+ * Raising it trades resident memory for keeping compilation alive; the
+ * instrumented counters (compiled/recompiled/evicted/live) show directly
+ * whether the working set now fits.
  */
-#define MAX_INSTANCES 12000
+#define MAX_INSTANCES 48000
 
 static int instances_global;
 
