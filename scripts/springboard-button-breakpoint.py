@@ -14,6 +14,19 @@ of `-[SpringBoard menuButtonUp:]` can be resolved from `__OBJC` without symbols
 (see `resolve_imp`). Set a HARDWARE-INDEPENDENT gdbstub breakpoint there, press
 HOME, and see whether it is reached.
 
+WARNING (2026-07-29): this script's HIT/MISS verdicts are NOT trustworthy on
+their own, and the conclusions drawn from them are retracted in
+NEXT_SESSION_HANDOFF.md. Two reasons:
+
+  * it pressed qcode "home", which `ipod_touch_input_event` DISCARDS (it accepts
+    only P and H) -- so every "NO HIT" was a run with no button press. Fixed
+    here, but the old results stand retracted.
+  * every main executable links its __TEXT at 0x1000, so a breakpoint at an IMP
+    like 0x6bd8 fires in ANY process. One 1.1.4 run produced 440 such hits
+    against 1 real one. Use `scripts/gsevent-type-probe.py`, which names the
+    process (Mach-O header at 0x1000) and verifies the code bytes at the
+    breakpoint before believing a hit.
+
 That splits the remaining search space in one run:
 
   * breakpoint HIT  -> the event reaches SpringBoard, and the handler decides to
@@ -35,6 +48,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -111,36 +125,61 @@ class Gdb:
     def __init__(self, port, timeout=10):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         self.s.settimeout(timeout)
+        self.buf = b""          # unparsed bytes, KEPT ACROSS CALLS
 
     def _send(self, body: str):
+        """Send a packet. Acks are consumed by the parser, not here.
+
+        The earlier version did a bare `recv(1)` for the '+'. That desyncs the
+        moment anything else arrives first -- e.g. an asynchronous stop packet,
+        whose '$' would be eaten as if it were an ack, after which every reply
+        fails to parse and the session silently wedges with the guest STOPPED.
+        That is exactly what a 75 s run with two hits and then nothing looks
+        like, so the buffering below is load-bearing, not tidying.
+        """
         csum = sum(body.encode()) & 0xFF
         self.s.sendall(f"${body}#{csum:02x}".encode())
-        try:
-            self.s.recv(1)          # '+'
-        except socket.timeout:
-            pass
 
     def _recv(self, timeout):
-        self.s.settimeout(timeout)
-        buf = b""
-        try:
-            while b"#" not in buf:
+        """Next packet body, or None on timeout. Skips '+'/'-' acks."""
+        deadline = time.time() + timeout
+        while True:
+            self.buf = self.buf.lstrip(b"+-")
+            if self.buf.startswith(b"$"):
+                h = self.buf.find(b"#")
+                if h >= 0 and len(self.buf) >= h + 3:
+                    body = self.buf[1:h]
+                    self.buf = self.buf[h + 3:]
+                    self.s.sendall(b"+")
+                    return body.decode("latin1")
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            self.s.settimeout(left)
+            try:
                 c = self.s.recv(4096)
-                if not c:
-                    return None
-                buf += c
-        except socket.timeout:
-            return None
-        self.s.sendall(b"+")
-        m = re.search(rb"\$([^#]*)#", buf)
-        return m.group(1).decode("latin1") if m else None
+            except socket.timeout:
+                return None
+            if not c:
+                return None
+            self.buf += c
 
     def set_break(self, addr, kind=4):
         self._send(f"Z0,{addr:x},{kind}")
         return self._recv(5)
 
+    def del_break(self, addr, kind=4):
+        self._send(f"z0,{addr:x},{kind}")
+        return self._recv(5)
+
     def cont(self):
         self._send("c")
+
+    def step(self, timeout=5):
+        """Single-step. Needed to get OFF a breakpoint address before
+        continuing -- otherwise the same breakpoint re-traps immediately."""
+        self._send("s")
+        return self._recv(timeout)
 
     def wait_stop(self, timeout):
         return self._recv(timeout)
@@ -275,8 +314,11 @@ def main() -> int:
            "-qmp", f"unix:{qmp_path},server,nowait",
            "-vnc", f"127.0.0.1:{args.vnc_port - 5900}",
            "-gdb", f"tcp::{args.gdb_port}"]
+    # start_new_session + killpg below: the bundle's entry point is a shell that
+    # runs QEMU as a CHILD, so terminating `proc` leaks qemu-system-arm, which
+    # keeps holding the gdb port and its ~220 MB NAND clone.
     proc = subprocess.Popen(cmd, env=env, stdout=open(logp, "wb"),
-                            stderr=subprocess.STDOUT)
+                            stderr=subprocess.STDOUT, start_new_session=True)
     client = None
     try:
         client = lock.DisplayClient(args.vnc_port)
@@ -312,7 +354,7 @@ def main() -> int:
         time.sleep(1)
 
         print("pressing HOME ...")
-        btn.key(q, "home")
+        btn.key(q, "h")
         stop = g.wait_stop(args.wait)
         if stop:
             print(f"\nBREAKPOINT HIT: {stop}")
@@ -351,11 +393,17 @@ def main() -> int:
     finally:
         if client:
             client.stop()
-        proc.terminate()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            proc.terminate()
         try:
             proc.wait(timeout=10)
         except Exception:
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
     return 0
 
 

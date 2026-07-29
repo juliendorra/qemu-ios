@@ -142,7 +142,7 @@ def main() -> int:
 
             base = lit3()
             print(f"  t=0s   lit {base}   (app on screen)")
-            btn.key(q, "home")
+            btn.key(q, "h")
             print("  -> HOME pressed; watching ...")
             t0 = time.time()
             report["watch"] = [{"t": 0, "lit": base}]
@@ -177,7 +177,7 @@ def main() -> int:
         for i in range(args.samples):
             if i == press_at:
                 print("  -> HOME")
-                btn.key(q, "home")
+                btn.key(q, "h")
             r = q.cmd("human-monitor-command",
                       {"command-line": "info registers"})
             regs = r.get("return", "") or ""

@@ -935,3 +935,146 @@ can be told from touches. Then run the same thing in-app and from SpringBoard on
 the event is being routed to the foreground application's port instead of the
 system event port, and `_GSRegisterApplicationPort` / `_ResetEventPortSet` are
 where to look.
+
+---
+
+## RETRACTED: "it is event ROUTING" — the gdb probes never pressed the button (2026-07-29, later)
+
+**Everything in the two sections above that rests on
+`springboard-button-breakpoint.py` or `home-wedge-probe.py` is void.** Those two
+probes press HOME with
+
+```python
+btn.key(q, "home")        # qcode "home"
+```
+
+and the machine's input handler, `ipod_touch_input_event`
+([hw/arm/ipod_touch.c:1085](hw/arm/ipod_touch.c:1085)), accepts **only**
+`Q_KEY_CODE_P` and `Q_KEY_CODE_H`:
+
+```c
+switch (qcode) {
+case Q_KEY_CODE_P: keycode = key->down ? 25 : 153; break;
+case Q_KEY_CODE_H: keycode = key->down ? 35 : 163; break;
+default: return;                       /* <-- "home" lands here, silently */
+}
+```
+
+`"home"` is a perfectly valid QMP qcode, so QMP returns success and nothing
+whatsoever happens in the guest. `app-button-probe.py` — the harness that works
+— has always sent `"h"`; only the gdb-based probes drifted. Confirmed by
+`IT_KEY_TRACE=1`: with `"home"`, **zero** `[KEYTRACE]` lines; with `"h"`,
+`keycode=35` then `keycode=163`.
+
+Void as a result, therefore:
+
+* "1.0 in-app: **NO HIT** on `menuButtonUp:`" — no button was pressed.
+* "1.0 `--no-app`: **HIT**" and "1.1.4 in-app: **HIT**" — see below; those were
+  hits in *other processes*.
+* "**THE DISCRIMINATOR: it is event ROUTING, not the button**" — retracted
+  entirely.
+* The 7-minute `--watch` run ("1.0 does not return slowly; it does not return")
+  and the PC-sampling histograms — all pressed nothing.
+
+Fixed in all three probes (`"home"` -> `"h"`).
+
+### The second flaw: a breakpoint at 0x6ae0 hits in EVERY process
+
+Every main executable in this OS links its `__TEXT` at 0x1000, and QEMU
+breakpoints are virtual-address based with no notion of process. So a breakpoint
+on `-[SpringBoard menuButtonUp:]` at 0x6bd8 fires whenever *any* process
+executes its own code at 0x6bd8. Measured, in one 1.1.4 run: **440 such hits
+against 1 real one**, in `configd`, `iapd`, `lockdownd`, `crashdump`,
+`DumpBasebandCrash`.
+
+The handoff's celebrated 1.1.4 stack read — `self=0x3898ca94`, `lr=Foundation`,
+frames 0x5a3c/0x5b4c/0x5c38 — reproduces **exactly**, and this probe attributes
+it to **`iapd`**. It was never SpringBoard.
+
+Two cheap fixes, both now in `gsevent-type-probe.py`:
+
+* **Name the process.** Read guest virtual memory at 0x1000 — it resolves
+  through the *current* process's MMU mapping — and fingerprint the Mach-O
+  header against every executable in the root filesystem (54 on 1.0, 58 on
+  1.1.4, 0.3 s to build).
+* **Verify the code.** Read 16 bytes at the breakpoint address and compare with
+  SpringBoard's own bytes at that vmaddr. Mismatch => other process => reject.
+
+## THE ANSWER: the event arrives, and SpringBoard's handler RUNS (2026-07-29)
+
+`scripts/gsevent-type-probe.py` breaks inside `_PurpleEventCallback` at the
+per-event **dequeue** and reads each GSEvent's type, names the process at every
+hit, and verifies handler hits against SpringBoard's own code bytes.
+
+| | 1.0 in-app (FAILS) | 1.1.4 in-app (WORKS) |
+| --- | --- | --- |
+| `[KEYTRACE]` | keycode 35, 163 | keycode 35, 163 |
+| GSEvent to **SpringBoard** | **type1001** | **type1001** (+2003, 2009) |
+| GSEvent to the app | Preferences type2002 | Preferences type2002 |
+| `-[SpringBoard menuButtonUp:]` | **REAL HIT in SpringBoard** | **REAL HIT in SpringBoard** |
+| at the hit | `self=0x104650`, `lr=UIKit+0xdb78` | `self=0x104910`, `lr=UIKit+0xe9c0` |
+| early-return ivar | `+0x40 = 0x00` (gate OPEN) | `+0x44 = 0x00` (gate OPEN) |
+
+**The two builds are indistinguishable at this layer.** On 1.0, with an app
+frontmost: the button event is delivered to SpringBoard, `menuButtonUp:` really
+runs, and its early-return ivar is clear — and the app still does not close.
+
+So the event is **not** mis-routed, and the port symbols
+(`_GSRegisterApplicationPort`, `_ResetEventPortSet`,
+`_GSGetPurpleSystemEventPort`) are not where the fix lives. The divergence is
+**inside `-[SpringBoard menuButtonUp:]`**, past its entry — the layer the
+previous session declared "innocent, because it never runs". It does run.
+
+Reproduce (each ~4 min; run the control first, it is the one that must produce a
+positive):
+
+```bash
+IT_PROBE_WAIT=8 python3 scripts/gsevent-type-probe.py --board m68ap-10 --no-app
+IT_PROBE_WAIT=8 python3 scripts/gsevent-type-probe.py --board m68ap-10
+IT_PROBE_WAIT=8 python3 scripts/gsevent-type-probe.py --board m68ap-114
+```
+
+### Constants established, so nobody re-derives them
+
+* **GSEvent types.** `_GSEventGetType` is
+  `t = [ev+8]; if t != 3001 return t; else map [ev+0x38] (1..6) -> {1,6,3,4,5,2}`
+  — literal `0xbb9` on both builds. Observed: **type1000 = menu button DOWN,
+  type1001 = menu button UP** (1000 appears only in a run whose press produced a
+  real `menuButtonDown:` hit; 2000/2001/2006/2009/2002/2003/50 occur without any
+  press and are background traffic).
+* **The dequeue breakpoint** inside `_PurpleEventCallback`: 1.0 `0x3098d028`,
+  1.1.4 `0x30ab642c` — the `ldr r1,[r8,#8]` right after `ldm r0,{r3,r8}`. Do
+  **not** use the loop body at the top of the function (1.0 `0x3098ceac`): it is
+  reached conditionally, after `_GSEventTakeLater` coalescing, and a run that
+  broke there recorded **zero** events in 75 s of a live SpringBoard.
+* **`nm` is useless on these binaries** but `LC_SYMTAB` parses fine —
+  `scripts/macho-symbols.py --build 1A543a --lib GraphicsServices --grep GSEvent`.
+
+### Harness bugs fixed along the way (all of them cost a run)
+
+| bug | symptom | fix |
+| --- | --- | --- |
+| `key(q, "home")` | no press at all, silently | `key(q, "h")` in all three gdb probes |
+| bare `recv(1)` for the RSP '+' ack | eats a `$` when a stop packet races the ack, then the session wedges with the guest STOPPED and every phase reads as "no events" | persistent buffer in `Gdb._recv`, acks skipped by the parser |
+| `cont()` sent to an already-running target | same wedge | explicit `stopped` state, `go()` |
+| `proc.terminate()` on the bundle launcher | the launcher is a SHELL; `qemu-system-arm` survives holding the gdb port and a ~220 MB NAND clone, so the next run dies with "Address already in use" and the disk fills | `start_new_session=True` + `killpg` (also fixed in `springboard-button-breakpoint.py`) |
+
+Every one of those produces *silence*, which is why the probe now asserts a
+positive control on each run: `IT_KEY_TRACE=1` lines proving the press reached
+`ipod_touch_key_event`, and a QMP `query-status` liveness check per phase.
+
+### Where to look next
+
+Inside `-[SpringBoard menuButtonUp:]` on 1.0, past the early-return ivar. It is
+known to run and to get past its first gate, so the question is which of the
+subsequent branches diverges from 1.1.4:
+
+* the `SBSyncController` `isRestoring` / `isResetting` / `isSoftwareUpdating`
+  gates (read the returned values at the hit — `gsevent-type-probe.py` already
+  has `regs()`/`mem()` and a verified breakpoint, so single-stepping the handler
+  and logging the taken branches is the direct next step);
+* whatever it calls to dismiss the foreground app, which is where a
+  1.0-vs-1.1.4 structural difference would actually show up.
+
+Do **not** re-run the routing hypothesis, and do not trust any breakpoint at an
+address below 0x100000 without the process/code check described above.
