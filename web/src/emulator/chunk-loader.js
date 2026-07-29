@@ -32,6 +32,10 @@ export async function registerChunkWorker(scriptUrl = '/sw.js') {
 }
 
 export async function loadManifest(baseUrl) {
+  // Absolutise first: URL() rejects a RELATIVE base ("/chunked/1A543a/") with
+  // a bare "Invalid base URL", which reads like a bad manifest rather than a
+  // bad call.
+  baseUrl = new URL(baseUrl, location.href).href;
   const url = new URL('chunk-manifest.json', baseUrl).href;
   const response = await fetch(url);
   if (!response.ok) {
@@ -47,8 +51,7 @@ export async function loadManifest(baseUrl) {
 
 /* Absolute URL of one chunk, the same string the emulator builds in C. */
 export function chunkUrl(manifest, index) {
-  return new URL(manifest.base + manifest.hashes[index],
-                 location.origin + manifest.baseUrl).href;
+  return new URL(manifest.base + manifest.hashes[index], manifest.baseUrl).href;
 }
 
 /*

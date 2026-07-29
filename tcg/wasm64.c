@@ -58,7 +58,7 @@
  * measured settings.
  */
 static int jit_instantiate_num = INSTANTIATE_NUM_DEFAULT;
-#define INSTANTIATE_NUM jit_instantiate_num
+#define INSTANTIATE_NUM jit_threshold
 
 #define JIT_TUNE_FILE "/fw/jit-tune"
 
@@ -90,6 +90,28 @@ static long jit_tunable(const char *env, const char *key, long fallback)
     }
     return jit_tune_lookup(key, fallback);
 }
+
+/*
+ * ADAPTIVE THRESHOLD (adaptive=1 in /fw/jit-tune, off by default).
+ *
+ * A boot and a running app want opposite settings. A boot is a long COLD TAIL
+ * -- tens of thousands of blocks executed a few hundred times each -- and wants
+ * to compile eagerly. A running app is a small hot working set and tolerates a
+ * high threshold. One static number cannot serve both, and the measured cost of
+ * getting it wrong is large in both directions: at 1500 only 208 blocks
+ * compiled in an entire boot, while at 100 the instance cap saturates partway
+ * through and the backend spends the rest of the boot evicting and recompiling.
+ *
+ * So scale the threshold by how much room is left. While there is headroom,
+ * compile anything warm; as the cap fills, spend the remaining slots only on
+ * blocks that are genuinely hot -- which also slows the eviction churn instead
+ * of feeding it.
+ *
+ * Recomputed on each compile and each eviction, never per TB execution: the
+ * hot path reads one int.
+ */
+static bool jit_adaptive;
+static int jit_threshold;          /* effective; == jit_instantiate_num when off */
 
 #define EM_JS_PRE(ret, name, args, body...) EM_JS(ret, name, args, body)
 
@@ -774,6 +796,29 @@ static int jit_max_instances = MAX_INSTANCES;
 
 static int instances_global;
 
+/*
+ * Effective threshold from cap pressure. The steps are coarse on purpose --
+ * this is a heuristic about where the remaining slots should go, and a smooth
+ * curve would only make the counters harder to read.
+ */
+static void jit_update_threshold(void)
+{
+    int live, pressure_num;
+
+    if (!jit_adaptive) {
+        return;
+    }
+    live = qatomic_read(&instances_global);
+    pressure_num = live / (jit_max_instances / 100 + 1);   /* percent */
+    if (pressure_num < 50) {
+        jit_threshold = jit_instantiate_num;               /* headroom: eager */
+    } else if (pressure_num < 80) {
+        jit_threshold = jit_instantiate_num * 4;
+    } else {
+        jit_threshold = jit_instantiate_num * 16;
+    }
+}
+
 /* Avoid overwrapping of begin/end pointers */
 #define INSTANCES_BUF_MAX (MAX_INSTANCES + 1)
 
@@ -805,16 +850,19 @@ static void add_instance(wasm_tb_func tb_func, void *tb_ptr)
     instances_end  = (instances_end + 1) % INSTANCES_BUF_MAX;
 
     qatomic_inc(&instances_global);
+    jit_update_threshold();
 
     /* Report the first compile too: knowing WHEN the JIT starts doing work at
      * all separates "not compiling" from "compiling and thrashing". */
     if (++jit_compiles == 1 || jit_compiles % JIT_STATS_EVERY == 0) {
         fprintf(stderr,
-                "[JIT] compiled=%llu recompiled=%llu evicted=%llu live=%d/%d\n",
+                "[JIT] compiled=%llu recompiled=%llu evicted=%llu live=%d/%d "
+                "threshold=%d\n",
                 (unsigned long long)jit_compiles,
                 (unsigned long long)jit_recompiles,
                 (unsigned long long)jit_evictions,
-                qatomic_read(&instances_global), jit_max_instances);
+                qatomic_read(&instances_global), jit_max_instances,
+                jit_threshold);
     }
 }
 
@@ -840,6 +888,7 @@ static void remove_old_instances(void)
         instances_begin = (instances_begin + 1) % INSTANCES_BUF_MAX;
         jit_evictions++;
     }
+    jit_update_threshold();
     instance_pending_gc += num;
 }
 
@@ -920,8 +969,11 @@ static void init_wasm(void)
                                                         : INSTANTIATE_NUM_DEFAULT;
         jit_max_instances = (cap > 0 && cap <= MAX_INSTANCES) ? (int)cap
                                                               : MAX_INSTANCES;
-        fprintf(stderr, "[JIT] tuning: instantiate=%d max_instances=%d\n",
-                jit_instantiate_num, jit_max_instances);
+        jit_adaptive = jit_tunable("IT_WASM_JIT_ADAPTIVE", "adaptive", 0) != 0;
+        jit_threshold = jit_instantiate_num;
+        fprintf(stderr, "[JIT] tuning: instantiate=%d max_instances=%d "
+                "adaptive=%d\n", jit_instantiate_num, jit_max_instances,
+                jit_adaptive);
     }
     thread_idx = qatomic_fetch_inc(&thread_idx_max);
     ctx.stack = g_malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);

@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -45,6 +46,18 @@ CHROME_FLAGS = [
 ]
 
 
+def port_is_busy(port: int) -> bool:
+    """Is something already listening?
+
+    Worth checking rather than assuming: a killed run can leave its server
+    behind, the new run's bind then loses the race silently, and the RESULTS
+    GO TO THE OLD RUN'S FILE. One measurement was read out of the wrong file
+    that way before the cause was obvious.
+    """
+    with socket.socket() as probe:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
 def wait_for_server(port: int, timeout: float = 20.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -67,6 +80,8 @@ def main() -> None:
     parser.add_argument("--cold", action="store_true",
                         help="chunked mode: drop the chunk cache first")
     parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument("--adaptive", action="store_true",
+                        help="scale the compile threshold with cap pressure")
     parser.add_argument("--until", default="launchd",
                         help="stop once this landmark is reached "
                              "(iBoot banner/kernel/BSD root/launchd/SpringBoard)")
@@ -84,6 +99,11 @@ def main() -> None:
 
     if not CHROME.exists():
         raise SystemExit(f"Chrome not found at {CHROME}")
+    if port_is_busy(args.port):
+        raise SystemExit(
+            f"something is already listening on :{args.port} -- probably a "
+            "server left behind by an interrupted run. Kill it "
+            f"(pkill -f 'serve.py --port {args.port}') or pass --port.")
     args.out.mkdir(parents=True, exist_ok=True)
     result_path = args.out / f"{args.label}.json"
     if result_path.exists():
@@ -103,6 +123,8 @@ def main() -> None:
             query += "&cold=1"
         if args.no_prefetch:
             query += "&prefetch=0"
+        if args.adaptive:
+            query += "&adaptive=1"
         url = f"http://localhost:{args.port}/bench-b/{query}"
 
         flags = list(CHROME_FLAGS)

@@ -49,6 +49,7 @@
   const CHUNK_BASE = params.get('chunks') || '/chunked/1A543a/';
   const PREFETCH = params.get('prefetch') !== '0';
   const COLD = params.get('cold') === '1';           // drop the chunk cache
+  const ADAPTIVE = params.get('adaptive') === '1';   // scale the threshold
 
   const logEl = document.getElementById('log');
   const stateEl = document.getElementById('state');
@@ -68,11 +69,11 @@
   const hit = new Map();
   let fsRef = null;
   let serialSeen = 0;
-  let lastJit = '';
 
   const renderMarks = () => {
     marksEl.textContent =
-      `instantiate=${INSTANTIATE} max=${MAX_INSTANCES} mode=${MODE}\n` +
+      `instantiate=${INSTANTIATE} max=${MAX_INSTANCES} mode=${MODE}` +
+      `${ADAPTIVE ? ' adaptive' : ''}\n` +
       LANDMARKS.map(([name]) =>
         `${hit.has(name) ? hit.get(name).padStart(8) : '       —'}  ${name}`)
       .join('\n');
@@ -140,7 +141,7 @@
     lastReport = now;
     const body = JSON.stringify({
       instantiate: Number(INSTANTIATE), maxInstances: Number(MAX_INSTANCES),
-      mode: MODE, prefetch: PREFETCH, cold: COLD,
+      mode: MODE, prefetch: PREFETCH, cold: COLD, adaptive: ADAPTIVE,
       elapsed: Number((now / 1000).toFixed(1)),
       landmarks: Object.fromEntries([...hit].map(([k, v]) => [k, Number(v)])),
       counters: Object.fromEntries(counters),
@@ -221,7 +222,8 @@
       // tcg/wasm64.c reads this: a browser cannot set an environment
       // variable, but it can write a file before startup.
       mod.FS.writeFile('/fw/jit-tune',
-        `instantiate=${INSTANTIATE}\nmax_instances=${MAX_INSTANCES}\n`);
+        `instantiate=${INSTANTIATE}\nmax_instances=${MAX_INSTANCES}\n` +
+        `adaptive=${ADAPTIVE ? 1 : 0}\n`);
 
       let staged = 0;
       for (const [dst, src] of [['/fw/bootrom', 'bootrom'],
@@ -237,14 +239,19 @@
         state('staging the pack index…');
         staged += await stageChunkedNand(mod.FS, manifest);
         if (PREFETCH) {
+          // Deliberately NOT awaited: a chunk the guest asks for before the
+          // prefetch reaches it is demand-faulted correctly, just slower, so
+          // blocking the boot on the prefetch buys nothing -- and a prefetch
+          // that stalls would then stall the boot. (It did: a headless run sat
+          // at 507 of 512 chunks with the emulator never starting.)
           state('prefetching the boot working set…');
-          const done = await prefetchBootSet(manifest, {
-            onProgress: (m) => state(
-              `prefetch ${m.done}/${m.total} chunks ` +
+          prefetchBootSet(manifest, {
+            onProgress: (m) => line(`prefetch ${m.done}/${m.total} chunks ` +
               `(${(m.stats.bytesFromNetwork / 1048576).toFixed(1)} MiB)`),
-          });
-          line(`prefetch complete in ${done.seconds.toFixed(1)}s, ` +
-               `${(done.stats.bytesFromNetwork / 1048576).toFixed(2)} MiB`);
+          }).then((done) => line(
+            `prefetch complete in ${done.seconds.toFixed(1)}s, ` +
+            `${(done.stats.bytesFromNetwork / 1048576).toFixed(2)} MiB`))
+            .catch((e) => line(`prefetch failed: ${e}`, 'err'));
         }
       } else {
         mod.FS.mkdir('/fw/nand');
