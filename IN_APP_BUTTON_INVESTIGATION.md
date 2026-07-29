@@ -396,10 +396,34 @@ reaching the two unbounded loops; for them the change should be a no-op there.
 The one place it could change behaviour on a working build is the third,
 bounded, `tst #0x40` site.
 
-**Not yet checked: 1.1.4 and the iPod with this engine.** Only the 1.0 bundle
-has it; the other two still run the previous engine, so nothing shipped can have
-regressed. Before installing it more widely, re-run `app-button-probe.py` for
-`m68ap-114` and `n45ap` -- MBX `0x12C` previously read `0x100` for every board.
+**Regression-checked on all three bundles (2026-07-30).** The engine is now
+installed in all three and `app-button-probe.py` gives:
+
+| board | 1_open | 2_touch | 3_home_returns | 4_power | 5_wake |
+|---|---|---|---|---|---|
+| iPod (N45AP, 1.1 / 3A101a) | PASS | PASS | **PASS 98.57%** | PASS | PASS |
+| iPhone OS 1.1.4 | PASS | PASS | **PASS 96.98%** | PASS | PASS |
+| iPhone OS 1.0 | PASS | PASS | **FAIL 0.00%** | FAIL | — |
+
+So the stub answer costs the working builds nothing: 5/5 on both, unchanged from
+before. Backups of the previous engines: `/tmp/qemu-{1.0,114,n45}-engine.bak`,
+and `IT_MBX_READY=0` disables the change at runtime without reinstalling.
+
+### "Spins" then, "idles" now -- both are true, in that order
+
+Two sessions measured this with different instruments and the results agree once
+the order is stated explicitly:
+
+| | native (host CPU + PC sampling) | browser (guest-seconds per wall-second) |
+|---|---|---|
+| BEFORE the fix | **spins**: 0.97 cores, 30/30 PC samples in the 9-instruction AppleMBX loop | not measured |
+| AFTER the fix | **idles**: 0.10 cores, only the kernel idle delay at `0xc005a2f0` | **idles**: ratio 0.24-0.69 with the frame counter frozen (under `-icount` a high ratio means virtual time is being warped forward because the cpu is halted; a spinning guest reads ~0.02) |
+
+The browser note above is therefore a confirmation of the POST-fix state, not a
+contradiction of the spin. And the two instruments cross-validate each other:
+the native A/B shows that a halted guest here burns almost no host CPU
+(0.10 cores post-fix), so the pre-fix 0.97 cores cannot have been idle-warping --
+it was real execution.
 
 ## Where it stands: this is the MBX gap (T1), not a 1.0 software bug
 
