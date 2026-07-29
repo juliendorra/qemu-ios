@@ -245,6 +245,34 @@ order would need `7,7,5,7,5`. Still inference, not an observed acknowledge:
 
 ---
 
+---
+
+> # ⚠ The in-app HOME/POWER investigation has its own doc now
+>
+> **[`IN_APP_BUTTON_INVESTIGATION.md`](IN_APP_BUTTON_INVESTIGATION.md) is the
+> authoritative record** — established facts, every hypothesis with the
+> measurement that killed it, the harness traps, the constants, and the tools.
+> **Read it instead of the sections below.**
+>
+> Everything from here to the end of this file is the raw chronological log, kept
+> for provenance. Several of its conclusions are **RETRACTED** in the new doc:
+>
+> * "THE DISCRIMINATOR: it is event ROUTING" — void, the probe pressed qcode
+>   `"home"`, which the machine discards (it takes only P/H), so no button was
+>   ever pressed.
+> * "The stack at 1.1.4's in-app hit: Foundation -> SpringBoard 0x5a3c" — that
+>   hit was in **`iapd`**; a breakpoint on an IMP fires in every process.
+> * The 7-minute "it does not return" watch and the PC-sampling histograms —
+>   same cause, no press was made.
+> * "The DOWN event is rarely delivered" — an artifact of QMP refusing input
+>   while the VM is stopped.
+>
+> **Current state (2026-07-29):** the first in-app press is delivered and handled
+> completely — both handlers hit for real, `clickedMenuButton` runs the display
+> stack unwind and returns, and the stack unwinds cleanly into the run loop.
+> Then event delivery dies permanently, for every process, taps included. The
+> wedge is asynchronous and takes seconds.
+
 ## The in-app HOME wedge on iPhone OS 1.0 — localised (2026-07-28, later session)
 
 **Not an ignored button, and not a spin. The guest goes IDLE and never wakes.**
