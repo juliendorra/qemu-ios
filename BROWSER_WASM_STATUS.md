@@ -596,6 +596,48 @@ reports `fetched=320 hits=11095 resident<=64 bytes=39.9 MiB` — a **97% hit rat
 in the 64-slot LRU**, and 39.9 MiB of records consumed for 18.52 MiB
 downloaded, which is the read amplification the chunk size trades away.
 
+### 1.1.4 does it too — both shipping versions boot in a browser
+
+Same pipeline, same defaults, iPhone OS **1.1.4** (`4A102`) beside **1.0**
+(`1A543a`), cold cache, chunked:
+
+| | 1.0 (`1A543a`) | 1.1.4 (`4A102`) |
+| --- | --- | --- |
+| pack | 215.2 MiB, 106,858 pages | 299.7 MiB, 148,812 pages |
+| chunks (62 pages) | 1,724, 1,320 unique (23.4% dedup) | 2,401, 1,998 unique (16.8% dedup) |
+| stored, whole set | 68.8 MiB (32.0%) | 102.3 MiB (34.1%) |
+| index, always downloaded | 0.41 MiB | 0.57 MiB |
+| cold boot touches | 20,507 pages, 512 chunks | 25,136 pages, 600 chunks |
+| first pixels | 12 s | 16 s |
+| iBoot banner | never printed (iBoot-159) | 31 s |
+| kernel | 156 s | 110 s |
+| BSD root | 169 s | 130 s |
+| launchd | — | 149 s |
+| **home screen** | **252 s** | **296 s** |
+| non-black, settled | 45.5% (59.04% native) | **69.4%** (73.96% native) |
+| **downloaded, cold** | **18.57 MiB** | **20.97 MiB** |
+| guest time / wall | 32.5 s / 315 s | 15.5 s / 359 s |
+
+**1.1.4's own iBoot prints a banner and 1.0's does not**, which is worth
+remembering when a 1.0 run looks silent for two minutes — it is supposed to.
+
+The one thing that had to change for 1.1.4 was **not** in the browser at all:
+
+> `scripts/fb-snapshot.py` never passed `-icount`, and 1.1.4 needs it. The
+> first native verification boot panicked in `IOIpodUSBDevice::start` and the
+> USB wrangler (`caller 0xC00638CC`) and rendered **nothing** — kernel
+> framebuffer 0.0%, which reads exactly like "this NAND is broken". With
+> `--icount 1` the same NAND reports **73.96% non-black** and zero panics.
+
+That is the third independent confirmation of the icount rule (browser, the
+shipped app's intermittent Apple-logo hang, and now the verification tool), and
+the trap it sets is the worst kind: the tool that exists to tell you whether a
+NAND is good was quietly answering a different question.
+
+The per-build **security epoch** travels with the build in the bench page
+(`1A543a` → 0, `4A102` → 3): getting it wrong wedges iBoot with an empty serial
+log that looks like a hang.
+
 ### THE HOME SCREEN, IN A BROWSER, FROM CHUNKED ASSETS
 
 A cold browser boot of iPhone OS 1.0 now reaches the **SpringBoard home

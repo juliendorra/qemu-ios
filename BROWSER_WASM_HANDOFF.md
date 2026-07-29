@@ -335,7 +335,14 @@ with **zero bytes and no error**.
 second (`?nested=1` to see the failing arrangement). Use it before rebuilding
 the emulator for anything in this protocol.
 
-**A cold browser boot now reaches the SpringBoard HOME SCREEN from chunked
+**Both shipping versions reach the home screen in a browser** (2026-07-29):
+1.0 at **252 s** on **18.57 MiB**, 1.1.4 at **296 s** on **20.97 MiB** —
+`?build=1A543a|4A102`, with the security epoch carried per build. 1.1.4 needed
+`fb-snapshot.py --icount 1` for its NATIVE verification: without it the boot
+panics in `IOIpodUSBDevice::start` and renders nothing, which reads as a broken
+NAND.
+
+**A cold browser boot reaches the SpringBoard HOME SCREEN from chunked
 assets:** first pixels 12 s, kernel 156 s, BSD root 169 s, **home screen 252 s**,
 verified at **45.5% non-black** in the kernel framebuffer (59.04% natively,
 ~1.6% for the Apple logo). 504 chunk requests = **18.57 MiB** for a 215.6 MiB
