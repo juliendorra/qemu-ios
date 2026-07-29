@@ -883,3 +883,55 @@ corresponding code in 1.0's SpringBoard and diff. The two binaries' handlers are
 already known to be structurally identical, so the divergence should be in this
 caller layer -- most likely a condition about whether SpringBoard is frontmost
 or holds the event stream.
+
+## GraphicsServices has a full symbol table -- use it (2026-07-29)
+
+`nm` returns nothing for these binaries (it does not parse this old ARM Mach-O),
+which made them look stripped. **They are not.** Parsing `LC_SYMTAB` directly
+gives 360 defined symbols in GraphicsServices with addresses, and since the OS
+prebinds and has no ASLR those ARE the runtime addresses:
+
+| symbol | 1.0 | 1.1.4 |
+| --- | --- | --- |
+| `_PurpleEventCallback` | 0x3098ce60 | 0x30ab624c |
+| `_GSSendSystemEvent` | 0x3098c730 | 0x30ab5bd8 |
+| `_GSSendEvent` | 0x3098bdb0 | 0x30ab50e4 |
+| `_GSEventRun` | 0x3098bbd8 | 0x30ab4ef4 |
+| `_GSRegisterApplicationPort` | 0x3098b74c | 0x30ab4a28 |
+| `_GSGetPurpleSystemEventPort` | 0x3098b8f4 | 0x30ab4bd0 |
+| `_ResetEventPortSet` | 0x3098b5e4 | 0x30ab48c0 |
+
+`springboard-button-breakpoint.py --break-addr NAME=0xADDR` breaks on any of
+them. The port symbols matter because that is the routing mechanism: an
+application registers its port with `_GSRegisterApplicationPort`, while hardware
+buttons go to the *system* event port -- so "who owns which port while an app is
+frontmost" is the question this bug reduces to.
+
+### First result, and its limits
+
+1.0, in-app, breaking on `_PurpleEventCallback`: **HIT**, with
+
+```
+  lr = CoreFoundation+0x168a1
+  #1 GraphicsServices+0x3b64   #2 UIKit+0xe928   #3 UIKit+0x6f54
+  #5..#7 low addresses -- the RUNNING EXECUTABLE
+```
+
+**Two reasons not to conclude from this yet**, both learned the hard way today:
+
+* `_PurpleEventCallback` runs for EVERY event, not just buttons. Hitting it
+  proves the event machinery is alive in-app, not that the button arrived.
+* The stack does not identify the process. SpringBoard is itself a UIKit app,
+  so `UIKit -> executable` is equally consistent with SpringBoard or the
+  foreground app, and the low frames are attributed to whatever executable the
+  resolver happens to match (the CommCenter mis-attribution noted above).
+
+### The measurement that would settle it
+
+Break on `_PurpleEventCallback` and read the GSEvent's TYPE (`_GSEventGetType`
+is exported, and the event pointer is on hand at the callback), so button events
+can be told from touches. Then run the same thing in-app and from SpringBoard on
+1.0 and compare: if the button event appears from SpringBoard but not in-app,
+the event is being routed to the foreground application's port instead of the
+system event port, and `_GSRegisterApplicationPort` / `_ResetEventPortSet` are
+where to look.

@@ -231,6 +231,9 @@ def main() -> int:
     ap.add_argument("--vnc-port", type=int, default=5930)
     ap.add_argument("--settle", type=float, default=45)
     ap.add_argument("--wait", type=float, default=90)
+    ap.add_argument("--break-addr", action="append", default=[],
+                    help="extra address to break on, as NAME=0xADDR (e.g. a "
+                         "GraphicsServices routing function). Repeatable.")
     ap.add_argument("--no-app", action="store_true",
                     help="press HOME from the home screen instead of from "
                          "inside an app -- isolates whether the frontmost app "
@@ -257,6 +260,9 @@ def main() -> int:
 
     imps = {sel.decode(): resolve_imp(binary, sel)
             for sel in (b"menuButtonDown:", b"menuButtonUp:")}
+    for spec in args.break_addr:
+        name, _, addr = spec.partition("=")
+        imps[name] = int(addr, 0)
     for k, v in imps.items():
         print(f"  -[SpringBoard {k}] IMP = {v:#x}" if v else f"  {k}: NOT FOUND")
     if not all(imps.values()):
