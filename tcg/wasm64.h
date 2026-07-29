@@ -52,6 +52,15 @@ static inline uintptr_t call_wasm_tb(wasm_tb_func f, struct WasmContext *ctx)
 struct WasmInstanceInfo {
     void *tb_ptr;
     wasm_tb_func tb_func;
+
+    /*
+     * Reference bit for second-chance (CLOCK) eviction. Set every time the
+     * compiled instance is entered, cleared when the eviction hand passes over
+     * it. Plain FIFO eviction discards by AGE, which throws away the kernel
+     * and libc blocks that have been hot since early boot while keeping
+     * one-shot code compiled seconds ago.
+     */
+    bool used;
 };
 
 /*
