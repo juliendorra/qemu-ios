@@ -1078,3 +1078,114 @@ subsequent branches diverges from 1.1.4:
 
 Do **not** re-run the routing hypothesis, and do not trust any breakpoint at an
 address below 0x100000 without the process/code check described above.
+
+## Single-stepping menuButtonUp: on both builds — the branch diff (2026-07-29)
+
+`scripts/menubutton-step-trace.py` single-steps the handler over the gdbstub,
+stepping OVER calls (temporary breakpoint at `pc+4`), and validates every stop
+against the process fingerprint and SpringBoard's own code bytes.
+
+### The handler, with its ivars named
+
+`scripts/objc-xref.py --list-methods` and the old-ABI class metadata give the
+layout, so the pseudocode is exact rather than guessed. **+0xc =
+`_uiController` (SBUIController), +0x10 = `_menuButtonTimer` (NSTimer),
++0x40 (1.1.4: +0x44) = `_screenShooting`** — identical on both builds:
+
+```objc
+if (_screenShooting) { _screenShooting = NO; return; }              // measured 0
+if ([[SBSyncController sharedInstance] isRestoring])        return; // measured NO
+if ([[SBSyncController sharedInstance] isResetting])        return; // measured NO
+if ([[SBSyncController sharedInstance] isSoftwareUpdating]) return; // measured NO
+if ([self shouldRunFieldTestScript]) { ...; return; }               // measured NO
+                        // 1.1.4 only: if ([[SBAwayController …] isLocked]) …
+if (_menuButtonTimer == nil) return;            // <-- THE ONLY DIVERGENT BRANCH
+[self _setMenuButtonTimer:nil];
+[_uiController clickedMenuButton];              // 1.1.4: + _handleMenuButtonEvent:
+```
+
+`menuButtonDown:` is **instruction-for-instruction the same path on both
+builds** (traced, not assumed): the three sync gates, then
+`[NSTimer scheduledTimerWithTimeInterval:5.0 … _menuButtonWasHeld …]` and
+`[self _setMenuButtonTimer:timer]`. The 5.0 s interval is identical on both.
+
+### What each build actually did
+
+| run | `_menuButtonTimer` at `menuButtonUp:` | branch taken |
+| --- | --- | --- |
+| 1.0 in-app, tracing Down **and** Up | **non-nil** | full path -> **`[_uiController clickedMenuButton]` CALLED** |
+| 1.0 in-app, `--only-up`, 3 presses | **nil** | `popeq` early return |
+| 1.1.4 in-app, `--only-up` | **nil** | `beq` early return |
+
+**Report this honestly: the 1.0 branch is not stable between runs.** Everything
+above the `_menuButtonTimer` test is identical and takes the identical decision
+on both builds; that one gate is the whole difference, and it depends on whether
+`menuButtonDown:` ran and set the timer before the up arrived.
+
+### Two findings that matter more than the branch itself
+
+**1. When the gate passes on 1.0, the click IS dispatched and the app still does
+not close.** So `-[SBUIController clickedMenuButton]` (1.0: `0xd794`) is the
+next layer, and it has gates of its own, in order:
+
+```objc
+r6 = [self launchState];
+if ([[SBAwayController sharedAwayController] isLocked]) { [… attemptUnlock]; return; }
+if ([<active thing> isKindOfClass:[SBAlert class]]) return;                 // popne
+if (![[SBAlertItemsController sharedInstance] deactivateAlertForMenuClick]) return;  // popeq
+switch (launchState) { … }                                                 // jump table
+```
+
+Trace it with the harness that already exists:
+
+```bash
+IT_PROBE_WAIT=8 python3 scripts/menubutton-step-trace.py --board m68ap-10 \
+    --only-up --trace-sel clickedMenuButton
+```
+
+**2. `_handleMenuButtonEvent:` is a red herring.** 1.1.4 has it and 1.0 does not
+(`objc-xref.py` finds four `clickedMenuButton` senders on 1.1.4 against two on
+1.0), which looked like a second, newer delivery route. It is not: its only
+caller is `menuButtonUp:+0x23c`, i.e. **downstream of the same
+`_menuButtonTimer` gate**, and it exists to service `_menuButtonClickCount`
+(+0x38, the double-tap counter that 1.0 lacks entirely). So it cannot explain
+why 1.1.4 works.
+
+### The strongest remaining lead: the DOWN event
+
+Across every `gsevent-type-probe.py` run, SpringBoard reliably receives
+**type1001 (menu UP)** and only occasionally **type1000 (menu DOWN)**. That fits
+the gate exactly: no DOWN -> `menuButtonDown:` never runs -> `_menuButtonTimer`
+stays nil -> every UP is swallowed by `popeq`, and nothing happens. It also fits
+the user-visible symptom precisely.
+
+It is a hypothesis, not a result — nobody has yet counted type1000 versus
+type1001 deliveries across many presses on both builds. That count is the next
+measurement, and `gsevent-type-probe.py` already produces it (raise `--presses`
+equivalent by pressing repeatedly and reading `events.json`). Note the model
+side is in scope here: `ipod_touch_key_event` has `suppress_home_release`
+handling, and one run logged **5 `[KEYTRACE]` lines for 3 presses** when 6 were
+due, so a dropped edge in the model is a live possibility.
+
+### Harness notes (all cost a run)
+
+* **Never `c` while sitting on a breakpoint.** QEMU re-traps at the same PC, the
+  guest makes no progress, and the run reports a huge stop count that is really
+  one stop: 628104 and 430068 in two lost runs. Always delete / single-step /
+  re-set. `menubutton-step-trace.py` funnels every resume through `resume(pc)`.
+* **Do not leave handler breakpoints armed.** They sit at executable-range
+  addresses that every process shares. Arm them only inside a ~3 s window opened
+  by a button GSEvent seen at the GraphicsServices dequeue.
+* **Tracing `menuButtonDown:` perturbs the very gate under test** — it
+  single-steps the guest between key-down and key-up. Use `--only-up` for any
+  down/up comparison.
+* **Function end must come from the ObjC method table, not from the first
+  `pop {…,pc}`.** 1.1.4's `menuButtonUp:` has a shared epilogue in the MIDDLE of
+  the function; the heuristic cut it at 0x7bd4 when it runs to 0x7c28.
+* **`resolve_imp` is unreliable for arbitrary selectors** — it mis-resolved
+  `clickedMenuButton` to 0x732f0, inside the string section, instead of 0xd794.
+  Resolve from the method table (`objc-xref.methods`).
+
+New tools: `scripts/menubutton-step-trace.py` (step-trace + branch diff),
+`scripts/objc-method-disasm.py` (disassembly with every selector named),
+`scripts/objc-xref.py` (who sends this selector; `--list-methods`).
