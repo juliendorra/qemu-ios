@@ -224,6 +224,17 @@ def main() -> int:
                          "recording window -- the menu DOWN/UP delivery count")
     ap.add_argument("--press-interval", type=float, default=6,
                     help="seconds of recording after each press")
+    ap.add_argument("--watch-port", action="store_true",
+                    help="also break on the GraphicsServices event-PORT calls "
+                         "(_GSGetPurpleSystemEventPort, _ResetEventPortSet, "
+                         "_GSRegisterApplicationPort, _GSSendSystemEvent, "
+                         "_GSSendEvent)")
+    ap.add_argument("--taps", action="store_true",
+                    help="tap the screen after every press and record that too "
+                         "-- the control that separates 'the button path died' "
+                         "from 'all event delivery died'")
+    ap.add_argument("--tap-at", type=int, nargs=2, default=(160, 240),
+                    metavar=("X", "Y"))
     ap.add_argument("--no-gdb", action="store_true",
                     help="CONTROL: skip the gdbstub entirely and only count "
                          "[KEYTRACE] edges. Stopping the vCPU at a breakpoint "
@@ -275,7 +286,24 @@ def main() -> int:
         return 2
     print(f"  _PurpleEventCallback = {cb:#x}, per-event dequeue = {deq:#x}")
 
-    bps = {deq: "event"}
+    # `event` is the per-event dequeue; `callback` is the CFMachPort callback
+    # ENTRY. Both matter: if the callback still fires after the wedge but no
+    # event is dequeued, the mach message is arriving and the QUEUE is empty; if
+    # the callback stops firing too, nothing is being posted to the port at all.
+    bps = {deq: "event", cb: "callback"}
+    # The event PORT itself. After the first in-app press on 1.0, the kernel
+    # still ACKs the button IRQ but _PurpleEventCallback never fires again in
+    # ANY process -- so the mach message stops arriving. These are the calls
+    # that could make that happen, and they are ordinary GraphicsServices
+    # addresses (>= 0x30000000), so unlike the SpringBoard IMPs they are not
+    # ambiguous across processes.
+    if args.watch_port:
+        for n in ("_GSGetPurpleSystemEventPort", "_ResetEventPortSet",
+                  "_GSRegisterApplicationPort", "_GSSendSystemEvent",
+                  "_GSSendEvent"):
+            if n in syms:
+                bps[syms[n]] = n
+                print(f"  watching {n} at {syms[n]:#x}")
     # Expected instruction bytes at each SpringBoard breakpoint, so a hit can be
     # CHECKED rather than assumed: 0x6ae0 is a valid address in every process in
     # this OS, and the code that lives there differs per executable.
@@ -458,44 +486,67 @@ def main() -> int:
         n_before = len(records)
         print(f"  {n_before} hits, guest running: {live_before}")
 
-        def key_edge(down, phase, tries=40):
-            """Send ONE key edge, and make sure the model actually gets it.
+        def send_ev(events, phase, tries=40):
+            """Send QMP input events, and make sure they are ACCEPTED.
 
-            `qmp_input_send_event` REFUSES the event outright while the VM is
-            not running ("VM not running", ui/input.c), and QMP.cmd does not
-            look at the reply -- so a breakpoint landing inside the 150 ms hold
-            silently swallows the RELEASE. Measured: 10 downs but only 5 ups
-            reached ipod_touch_key_event under gdb, against 10/10 with no gdb.
-            That alone produced a fake "the DOWN event is rarely delivered"
-            result, so this retries until the edge is accepted, servicing (and
-            RECORDING) any breakpoint that is in the way.
+            `qmp_input_send_event` REFUSES everything with "VM not running"
+            while the VM is stopped (ui/input.c), and QMP.cmd does not look at
+            the reply -- so a breakpoint landing mid-gesture silently swallows
+            it. Measured: 10 key-downs but only 5 key-ups reached the model
+            under gdb, against 10/10 with --no-gdb, which manufactured a fake
+            "the DOWN event is rarely delivered" result. Retry, servicing (and
+            RECORDING) whatever breakpoint is in the way.
             """
             for n in range(tries):
                 go()
-                r = q.cmd("input-send-event", {"events": [
-                    {"type": "key", "data": {"down": down, "key": {
-                        "type": "qcode", "data": "h"}}}]})
+                r = q.cmd("input-send-event", {"events": events})
                 if "error" not in r:
                     return n
-                # Refused: the guest is stopped at a breakpoint. Deal with it.
                 if g.wait_stop(0.5) is not None:
                     state["stopped"] = True
                     service(phase)
                 else:
-                    state["stopped"] = True      # stopped, but nothing pending
+                    state["stopped"] = True
                     go()
                 time.sleep(0.02)
-            print(f"  !! key edge down={down} NEVER accepted -- run is INVALID")
+            print(f"  !! input event NEVER accepted -- run is INVALID")
             return -1
 
-        def press(phase, hold=0.15):
-            a = key_edge(True, phase)
-            end = time.time() + hold
-            while time.time() < end:          # keep recording during the hold
+        def hold(seconds, phase):
+            """Let the guest run for `seconds`, still recording every stop."""
+            end = time.time() + seconds
+            while time.time() < end:
                 if g.wait_stop(end - time.time()) is not None:
                     state["stopped"] = True
                     service(phase)
+
+        def key_edge(down, phase):
+            return send_ev([{"type": "key", "data": {"down": down, "key": {
+                "type": "qcode", "data": "h"}}}], phase)
+
+        def press(phase, hold_s=0.15):
+            a = key_edge(True, phase)
+            hold(hold_s, phase)
             b = key_edge(False, phase)
+            return a, b
+
+        def tap(px, py, phase, hold_s=0.15):
+            """A screen tap, sent with the same acceptance checking.
+
+            This is the control that separates "the BUTTON path died" from "ALL
+            event delivery died": after the wedge, a tap should still produce
+            GSEvents for the foreground app if only the button path is broken.
+            """
+            send_ev([{"type": "abs", "data": {"axis": "x",
+                                              "value": int(px / 320 * 32768)}},
+                     {"type": "abs", "data": {"axis": "y",
+                                              "value": int(py / 480 * 32768)}}],
+                    phase)
+            a = send_ev([{"type": "btn", "data": {"down": True,
+                                                  "button": "left"}}], phase)
+            hold(hold_s, phase)
+            b = send_ev([{"type": "btn", "data": {"down": False,
+                                                  "button": "left"}}], phase)
             return a, b
 
         press_times = []
@@ -506,6 +557,10 @@ def main() -> int:
             retries.append(press(f"p{i + 1}"))
             press_times.append(round(time.time() - t0, 2))
             live_after = drain(args.press_interval, f"p{i + 1}") and live_after
+            if args.taps:
+                print(f"  tapping the screen (t{i + 1}) ...")
+                tap(args.tap_at[0], args.tap_at[1], f"t{i + 1}")
+                live_after = drain(args.press_interval, f"t{i + 1}") and live_after
         n_pressed = len(records) - n_before
         if args.wait:
             live_after = drain(args.wait, "after") and live_after
@@ -524,18 +579,25 @@ def main() -> int:
         # (type1000) and an UP (type1001) for each press. `menuButtonUp:` gates
         # on `_menuButtonTimer`, which only `menuButtonDown:` sets -- so a
         # missing DOWN silently swallows the press.
-        press_phases = [f"p{i + 1}" for i in range(args.presses)]
+        press_phases = []
+        for i in range(args.presses):
+            press_phases.append(f"p{i + 1}")
+            if args.taps:
+                press_phases.append(f"t{i + 1}")
         sb_ev = [r for r in records if r["at"] == "event"
                  and r.get("proc") == "SpringBoard"]
         print(f"\n=== {args.board} {'--no-app' if args.no_app else 'in-app'}: "
               f"{args.presses} presses ===")
-        print("\n  press | DOWN(1000) | UP(1001) | other types to SpringBoard")
+        print("\n  phase | DOWN(1000) | UP(1001) | other types (any process)")
         n_down = n_up = 0
+        all_ev = [r for r in records if r["at"] == "event"]
         for ph in press_phases:
             evs = [r for r in sb_ev if r["phase"] == ph]
             d = sum(1 for r in evs if r.get("type") == 1000)
             u = sum(1 for r in evs if r.get("type") == 1001)
-            other = sorted({r.get("type") for r in evs} - {1000, 1001})
+            other = sorted({(r.get("proc"), r.get("type")) for r in all_ev
+                            if r["phase"] == ph} - {("SpringBoard", 1000),
+                                                    ("SpringBoard", 1001)})
             n_down += d
             n_up += u
             print(f"   {ph:>4} |     {d:^6} |   {u:^4} | {other}")

@@ -1279,3 +1279,89 @@ candidates, in the order the evidence favours:
   GSEvent appears, the break is between the kernel HID path and the event port.
   `IT_SYSIC_TRACE=1` plus this probe in one run answers that; mind that the
   SYSIC trace suppresses a register after its 8th access.
+
+## NOTHING BREAKS IN THE EVENT PORT — SpringBoard stops SENDING (2026-07-29)
+
+`gsevent-type-probe.py --watch-port --taps` adds breakpoints on the
+GraphicsServices port calls (`_GSGetPurpleSystemEventPort`,
+`_ResetEventPortSet`, `_GSRegisterApplicationPort`, `_GSSendSystemEvent`,
+`_GSSendEvent`), on `_PurpleEventCallback`'s **entry** as well as its dequeue,
+and taps the screen after every press. Those are library addresses
+(>= 0x30000000), so unlike the SpringBoard IMPs they are unambiguous across
+processes.
+
+### The actual delivery chain, as measured
+
+SpringBoard is the **router**: it reads the HID event and re-sends it into the
+purple port, for its own consumption and for the foreground app's.
+
+```
+1.0, press 1 (in-app) -- WORKS, end to end
+  t=10.05  _GSGetPurpleSystemEventPort   SpringBoard
+  t=10.05  _GSSendEvent                  SpringBoard
+  t=10.06  callback                      SpringBoard
+  t=10.07  event type1000 (MENU DOWN)    SpringBoard   -> menuButtonDown: REAL HIT
+  t=10.20  _GSGetPurpleSystemEventPort   SpringBoard
+  t=10.20  _GSSendEvent                  SpringBoard
+  t=10.21  event type1001 (MENU UP)      SpringBoard   -> menuButtonUp:   REAL HIT
+  t=10.24  _GSSendEvent                  SpringBoard
+  t=10.26  callback                      Preferences
+  t=10.27  event type2002                Preferences   (the app is deactivated)
+  t=14.25  callback                      SpringBoard
+  -------- then NOTHING, for 2 more presses and 3 taps, over ~30 s ------------
+```
+
+**After that point SpringBoard never calls `_GSGetPurpleSystemEventPort` or
+`_GSSendEvent` again.** It is not that the port refuses, or that the message is
+lost: nothing is ever sent. `_PurpleEventCallback` stops firing in every
+process, taps included, which is why touch dies with the button.
+
+Meanwhile the layer below stays healthy: `IT_SYSIC_TRACE` shows the kernel
+receiving and ACKing the button IRQ for every later press
+(`ACK INTSTAT group 1 = 0x00000100` continuing to n=16). The interrupt arrives;
+SpringBoard just never turns it into a GSEvent.
+
+### The same measurement on 1.1.4, which works
+
+Every press and every tap keeps the chain alive, indefinitely:
+
+```
+  p1  _GSGetPurpleSystemEventPort x1  _GSSendEvent x1   callback x7
+  p2  _GSGetPurpleSystemEventPort x2  _GSSendEvent x4   callback x28
+      _ResetEventPortSet (Preferences) x1     <- the app's own teardown
+  p3  _GSGetPurpleSystemEventPort x2  _GSSendEvent x2   callback x13
+  t1  _GSSendEvent x2  -> callback (Preferences) x9, 2 events to the app
+  t2, t3  the same, now routed to SpringBoard because the app has closed
+```
+
+### What this rules out, and the one concrete difference
+
+* **The port is not reset, torn down or re-registered on 1.0.**
+  `_ResetEventPortSet` and `_GSRegisterApplicationPort` NEVER fire on 1.0 --
+  not before the wedge, not during it, not after.
+* **The kernel is not the problem**: it keeps servicing the IRQ.
+* **GraphicsServices is not the problem**: its send path is simply not entered.
+
+The one concrete divergence worth chasing: on 1.1.4 the dismissed app runs
+`_ResetEventPortSet` **in the app process** as part of being torn down (p2
+above). On 1.0 that never happens. So 1.0's app-teardown handoff does not
+complete, and the last thing SpringBoard does before going silent is deliver
+type2002 to Preferences at t=10.27 -- i.e. the wedge is inside the teardown that
+`-[SBUIController clickedMenuButton]` starts.
+
+### Where to look next
+
+SpringBoard's own state after the first press, not the port:
+
+* **`-[SBUIController clickedMenuButton]`** (1.0: `0xd794`) is the last code
+  known to run before the silence, and it drives the teardown. Step it with
+  `menubutton-step-trace.py --board m68ap-10 --only-up --trace-sel clickedMenuButton`
+  -- arm before the FIRST press, since only press 1 gets through.
+* **Is SpringBoard's HID-reading thread blocked, or its main thread?** The
+  sender stopping, with the runloop also going quiet (one last callback at
+  t=14.25 and then nothing), fits a thread blocked on a lock held across the
+  teardown. A per-thread view is what is missing; the gdbstub only shows the
+  running CPU, so this needs either a very low-rate sample filtered by the
+  process fingerprint, or a breakpoint on whatever SpringBoard calls to read HID
+  events (find it by xrefing from the `_GSSendEvent` call site at the top of the
+  trace above -- its caller is in SpringBoard).
