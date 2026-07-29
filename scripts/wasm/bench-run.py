@@ -76,6 +76,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--instantiate", type=int, default=100)
     parser.add_argument("--max", type=int, default=48000)
+    parser.add_argument("--build", default="1A543a",
+                        help="firmware build: 1A543a (1.0) or 4A102 (1.1.4). "
+                             "The security epoch travels with it -- a wrong one "
+                             "wedges iBoot with an EMPTY serial log")
     parser.add_argument("--mode", choices=("pack", "chunked"), default="pack")
     parser.add_argument("--cold", action="store_true",
                         help="chunked mode: drop the chunk cache first")
@@ -132,7 +136,7 @@ def main() -> None:
         wait_for_server(args.port)
 
         query = (f"?instantiate={args.instantiate}&max={args.max}"
-                 f"&mode={args.mode}&label={args.label}")
+                 f"&mode={args.mode}&label={args.label}&build={args.build}")
         if args.cold:
             query += "&cold=1"
         if args.no_prefetch:

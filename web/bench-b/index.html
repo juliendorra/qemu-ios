@@ -16,7 +16,7 @@
      Serve with scripts/wasm/serve.py --port 8011 (COOP/COEP required) and
      open /bench-b/. Session A owns web/public/*; nothing here touches it. -->
 <meta charset="utf-8">
-<title>iPhone OS 1.0 — Session B bench</title>
+<title>iPhone OS — Session B bench</title>
 <style>
   body { font: 13px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem;
          background: #14161a; color: #d7dae0; }
@@ -31,7 +31,7 @@
   #log { white-space: pre-wrap; line-height: 1.4; }
   .err { color: #e5a3a0; }
 </style>
-<h1>iPhone OS 1.0 (1A543a) — WebAssembly JIT bench</h1>
+<h1>iPhone OS — WebAssembly JIT bench</h1>
 <div class="card" id="state">loading…</div>
 <div class="card" id="marks">(no landmarks yet)</div>
 <div class="card" id="jit">(no JIT stats yet)</div>
@@ -44,10 +44,24 @@
     from '../src/emulator/chunk-loader.js';
 
   const params = new URLSearchParams(location.search);
+  /*
+   * Which firmware. The epoch is the security epoch the bootrom checks, and it
+   * is per-BUILD: get it wrong and iBoot wedges with an EMPTY serial log that
+   * looks exactly like a hang. Never default it silently to another build's.
+   */
+  const BUILDS = {
+    '1A543a': { epoch: 0, version: '1.0' },
+    '4A102':  { epoch: 3, version: '1.1.4' },
+  };
+  const BUILD = params.get('build') || '1A543a';
+  if (!BUILDS[BUILD]) {
+    throw new Error(`unknown build ${BUILD}; known: ${Object.keys(BUILDS)}`);
+  }
+  const EPOCH = BUILDS[BUILD].epoch;
   const INSTANTIATE = params.get('instantiate') || '100';
   const MAX_INSTANCES = params.get('max') || '48000';
   const MODE = params.get('mode') || 'pack';         // pack | chunked
-  const CHUNK_BASE = params.get('chunks') || '/chunked/1A543a/';
+  const CHUNK_BASE = params.get('chunks') || `/chunked/${BUILD}/`;
   const PREFETCH = params.get('prefetch') !== '0';
   const COLD = params.get('cold') === '1';           // drop the chunk cache
   // Default ON, matching tcg/wasm64.c; ?adaptive=0 pins the static threshold.
@@ -100,7 +114,8 @@
 
   const renderMarks = () => {
     marksEl.textContent =
-      `instantiate=${INSTANTIATE} max=${MAX_INSTANCES} mode=${MODE}` +
+      `${BUILD} (${BUILDS[BUILD].version})  instantiate=${INSTANTIATE} ` +
+      `max=${MAX_INSTANCES} mode=${MODE}` +
       `${ADAPTIVE ? ' adaptive' : ''}\n` +
       LANDMARKS.map(([name]) =>
         `${hit.has(name) ? hit.get(name).padStart(8) : '       —'}  ${name}`)
@@ -203,7 +218,7 @@
     lastReport = now;
     const body = JSON.stringify({
       instantiate: Number(INSTANTIATE), maxInstances: Number(MAX_INSTANCES),
-      label: LABEL,
+      label: LABEL, build: BUILD,
       mode: MODE, prefetch: PREFETCH, cold: COLD, adaptive: ADAPTIVE,
       elapsed: Number((now / 1000).toFixed(1)),
       landmarks: Object.fromEntries([...hit].map(([k, v]) => [k, Number(v)])),
@@ -350,7 +365,7 @@
   await Module({
     arguments: [
       '-M', 'iPhone-2G,bootrom=/fw/bootrom,iboot=/fw/iboot.bin,' +
-            'nand=/fw/nand,epoch=0',
+            `nand=/fw/nand,epoch=${EPOCH}`,
       '-m', '1G',
       '-pflash', '/fw/nor.bin',
       // -display wasm publishes the surface into the wasm heap (ui/wasm.c,
@@ -376,9 +391,9 @@
         `adaptive=${ADAPTIVE ? 1 : 0}\n`);
 
       let staged = 0;
-      for (const [dst, src] of [['/fw/bootrom', 'bootrom'],
-                                ['/fw/iboot.bin', 'iboot.bin'],
-                                ['/fw/nor.bin', 'nor.bin']]) {
+      for (const [dst, src] of [['/fw/bootrom', `${BUILD}/bootrom`],
+                                ['/fw/iboot.bin', `${BUILD}/iboot.bin`],
+                                ['/fw/nor.bin', `${BUILD}/nor.bin`]]) {
         state(`downloading ${src}…`);
         const data = new Uint8Array(await (await fetch(src)).arrayBuffer());
         mod.FS.writeFile(dst, data);
@@ -410,9 +425,9 @@
       } else {
         mod.FS.mkdir('/fw/nand');
         for (let b = 0; b < 8; b++) mod.FS.mkdir(`/fw/nand/bank${b}`);
-        state('downloading nand.pack (215.6 MiB)…');
+        state('downloading the whole nand.pack…');
         const data = new Uint8Array(
-          await (await fetch('/public/jit-boot/nand.pack')).arrayBuffer());
+          await (await fetch(`${BUILD}/nand.pack`)).arrayBuffer());
         mod.FS.writeFile('/fw/nand/nand.pack', data);
         if (WRITABLE) mod.FS.writeFile('/fw/nand/nand-tune', 'overlay=ram\n');
         staged += data.length;

@@ -79,7 +79,9 @@ def main() -> None:
 
     chunks_dir = args.out / "chunks"
     if chunks_dir.exists() and any(chunks_dir.iterdir()) and not args.force:
-        raise SystemExit(f"{chunks_dir} is not empty (use --force)")
+        raise SystemExit(f"{chunks_dir} is not empty (use --force, which now "
+                         "REUSES chunks already written rather than "
+                         "recompressing them)")
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
     with args.pack.open("rb") as handle:
@@ -99,6 +101,7 @@ def main() -> None:
         raw_total = 0
         stored_total = 0
         unique: dict[str, int] = {}
+        reused = 0
 
         for chunk in range(total_chunks):
             slots = min(per_chunk, count - chunk * per_chunk)
@@ -112,11 +115,21 @@ def main() -> None:
                 # every reference to it is a cache hit after the first.
                 sizes.append(sizes[unique[digest]])
             else:
-                compressed = brotli.compress(block, quality=args.quality)
-                (chunks_dir / digest).write_bytes(compressed)
+                path = chunks_dir / digest
+                # Already there? Then it is the same bytes -- the name IS the
+                # hash. Brotli q11 over a 300 MiB pack is ~45 minutes, so this
+                # makes a re-run (to add a prefetch list, say) cheap instead of
+                # a repeat of the whole compression.
+                if path.exists() and path.stat().st_size > 0:
+                    size = path.stat().st_size
+                    reused += 1
+                else:
+                    compressed = brotli.compress(block, quality=args.quality)
+                    path.write_bytes(compressed)
+                    size = len(compressed)
                 unique[digest] = chunk
-                sizes.append(len(compressed))
-                stored_total += len(compressed)
+                sizes.append(size)
+                stored_total += size
             hashes.append(digest)
             if chunk % 50 == 0 or chunk == total_chunks - 1:
                 print(f"\r  chunk {chunk + 1}/{total_chunks} "
@@ -177,7 +190,8 @@ def main() -> None:
           f"({len(unique):,} unique, "
           f"{(1 - len(unique) / total_chunks) * 100:.1f}% deduplicated)")
     print(f"stored        {stored_total / mb:.1f} MiB brotli q{args.quality} "
-          f"({stored_total / raw_total * 100:.1f}%)")
+          f"({stored_total / raw_total * 100:.1f}%)"
+          + (f", {reused:,} chunks reused from a previous run" if reused else ""))
     if prefetch:
         print(f"prefetch      {len(prefetch):,} chunks = "
               f"{prefetch_bytes / mb:.1f} MiB -- what a cold boot downloads")

@@ -25,6 +25,9 @@ node_modules/
 /bench-b/nor.bin
 /bench-b/qemu-system-arm.js
 /bench-b/qemu-system-arm.wasm
+# Per-build firmware, symlinked in as web/bench-b/<BUILD>/{bootrom,iboot.bin,
+# nor.bin,nand.pack}.
+/bench-b/*/
 
 # Chunked NAND asset sets: produced by scripts/wasm/chunk-pack.py, ~64 MiB per
 # firmware version.

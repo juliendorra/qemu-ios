@@ -152,6 +152,15 @@ def main() -> int:
                     "scanout vs the kernel FB, spaced --sample-interval apart, "
                     "to catch the awake window before the panel auto-sleeps.")
     ap.add_argument("--sample-interval", type=float, default=5.0)
+    # -icount is not a nicety on M68AP: without it QEMU_CLOCK_VIRTUAL follows
+    # wall clock, drivers see their own start() taking seconds, and the kernel
+    # takes timeout paths no real device takes. 1.1.4 panics in
+    # IOIpodUSBDevice::start / the USB wrangler -- intermittently on a fast
+    # host, reliably on a loaded one -- and then renders NOTHING, which reads as
+    # "this NAND is broken". ipod-app-launcher.sh already passes shift=1 for the
+    # iphone-2g profile; this makes the same setting available here.
+    ap.add_argument("--icount", type=int, default=None, metavar="SHIFT",
+                    help="run with -icount shift=SHIFT (use 1 for m68ap)")
     ap.add_argument("--logs", type=Path, required=True)
     m68ap_paths.add_build_argument(ap, required=False)
     args = ap.parse_args()
@@ -223,6 +232,8 @@ def main() -> int:
            "-L", str(APP / "Resources" / "pc-bios"),
            "-display", "none", "-serial", f"file:{serial}",
            "-qmp", f"unix:{sock_path},server,nowait"]
+    if args.icount is not None:
+        cmd += ["-icount", f"shift={args.icount}"]
     if args.observer and args.observer_plugin.is_file():
         spec = (f"{args.observer_plugin},profile={profile},"
                 f"service-observer-only=true,trace-details=false,"
