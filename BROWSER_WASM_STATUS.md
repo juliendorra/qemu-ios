@@ -141,52 +141,80 @@ back-to-back with no guest execution in between, so SpringBoard never observes
 a finger. An 800 ms hold produced ~1.5 s of *guest* separation and launched the
 app immediately.
 
-The page therefore floors every release at `MIN_PRESS_MS` — for taps and for
-the Home/Power buttons alike. **This is a browser-speed workaround, not a
-fidelity question, and it should shrink as Session B's work lands.**
+The page therefore floors every release at `MIN_PRESS_MS` (800 ms) — for taps
+and for the Home/Power buttons alike. **This is a browser-speed workaround, not
+a fidelity question, and it should shrink as Session B's work lands.** The value
+is conservative rather than measured; the correction below explains why, and it
+is worth reading before trusting any number in this area.
 
-#### The constant is derived, not guessed (`?sweep=1`)
+#### CORRECTION: the "derived" 450 ms threshold was an artifact. WITHDRAWN.
 
-The page drives its own ladder: after the home screen appears it taps a
-different icon at each hold and reports the shortest one that launches an app
-(45.6% non-black → ~96%). A hold too short to register leaves SpringBoard
-exactly where it was, so failures are free and repeatable, while the first
-success ends the run — which is all one boot affords on 1.0, since there is no
-way back out of an app.
+An earlier version of this section reported a swept threshold of ~450 ms and
+called it derived. **It was not.** Three sweeps, with the ladder in different
+orders, all succeeded at **rung index 5**:
 
-| run | guestRatio | result |
+| run | ladder | success |
 | --- | --- | --- |
-| 1 | 0.0147 | 30, 60, 120, 250 ms fail · **500 ms launches** |
-| 2 | 0.0170 | 280, 320, 360, 400 ms fail · **450 ms launches** |
+| 1 | 30, 60, 120, 250, **500** | rung 5 (500 ms) |
+| 2 | 280, 320, 360, 400, **450** | rung 5 (450 ms) |
+| 3 | 30, 60, 120, 250, **500** | rung 5 (500 ms) |
 
-**The threshold is ~450 ms of wall time.** The hand-picked 500 ms therefore had
-only ~11% of margin — too little, because run-to-run engine speed varies about
-twofold (boots to the home screen ranged 268–569 s, `guestRatio` 0.0147–0.0357)
-and the threshold scales inversely with it. **`MIN_PRESS_MS` is now 800 ms**,
-~1.8× the measured threshold, which covers the slowest run observed.
+**Success tracked position in the ladder, not hold length.** Three for three at
+the same index is not a threshold; it is a clock. Every rung ran 25 s apart, so
+rung 5 is simply ~100 s of wall time after the sweep began — about 2 s of guest
+time at the measured ratio.
 
-#### Two dead ends in getting that number, both worth not repeating
+Two candidate confounds were checked and ONE was confirmed:
 
-**Do not express the hold in GUEST milliseconds.** The first sweep swept guest
-holds and converted through `guestRatio`. It produced nonsense — 4 ms guest →
-10 ms wall alongside 256 ms guest → 4113 ms wall — because **with `-icount`
-QEMU warps virtual time forward whenever the CPU idles**, and an idle home
-screen is exactly where the sweep runs. The ratio is worth reporting; it is not
-worth steering by. The constant is a wall-clock quantity, so sweep it in wall
-time.
+- **Geometry: ruled out.** Every failure was at panel y=67 and every success at
+  y=157, which looked like a bad coordinate grid. It is not: a row-brightness
+  profile of a native home-screen framebuffer puts icon row 1 at rows 40–94
+  (centre 67), and the guest's own log confirms the mapping end to end — panel
+  y=249 arrives as `fy=0.481` and launched Settings.
+- **The guest's input gate: confirmed, and it is real.**
+  `lcd_update_input_ready()` refuses ALL touch until it has seen
+  `2 * LCD_REFRESH_RATE_FREQUENCY` frames of a stable OS image — **two seconds
+  of GUEST time**, which at a ratio of ~0.02 is ~100 s of wall time. The page
+  now mirrors `[LCD] Touch input ready` and every `[TOUCH]` verdict to the
+  console, and waits for that message before the first rung.
 
-**The ladder must finish inside the auto-lock window.** That same first sweep
-used eight rungs at 45 s each; the guest locked after roughly 260 s of idle and
-the last five rungs tapped a dead panel, every one reading as a clean failure.
-The sweep now aborts and reports `invalid` the moment the panel goes below 5%
-non-black, rather than reporting a threshold the run never established. It is
-also the first place where the engine being slow has a *user-visible* effect
-rather than merely a slow one.
+**But gating on the message was not enough**: run 3 waited for
+`[LCD] Touch input ready (4/6 visible after 120 frames)` and *still* succeeded
+only at rung 5. So something settles for a further ~100 s of wall time (~2 s of
+guest) after the gate opens, or the effect is tap-count rather than time.
 
-Two smaller input fixes came out of the same test: `setPointerCapture` throws
-for a pointer id with no active pointer and aborted the whole handler before
-any touch was sent (it is now wrapped), and a pointer released outside the
-window never delivers `pointerup`, which would leave a finger down forever.
+A verification of 800 ms through the real pointer-event path (`?sweep=real`,
+a normal 50 ms click floored by `endTouch`) **failed** — but it fired ~5 s after
+the gate armed, i.e. inside that same settling window, so it does not disprove
+800 ms either. It is confounded identically.
+
+#### What is actually known about the hold
+
+Only the original interactive observation, which remains unconfounded because it
+happened long after boot: a fast click logged `[TOUCH] mouse DOWN` and
+`mouse UP` at the same guest timestamp and launched nothing, and a ~700 ms hold
+at the same coordinates launched Settings immediately. **That is n=1.** It is
+why a hold exists at all; it does not size one.
+
+**`MIN_PRESS_MS` is therefore 800 ms as a CONSERVATIVE CHOICE, not a measured
+one.** It is comfortably above anything observed to work and costs only tap
+latency. Do not cite a threshold for it.
+
+#### The experiment that would settle it
+
+Run the ladder **descending** (500, 250, 120, 60, 30). The elapsed-time effect
+and the hold effect then push in opposite directions:
+
+- success at rung 1 → the hold matters and 500 ms suffices early;
+- success at rung 5 (30 ms) → it was never the hold, only elapsed time.
+
+That run was attempted and did not complete: the emulator **wedged with
+`guestRatio` at 0.0000** — guest virtual time not advancing at all — about
+1170 s in, having reached BSD root but never launchd. Worth knowing that a
+browser boot can hang this way; the heartbeat is what made it visible.
+
+Better still, characterise the settling window first (constant hold, varying
+delay after the gate), then sweep holds from beyond it.
 
 ### The real-time ratio, and why it cannot be trusted at idle
 

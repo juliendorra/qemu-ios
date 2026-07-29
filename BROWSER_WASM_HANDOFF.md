@@ -445,20 +445,33 @@ thread boundary:
 
 **Two traps that will outlive this step:**
 
-1. **Presses must be held ~800 ms of WALL time** (`MIN_PRESS_MS`). Guest time
-   runs at ~2% of wall time, so a normal 100 ms tap is a few guest milliseconds
-   — less than the multitouch model's own 16.7 ms motion report interval — and
-   the guest never sees a finger. **Derived, not guessed**: `?sweep=1` walks a
-   ladder of holds and reports the shortest that launches an app; two runs put
-   the threshold at ~450 ms, and 800 ms is the margin for a twofold spread in
-   engine speed. Re-run the sweep as the engine gets faster; do not mistake the
-   constant for a device-model defect.
+1. **Presses are held 800 ms of WALL time** (`MIN_PRESS_MS`) — a CONSERVATIVE
+   choice, **not** a measured threshold. Guest time runs at ~2% of wall time, so
+   a normal 100 ms tap is a few guest milliseconds, less than the multitouch
+   model's own 16.7 ms motion report interval, and the guest never sees a
+   finger. That a hold is needed rests on one clean observation (a fast click
+   logged DOWN and UP at the same guest timestamp and launched nothing; ~700 ms
+   launched Settings at once). **How long it must be is NOT established** —
+   `BROWSER_WASM_STATUS.md` withdraws an earlier "derived ~450 ms" claim and
+   explains the confound.
 
-   Two ways that sweep can lie, both paid for already: **never express the hold
-   in guest milliseconds** (with `-icount` QEMU warps virtual time forward when
-   the CPU idles, so `guestRatio` at an idle home screen is not a conversion
-   factor), and **keep the whole ladder inside the ~260 s auto-lock window** or
-   the later rungs tap a dead panel and read as clean failures.
+   **Before sweeping input timing, know these three.** All three cost a run:
+
+   - **`lcd_update_input_ready()` refuses ALL touch** until it has seen
+     `2 * LCD_REFRESH_RATE_FREQUENCY` frames of a stable OS image — two seconds
+     of GUEST time, ~100 s of wall time. Wait for `[LCD] Touch input ready` on
+     stderr; the boot page mirrors it and every `[TOUCH]` verdict to the
+     console. Waiting a fixed wall time instead invalidated two sweeps.
+   - **Something settles for a further ~100 s of wall time after that gate
+     opens.** Three sweeps in different ladder orders all succeeded at rung
+     index 5, which is a clock, not a threshold. Run the ladder DESCENDING to
+     separate the two effects.
+   - **Never express the hold in guest milliseconds.** With `-icount` QEMU warps
+     virtual time forward when the CPU idles, so `guestRatio` at an idle home
+     screen is not a conversion factor: converting through it produced 4 ms
+     guest -> 10 ms wall alongside 256 ms -> 4113 ms.
+   - **Keep the whole ladder inside the ~260 s auto-lock window**, or later
+     rungs tap a dead panel and read as clean failures.
 2. **Home from inside an app does nothing on 1.0.** That is the known event
    *routing* bug (`5f019eac7f`), not the input bridge — the bridge is proven to
    deliver and the guest is proven to service it. Do not re-investigate it from

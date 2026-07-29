@@ -75,6 +75,7 @@
   let fsRef = null;      // MEMFS, captured in preRun so serial.log can be read
   let moduleRef = null;  // the MAIN THREAD's Module -- see the note below
   let serialSeen = 0;    // bytes of guest serial already rendered
+  let touchReady = false;  // the guest's input gate has armed
 
   function renderMarks() {
     const rows = LANDMARKS.map(([name]) =>
@@ -158,6 +159,20 @@
   function note(text) {
     for (const [name, test] of LANDMARKS) {
       if (!hit.has(name) && test(text)) { mark(name); }
+    }
+    // The guest's own verdict on every touch, mirrored to the console because
+    // it is the only way to tell a REFUSED touch from an unregistered one.
+    //
+    // lcd_update_input_ready() refuses all input until it has seen
+    // 2 * LCD_REFRESH_RATE_FREQUENCY frames of a stable OS image -- two seconds
+    // of GUEST time, which at a ratio of 0.018 is about 110 seconds of WALL
+    // time. Any press sweep that starts tapping before that measures the gate,
+    // not the press.
+    if (/\[TOUCH\]|\[LCD\] (Touch input|Retained touch)/.test(text)) {
+      console.log(`[guest] ${text.trim()}`);
+      if (/Touch input ready|Retained touch input ready/.test(text)) {
+        touchReady = true;
+      }
     }
     if (/panic\(|kernel abort|hardware error/.test(text)) {
       failed = text.slice(0, 120);
@@ -392,19 +407,18 @@
   //
   // So releases are floored to this. It is a browser-speed workaround, not a
   // device fidelity question, and it should shrink as the engine gets faster.
-  // How long a press is held, in WALL milliseconds. DERIVED, not guessed:
-  // ?sweep=1 walks a ladder of holds on the home screen and reports the
-  // shortest one that launches an app. Two independent runs:
+  // How long a press is held, in WALL milliseconds. A CONSERVATIVE CHOICE, not
+  // a measured threshold -- an earlier revision claimed ~450 ms "derived by
+  // sweep" and that claim is WITHDRAWN. Three sweeps in different ladder orders
+  // all succeeded at rung INDEX 5 (holds 500, 450, 500), which is a clock, not
+  // a threshold: lcd_update_input_ready() refuses all touch for two seconds of
+  // GUEST time (~100 s of wall), and something settles for about that long
+  // again afterwards. See BROWSER_WASM_STATUS.md.
   //
-  //   run 1 (ratio 0.0147)   250 ms fail   500 ms LAUNCH
-  //   run 2 (ratio 0.0170)   400 ms fail   450 ms LAUNCH
-  //
-  // So the threshold is ~450 ms at the speeds measured here, and the earlier
-  // hand-picked 500 ms had only ~11% of margin -- too little, because
-  // run-to-run engine speed varies about twofold (boots to the home screen
-  // ranged 268-569 s, guestRatio 0.0147-0.0357) and the threshold scales
-  // inversely with it. 800 ms is roughly 1.8x the measured threshold, which
-  // covers the slowest run observed.
+  // What IS known: a fast click logs [TOUCH] mouse DOWN and mouse UP at the
+  // same guest timestamp and launches nothing, while a ~700 ms hold launches an
+  // app at once. That is why a floor exists. 800 ms is comfortably above
+  // anything observed to work and costs only tap latency.
   //
   // WHY a hold is needed at all: guest time runs at ~2% of wall time, so a
   // normal ~100 ms tap is a few guest milliseconds -- less than the multitouch
@@ -513,9 +527,56 @@
     setTimeout(() => moduleRef._wasm_input_touch(px, py, 0), wallMs);
   }
 
-  async function runSweep() {
+  // ?sweep=real verifies MIN_PRESS_MS through the REAL input path rather than
+  // the sweep's own shortcut. It dispatches a normal fast click -- pointerdown
+  // and a pointerup 50 ms later -- and leaves endTouch() to floor the release
+  // at MIN_PRESS_MS. That is what a user actually does, and it exercises
+  // sendTouch(), the coordinate mapping and the setPointerCapture try/catch
+  // that a direct _wasm_input_touch() call all skip.
+  //
+  // One trial per boot: a success launches an app and on 1.0 there is no way
+  // back to SpringBoard.
+  function clickLikeAUser(px, py) {
+    const r = canvas.getBoundingClientRect();
+    const opts = { pointerId: 1, bubbles: true, cancelable: true,
+                   clientX: r.left + px, clientY: r.top + py,
+                   isPrimary: true, pointerType: 'mouse' };
+    canvas.dispatchEvent(new PointerEvent('pointerdown', opts));
+    setTimeout(() => canvas.dispatchEvent(new PointerEvent('pointerup', opts)),
+               50);
+  }
+
+  // Wait for the GUEST to say it will accept touch. Waiting a fixed wall time
+  // instead is what invalidated the first two press sweeps: the gate armed
+  // around rung 5 in both, so both reported "the 5th hold worked" when what
+  // actually happened was "the gate opened".
+  async function awaitTouchGate() {
     while (nonBlackPct < 40) await sleep(2000);
-    await sleep(10000);                       // let the home screen settle
+    while (!touchReady) await sleep(2000);
+    console.log(`[sweep] touch gate armed at ${at()}s`);
+    await sleep(5000);
+  }
+
+  async function runVerify() {
+    await awaitTouchGate();
+    const baseline = nonBlackPct;
+    const [px, py] = SWEEP_TARGETS[0];
+    console.log(`[verify] MIN_PRESS_MS=${MIN_PRESS_MS} baseline=${baseline}%`
+                + ` ratio=${guestRatio.toFixed(4)} -- fast 50ms click at (${px},${py})`);
+    clickLikeAUser(px, py);
+    await sleep(SWEEP_SETTLE_MS);
+    const launched = nonBlackPct > 80;
+    const asleep = nonBlackPct < 5;
+    sweepResult = { mode: 'verify', minPressMs: MIN_PRESS_MS, baseline,
+                    ratioAtStart: Number(guestRatio.toFixed(4)),
+                    nonBlackPct, launched, invalid: asleep || null };
+    report(true);
+    console.log(`[verify] nonBlack=${nonBlackPct}% launched=${launched}`
+                + `${asleep ? ' PANEL ASLEEP - INVALID' : ''}`);
+  }
+
+  async function runSweep() {
+    await awaitTouchGate();
     const baseline = nonBlackPct;
     const ratioAtStart = guestRatio;
     console.log(`[sweep] start baseline=${baseline}% ratio=${ratioAtStart.toFixed(4)}`);
@@ -546,7 +607,7 @@
                 + SWEEP_WALL_MS[SWEEP_WALL_MS.length - 1] + 'ms');
   }
   let sweepResult = null;
-  const SWEEP = new URLSearchParams(location.search).get('sweep') === '1';
+  const SWEEP_MODE = new URLSearchParams(location.search).get('sweep');
 
   // ---------------------------------------------------------------- boot ---
   const { default: Module } = await import('./qemu-system-arm.js');
@@ -578,7 +639,8 @@
       runtimeReady = true;
       line('runtime initialized; painting enabled');
       console.log('[bench] runtime initialized');
-      if (SWEEP) runSweep();
+      if (SWEEP_MODE === '1') runSweep();
+      else if (SWEEP_MODE === 'real') runVerify();
     },
     preRun: [async (mod) => {
       // preRun runs on the MAIN thread, so this is the Module whose exports
