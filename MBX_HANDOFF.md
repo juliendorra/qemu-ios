@@ -12,7 +12,17 @@
 > `scripts/kernel-addr-symbolize.py`). So **T1 has a second, much more visible
 > symptom than the swap-device window**, and the cheapest experiment is to make
 > bit 6 of register 0x12C readable-as-set in the stub and re-run
-> `app-button-probe.py --board m68ap-10`. Full record:
+> `app-button-probe.py --board m68ap-10`.
+>
+> **DONE, and it worked in part (2026-07-29).** `0x12C` now returns `0x140`
+> instead of `0x100` (`IT_MBX_READY=0` reverts). A/B on the same binary:
+> **0.99 cores with the bit clear vs 0.10 with it set**, and event delivery goes
+> from 1 DOWN/1 UP over ten presses to 5/6 over six, with taps reaching the app
+> again. **But the app still does not visually dismiss** (`3_home_returns` 0.00%),
+> and the guest is now IDLE rather than spinning -- i.e. something waits on an
+> MBX completion that never arrives, which is the other half of T1: the MBX
+> region still has no IRQ connected. Installed in the 1.0 bundle only; 1.1.4 and
+> the iPod have NOT been re-tested with it. Full record:
 > [`IN_APP_BUTTON_INVESTIGATION.md`](IN_APP_BUTTON_INVESTIGATION.md).
 
 **Date:** 2026-07-28 · **Branch:** `ipod_touch_1g` · **State:** nothing started —

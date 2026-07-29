@@ -561,13 +561,49 @@ static const MemoryRegionOps usb_phys_ops = {
 /*
 MBX
 */
+/*
+ * MBX register 0x12C bit 6 (0x40) -- the bit AppleMBX spins on.
+ *
+ * On iPhone OS 1.0, dismissing an app with HOME leaves
+ * com.apple.driver.AppleMBX in a nine-instruction loop:
+ *
+ *   0xc0336010  mov r0, r4              ; the MBX object
+ *   0xc0336014  mov r1, #0x12c          ; the register offset
+ *   0xc0336018  blx r5                  ; -> ldr r0,[r0,r1]; bx lr  (register read)
+ *   0xc0336024  tst r3, #0x40
+ *   0xc0336028  beq 0xc0336010          ; loop while bit 6 is CLEAR
+ *
+ * i.e. `do { v = mbx_read(base, 0x12C); } while (!(v & 0x40));`. Measured with
+ * scripts/spin-locate.py (30/30 PC samples in the kernel, exact period 9) and
+ * attributed with scripts/kernel-addr-symbolize.py against the RELEASE
+ * kernelcache's kmod_info list. This stub returned 0x100 -- bit 8 set, bit 6
+ * clear -- so the driver span forever at ~0.98 host cores and starved every
+ * other process, which is why no further GSEvent was delivered and why touch
+ * died together with the button (see IN_APP_BUTTON_INVESTIGATION.md).
+ *
+ * Reporting the bit as set is a STUB ANSWER, not a model: it says "the
+ * operation you are waiting for is complete" unconditionally. The honest fix is
+ * task T1 -- model swap completion and wire the TVOut SDO IRQ (MBX_HANDOFF.md).
+ * `IT_MBX_READY=0` restores the old value for an A/B.
+ */
+static uint32_t mbx_status_12c(void)
+{
+    static int ready = -1;
+
+    if (ready < 0) {
+        const char *e = getenv("IT_MBX_READY");
+        ready = !(e && e[0] == '0');
+    }
+    return ready ? 0x140 : 0x100;
+}
+
 static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
 {
     //fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
     switch(addr)
     {
         case 0x12c:
-            return 0x100;
+            return mbx_status_12c();
         case 0xf00:
             return (1 << 0x18) | 0x10000; // seems to be some kind of identifier
         case 0x1020:

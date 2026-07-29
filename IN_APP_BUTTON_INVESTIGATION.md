@@ -306,6 +306,50 @@ is what stops.
 The run's real payoff was accidental: the per-phase process mix and the host CPU
 figure, which is finding 9 above.
 
+## PARTIAL FIX SHIPPED: the spin is gone, the events are back, the screen is not
+
+`hw/arm/ipod_touch.c`: MBX register `0x12C` returned `0x100` -- bit 8 set, **bit 6
+clear** -- which is exactly the bit `AppleMBX` polls. It now returns `0x140`.
+`IT_MBX_READY=0` restores the old value.
+
+**A/B on the SAME binary, in the 1.0 bundle** (this matters: the rebuilt engine
+also carries unrelated in-tree changes, so only a knob toggle isolates the
+cause):
+
+| | QEMU host CPU after the press | process mapped | loop |
+|---|---|---|---|
+| `IT_MBX_READY=0` | **0.99 cores** | SpringBoard 12/12 | the 9-instruction AppleMBX poll |
+| default (bit set) | **0.10 cores** | healthy daemon mix | only the kernel idle delay at `0xc005a2f0` |
+
+**What the fix bought, measured:**
+
+* **The starvation is gone.** 0.97 -> 0.10 host cores; other processes are
+  scheduled again.
+* **Event delivery is restored.** Six presses in-app now deliver **5 DOWN and
+  6 UP** (before: 1 and 1 over TEN presses), the app receives its `type2002`
+  deactivation again, and taps reach the foreground app (`Preferences` types 1
+  and 2). So the button and touch both work in-app on 1.0 now.
+
+**What still fails:** `app-button-probe.py --board m68ap-10` still reports
+
+```
+PASS  1_open_app       97.10%
+PASS  2_touch_in_app   35.95%
+FAIL  3_home_returns    0.00%   lit 99.0% -> 99.0%
+FAIL  4_power_sleeps    0.00%
+```
+
+The app is still on screen. So the remaining failure is **display/compositing
+only** -- the event path is healthy and the guest is idle rather than spinning,
+which means something is now waiting on an MBX completion that never arrives
+instead of busy-polling for it. The MBX region still has **no IRQ connected at
+all**, which is the other half of T1.
+
+**Not yet checked: 1.1.4 and the iPod with this engine.** Only the 1.0 bundle
+has it; the other two still run the previous engine, so nothing shipped can have
+regressed. Before installing it more widely, re-run `app-button-probe.py` for
+`m68ap-114` and `n45ap` -- MBX `0x12C` previously read `0x100` for every board.
+
 ## Where it stands: this is the MBX gap (T1), not a 1.0 software bug
 
 **Root cause: `AppleMBX` spins on `(mbx[0x12C] & 0x40)`, which our do-nothing
@@ -325,10 +369,9 @@ never modelled.
 
 Next steps, in order of cost:
 
-1. **Set bit 6 of MBX register 0x12C** (a completion/ready bit) in the model and
-   re-run `app-button-probe.py --board m68ap-10`. This is a few lines in the MBX
-   stub and it either fixes step 3/4 outright or moves the spin to the next
-   unmodelled bit -- either outcome is progress, and it is cheap.
+1. ~~**Set bit 6 of MBX register 0x12C**~~ **DONE** -- see the partial fix above.
+   It removed the spin and restored event delivery; the visual transition still
+   does not complete.
 2. **Then do T1 properly**: model swap completion and wire the TVOut SDO IRQ, so
    the driver clears the swap-device field itself. That also retires the
    address-dependent TVOut window hack and the `LK_ENABLE_MBX2D=0` plist edit.
