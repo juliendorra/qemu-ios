@@ -133,6 +133,18 @@ def main() -> int:
                     help="additional method to trace, by selector (e.g. "
                          "clickedMenuButton). Armed in the same window as "
                          "menuButtonUp:, so a call FROM it is caught.")
+    ap.add_argument("--follow-sel", action="append", default=[],
+                    help="when the traced method sends this selector, step INTO "
+                         "it and carry on tracing there. Use instead of "
+                         "--skip-handlers for a callee whose entry address is "
+                         "hot in other processes (clickedMenuButton at 0xd794 "
+                         "is: arming it produced 295270 rejected stops).")
+    ap.add_argument("--skip-handlers", action="store_true",
+                    help="do NOT trace menuButtonDown:/Up: -- use the button "
+                         "GSEvent only as the trigger, and trace just the "
+                         "--trace-sel methods. Required to trace a CALLEE: "
+                         "tracing menuButtonUp: steps OVER its objc_msgSend and "
+                         "would skip straight past clickedMenuButton.")
     ap.add_argument("--only-up", action="store_true",
                     help="trace ONLY menuButtonUp:. Tracing menuButtonDown: "
                          "single-steps the guest between the key-down and the "
@@ -288,9 +300,69 @@ def main() -> int:
                 g.set_break(pc)
             g.cont()
 
+        def send_key(down, tries=40):
+            """One key edge, CHECKED.
+
+            `qmp_input_send_event` refuses everything with "VM not running"
+            while the VM is stopped (ui/input.c) and QMP.cmd ignores the reply,
+            so a breakpoint inside the hold silently swallows the RELEASE --
+            measured 10 downs to 5 ups under gdb. Without this, "clickedMenuButton
+            never ran" could equally mean the button was never released.
+            """
+            for _ in range(tries):
+                r = q.cmd("input-send-event", {"events": [
+                    {"type": "key", "data": {"down": down, "key": {
+                        "type": "qcode", "data": "h"}}}]})
+                if "error" not in r:
+                    return True
+                msg = r.get("error", {}).get("desc", "")
+                if "not running" not in msg:
+                    print(f"  !! input-send-event failed: {msg}")
+                    return False
+                # The guest is stopped at a breakpoint: step off it and resume.
+                w = g.regs()
+                if w:
+                    resume(w[0][15])
+                else:
+                    g.cont()
+                time.sleep(0.02)
+            print("  !! key edge never accepted -- run is INVALID")
+            return False
+
         def is_springboard():
             hdr = g.mem(gsp.EXEC_BASE, 0x40)
             return fps.get(hdr) == "SpringBoard"
+
+        # {selector: (start, end, label)} for the methods we may FOLLOW INTO.
+        follow = {}
+        for sel in args.follow_sel:
+            for a, f in funcs.items():
+                if f["name"].endswith(f" {sel}]"):
+                    follow[sel] = (a, f["end"], f["name"])
+
+        def step_into(target, seq, budget=6000):
+            """Single-step from a `bl` until pc lands inside `target`.
+
+            Used instead of a breakpoint on the callee's ENTRY. That entry is an
+            executable-range address every process shares, and arming
+            -[SBUIController clickedMenuButton] at 0xd794 collected 295270
+            rejected stops from another process and starved the guest so the
+            press never completed. Single-stepping through objc_msgSend costs a
+            few hundred steps and arms nothing.
+            """
+            lo, hi, label = target
+            for n in range(budget):
+                g.step()
+                w = g.regs()
+                if not w:
+                    seq.append((0, "!! no registers stepping into the call"))
+                    return None
+                pc = w[0][15]
+                if lo <= pc < hi:
+                    seq.append((pc, f"==> stepped INTO {label} after {n} steps"))
+                    return pc
+            seq.append((0, f"!! never reached {label} in {budget} steps"))
+            return None
 
         def trace(entry):
             """Single-step one handler, stepping OVER calls. -> [(pc, text)]"""
@@ -300,6 +372,17 @@ def main() -> int:
             for _ in range(args.max_steps):
                 text = fn["text"].get(pc, "?")
                 seq.append((pc, text))
+                hit = next((t for sel, t in follow.items()
+                            if CALL.match(text) and f" {sel}]" in text), None)
+                if hit:
+                    npc = step_into(hit, seq)
+                    if npc is None:
+                        return seq
+                    # Continue the trace INSIDE the callee.
+                    fn = funcs[hit[0]]
+                    lo, hi = hit[0], hit[1]
+                    pc = npc
+                    continue
                 if CALL.match(text):
                     # Step over the call: temporary breakpoint at the return.
                     ret = pc + 4
@@ -354,7 +437,9 @@ def main() -> int:
             if time.time() >= next_press and press < args.presses:
                 press += 1
                 print(f"pressing HOME ({press}/{args.presses}) ...")
-                btn.key(q, "h")
+                send_key(True)
+                time.sleep(0.15)
+                send_key(False)
                 next_press = time.time() + args.repress
             if armed and time.time() > window_until:
                 disarm_all()            # window closed; stop paying for rejects
@@ -383,15 +468,19 @@ def main() -> int:
                         resume(pc)
                         continue
                     for a, f in funcs.items():
-                        if (f["name"] == want
-                                or any(f["name"].endswith(f" {x}]")
-                                       for x in args.trace_sel)) \
-                                and a not in done:
-                            arm(a)
-                            stops["armed"] += 1
-                            window_until = time.time() + args.window
-                            print(f"  GSEvent type{ty} in SpringBoard -> armed "
-                                  f"{want}")
+                        is_extra = any(f["name"].endswith(f" {x}]")
+                                       for x in args.trace_sel)
+                        if args.skip_handlers and not is_extra:
+                            continue        # the handlers are only the trigger
+                        if not (f["name"] == want or is_extra):
+                            continue
+                        if a in done:
+                            continue
+                        arm(a)
+                        stops["armed"] += 1
+                        window_until = time.time() + args.window
+                        print(f"  GSEvent type{ty} in SpringBoard -> armed "
+                              f"{f['name']}")
                 resume(pc)
                 continue
 

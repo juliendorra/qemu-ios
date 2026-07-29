@@ -1365,3 +1365,72 @@ SpringBoard's own state after the first press, not the port:
   process fingerprint, or a breakpoint on whatever SpringBoard calls to read HID
   events (find it by xrefing from the `_GSSendEvent` call site at the top of the
   trace above -- its caller is in SpringBoard).
+
+## clickedMenuButton on the first press: it RUNS TO COMPLETION (2026-07-29)
+
+```bash
+IT_PROBE_WAIT=8 python3 scripts/menubutton-step-trace.py --board m68ap-10 \
+    --only-up --trace-sel clickedMenuButton --follow-sel clickedMenuButton
+```
+
+Traced on the FIRST in-app press -- the only one that gets through -- with
+`_menuButtonTimer = 0x15fbd0` (non-nil, so the gate passes; it is nil only when
+the harness perturbs the down/up interval, which settles the earlier
+"unstable branch" observation).
+
+Every gate passes and the method returns normally:
+
+```
+  -[SpringBoard menuButtonUp:]  ... _screenShooting 0, sync gates all NO,
+                                    shouldRunFieldTestScript NO,
+                                    _menuButtonTimer non-nil -> proceeds
+  bl _objc_msgSend  [_uiController clickedMenuButton]
+  ==> stepped INTO -[SBUIController clickedMenuButton] after 699 steps
+  0xd7a4  [self launchState]                       -> r6 = 3
+  0xd7cc  [[SBAwayController sharedAwayController] isLocked]  -> NO   (not locked)
+  0xd7ec  bl 0x109fc                               -> the top display
+  0xd81c  [topDisplay isKindOfClass:[SBAlert class]]           -> NO   (gate open)
+  0xd844  [[SBAlertItemsController sharedInstance]
+                              deactivateAlertForMenuClick]     -> YES  (gate open)
+  0xd850  cmp r6,#5 ; ldrls pc,[pc,r6,lsl #2]      -> launchState 3 -> 0xd890
+  0xd890  bl 0x1486c                               -> topApplication != nil
+  0xd89c  bl 0x10794                               -> THE DISPLAY-STACK UNWINDER
+  0xd8a0  pop {r4,r5,r6,r7,pc}
+  0x6ccc  <- RETURNED
+```
+
+The jump table at `0xd85c` is
+`{0: 0xd8f4, 1: 0xd874, 2: 0xd8f4, 3: 0xd890, 4: 0xd8b8, 5: 0xd8f4}`, and the
+three helpers on the taken path are display-stack code:
+
+* `0x109fc` -> `[<stack> topDisplay]`
+* `0x1486c` -> `[<stack> topApplication]`, falling back to a second stack
+* `0x10794` -> `while (![stack isEmpty]) { d = [stack topDisplay]; f0x10098(d); }`
+  twice, over two stacks -- **this is the app dismissal**
+
+**So the dismissal path executes completely and returns.** It does not block, it
+does not spin, and it takes no early exit. `clickedMenuButton` is exonerated, and
+so is `menuButtonUp:`.
+
+That moves the wedge to **after** the synchronous handling: SpringBoard finishes
+the press, unwinds the display stack, returns through both frames -- and only
+then does event delivery stop (in the earlier run, one more `callback` fired
+4 s later, then nothing ever again). Whatever breaks is asynchronous: the app's
+side of the deactivation, or the framebuffer/CoreSurface teardown that follows
+it, not the button handling.
+
+### Instrument notes
+
+* **`--follow-sel` exists because the callee's entry cannot be armed.** A
+  breakpoint on `-[SBUIController clickedMenuButton]` at `0xd794` collected
+  **295270** rejected stops from another process executing its own code at that
+  address, starving the guest so badly the press never completed. `--follow-sel`
+  single-steps through `objc_msgSend` into the callee instead (699 steps) and
+  arms nothing. Prefer it for any callee below 0x100000.
+* `menubutton-step-trace.py` now sends key edges through the same
+  acceptance-checked path as `gsevent-type-probe.py`; otherwise a breakpoint
+  inside the hold swallows the release and "clickedMenuButton never ran" would
+  be indistinguishable from "the button was never released".
+* **Caveat in `objc-method-disasm.py` output:** class references sometimes
+  resolve to a section name (`&"__TEXT"`) rather than a class name, so the
+  RECEIVER in the annotation is not always trustworthy. The SELECTOR always is.
