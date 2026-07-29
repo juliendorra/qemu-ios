@@ -1513,6 +1513,11 @@
 #
 # @dbus: Start a D-Bus service for the display.  (Since 7.0)
 #
+# @wasm: Publish the guest framebuffer to JavaScript for a web page
+#     to paint.  Emscripten hosts only.  QEMU does not draw: it
+#     exports the surface geometry and its address in the wasm heap,
+#     and the page reads those pixels directly.
+#
 # Since: 2.12
 ##
 { 'enum'    : 'DisplayType',
@@ -1525,7 +1530,8 @@
     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
-    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
+    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
+    { 'name': 'wasm', 'if': 'CONFIG_WASM_DISPLAY' }
   ]
 }
 

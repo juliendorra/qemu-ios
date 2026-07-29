@@ -2505,6 +2505,9 @@ config_host_data.set('CONFIG_RELOCATABLE', get_option('relocatable'))
 config_host_data.set('CONFIG_SAFESTACK', get_option('safe_stack'))
 config_host_data.set('CONFIG_SDL', sdl.found())
 config_host_data.set('CONFIG_SDL_IMAGE', sdl_image.found())
+# The browser display backend (ui/wasm.c): always available on an Emscripten
+# host, never elsewhere.
+config_host_data.set('CONFIG_WASM_DISPLAY', host_os == 'emscripten')
 config_host_data.set('CONFIG_SECCOMP', seccomp.found())
 if seccomp.found()
   config_host_data.set('CONFIG_SECCOMP_SYSRAWRC', seccomp_has_sysrawrc)
