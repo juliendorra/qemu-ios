@@ -365,10 +365,24 @@ scripts/wasm/analyze-nand-trace.py /tmp/boot.trace \
 
 ## W5 — Display and input bridges — DONE (2026-07-29)
 
-**iPhone OS 1.0 reaches its home screen in a browser and launches an app when
-you tap its icon.** `ui/wasm.c` plus `web/public/jit-boot/index.html`; the full
-account, including what the committed backend got wrong, is in
-`BROWSER_WASM_STATUS.md`.
+**iPhone OS 1.0 reaches its home screen in a browser in 270-330 s, and launches
+an app when you tap its icon.** `ui/wasm.c` plus
+`web/public/jit-boot/index.html`; the full account, including what the committed
+backend got wrong, is in `BROWSER_WASM_STATUS.md`.
+
+| landmark | headless #1 | headless #2 |
+| --- | --- | --- |
+| first pixels | 1.0 s | 1.3 s |
+| kernel | 138.0 s | 169.0 s |
+| BSD root | 150.0 s | 188.0 s |
+| launchd | 170.0 s | 212.0 s |
+| **home screen** (45.6% non-black) | **268.4 s** | **326.7 s** |
+
+**Measure headless, with the throttles disabled.** The same page watched in a
+tab reported 1206 s — inflated ~4x by throttling alone. The page posts to
+`serve.py --results` and mirrors landmarks to `console.log`; the exact command
+is in `BROWSER_WASM_STATUS.md`. Two runs 22% apart is the honest spread, so
+quote a range.
 
 The shape, because it generalises to anything else that has to cross the
 thread boundary:

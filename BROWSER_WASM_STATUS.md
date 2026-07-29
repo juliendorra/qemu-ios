@@ -28,16 +28,80 @@ at all, so it is a worthwhile session of its own rather than a step in this one.
 ### It works: the home screen renders in a browser and takes touch
 
 A cold JIT boot of iPhone OS 1.0 (`1A543a`, whole 215.6 MiB pack staged into
-MEMFS, `-icount shift=1`), measured by the page itself:
+MEMFS, `-icount shift=1`), measured by the page itself. **Measure headless with
+throttling disabled** — the first column shows what a watched tab costs:
 
-| landmark | at |
-| --- | --- |
-| first pixels published and painted | **6.7 s** |
-| Apple logo visible | ~17 s |
-| Darwin kernel | 755.0 s |
-| BSD root | 815.8 s |
-| launchd | 935.0 s |
-| **SpringBoard home screen** (45.6% non-black) | **1206.3 s** |
+| landmark | watched tab | headless #1 | headless #2 |
+| --- | --- | --- | --- |
+| first pixels published and painted | 6.7 s | **1.0 s** | 1.3 s |
+| Darwin kernel | 755.0 s | **138.0 s** | 169.0 s |
+| BSD root | 815.8 s | **150.0 s** | 188.0 s |
+| launchd | 935.0 s | **170.0 s** | 212.0 s |
+| **SpringBoard home screen** (45.6% non-black) | 1206.3 s | **268.4 s** | 326.7 s |
+
+**A browser reaches the iPhone OS 1.0 home screen in 270-330 s.** The tab figure
+was inflated ~4x purely by throttling; do not quote it.
+
+The two headless runs used a warm and a fresh Chrome profile respectively, but
+**the difference between them is run-to-run variance, not cache**: the assets
+come from localhost and staging differed by 0.3 s. Two runs 22% apart is the
+honest spread, so quote a range, not a figure.
+
+The panel goes to 0% non-black at ~585 s: the guest auto-locks in the browser
+exactly as it does natively. A late sample of a healthy run reads as black.
+
+Then, in the page:
+
+- **tapping the Settings icon launched Settings** — `[TOUCH] mouse DOWN at
+  (0.856, 0.481)`, which is exactly the panel coordinate clicked (274/320 =
+  0.856), followed by the app's own `IOMobileFramebufferUserClient::attach`
+  and a fully rendered settings list at 99.9% non-black;
+- **Power reached the guest and was serviced**: `[BTN] keycode=25 ... [PMU]
+  ONKEY pressed ... nIRQ assert`, then `keycode=153 ... ONKEY released`, then
+  the kernel reading and clearing INT1/INT2. keycodes 25/153 are exactly
+  `ipod_touch_input_event`'s Power mapping.
+
+**How to reproduce it, and the two bugs that stood in the way.** The page now
+posts its landmarks to `scripts/wasm/serve.py --results` (the endpoint Session B
+added for `web/bench-b/`) and mirrors them to `console.log`, so a run is driven
+headlessly rather than watched:
+
+```sh
+scripts/wasm/serve.py --port 8013 --results /tmp/run.json &
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --user-data-dir=/tmp/prof --headless=new --enable-logging=stderr --v=0 \
+  --disable-background-timer-throttling \
+  --disable-backgrounding-occluded-windows \
+  --disable-renderer-backgrounding \
+  --disable-features=CalculateNativeWinOcclusion \
+  http://localhost:8013/public/jit-boot/
+```
+
+What this page contributes that `bench-b` cannot: **SpringBoard is never
+announced on serial, so "home screen" can only be established from the
+framebuffer** — and only a page that paints can see it. `bench-b`'s landmarks
+stop at launchd.
+
+Getting there surfaced **a real race in the paint loop, which the interactive
+run had merely got lucky on**:
+
+> `preRun` runs BEFORE the runtime is initialised, so capturing `moduleRef`
+> there does not mean it may be called. Emscripten's pre-init exports are
+> assert stubs that abort with *"native function `wasm_display_info_addr`
+> called before runtime initialization"* — **and they are functions**, so the
+> `typeof fn === 'function'` guard sailed straight past them and killed the
+> emulator on the first animation frame.
+
+Interactively the first frame happened to land after init and everything
+worked. Headless, with the assets staged faster, the frame came first and the
+run died ~2 s in, on every frame, while the server showed a perfectly normal
+asset fetch. Painting now waits on an `onRuntimeInitialized` flag.
+
+The second bug was mine and mundane — `report()` sent `failure` where the
+variable is `failed`, a ReferenceError that would have suppressed every POST on
+its own. `node --check` does not catch that; a heartbeat log does. **Do not
+swallow errors in a headless page's reporting path**: the original
+`.catch(() => {})` left a run looking dead with no way to ask why.
 
 Then, in the page:
 
@@ -79,7 +143,13 @@ app immediately.
 
 The page therefore floors every release at `MIN_PRESS_MS` (500 ms) — for taps
 and for the Home/Power buttons alike. **This is a browser-speed workaround, not
-a fidelity question, and it should shrink as Session B's work lands.** It is
+a fidelity question, and it should shrink as Session B's work lands.**
+
+**Note the ratio these numbers were taken at.** They come from the throttled
+tab, where the guest ran ~4x slower than it does headless. 500 ms is therefore
+conservative for an unthrottled run and very conservative for a faster engine.
+Re-derive it rather than inheriting it: the test is whether a down and its up
+land on distinguishable guest timestamps in the `[TOUCH]` log. It is
 also the first place where the engine being slow has a *user-visible* effect
 rather than merely a slow one.
 

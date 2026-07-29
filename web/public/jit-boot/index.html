@@ -88,8 +88,56 @@
   }
   renderMarks();
 
+  // Post landmarks back to scripts/wasm/serve.py --results, so a run can be
+  // driven headlessly instead of by watching a tab. A watched tab is not just
+  // inconvenient: Chrome throttles a backgrounded or occluded page and the
+  // freeze is indistinguishable from a hang -- which is exactly how this
+  // page's first 1206 s boot came to be misread.
+  //
+  // Same endpoint as web/bench-b/, deliberately. What this page adds is the
+  // landmark bench-b cannot have: SpringBoard is NEVER announced on serial, so
+  // "home screen" can only be established from the framebuffer, and only a
+  // page that paints can see it.
+  let lastReport = 0;
+  function report(force) {
+    const now = performance.now();
+    if (!force && now - lastReport < 5000) return;
+    lastReport = now;
+    const body = JSON.stringify({
+      elapsed: Number((now / 1000).toFixed(1)),
+      landmarks: Object.fromEntries(
+        [...hit].map(([k, v]) => [k, Number(parseFloat(v).toFixed(1))])),
+      frames,
+      nonBlackPct,
+      failure: failed,
+    });
+    // fetch(), not sendBeacon(): beacons from a standalone headless Chrome are
+    // silently dropped (bench-b found this the hard way).
+    //
+    // The failure is logged rather than swallowed. A headless run has no other
+    // channel: `--enable-logging=stderr` is the ONLY way to see what a page is
+    // doing, and a silent .catch() here left a run looking dead for ten minutes
+    // with the server showing no POSTs and no way to tell why.
+    fetch('/__bench-result', { method: 'POST', body, keepalive: true })
+      .catch((e) => console.error('[bench] report POST failed:', e));
+  }
+  // A heartbeat, so a headless run says something every 15 s even before the
+  // first landmark. Silence then means the page is genuinely wedged, which is
+  // the distinction that was impossible to draw without it.
+  setInterval(() => {
+    console.log(`[bench] t=${at()}s frames=${frames} nonBlack=${nonBlackPct}%`
+                + ` landmarks=${[...hit.keys()].join(',') || 'none'}`);
+    report(true);
+  }, 15000);
+
   function mark(name) {
-    if (!hit.has(name)) { hit.set(name, at()); renderMarks(); }
+    if (!hit.has(name)) {
+      hit.set(name, at());
+      renderMarks();
+      // Console, not just the DOM: under --headless there is no DOM to look at.
+      console.log(`[bench] landmark ${name} at ${at()}s`);
+      report(true);
+    }
   }
 
   function state(text, cls) { stateEl.textContent = text; stateEl.className = cls || ''; }
@@ -118,6 +166,7 @@
     failed = msg;
     state(`emulator failure: ${msg.slice(0, 140)}`, 'fail');
     line(`window error: ${msg}`, 'err');
+    console.error('[bench] window error:', msg);
   });
 
   // The guest writes serial into MEMFS; the emulator runs on a worker but
@@ -162,9 +211,21 @@
   // than merely tearing a frame.
   let infoBase = -1;            // struct address >> 2
   let lastSeq = -1;
+  // preRun runs BEFORE the runtime is initialized, so having `moduleRef` is not
+  // the same as being allowed to call into it. Emscripten's pre-init exports
+  // are assert stubs that abort with "native function ... called before runtime
+  // initialization" -- and they ARE functions, so a `typeof fn === 'function'`
+  // guard sails straight past them and kills the emulator.
+  //
+  // This was a live race, not a theoretical one: an interactive run happened to
+  // fire its first animation frame after init and worked, while a headless run
+  // with a warm cache staged the assets faster, painted first, and aborted the
+  // runtime ~2 s in on every single frame.
+  let runtimeReady = false;
   let imageData = null;
   let imageWords = null;        // u32 view over imageData.data
   let frames = 0;
+  let nonBlackPct = 0;          // reported: the only evidence SpringBoard is up
 
   function readDisplayInfo(u32) {
     for (let attempt = 0; attempt < 4; attempt++) {
@@ -220,7 +281,7 @@
 
   function paint() {
     if (!displayBroken) requestAnimationFrame(paint);
-    if (!moduleRef || displayBroken) return;
+    if (!moduleRef || !runtimeReady || displayBroken) return;
 
     if (infoBase < 0) {
       const fn = moduleProp('_wasm_display_info_addr');
@@ -263,10 +324,11 @@
     frames++;
     if (frames === 1) mark('first pixels');
     const pct = (100 * nonBlack / (info.width * info.height)).toFixed(1);
+    nonBlackPct = Number(pct);
     fbstatEl.textContent =
       `panel: ${info.width}x${info.height} · ${frames} frames · ${pct}% non-black`;
     // The native oracle renders 59.0% non-black at 1.0's home screen.
-    if (Number(pct) > 40) mark('home screen (>40% non-black)');
+    if (nonBlackPct > 40) mark('home screen (>40% non-black)');
   }
   requestAnimationFrame(paint);
 
@@ -277,7 +339,7 @@
   // Calling QEMU's input API straight from here would touch a queue owned by
   // another thread, without the BQL.
   function sendTouch(ev, down) {
-    if (!moduleRef || !moduleRef._wasm_input_touch) return;
+    if (!moduleRef || !runtimeReady) return;
     const r = canvas.getBoundingClientRect();
     const x = Math.round((ev.clientX - r.left) / r.width * canvas.width);
     const y = Math.round((ev.clientY - r.top) / r.height * canvas.height);
@@ -326,7 +388,7 @@
   // A pointer released outside the window never delivers pointerup; without
   // this the guest keeps a finger down forever.
   addEventListener('blur', () => {
-    if (touching && moduleRef && moduleRef._wasm_input_touch) {
+    if (touching && moduleRef && runtimeReady) {
       touching = false;
       moduleRef._wasm_input_touch(0, 0, 0);
     }
@@ -334,7 +396,7 @@
 
   const BUTTON_HOME = 0, BUTTON_POWER = 1;
   function pressButton(which) {
-    if (!moduleRef || !moduleRef._wasm_input_button) return;
+    if (!moduleRef || !runtimeReady) return;
     // The guest's key handler translates make/break itself, so a tap is a
     // down/up pair rather than a level held for as long as the mouse is.
     // Same MIN_PRESS_MS reasoning as touch: verified in the browser as
@@ -377,6 +439,11 @@
       '-serial', 'file:/fw/serial.log',
       '-icount', 'shift=1',
     ],
+    onRuntimeInitialized: () => {
+      runtimeReady = true;
+      line('runtime initialized; painting enabled');
+      console.log('[bench] runtime initialized');
+    },
     preRun: [async (mod) => {
       // preRun runs on the MAIN thread, so this is the Module whose exports
       // and HEAP views address the shared memory from here.
