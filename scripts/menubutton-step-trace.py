@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import re
@@ -133,6 +134,12 @@ def main() -> int:
                     help="additional method to trace, by selector (e.g. "
                          "clickedMenuButton). Armed in the same window as "
                          "menuButtonUp:, so a call FROM it is caught.")
+    ap.add_argument("--after-steps", type=int, default=0,
+                    help="after the traced method RETURNS, keep single-stepping "
+                         "this many instructions and log every change of "
+                         "function. This is how to see what happens AFTER the "
+                         "press is handled -- the wedge is asynchronous, so the "
+                         "synchronous trace ends before anything goes wrong.")
     ap.add_argument("--follow-sel", action="append", default=[],
                     help="when the traced method sends this selector, step INTO "
                          "it and carry on tracing there. Use instead of "
@@ -176,6 +183,19 @@ def main() -> int:
         gs_bin = args.logs / "GraphicsServices"
         gs_bin.write_bytes((mnt / gsp.GS).read_bytes())
         fps = gsp.exec_fingerprints(mnt)
+        print("building the guest library address map ...")
+        libs = brk.library_map(mnt)
+        print(f"  {len(libs)} images mapped")
+        # Extra binaries, only to NAME addresses in the after-return trace.
+        extra_bins = {}
+        for nm, rel in (("UIKit", "System/Library/Frameworks/UIKit.framework/UIKit"),
+                        ("Foundation",
+                         "System/Library/Frameworks/Foundation.framework/Foundation")):
+            src = mnt / rel
+            if src.is_file():
+                dst = args.logs / nm
+                dst.write_bytes(src.read_bytes())
+                extra_bins[nm] = dst
     finally:
         subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
 
@@ -231,6 +251,49 @@ def main() -> int:
     if not funcs:
         print("FAIL: could not resolve the handlers")
         return 2
+
+    # ---- an address -> name map, for the after-return trace ----------------
+    # Single-stepping past the return wanders through UIKit, Foundation and the
+    # kernel, where a raw pc says nothing. ObjC metadata gives method-level names
+    # for the frameworks, and GraphicsServices has a real symbol table.
+    symmap = []
+    for i, n in named_methods:
+        symmap.append((i, n))
+    for nm, path in extra_bins.items():
+        try:
+            for i, n in xref.methods(dis.Image(path)):
+                symmap.append((i, n))
+        except Exception:
+            pass
+    try:
+        for v, n, d in msym.symbols(gs_bin.read_bytes()):
+            if d and v:
+                symmap.append((v, f"GS:{n}"))
+    except Exception:
+        pass
+    symmap.sort()
+
+    sym_addrs = [a for a, _ in symmap]
+    _name_cache = {}
+
+    def name_of(addr):
+        """Resolve a pc to a function name. Bisect, not a scan: this is called
+        once per single step, and a linear walk over ~20k symbols per step is
+        the difference between seconds and never finishing."""
+        page = addr & ~0xF
+        hit = _name_cache.get(page)
+        if hit is not None:
+            return hit
+        if addr >= 0xC0000000:
+            r = "KERNEL"
+        else:
+            i = bisect.bisect_right(sym_addrs, addr) - 1
+            if i >= 0 and addr - symmap[i][0] < 0x4000:
+                r = f"{symmap[i][1]}+{addr - symmap[i][0]:#x}"
+            else:
+                r = brk.whose(addr, libs)
+        _name_cache[page] = r
+        return r
 
     logp = args.logs / "qemu.log"
     qmp_path = f"/tmp/mbtrace-{os.getpid()}.sock"
@@ -363,6 +426,34 @@ def main() -> int:
                     return pc
             seq.append((0, f"!! never reached {label} in {budget} steps"))
             return None
+
+        def after(n_steps):
+            """Single-step past the return, logging every function change.
+
+            No breakpoints: at these addresses a breakpoint fires in every
+            process (0xd794 alone produced 295270 rejected stops), so stepping
+            is the only safe instrument. Records a line whenever the resolved
+            function changes, with how many instructions were spent in the
+            previous one.
+            """
+            out, cur, spent = [], None, 0
+            for i in range(n_steps):
+                g.step()
+                w = g.regs()
+                if not w:
+                    out.append(("?", "!! no registers", i))
+                    break
+                pc = w[0][15]
+                nm = name_of(pc)
+                if nm != cur:
+                    if cur is not None:
+                        out.append((cur, spent, i))
+                    cur, spent = nm, 1
+                else:
+                    spent += 1
+            if cur is not None:
+                out.append((cur, spent, n_steps))
+            return out
 
         def trace(entry):
             """Single-step one handler, stepping OVER calls. -> [(pc, text)]"""
@@ -513,6 +604,13 @@ def main() -> int:
                            "seq": [[a, t] for a, t in seq]})
             for a, t in seq:
                 print(f"    {a:08x}  {t}")
+            if args.after_steps:
+                print(f"\n  --- after the return: {args.after_steps} single "
+                      f"steps, one line per function change ---")
+                walk = after(args.after_steps)
+                traces[-1]["after"] = [[str(a), b, c] for a, b, c in walk]
+                for nm, spent, at in walk:
+                    print(f"    @{at:<6} {str(spent):>7} insns  {nm}")
             done.add(pc)
             disarm_all()          # one trace per handler is enough
             g.cont()              # trace() already left the pc past the entry

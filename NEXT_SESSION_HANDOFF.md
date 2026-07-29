@@ -1434,3 +1434,75 @@ it, not the button handling.
 * **Caveat in `objc-method-disasm.py` output:** class references sometimes
   resolve to a section name (`&"__TEXT"`) rather than a class name, so the
   RECEIVER in the annotation is not always trustworthy. The SELECTOR always is.
+
+## After clickedMenuButton returns: SpringBoard unwinds NORMALLY (2026-07-29)
+
+`menubutton-step-trace.py --after-steps N` keeps single-stepping past the
+return and logs a line every time the resolved function changes. Names come
+from the ObjC metadata of SpringBoard, UIKit and Foundation plus
+GraphicsServices' symbol table, so the unwind is readable at method level.
+
+```bash
+IT_PROBE_WAIT=8 python3 scripts/menubutton-step-trace.py --board m68ap-10 \
+    --only-up --trace-sel clickedMenuButton --follow-sel clickedMenuButton \
+    --after-steps 15000 --presses 1
+```
+
+The unwind is exactly what a healthy dispatch looks like:
+
+```
+  -[UIApplication handleEvent:]+0x1558      <- returned into
+  -[SpringBoard handleEvent:]+0x30 .. +0xac  (statusBarView, UIControl isTracking …)
+  GS:_PurpleEventCallback+0x170/+0x180       <- back out through the callback
+  CoreFoundation+0x308c ...                  <- back into the run loop
+```
+
+and then it keeps **working**: over the full 15 000 steps SpringBoard never
+blocks, never faults, and never returns to the idle loop.
+
+| where the 15 000 instructions went | share |
+| --- | --- |
+| `libobjc.A.dylib` (objc_msgSend) | 48.0% |
+| `libSystem.B.dylib` | 25.6% |
+| `CoreFoundation` | 18.5% |
+| `-[NSCFString isEqual:]`, `-[NSCFArray getObjects:range:]`, `NSThread` … | ~7% |
+
+That mix -- string compares against array enumeration inside CF -- is the shape
+of notification dispatch, and `-[NSThread init]` / `-[NSThread main]` appear in
+it, so a thread is being started on the way out. (Attribution inside
+libobjc/libSystem/CF is library-level only; the SpringBoard and UIKit frames are
+method-level and reliable.)
+
+**So nothing goes wrong synchronously, at any level.** The press is handled, the
+app dismissal runs, the stack unwinds into the run loop, and SpringBoard carries
+on doing ordinary work.
+
+### The reach limit of this instrument, stated plainly
+
+15 000 single steps is **microseconds of guest time**. The wedge takes
+**seconds** -- in the port run, one more `_PurpleEventCallback` fired 4 s after
+the press and then nothing ever again. So this trace cannot see the wedge
+happen, and no amount of single-stepping will: at ~0.5 ms per step over the
+gdbstub, one second of guest time is out of reach by orders of magnitude.
+
+### What the next instrument has to be
+
+Not a stepper, and not a breakpoint at an executable-range address. Something
+that watches for seconds without stopping the guest:
+
+* **A low-rate sampler that does not stop the CPU.** QMP `pmemsave` is a memory
+  read, not a stop-the-world query (this is what made `--watch` viable earlier),
+  so poll something in SpringBoard's own memory that says whether it is still
+  pumping -- e.g. the GSEvent queue head that `_PurpleEventCallback` drains
+  (the word at `[sp+0xc]` in that function resolves to a fixed global; read it
+  out of the binary once and then poll it). A queue that grows and stops
+  draining names the wedge without touching the vCPU.
+* **The thread that started on the way out.** `NSThread init`/`main` in the
+  unwind is worth identifying: if the deactivation hands off to a worker thread
+  that then blocks, the main thread would look healthy in every trace taken so
+  far -- which is exactly what we see.
+* **The app side.** On 1.1.4 the dismissed app runs `_ResetEventPortSet` in the
+  APP process; on 1.0 it never does. Neither UIKit binary imports that symbol
+  and GraphicsServices contains no direct branch to it, so it is reached through
+  a function pointer -- find it by breaking on `_ResetEventPortSet` on 1.1.4
+  (a safe library address) and reading the caller from `lr`.
