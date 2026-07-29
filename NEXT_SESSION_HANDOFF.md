@@ -736,3 +736,69 @@ driver claims the interrupt and whether it posts an event. Both kernelcaches
 are readable with the technique that worked twice today (`__PRELINK` skew
 0xC0027000 for 1A543a; recompute it for 4A102 from its own load commands), and
 the strings to anchor on are in the button/HID kext rather than SpringBoard.
+
+## Reading the kernel button path in both kernelcaches (2026-07-29)
+
+Both kernelcaches extract with `scripts/extract-kernelcache.py`. The `__PRELINK`
+skew differs per build and must be computed from that build's own load commands
+-- **1A543a: 0xC0027000, 4A102: 0xC00A7000**. (Dead end #5's "the kext uses
+PC-relative references so a byte search cannot work" was wrong; it had used a
+guessed skew. With the right one, every log string has exactly one absolute
+literal pointer.)
+
+### The button driver is `AppleM68Buttons`, and it is identical on both
+
+It builds each device-tree property name with `function-button_%s` and looks it
+up. The enumeration code around that string is **instruction-for-instruction
+identical** between 1.0 (`0xc032792c`) and 1.1.4 (`0xc03ab938`); the only
+differences are vtable slot offsets (`0x588/0xa8` vs `0x3c8/0x68`), which is
+just the two kernels' vtable layouts. So button registration is not the
+difference.
+
+### SpringBoard's handlers are also identical -- and never run on 1.0
+
+`-[SpringBoard menuButtonDown:]` / `menuButtonUp:`, resolved from each build's
+own binary via old-ABI `__OBJC` metadata:
+
+```
+-[SpringBoard menuButtonUp:]
+    ldrsb r3, [self, #0x40]            ; 1.1.4: #0x44
+    cmp   r3, #0 ; movne/strbne/popne  ; early-return ivar, swallows the up
+    [[SBSyncController sharedInstance] isRestoring]        -> return
+    [[SBSyncController sharedInstance] isResetting]        -> return
+    [[SBSyncController sharedInstance] isSoftwareUpdating] -> return
+```
+
+Structurally the same on both. And they are innocent, because on 1.0 they are
+never reached -- see the breakpoint result above (1.1.4 HIT, 1.0 NO HIT, with
+the control proving the instrument works).
+
+### New dead end: the interrupt IS enabled on 1.0
+
+Suspicion: the model stores `gpio_int_enabled[]` and **never consults it** --
+`ipod_touch_key_event()` says "Always raise the GPIO interrupt for all buttons".
+So a guest that had not enabled the menu pin would still get an interrupt, its
+GPIO IC driver would ACK an unregistered line and drop it, and nothing further
+would happen: exactly the observed shape.
+
+**Measured, and it is not that.** The INTEN writes are the same on both builds,
+and both end with group 1 = `0x04003f00`, which includes bit 8 (the menu
+button):
+
+```
+1.1.4   group1: 0x2000 -> 0x2100 -> 0x2300 -> 0x2700 -> 0x2f00 -> 0x3f00 -> 0x04003f00
+1.0     group1: 0x2000 -> 0x2100 -> 0x2300 -> 0x2700 -> 0x2f00 -> 0x04002f00 -> 0x04003f00
+```
+
+**Separate fidelity bug, worth fixing on its own merits but NOT this bug:** the
+model ignores `gpio_int_enabled` entirely. Nothing today depends on that being
+wrong, and fixing it would not change this outcome, since 1.0 enables the pin.
+
+### Where the break must be
+
+Between the GPIO IC driver acknowledging the interrupt (observed, identical on
+both) and SpringBoard's handler being called (observed on 1.1.4, absent on 1.0).
+That interval is `AppleM68Buttons`' interrupt handler and the HID event posting
+above it. Registration and enablement are both ruled out, so the next thing to
+read is the handler itself -- anchor on `AppleM68Buttons`' class name and vtable
+rather than on `function-button_%s`, which is registration-time only.
