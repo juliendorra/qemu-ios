@@ -50,11 +50,17 @@ Then, in the page:
   the kernel reading and clearing INT1/INT2. keycodes 25/153 are exactly
   `ipod_touch_input_event`'s Power mapping.
 
-**Caveat on the boot time: it is not a clean measurement.** Two native QEMU
-probes were running for the first ~600 s of it, and the log shows the cost —
-a 284 s stretch with no new compiles at all. Treat 1206 s as an upper bound
-and re-measure solo. (This is the repo's own already-learned lesson about
-running two engines at once, repeated.)
+**Caveat: 1206 s is an upper bound, not a measurement.** The log contains a
+284 s stretch with no new compiles at all, which was first put down to the two
+native QEMU probes running alongside. **That attribution was probably wrong.**
+Session B hit the identical symptom independently the same afternoon —
+"compiled=352 for minutes" — and found the cause: **a browser throttles a
+backgrounded or occluded page**, and the freeze is indistinguishable from a
+hang. This page was in a pane that was not frontmost for most of the run.
+
+Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
+which launches Chrome with the three throttles disabled. Do not quote 1206 s as
+a browser boot time.
 
 ### Guest time is far slower than wall time, and that breaks normal taps
 
