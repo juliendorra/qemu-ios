@@ -15,6 +15,141 @@ comes after.
 
 ---
 
+## Session — 2026-07-29 (Session A): making it visible and interactive
+
+Parallel session A (`BROWSER_WASM_SESSION_A.md`): paint the framebuffer, take
+input, skip the boot. **The browser now renders the guest panel** — the Apple
+logo appears at ~17 s of a cold JIT boot, in correct colours.
+
+### The display seam as committed could never have worked
+
+`ui/wasm.c` published `Module.qemuDisplay` from an `EM_JS` body. Under
+`-sPROXY_TO_PTHREAD=1` — which `configs/meson/emscripten.txt` sets — `main()`
+runs on a *worker*, and an `EM_JS` body executed there sees **that worker's**
+`Module`, a different JavaScript object from the page's. Nothing assigned to it
+is visible to the page, ever.
+
+It had never been exercised: the committed `jit-boot` page ran `-display none`,
+so the backend was registered-but-unused and the defect was invisible.
+
+Replaced with a seam that does not care which thread is asking:
+
+- a static `WasmDisplayInfo` struct in the wasm heap, all `u32` fields so JS can
+  read it out of `HEAPU32` with no layout guesswork (the surface pointer is
+  split into two words because a wasm64 pointer does not fit in one);
+- `EMSCRIPTEN_KEEPALIVE uint32_t wasm_display_info_addr(void)` returning its
+  address. **Exported wasm functions are callable from any thread holding the
+  instance, and every thread addresses the same shared memory** — which is the
+  property `EM_JS` lacks.
+
+`seq` is a **seqlock** (odd while the emulator thread is mid-update), not a bare
+counter. This is not fastidiousness: a torn *pointer* read is not a torn frame,
+it is an arbitrary index into `HEAPU8`.
+
+**Generalise this.** Anything that has to reach the page from the emulator
+thread has the same problem, and the same answer: put it in memory and export
+an accessor. `EM_JS` is only safe for code that runs on the thread that owns the
+`Module` you mean.
+
+### The heap views are not exported — and touching one kills the emulator
+
+First run with `-display wasm` died 2.2 s in:
+
+```
+Aborted('HEAPU32' was not exported. add it to EXPORTED_RUNTIME_METHODS)
+```
+
+`Module.HEAPU8`, `HEAPU32`, `wasmMemory` and `wasmExports` are all **absent, and
+absent in the worst way**: the property is a stub that calls `abort()`, tearing
+down the runtime and taking the emulator with it. A missing display feature
+killed a boot.
+
+Two fixes, both needed:
+
+1. `configs/meson/emscripten.txt` now exports `HEAPU8,HEAPU32` alongside
+   `addFunction,removeFunction,TTY,FS`.
+2. **The page reaches every `Module` property through a try/catch** and switches
+   painting off after the first failure. Presentation is a nice-to-have; it must
+   never be able to end a run.
+
+**Trap worth its own line: meson reads a cross file's `[built-in options]` only
+at CONFIGURE time.** Editing `emscripten.txt` and rebuilding is a silent no-op —
+ninja's own regenerate does not re-read them, and the link succeeds with the old
+flags. It needs `build-qemu.sh --configure`.
+
+### Pixel format: `x8r8g8b8`, read from the source rather than diagnosed
+
+`draw_line32_32()` in `hw/arm/ipod_touch_lcd.c` stores
+`rgb_to_pixel32(r, g, b)` = `(r<<16)|(g<<8)|b` as a native `u32`, so memory
+holds **B, G, R, X** while `ImageData` wants **R, G, B, A**. The page does one
+`u32` shuffle per pixel:
+
+```js
+dst = 0xff000000 | ((p & 0xff) << 16) | (p & 0xff00) | ((p >>> 16) & 0xff);
+```
+
+The handoff predicted "if the panel comes out blue, this is why". It never came
+out blue, because the conversion was written from the source before the first
+run. Recorded because the cheap move (read the drawing function) beat the
+expensive one (recognise the symptom).
+
+### Input: an SPSC ring drained by a QEMU timer
+
+QEMU's input queue belongs to the emulator thread and expects the BQL, so
+nothing may call into `ui/input.c` from JS. The exported entry points
+(`wasm_input_touch`, `wasm_input_button`) **only write a slot** in a
+single-producer/single-consumer ring; a 15 ms `QEMU_CLOCK_REALTIME` timer on the
+emulator thread drains it and dispatches.
+
+- **`dpy_refresh` was the tempting free drain point and was rejected.** It
+  already runs on the right thread at roughly the right rate, but QEMU throttles
+  the display refresh interval when a console looks idle — input latency would
+  then depend on how much the guest happens to be drawing.
+- The page speaks **buttons** (`home`/`power`), not QKeyCodes, so the
+  `Q_KEY_CODE_H` / `Q_KEY_CODE_P` mapping stays in C where the enum lives.
+- Touch is sent in the panel's own 320x480 coordinates and
+  `qemu_input_queue_abs` rescales; the **multitouch model is what flips Y**
+  (`fy = 1 - y/2^15`), exactly as for a native display, so the page must not
+  pre-flip.
+
+### The damage rectangle needed an ack to mean anything
+
+As written the union only ever grew: `wasm_gfx_update` accumulated into one
+rectangle with nothing to say when accumulation could restart, so within a
+second it was permanently full-screen. The struct now carries an `ack` field —
+the only field written by the page — holding the seq it last painted. The page
+repaints in full and ignores the rectangle, but a partial-blit consumer can now
+exist.
+
+### The shared working tree is a live hazard between the two sessions
+
+Both sessions edit one checkout, and B's in-flight work broke A's build twice
+(first `no member named 'pack_entry_count'`, then undefined `it_nand_pack_*`
+symbols) — unavoidable, and cheap to wait out.
+
+**What was not cheap:** B editing `hw/arm/meson.build` made ninja auto-regenerate,
+and *that* enabled curl, zstd and libssh for a WebAssembly build — the disaster
+this repo documents as "never run meson/ninja by hand", reached **without anyone
+running meson by hand**.
+
+Root cause, and it is a real bug in our tooling:
+
+> `build-qemu.sh` exported `PKG_CONFIG_PATH`, which only **prepends** to
+> pkg-config's search path. The initial configure was clean only because
+> `emconfigure` sets `PKG_CONFIG_LIBDIR`, which **replaces** it. Ninja's
+> `meson --internal regenerate` escapes `emconfigure` entirely, so pkg-config
+> fell back to its built-in path and found `/opt/homebrew`.
+
+`build-qemu.sh` now exports `PKG_CONFIG_LIBDIR` itself. Verified: a regenerate
+after the fix reports `libcurl found: NO`, `libssh found: NO`, `libzstd found:
+NO`.
+
+**This retires "never run meson/ninja by hand" as sufficient advice.** Ninja
+runs meson on its own, whenever any `meson.build` changes — which, with two
+sessions in one tree, is constantly.
+
+---
+
 ## Session — 2026-07-29 (Session B): fast and small
 
 Parallel session B (`BROWSER_WASM_SESSION_B.md`): JIT tuning, the pack-access

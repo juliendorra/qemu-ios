@@ -2,53 +2,95 @@
      JIT and the real 215 MiB NAND pack.
 
      Deliberately dumb about assets: it fetches the whole pack up front, which
-     is what the chunked loader (W4) exists to replace. The point here is only
-     to prove the engine boots the guest end to end.
+     is what the chunked loader (W4) exists to replace. The point here is to
+     prove the engine boots the guest end to end, paints the panel, and takes
+     touch.
 
      Serve with scripts/wasm/serve.py (the COOP/COEP headers are required) and
      open /public/jit-boot/. -->
+<title>iPhone OS 1.0 in the browser</title>
 <style>
   body { font: 13px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem;
-         background: #14161a; color: #d7dae0; }
-  h1 { font-size: 14px; margin: 0 0 .75rem; color: #9aa4b2; font-weight: 600; }
+         background: #14161a; color: #d7dae0;
+         display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1rem;
+         align-items: start; }
+  h1 { font-size: 14px; margin: 0 0 .75rem; color: #9aa4b2; font-weight: 600;
+       grid-column: 1 / -1; }
+  #device { display: flex; flex-direction: column; align-items: center;
+            gap: .5rem; }
+  /* image-rendering: pixelated keeps the 320x480 panel honest when scaled. */
+  canvas { width: 320px; height: 480px; background: #000; border-radius: 6px;
+           image-rendering: pixelated; touch-action: none; cursor: pointer; }
+  #buttons { display: flex; gap: .5rem; }
+  button { font: inherit; background: #2a2f39; color: #d7dae0; border: 0;
+           border-radius: 4px; padding: .4rem .9rem; cursor: pointer; }
+  button:active { background: #3a4150; }
+  #fbstat { color: #7f8896; }
   #state { padding: .5rem .75rem; border-radius: 4px; background: #22262e;
            margin-bottom: .5rem; }
   #marks { padding: .5rem .75rem; border-radius: 4px; background: #1b1f26;
            margin-bottom: .75rem; white-space: pre; color: #8fd694; }
   .ok   { border-left: 3px solid #4ac26b; }
   .fail { border-left: 3px solid #e5534b; }
-  #log { white-space: pre-wrap; line-height: 1.4; }
+  #log { white-space: pre-wrap; line-height: 1.4; max-height: 70vh;
+         overflow-y: auto; }
   .err { color: #e5a3a0; }
 </style>
 <h1>iPhone OS 1.0 — full boot, WebAssembly JIT</h1>
-<div id="state">loading…</div>
-<div id="marks">(no landmarks yet)</div>
-<div id="log"></div>
+<div id="device">
+  <canvas id="screen" width="320" height="480"></canvas>
+  <div id="buttons">
+    <button id="home">Home (H)</button>
+    <button id="power">Power (P)</button>
+  </div>
+  <div id="fbstat">panel: no frames yet</div>
+</div>
+<div>
+  <div id="state">loading…</div>
+  <div id="marks">(no landmarks yet)</div>
+  <div id="log"></div>
+</div>
 <script type="module">
   const logEl = document.getElementById('log');
   const stateEl = document.getElementById('state');
   const marksEl = document.getElementById('marks');
+  const fbstatEl = document.getElementById('fbstat');
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d', { alpha: false });
   const t0 = performance.now();
   const at = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(7);
 
   // Landmarks in boot order. `hit` is filled with the elapsed seconds so the
   // page itself is the measurement, readable without a debugger attached.
+  // "first pixels" is not a serial landmark: SpringBoard never announces
+  // itself, so the framebuffer is the only honest evidence it is up.
   const LANDMARKS = [
     ['iBoot banner',   t => t.includes('BUILD_TAG')],
     ['kernel',         t => t.includes('Darwin Kernel Version')],
     ['BSD root',       t => t.includes('BSD root:')],
     ['launchd',        t => t.includes('BOOT_TIME')],
-    ['SpringBoard',    t => t.includes('SpringBoard')],
   ];
   const hit = new Map();
   let failed = null;
+  let fsRef = null;      // MEMFS, captured in preRun so serial.log can be read
+  let moduleRef = null;  // the MAIN THREAD's Module -- see the note below
+  let serialSeen = 0;    // bytes of guest serial already rendered
 
   function renderMarks() {
-    marksEl.textContent = LANDMARKS
-      .map(([name]) => `${hit.has(name) ? hit.get(name).padStart(8) : '       —'}  ${name}`)
-      .join('\n');
+    const rows = LANDMARKS.map(([name]) =>
+      `${hit.has(name) ? hit.get(name).padStart(8) : '       —'}  ${name}`);
+    for (const [name, when] of hit) {
+      if (!LANDMARKS.some(([n]) => n === name)) {
+        rows.push(`${when.padStart(8)}  ${name}`);
+      }
+    }
+    marksEl.textContent = rows.join('\n');
   }
   renderMarks();
+
+  function mark(name) {
+    if (!hit.has(name)) { hit.set(name, at()); renderMarks(); }
+  }
 
   function state(text, cls) { stateEl.textContent = text; stateEl.className = cls || ''; }
 
@@ -58,16 +100,12 @@
     el.textContent = `[${at()}s] ${text}`;
     logEl.appendChild(el);
     if (logEl.childElementCount > 300) logEl.firstElementChild.remove();
-    logEl.scrollIntoView({ block: 'end' });
+    logEl.scrollTop = logEl.scrollHeight;
   }
 
   function note(text) {
     for (const [name, test] of LANDMARKS) {
-      if (!hit.has(name) && test(text)) {
-        hit.set(name, at());
-        renderMarks();
-        if (name === 'SpringBoard') state('SpringBoard reached', 'ok');
-      }
+      if (!hit.has(name) && test(text)) { mark(name); }
     }
     if (/panic\(|kernel abort|hardware error/.test(text)) {
       failed = text.slice(0, 120);
@@ -82,6 +120,213 @@
     line(`window error: ${msg}`, 'err');
   });
 
+  // The guest writes serial into MEMFS; the emulator runs on a worker but
+  // shares memory, so the file can be read from here. Poll it and render what
+  // is new.
+  setInterval(() => {
+    if (!fsRef) return;
+    let data;
+    try {
+      data = fsRef.readFile('/fw/serial.log', { encoding: 'utf8' });
+    } catch (e) {
+      return;                       // not created until the guest writes
+    }
+    if (data.length <= serialSeen) return;
+    const fresh = data.slice(serialSeen);
+    serialSeen = data.length;
+    for (const text of fresh.split('\n')) {
+      if (text.trim()) { note(text); line(text); }
+    }
+  }, 1000);
+
+  // ------------------------------------------------------------- display ---
+  //
+  // ui/wasm.c does not draw and does not publish anything onto `Module`: with
+  // -sPROXY_TO_PTHREAD the emulator runs on a worker whose `Module` is a
+  // different object from this one, so an EM_JS assignment there would be
+  // invisible here. Instead it exports the ADDRESS of a small struct, and both
+  // threads look at the same shared linear memory.
+  //
+  // Struct layout (all u32; see WasmDisplayInfo in ui/wasm.c):
+  //   0 seq  1 width  2 height  3 stride  4 pixels_lo  5 pixels_hi
+  //   6 damage_x  7 damage_y  8 damage_w  9 damage_h  10 ack
+  //
+  // `ack` is the one field written from here: the seq this page last painted.
+  // The emulator side needs it to know when it may stop accumulating damage
+  // into one rectangle. This page repaints in full and ignores the rectangle,
+  // but writing the ack keeps it meaningful for a partial-blit consumer.
+  //
+  // `seq` is a seqlock -- odd while the emulator thread is mid-update. Reading
+  // the fields without honouring it can catch a half-written pointer, and a
+  // half-written pointer indexed into HEAPU8 reads arbitrary memory rather
+  // than merely tearing a frame.
+  let infoBase = -1;            // struct address >> 2
+  let lastSeq = -1;
+  let imageData = null;
+  let imageWords = null;        // u32 view over imageData.data
+  let frames = 0;
+
+  function readDisplayInfo(u32) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const s0 = Atomics.load(u32, infoBase);
+      if (s0 & 1) continue;                       // writer in progress
+      const width = u32[infoBase + 1];
+      const height = u32[infoBase + 2];
+      const stride = u32[infoBase + 3];
+      const lo = u32[infoBase + 4];
+      const hi = u32[infoBase + 5];
+      if (Atomics.load(u32, infoBase) !== s0) continue;
+      return { seq: s0, width, height, stride, ptr: lo + hi * 4294967296 };
+    }
+    return null;
+  }
+
+  // The surface is 32bpp x8r8g8b8: rgb_to_pixel32() in hw/arm/ipod_touch_lcd.c
+  // stores (r<<16)|(g<<8)|b as a native u32, which on a little-endian host is
+  // B,G,R,X in memory. ImageData wants R,G,B,A. Doing the swizzle as one u32
+  // shuffle per pixel is ~150k operations a frame at 10 Hz -- negligible, and
+  // far cheaper than four byte reads.
+  function blit(src, srcWordOffset, rowWords, width, height) {
+    let nonBlack = 0;
+    for (let y = 0; y < height; y++) {
+      let s = srcWordOffset + y * rowWords;
+      let d = y * width;
+      for (let x = 0; x < width; x++, s++, d++) {
+        const p = src[s];
+        if (p & 0x00ffffff) nonBlack++;
+        imageWords[d] = 0xff000000 | ((p & 0xff) << 16) | (p & 0xff00) |
+                        ((p >>> 16) & 0xff);
+      }
+    }
+    return nonBlack;
+  }
+
+  // Reading a runtime method Emscripten did not export does not return
+  // undefined -- the stub calls abort(), which tears down the whole runtime and
+  // takes the emulator with it. Painting is a nice-to-have; it must never be
+  // able to kill the boot, so every module property is reached through this and
+  // the paint loop switches itself off after the first failure.
+  let displayBroken = false;
+  function moduleProp(name) {
+    try {
+      return moduleRef[name];
+    } catch (e) {
+      displayBroken = true;
+      state(`display disabled: Module.${name} unavailable (${e})`, 'fail');
+      line(`display disabled: Module.${name} unavailable`, 'err');
+      return undefined;
+    }
+  }
+
+  function paint() {
+    if (!displayBroken) requestAnimationFrame(paint);
+    if (!moduleRef || displayBroken) return;
+
+    if (infoBase < 0) {
+      const fn = moduleProp('_wasm_display_info_addr');
+      if (typeof fn !== 'function') return;       // runtime not up yet
+      infoBase = fn() >>> 2;
+      line(`display info struct at 0x${(infoBase << 2).toString(16)}`);
+    }
+
+    const u32 = moduleProp('HEAPU32');
+    if (!u32) return;
+    const info = readDisplayInfo(u32);
+    if (!info || info.seq === lastSeq || !info.width || !info.height) return;
+    lastSeq = info.seq;
+
+    // Bounds-check before making a view: a bad pointer must fail here, loudly,
+    // rather than throw once per animation frame from inside the blit.
+    const bytes = info.stride * info.height;
+    if (info.ptr <= 0 || (info.ptr & 3) ||
+        info.ptr + bytes > u32.byteLength) {
+      state(`display: implausible surface ptr=${info.ptr} bytes=${bytes}`, 'fail');
+      infoBase = -1;
+      return;
+    }
+
+    if (!imageData || imageData.width !== info.width ||
+        imageData.height !== info.height) {
+      canvas.width = info.width;
+      canvas.height = info.height;
+      canvas.style.width = `${info.width}px`;
+      canvas.style.height = `${info.height}px`;
+      imageData = ctx.createImageData(info.width, info.height);
+      imageWords = new Uint32Array(imageData.data.buffer);
+    }
+
+    const nonBlack = blit(u32, info.ptr >>> 2, info.stride >>> 2,
+                          info.width, info.height);
+    ctx.putImageData(imageData, 0, 0);
+    Atomics.store(u32, infoBase + 10, info.seq);   // ack: painted through seq
+
+    frames++;
+    if (frames === 1) mark('first pixels');
+    const pct = (100 * nonBlack / (info.width * info.height)).toFixed(1);
+    fbstatEl.textContent =
+      `panel: ${info.width}x${info.height} · ${frames} frames · ${pct}% non-black`;
+    // The native oracle renders 59.0% non-black at 1.0's home screen.
+    if (Number(pct) > 40) mark('home screen (>40% non-black)');
+  }
+  requestAnimationFrame(paint);
+
+  // --------------------------------------------------------------- input ---
+  //
+  // Everything below only ever writes into ui/wasm.c's ring buffer; a QEMU
+  // timer on the emulator thread drains it and does the actual dispatch.
+  // Calling QEMU's input API straight from here would touch a queue owned by
+  // another thread, without the BQL.
+  function sendTouch(ev, down) {
+    if (!moduleRef || !moduleRef._wasm_input_touch) return;
+    const r = canvas.getBoundingClientRect();
+    const x = Math.round((ev.clientX - r.left) / r.width * canvas.width);
+    const y = Math.round((ev.clientY - r.top) / r.height * canvas.height);
+    if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return;
+    moduleRef._wasm_input_touch(x, y, down ? 1 : 0);
+  }
+
+  let touching = false;
+  canvas.addEventListener('pointerdown', (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    touching = true;
+    sendTouch(e, true);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (touching) sendTouch(e, true);
+  });
+  const endTouch = (e) => {
+    if (!touching) return;
+    touching = false;
+    sendTouch(e, false);
+  };
+  canvas.addEventListener('pointerup', endTouch);
+  canvas.addEventListener('pointercancel', endTouch);
+  // A pointer released outside the window never delivers pointerup; without
+  // this the guest keeps a finger down forever.
+  addEventListener('blur', () => {
+    if (touching && moduleRef && moduleRef._wasm_input_touch) {
+      touching = false;
+      moduleRef._wasm_input_touch(0, 0, 0);
+    }
+  });
+
+  const BUTTON_HOME = 0, BUTTON_POWER = 1;
+  function pressButton(which) {
+    if (!moduleRef || !moduleRef._wasm_input_button) return;
+    // The guest's key handler translates make/break itself, so a tap is a
+    // down/up pair rather than a level held for as long as the mouse is.
+    moduleRef._wasm_input_button(which, 1);
+    setTimeout(() => moduleRef._wasm_input_button(which, 0), 80);
+  }
+  document.getElementById('home').onclick = () => pressButton(BUTTON_HOME);
+  document.getElementById('power').onclick = () => pressButton(BUTTON_POWER);
+  addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    if (e.key === 'h' || e.key === 'H') pressButton(BUTTON_HOME);
+    if (e.key === 'p' || e.key === 'P') pressButton(BUTTON_POWER);
+  });
+
+  // ---------------------------------------------------------------- boot ---
   const { default: Module } = await import('./qemu-system-arm.js');
 
   const FILES = [
@@ -99,11 +344,20 @@
             'nand=/fw/nand,epoch=0',
       '-m', '1G',
       '-pflash', '/fw/nor.bin',
-      '-display', 'none',
-      '-serial', 'stdio',
+      '-display', 'wasm',
+      // NOT -serial stdio. In a browser the guest's stdout never reaches
+      // Module.print (it does under Node), so a run looks silent even while it
+      // is booting normally -- device-model stderr still arrives, which makes
+      // it especially misleading. Write to a MEMFS file and poll it instead.
+      '-serial', 'file:/fw/serial.log',
       '-icount', 'shift=1',
     ],
     preRun: [async (mod) => {
+      // preRun runs on the MAIN thread, so this is the Module whose exports
+      // and HEAP views address the shared memory from here.
+      moduleRef = mod;
+      fsRef = mod.FS;
+      globalThis.__mod = mod;        // for poking at the module from the console
       mod.FS.mkdir('/fw');
       mod.FS.mkdir('/fw/nand');
       // Required even for a packed, read-only NAND: the model opens

@@ -1,13 +1,19 @@
 /*
- * WebAssembly display backend: publish the guest framebuffer to JavaScript.
+ * WebAssembly display and input backend: a shared-memory seam to the page.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * The emulator runs on a pthread (PROXY_TO_PTHREAD) while the canvas lives on
- * the main thread, so this backend deliberately does NOT draw. It publishes
- * the surface's geometry and its address inside the wasm heap, and bumps a
- * generation counter on every damage event. The page then reads those pixels
- * straight out of HEAPU8 and paints, on its own animation frame.
+ * The emulator runs on a pthread (-sPROXY_TO_PTHREAD) while the canvas and the
+ * pointer/keyboard events live on the main thread, so this backend deliberately
+ * does NOT draw and is NOT called from JS directly. Everything crosses the
+ * thread boundary through plain structures in the wasm heap:
+ *
+ *   - the display publishes geometry, the surface address and a seqlock
+ *     counter into WasmDisplayInfo; the page reads the pixels straight out of
+ *     HEAPU8 and paints on its own animation frame;
+ *   - input is pushed by the page into a single-producer/single-consumer ring
+ *     and drained on the emulator thread by a QEMU timer, so QEMU's input
+ *     queue is only ever touched by the thread that owns it.
  *
  * That split is the point:
  *
@@ -18,6 +24,13 @@
  *   - the page decides how to present (scale, rotate, colour-convert), which
  *     keeps policy out of the emulator.
  *
+ * WHY NOT EM_JS: an EM_JS body executed here runs on the emulator's *worker*,
+ * where `Module` is that worker's own module object. Anything assigned to it is
+ * invisible to the page. Exported functions, by contrast, are callable from any
+ * thread holding the instance and all of them address the same shared memory.
+ * An earlier revision published `Module.qemuDisplay` from EM_JS; it could never
+ * have worked under PROXY_TO_PTHREAD.
+ *
  * The guest panel is 320x480 at 32bpp, so a whole frame is 614,400 bytes and
  * repainting all of it is cheap. Damage rectangles are still tracked and
  * published, so a future consumer can repaint only what changed.
@@ -25,62 +38,124 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "ui/surface.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include <emscripten.h>
 
 /*
- * Publish geometry. `pixels` is a wasm heap address; under -sMEMORY64 it
- * arrives in JS as a BigInt, hence bigintToI53Checked. Number() would silently
- * lose precision above 2^53, which cannot happen for our heap but is the kind
- * of thing that bites once memories grow.
+ * Published to the page. Every field is a 32-bit word so JS can read the whole
+ * thing out of HEAPU32 without any layout guesswork; the surface address is
+ * split into two words because a wasm64 pointer does not fit in one.
+ *
+ * `seq` is a seqlock: odd while the writer is mid-update, even when stable.
+ * A reader takes seq, reads the fields, takes seq again and retries if it moved
+ * or was odd. Without it a reader can catch a half-written pointer, which under
+ * a raw HEAPU8 view means reading arbitrary memory rather than a torn frame.
+ * `seq` doubles as the change counter: it advances by 2 per update.
  */
-EM_JS(void, wasm_display_publish, (int width, int height, int stride,
-                                   void *pixels), {
-    Module.qemuDisplay = {
-        width: width,
-        height: height,
-        stride: stride,
-        ptr: bigintToI53Checked(pixels),
-        generation: 0,
-        damage: { x: 0, y: 0, w: width, h: height },
-    };
-});
+typedef struct WasmDisplayInfo {
+    uint32_t seq;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t pixels_lo;
+    uint32_t pixels_hi;
+    uint32_t damage_x;
+    uint32_t damage_y;
+    uint32_t damage_w;
+    uint32_t damage_h;
+    /*
+     * Written by the PAGE, read here: the seq it last painted. Everything else
+     * in this struct goes the other way.
+     *
+     * Without it the damage rectangle is useless. Updates that arrive between
+     * two paints have to accumulate into one rectangle, so something has to say
+     * when accumulation may restart -- and with no ack the union only ever
+     * grows, reaching full-screen within a second and staying there. The page
+     * currently repaints in full and ignores damage, so this costs it one store
+     * per frame and buys a partial-blit consumer the option of existing.
+     */
+    uint32_t ack;
+} WasmDisplayInfo;
 
-EM_JS(void, wasm_display_damage, (int x, int y, int w, int h), {
-    const d = Module.qemuDisplay;
-    if (!d) {
-        return;
-    }
-    /* Union with any damage the page has not consumed yet. */
-    if (d.generation === d.consumed) {
-        d.damage = { x: x, y: y, w: w, h: h };
-    } else {
-        const x0 = Math.min(d.damage.x, x);
-        const y0 = Math.min(d.damage.y, y);
-        const x1 = Math.max(d.damage.x + d.damage.w, x + w);
-        const y1 = Math.max(d.damage.y + d.damage.h, y + h);
-        d.damage = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-    }
-    d.generation++;
-});
+static WasmDisplayInfo wasm_display_info;
+
+/*
+ * The page needs the address of the block above. Returning it as a uint32_t
+ * keeps it a plain JS Number: static data lives at the bottom of linear memory,
+ * far below 4 GiB, even in a full wasm64 build.
+ */
+EMSCRIPTEN_KEEPALIVE uint32_t wasm_display_info_addr(void)
+{
+    return (uint32_t)(uintptr_t)&wasm_display_info;
+}
+
+static void wasm_display_seq_begin(void)
+{
+    qatomic_store_release(&wasm_display_info.seq, wasm_display_info.seq + 1);
+}
+
+static void wasm_display_seq_end(void)
+{
+    qatomic_store_release(&wasm_display_info.seq, wasm_display_info.seq + 1);
+}
 
 static void wasm_gfx_switch(DisplayChangeListener *dcl,
                             DisplaySurface *surface)
 {
+    uint64_t pixels;
+
     if (surface == NULL) {
         return;
     }
-    wasm_display_publish(surface_width(surface), surface_height(surface),
-                         surface_stride(surface), surface_data(surface));
+
+    pixels = (uint64_t)(uintptr_t)surface_data(surface);
+
+    wasm_display_seq_begin();
+    wasm_display_info.width = surface_width(surface);
+    wasm_display_info.height = surface_height(surface);
+    wasm_display_info.stride = surface_stride(surface);
+    wasm_display_info.pixels_lo = (uint32_t)pixels;
+    wasm_display_info.pixels_hi = (uint32_t)(pixels >> 32);
+    /* A new surface invalidates everything the page has drawn so far. */
+    wasm_display_info.damage_x = 0;
+    wasm_display_info.damage_y = 0;
+    wasm_display_info.damage_w = wasm_display_info.width;
+    wasm_display_info.damage_h = wasm_display_info.height;
+    wasm_display_seq_end();
 }
 
 static void wasm_gfx_update(DisplayChangeListener *dcl,
                             int x, int y, int w, int h)
 {
-    wasm_display_damage(x, y, w, h);
+    uint32_t x0, y0, x1, y1;
+
+    /* Anything the page has not painted yet has to be unioned in. */
+    if (qatomic_read(&wasm_display_info.ack) != wasm_display_info.seq) {
+        /* Union with damage the page has not consumed yet. */
+        x0 = MIN(wasm_display_info.damage_x, (uint32_t)x);
+        y0 = MIN(wasm_display_info.damage_y, (uint32_t)y);
+        x1 = MAX(wasm_display_info.damage_x + wasm_display_info.damage_w,
+                 (uint32_t)(x + w));
+        y1 = MAX(wasm_display_info.damage_y + wasm_display_info.damage_h,
+                 (uint32_t)(y + h));
+    } else {
+        x0 = x;
+        y0 = y;
+        x1 = x + w;
+        y1 = y + h;
+    }
+
+    wasm_display_seq_begin();
+    wasm_display_info.damage_x = x0;
+    wasm_display_info.damage_y = y0;
+    wasm_display_info.damage_w = x1 - x0;
+    wasm_display_info.damage_h = y1 - y0;
+    wasm_display_seq_end();
 }
 
 static void wasm_refresh(DisplayChangeListener *dcl)
@@ -92,6 +167,121 @@ static void wasm_refresh(DisplayChangeListener *dcl)
      */
     graphic_hw_update(dcl->con);
 }
+
+/* ---------------------------------------------------------------- input --- */
+
+/*
+ * Single-producer (page, main thread) / single-consumer (emulator thread) ring.
+ * The producer only ever advances `head`, the consumer only `tail`, so no lock
+ * is needed -- just release/acquire ordering so the slot's contents are visible
+ * before the index that publishes them.
+ *
+ * QEMU's input queue is not thread-safe and expects the BQL, which is why
+ * nothing here calls into ui/input.c from the exported entry points: they only
+ * write a slot. The drain timer below runs on the emulator thread, under the
+ * BQL like every other QEMU timer, and does the actual dispatch.
+ */
+#define WASM_INPUT_RING_SIZE 256       /* power of two */
+#define WASM_INPUT_RING_MASK (WASM_INPUT_RING_SIZE - 1)
+
+enum {
+    WASM_INPUT_NONE = 0,
+    WASM_INPUT_TOUCH,                  /* a = x, b = y, c = down */
+    WASM_INPUT_BUTTON,                 /* a = WasmButton, b = down */
+};
+
+/* The page speaks in buttons, not QKeyCodes, so the mapping stays in C. */
+enum {
+    WASM_BUTTON_HOME = 0,
+    WASM_BUTTON_POWER = 1,
+};
+
+typedef struct WasmInputEvent {
+    uint32_t type;
+    int32_t a;
+    int32_t b;
+    int32_t c;
+} WasmInputEvent;
+
+static WasmInputEvent wasm_input_ring[WASM_INPUT_RING_SIZE];
+static uint32_t wasm_input_head;
+static uint32_t wasm_input_tail;
+static QEMUTimer *wasm_input_timer;
+
+/* How often the emulator thread looks at the ring. 15 ms is well inside the
+ * touch controller's own sampling and cheap enough to leave running: the
+ * display's own dpy_refresh would have been free, but QEMU throttles that
+ * interval when a console looks idle, which would make input latency depend on
+ * how much the guest happens to be drawing. */
+#define WASM_INPUT_POLL_MS 15
+
+static void wasm_input_push(uint32_t type, int32_t a, int32_t b, int32_t c)
+{
+    uint32_t head = qatomic_read(&wasm_input_head);
+    uint32_t tail = qatomic_load_acquire(&wasm_input_tail);
+
+    if (head - tail >= WASM_INPUT_RING_SIZE) {
+        return;                        /* full: drop, the guest is wedged */
+    }
+
+    wasm_input_ring[head & WASM_INPUT_RING_MASK] = (WasmInputEvent){
+        .type = type, .a = a, .b = b, .c = c,
+    };
+    qatomic_store_release(&wasm_input_head, head + 1);
+}
+
+/*
+ * Panel coordinates, origin top-left, in the surface's own 320x480 space.
+ * qemu_input_queue_abs rescales to QEMU's absolute range; the multitouch model
+ * is what flips Y, exactly as it does for a native display.
+ */
+EMSCRIPTEN_KEEPALIVE void wasm_input_touch(int x, int y, int down)
+{
+    wasm_input_push(WASM_INPUT_TOUCH, x, y, down);
+}
+
+EMSCRIPTEN_KEEPALIVE void wasm_input_button(int button, int down)
+{
+    wasm_input_push(WASM_INPUT_BUTTON, button, down, 0);
+}
+
+static void wasm_input_dispatch(const WasmInputEvent *ev)
+{
+    switch (ev->type) {
+    case WASM_INPUT_TOUCH:
+        qemu_input_queue_abs(NULL, INPUT_AXIS_X, ev->a, 0,
+                             wasm_display_info.width ?: 320);
+        qemu_input_queue_abs(NULL, INPUT_AXIS_Y, ev->b, 0,
+                             wasm_display_info.height ?: 480);
+        qemu_input_queue_btn(NULL, INPUT_BUTTON_LEFT, ev->c != 0);
+        qemu_input_event_sync();
+        break;
+    case WASM_INPUT_BUTTON:
+        qemu_input_event_send_key_qcode(
+            NULL, ev->a == WASM_BUTTON_POWER ? Q_KEY_CODE_P : Q_KEY_CODE_H,
+            ev->b != 0);
+        break;
+    default:
+        break;
+    }
+}
+
+static void wasm_input_drain(void *opaque)
+{
+    uint32_t tail = qatomic_read(&wasm_input_tail);
+    uint32_t head = qatomic_load_acquire(&wasm_input_head);
+
+    while (tail != head) {
+        wasm_input_dispatch(&wasm_input_ring[tail & WASM_INPUT_RING_MASK]);
+        tail++;
+    }
+    qatomic_store_release(&wasm_input_tail, tail);
+
+    timer_mod(wasm_input_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + WASM_INPUT_POLL_MS);
+}
+
+/* --------------------------------------------------------------- wiring --- */
 
 static const DisplayChangeListenerOps wasm_dcl_ops = {
     .dpy_name       = "wasm",
@@ -114,6 +304,11 @@ static void wasm_display_init(DisplayState *ds, DisplayOptions *opts)
     }
     wasm_dcl.con = con;
     register_displaychangelistener(&wasm_dcl);
+
+    wasm_input_timer = timer_new_ms(QEMU_CLOCK_REALTIME, wasm_input_drain,
+                                    NULL);
+    timer_mod(wasm_input_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + WASM_INPUT_POLL_MS);
 }
 
 static QemuDisplay qemu_display_wasm = {

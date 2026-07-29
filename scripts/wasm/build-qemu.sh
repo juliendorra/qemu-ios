@@ -111,6 +111,23 @@ else
     export CPATH="$root/target/include"
     export PKG_CONFIG_PATH="$root/target/lib/pkgconfig"
     export EM_PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
+    # PKG_CONFIG_LIBDIR *replaces* pkg-config's built-in search path;
+    # PKG_CONFIG_PATH only prepends to it. That distinction is what stands
+    # between this and a WebAssembly build linking Homebrew libraries:
+    #
+    #   - the initial configure runs under `emconfigure`, which sets
+    #     PKG_CONFIG_LIBDIR itself, so it has always been clean;
+    #   - but ninja re-runs `meson --internal regenerate` on its own whenever a
+    #     meson.build changes, and that escapes emconfigure entirely. With only
+    #     PKG_CONFIG_PATH set, pkg-config still searches /opt/homebrew, finds
+    #     zstd/libssh/libcurl there, and silently enables them -- after which
+    #     the build dies on `curl/curl.h file not found`.
+    #
+    # Observed for real on 2026-07-29 when a parallel session edited
+    # hw/arm/meson.build: a build that had worked minutes earlier came back
+    # with -I/opt/homebrew/opt/zstd/include on every command line. Setting
+    # LIBDIR here makes the auto-regenerate as hermetic as the configure.
+    export PKG_CONFIG_LIBDIR="$root/target/lib/pkgconfig:$EMSDK/upstream/emscripten/cache/sysroot/lib/pkgconfig"
     export CFLAGS="-O3 -pthread -DWASM_BIGINT"
     # -lnodefs.js lets a Node run mount the real filesystem, which is how the
     # emulator is booted headlessly for testing before the browser asset
