@@ -15,6 +15,14 @@ origin.
 Real-time speed is a stated requirement, not an aspiration: it is why the
 WebAssembly JIT backend is being adopted rather than shipping TCI.
 
+> **Split into two parallel sessions (2026-07-29).** See
+> [`BROWSER_WASM_SESSION_A.md`](BROWSER_WASM_SESSION_A.md) — make it visible and
+> interactive (display painting, input, post-boot snapshot) — and
+> [`BROWSER_WASM_SESSION_B.md`](BROWSER_WASM_SESSION_B.md) — make it fast and
+> small (JIT tuning, pack seam, chunked delivery). They own disjoint files; B
+> builds with `WASM_BUILD_DIR=build-wasm-b` and serves on port 8011 so the two
+> do not collide.
+
 ---
 
 ## Where things stand

@@ -191,6 +191,27 @@ landmark-to-landmark engine comparison, not a boot time. A boot-time number
 needs the NAND and a faster clock setting, and should be taken once the JIT
 completes a full boot.
 
+### The display backend, and two QAPI traps
+
+`ui/wasm.c` adds `-display wasm`. It does **not** draw: the emulator runs on a
+pthread while the canvas lives on the main thread, so the backend publishes
+`Module.qemuDisplay = {width, height, stride, ptr, generation, damage}` — `ptr`
+being an address inside the wasm heap — and bumps `generation` on damage. The
+page reads those pixels straight out of `HEAPU8`.
+
+That split is the point: wasm memory is SharedArrayBuffer-backed, so the main
+thread reads what the emulator thread wrote with **no copy and no postMessage
+per frame**, and presentation policy stays in the page.
+
+Two build errors worth knowing before adding a display type, both fatal rather
+than advisory:
+
+- every QAPI enum value needs a doc comment (`value 'wasm' lacks documentation`);
+- those comments are limited to **70 characters** per line.
+
+`error_report()` also needs `qemu/error-report.h`, which `ui/console.h` does not
+pull in.
+
 ### Tuning the JIT: what was measured, what failed
 
 Getting the backend to build was not the end of it. Once it ran, the browser
