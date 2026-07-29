@@ -26,8 +26,21 @@
 #include <emscripten.h>
 #include "wasm64.h"
 
-/* TBs executed more than this value will be compiled to wasm */
-#define INSTANTIATE_NUM 1500
+/*
+ * TBs executed more than this value will be compiled to wasm.
+ *
+ * Upstream uses 1500, which suits a long-running Linux guest: pay to compile
+ * only the very hottest blocks. Our workload is a BOOT -- thousands of
+ * moderately-warm blocks and few extremely hot ones -- and at 1500 the
+ * instrumented counters showed only 208 blocks compiled in an entire iPhone
+ * OS 1.0 boot, so essentially all of it ran on the forked TCI interpreter.
+ *
+ * There is enormous headroom to trade compile time for execution speed: that
+ * run peaked at 208 live instances against MAX_INSTANCES of 12000 (1.7%), with
+ * zero evictions and zero recompiles. Watch those two counters when changing
+ * this -- if they stay at zero while `compiled` rises, the trade is free.
+ */
+#define INSTANTIATE_NUM 100
 
 #define EM_JS_PRE(ret, name, args, body...) EM_JS(ret, name, args, body)
 
@@ -703,6 +716,22 @@ static __thread struct WasmInstanceInfo instances[INSTANCES_BUF_MAX];
 static __thread int instances_begin;
 static __thread int instances_end;
 
+/*
+ * Diagnostic counters. The browser caps how many WebAssembly instances a page
+ * may hold, so this backend evicts and recompiles; if the guest's hot working
+ * set is larger than MAX_INSTANCES that degenerates into thrash -- compile,
+ * evict, recompile -- which looks exactly like "the JIT is mysteriously slow".
+ *
+ * Reported to stderr every JIT_STATS_EVERY instantiations, which is cheap and
+ * needs no environment variable (getenv is awkward to set in a browser). The
+ * ratio that matters is recompiles/compiles: near zero is healthy, approaching
+ * one means the working set does not fit.
+ */
+#define JIT_STATS_EVERY 16
+static uint64_t jit_compiles;      /* modules instantiated */
+static uint64_t jit_recompiles;    /* instantiations of a TB evicted earlier */
+static uint64_t jit_evictions;     /* instances dropped to stay under the cap */
+
 static void add_instance(wasm_tb_func tb_func, void *tb_ptr)
 {
     instances[instances_end].tb_func = tb_func;
@@ -711,6 +740,17 @@ static void add_instance(wasm_tb_func tb_func, void *tb_ptr)
     instances_end  = (instances_end + 1) % INSTANCES_BUF_MAX;
 
     qatomic_inc(&instances_global);
+
+    /* Report the first compile too: knowing WHEN the JIT starts doing work at
+     * all separates "not compiling" from "compiling and thrashing". */
+    if (++jit_compiles == 1 || jit_compiles % JIT_STATS_EVERY == 0) {
+        fprintf(stderr,
+                "[JIT] compiled=%llu recompiled=%llu evicted=%llu live=%d/%d\n",
+                (unsigned long long)jit_compiles,
+                (unsigned long long)jit_recompiles,
+                (unsigned long long)jit_evictions,
+                qatomic_read(&instances_global), MAX_INSTANCES);
+    }
 }
 
 static __thread int instance_pending_gc;
@@ -733,6 +773,7 @@ static void remove_old_instances(void)
         EM_ASM({ removeFunction($0); }, instances[instances_begin].tb_func);
         instances[instances_begin].tb_ptr = NULL;
         instances_begin = (instances_begin + 1) % INSTANCES_BUF_MAX;
+        jit_evictions++;
     }
     instance_pending_gc += num;
 }
@@ -753,6 +794,7 @@ static wasm_tb_func get_instance_from_tb(void *tb_ptr)
          * This TB was instantiated before, but has been removed. Set counter to
          * the max value so that this will be instantiated.
          */
+        jit_recompiles++;      /* the thrash signal: evicted, now wanted again */
         set_counter_local(tb_ptr, INSTANTIATE_NUM);
         set_info_local(tb_ptr, NULL);
         return NULL;
