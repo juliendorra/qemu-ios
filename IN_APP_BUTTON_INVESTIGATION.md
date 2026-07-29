@@ -142,6 +142,45 @@ handled, and only afterwards does event delivery die permanently.
     and check the anchor: with it, `0xc032792c` correctly resolves to
     `com.apple.driver.AppleM68Buttons`.
 
+11. **The requester is `IOCoreSurface`, NOT TVOut** (2026-07-30,
+    `spin-locate.py --kernelcache`). With `IT_MBX_READY=0` the spin reproduces on
+    demand, so the kernel stack can be walked at leisure:
+
+    ```
+    pc  0xc033563c   AppleMBX  (the register-read accessor)
+    lr  0xc033601c   AppleMBX+0xd01c   (the poll loop)
+        AppleMBX+0x5094 -> AppleMBX+0x69cc -> kernel(IOKit) -> AppleMBX+0x8f90
+    stack also holds: com.apple.iokit.IOCoreSurface+0x27a8
+    ```
+
+    No TVOut, no AppleH1CLCD anywhere in the chain. So the MBX work is requested
+    by the **surface/compositing** layer during the dismissal, which is why
+    `LK_ENABLE_MBX2D=0` (a LayerKit *userland* knob) does not prevent it.
+
+    *Precondition trap, cost one run:* the spin only happens with an app
+    FRONTMOST, and a run whose icon tap missed looks exactly like "the bug did
+    not reproduce" (0.14 cores, idle loop). `spin-locate.py` now verifies the
+    screen is app-like (>80% lit) before pressing and calls the run INVALID
+    otherwise.
+
+12. **The MBX register protocol, read off the guest** (`IT_MBX_TRACE=1`):
+
+    ```
+    rd 0x12c = 0x140          status
+    WR 0x134 = 0x00000040     clear bit 6          <-- the guest ACKs the event
+    WR 0x134 = 0x0000ffff     clear everything
+    WR 0x130 = 0x00000000     host enable = 0      <-- interrupts MASKED OFF
+    WR 0x824..0x83c           a command descriptor
+    WR 0x6d8 = 0x09000000     the KICK, then it polls 0x12c
+    ```
+
+    So 0x12C = event status, 0x130 = host enable, 0x134 = host clear -- PowerVR
+    event registers. **Two consequences.** First, this path *polls* with all
+    events masked, so **an interrupt is not what it is waiting for** and T1's
+    "wire the TVOut SDO IRQ" is not the lever for this bug. Second, the shipped
+    stub's permanently-set bit 6 is a lie the guest can observe: it writes
+    `0x134 = 0x40` to acknowledge, re-reads, and the bit is still set.
+
 ## Hypotheses killed, with the measurement that killed each
 
 Do not re-try any of these.
@@ -409,6 +448,45 @@ deterministically inside the MBX poll, so attaching gdb and walking the kernel
 stack names the CALLER -- the driver or subsystem that requested the operation --
 and then one can check whether 1.1.4 ever calls the same entry. Do that before
 building hardware on an assumption.
+
+### The honest event model: implemented, at parity, OFF by default
+
+`IT_MBX_EVENTS=1` replaces the always-set bit with real semantics -- 0x130 is the
+mask, 0x134 clears, and a kick raises the completion bit. Getting the kick right
+took one disproof:
+
+| kick modelled as | result |
+|---|---|
+| `0x1020` bit 0 (guessed from a read-modify-write pair) | **WRONG** -- the guest span **46 million** times on `rd 0x12c = 0x100` |
+| `0x6d8` (the last write before the poll, from the ordered trace) | no spin, 0.18 host cores |
+
+With the correct kick the modelled mode matches the shipped default
+functionally -- no spin, events flow -- while no longer lying to the guest about
+an event it has acknowledged. It is **off by default**: promoting it means
+reinstalling the engine in all three bundles and re-running the regression, and
+it buys fidelity rather than function.
+
+The MBX event line is also now **plumbed but unbound**: `IT_MBX_IRQ=<n>` attaches
+it to SoC interrupt n (30 = TVOUT_SDO), so T1's TVOut hypothesis is testable with
+an env var instead of a rebuild. Unbound, `mbx_update_irq()` is a no-op, so
+nothing can regress -- and since the dismissal path masks all MBX events, an
+interrupt is not expected to help *there*.
+
+### Still open: the transition itself
+
+`3_home_returns` remains 0.00% in every mode. The guest no longer spins, events
+flow, the app is told to deactivate, SpringBoard runs its dismissal to
+completion -- and no new frame appears. The next candidates, in order:
+
+1. **The MBX registers we answer with zero.** `rd 0x00ff8`, `rd 0x00ffc`,
+   `rd 0x00f10` all return 0 from the stub. If any is a fifo level, completion
+   count or capability word the driver acts on, it stalls silently -- exactly the
+   failure shape we are left with.
+2. **Does anything ask the LCD to flip afterwards?** `IT_LCD_TRACE=1` across the
+   press: window-base writes mean SpringBoard submitted a frame and the problem
+   is downstream; no writes mean the compositor is still blocked upstream.
+3. Only then T1's swap-device/TVOut work, which the caller chain says is a
+   different consumer from this one.
 
 ### Is the change 1.0-specific? No -- all three builds ship the same MBX code
 

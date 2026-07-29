@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import struct
 import os
 import signal
 import subprocess
@@ -83,6 +84,11 @@ def main() -> int:
     ap.add_argument("--samples", type=int, default=40)
     ap.add_argument("--sample-gap", type=float, default=0.1)
     ap.add_argument("--steps", type=int, default=6000)
+    ap.add_argument("--kernelcache", type=Path, default=None,
+                    help="resolve KERNEL addresses through this extracted "
+                         "kernelcache's kmod_info list, and walk the kernel "
+                         "stack at the spin to name the CALLER -- i.e. which "
+                         "driver asked the MBX to do work")
     ap.add_argument("--no-app", action="store_true")
     args = ap.parse_args()
 
@@ -147,6 +153,29 @@ def main() -> int:
             return f"{symmap[i][1]}+{addr - symmap[i][0]:#x}"
         return brk.whose(addr, libs)
 
+    # ---- kernel naming, from the kernelcache -------------------------------
+    kexts, ksyms, kskew = [], [], None
+    if args.kernelcache:
+        xr = _load("kaddr", REPO / "scripts" / "kernel-addr-symbolize.py")
+        kdata = args.kernelcache.read_bytes()
+        ksegs = xr.segments(args.kernelcache)
+        pre = next((x for x in ksegs if x["name"] == "__PRELINK"), None)
+        kskew = pre["vmaddr"] - pre["fileoff"]
+        kexts = xr.kmods(kdata, (pre["vmaddr"], pre["vmaddr"] + pre["vmsize"]))
+        ktext = next((x for x in ksegs if x["name"] == "__TEXT"), None)
+        kranges = [(ktext["vmaddr"], ktext["vmaddr"] + ktext["vmsize"], "kernel")]
+        kranges += [(a, a + sz, n) for n, a, sz in kexts]
+        print(f"  {len(kexts)} kexts from the kernelcache")
+
+        def kname(addr):
+            for lo, hi, n in kranges:
+                if lo <= addr < hi:
+                    return f"{n.replace('com.apple.driver.', '')}+{addr - lo:#x}"
+            return None
+    else:
+        def kname(addr):
+            return None
+
     def func_of(addr):
         n = name_of(addr)
         return n.rsplit("+", 1)[0] if "+" in n else n
@@ -185,9 +214,25 @@ def main() -> int:
         if args.no_app:
             print("NOT opening an app")
         else:
-            print("opening an app ...")
-            btn.tap(q, *icon, 0.12)
-            time.sleep(args.settle)
+            # PRECONDITION, verified: the spin only happens on a press taken
+            # with an app FRONTMOST. A run whose icon tap missed presses HOME
+            # from the home screen, does not spin, and looks exactly like "the
+            # bug did not reproduce" -- which cost one run before this check
+            # existed. The home screen sits near 45% lit, an app near 99%.
+            tmpfb = args.logs / "fb.raw"
+            for attempt in range(3):
+                print(f"opening an app (attempt {attempt + 1}) ...")
+                btn.tap(q, *icon, 0.12)
+                time.sleep(args.settle)
+                litv = max(btn.lit(b) for b in btn.grab(q, tmpfb))
+                print(f"  screen lit fraction: {litv:.1f}%")
+                if litv > 80:
+                    break
+            else:
+                print("FAIL: no app frontmost after 3 taps -- run is INVALID "
+                      "(a press from the home screen does not spin)")
+                out["invalid"] = "no app frontmost"
+                return 1
 
         # The QEMU pid, for the CPU control.
         qpid = None
@@ -260,6 +305,50 @@ def main() -> int:
             g.cont()
             time.sleep(args.sample_gap)
             g.interrupt()
+        # ---- who CALLED into here? ------------------------------------------
+        # The button path is healthy; what fails is the display transition, so
+        # the question is which driver asked the MBX to do work. Walk the r7
+        # frame chain (XNU/ARM uses r7 as the frame pointer) and, because a leaf
+        # poll loop may have no frame, ALSO scan the stack for words that land
+        # in a kext -- belt and braces, since a wrong caller here would send the
+        # next person to model the wrong device.
+        w = g.regs()
+        if w and args.kernelcache:
+            regs, _cpsr = w
+            sp, fp, lr, pc = regs[13], regs[7], regs[14], regs[15]
+            print(f"\n  --- who called into the MBX? "
+                  f"pc={pc:#x} lr={lr:#x} sp={sp:#x} r7={fp:#x} ---")
+            print(f"    lr        {lr:#010x}  {kname(lr) or name_of(lr)}")
+            out["caller_lr"] = [lr, kname(lr)]
+            frames = []
+            cur = fp
+            for _ in range(12):
+                blk = g.mem(cur, 8)
+                if not blk or len(blk) < 8:
+                    break
+                prev, ret = struct.unpack("<II", blk)
+                if not ret or ret == 0xFFFFFFFF:
+                    break
+                nm = kname(ret) or name_of(ret)
+                print(f"    frame     {ret:#010x}  {nm}")
+                frames.append([ret, nm])
+                if not prev or prev <= cur:
+                    break
+                cur = prev
+            out["frames"] = frames
+            print("    stack scan (distinct kext addresses, sp..sp+0x400):")
+            seen, scanned = set(), []
+            blk = g.mem(sp, 0x400)
+            if blk:
+                for i in range(0, len(blk) - 4, 4):
+                    v, = struct.unpack_from("<I", blk, i)
+                    nm = kname(v)
+                    if nm and nm.split("+")[0] not in ("kernel",) and v not in seen:
+                        seen.add(v)
+                        scanned.append([v, nm])
+                for v, nm in scanned[:24]:
+                    print(f"      {v:#010x}  {nm}")
+            out["stack_scan"] = scanned
         print(f"\n  --- {args.samples} samples during the spin ---")
         print(f"  process: {dict(procs.most_common(5))}")
         for k, v in hist.most_common(12):

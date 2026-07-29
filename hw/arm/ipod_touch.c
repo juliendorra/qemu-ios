@@ -586,7 +586,56 @@ MBX
  * task T1 -- model swap completion and wire the TVOut SDO IRQ (MBX_HANDOFF.md).
  * `IT_MBX_READY=0` restores the old value for an A/B.
  */
-static uint32_t mbx_status_12c(void)
+/*
+ * The register conversation, measured with IT_MBX_TRACE=1 during a 1.0 app
+ * dismissal, says these are PowerVR-style EVENT registers:
+ *
+ *   rd 0x12c = 0x140          status
+ *   WR 0x134 = 0x00000040     clear bit 6      <-- the guest ACKs the event
+ *   WR 0x134 = 0x0000ffff     clear everything
+ *   WR 0x130 = 0x00000000     host enable = 0  <-- interrupts MASKED OFF
+ *   WR 0x130 = 0x0000ffff     (once, during setup)
+ *   rd 0x1020 = 0x00010000 ; WR 0x1020 = 0x00010001 ; rd 0x1020 = 0x00010000
+ *                             kick bit 0, read back clear = "accepted, done"
+ *
+ * So: 0x12C = event status, 0x130 = host enable (mask), 0x134 = host clear.
+ * Two things follow, and both matter:
+ *
+ *  - The driver POLLS. It writes 0x130 = 0 (all events masked) and then spins on
+ *    0x12C. So an interrupt would not be consumed on this path, and "wire the
+ *    TVOut SDO IRQ" -- T1's phrasing, inherited from the render investigation --
+ *    is NOT the lever for this bug. The IRQ line below exists for the paths that
+ *    DO enable events, and is gated by the guest's own mask, so it cannot
+ *    misfire while the mask is zero.
+ *  - Reporting bit 6 permanently set (IT_MBX_READY, the shipped default) is a
+ *    lie the guest can see: it writes 0x134 = 0x40 to acknowledge, re-reads, and
+ *    the bit is still there. IT_MBX_EVENTS=1 selects the modelled behaviour --
+ *    the bit is raised when an operation is kicked and cleared when the guest
+ *    acknowledges it.
+ *
+ * Neither mode models any actual rendering; there is no datasheet, and the
+ * region is otherwise a stub. See MBX_HANDOFF.md and
+ * IN_APP_BUTTON_INVESTIGATION.md.
+ */
+#define MBX_EVENT_READY   0x100     /* bit 8: what the stub always reported */
+#define MBX_EVENT_DONE    0x040     /* bit 6: the bit AppleMBX spins on */
+
+static uint32_t mbx_event_status = MBX_EVENT_READY;
+static uint32_t mbx_event_enable;
+static qemu_irq mbx_irq;
+
+static bool mbx_events_modelled(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_EVENTS");
+        mode = e && e[0] != '0';
+    }
+    return mode;
+}
+
+static bool mbx_ready_bit(void)
 {
     static int ready = -1;
 
@@ -594,30 +643,118 @@ static uint32_t mbx_status_12c(void)
         const char *e = getenv("IT_MBX_READY");
         ready = !(e && e[0] == '0');
     }
-    return ready ? 0x140 : 0x100;
+    return ready;
+}
+
+static void mbx_update_irq(void)
+{
+    if (mbx_irq) {
+        qemu_set_irq(mbx_irq, (mbx_event_status & mbx_event_enable) != 0);
+    }
+}
+
+static uint32_t mbx_status_12c(void)
+{
+    if (mbx_events_modelled()) {
+        return mbx_event_status;
+    }
+    return mbx_ready_bit() ? (MBX_EVENT_READY | MBX_EVENT_DONE)
+                           : MBX_EVENT_READY;
+}
+
+/*
+ * IT_MBX_TRACE=1: the MBX register conversation.
+ *
+ * The whole region is a stub, so the only way to learn what the driver actually
+ * expects is to watch the accesses. Needed because the completion the guest
+ * waits for cannot be modelled honestly without knowing which register kicks
+ * the operation and which reports it done. Repeats collapse per register: the
+ * first 12 print, then every 1024th, so a poll cannot bury a one-off write.
+ */
+static void mbx_trace(const char *dir, hwaddr addr, uint64_t val)
+{
+    static int enabled = -1;
+    static uint32_t counts[0x400];
+
+    if (enabled < 0) {
+        enabled = getenv("IT_MBX_TRACE") != NULL;
+    }
+    if (!enabled) {
+        return;
+    }
+    uint32_t slot = (uint32_t)((addr >> 2) & 0x3FF);
+    uint32_t n = ++counts[slot];
+    if (n > 12 && (n & 0x3FF) != 0) {
+        return;
+    }
+    fprintf(stderr, "[MBX] %s 0x%05x = 0x%08x (n=%u)\n",
+            dir, (uint32_t)addr, (uint32_t)val, n);
 }
 
 static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
 {
-    //fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
-    switch(addr)
-    {
+    uint64_t r = 0;
+
+    switch (addr) {
         case 0x12c:
-            return mbx_status_12c();
+            r = mbx_status_12c();
+            break;
+        case 0x130:
+            r = mbx_event_enable;
+            break;
         case 0xf00:
-            return (1 << 0x18) | 0x10000; // seems to be some kind of identifier
+            r = (1 << 0x18) | 0x10000;
+            break;
         case 0x1020:
-            return 0x10000;
+            r = 0x10000;
+            break;
         default:
             break;
     }
-    return 0;
+    mbx_trace("rd", addr, r);
+    return r;
 }
 
 static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
-    //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, val, addr);
-    // do nothing
+    mbx_trace("WR", addr, val);
+
+    if (!mbx_events_modelled()) {
+        return;             /* the shipped default: registers are inert */
+    }
+    switch (addr) {
+        case 0x130:         /* event host enable (mask) */
+            mbx_event_enable = (uint32_t)val;
+            mbx_update_irq();
+            break;
+        case 0x134:         /* event host clear: write 1s to ack */
+            mbx_event_status &= ~(uint32_t)val;
+            mbx_event_status |= MBX_EVENT_READY;
+            mbx_update_irq();
+            break;
+        /*
+         * The KICK. Derived from the trace, not guessed: with IT_MBX_EVENTS=1
+         * and completion tied to 0x1020 bit 0 the guest span 46 MILLION times on
+         * `rd 0x12c = 0x100`, which disproved that guess outright. The ordered
+         * trace shows the last write before the endless poll is
+         *
+         *   WR 0x00824 = 0x0001d000   WR 0x00828 = 0x00000022
+         *   WR 0x0082c = 0x00000025   WR 0x00838 = 0x00000001
+         *   WR 0x0083c = 0x00021000   WR 0x006d8 = 0x09000000   <-- then poll
+         *
+         * i.e. a command descriptor at 0x824..0x83c followed by a kick at 0x6d8.
+         */
+        case 0x6d8:
+        case 0x1020:        /* 0x1020 bit 0 also starts work on other paths */
+            if (addr == 0x6d8 || (val & 1)) {
+                /* Nothing is actually rendered, so completion is immediate. */
+                mbx_event_status |= MBX_EVENT_DONE;
+                mbx_update_irq();
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 static const MemoryRegionOps mbx_ops = {
@@ -1445,6 +1582,26 @@ static void ipod_touch_machine_init(MachineState *machine)
     iomem = g_new(MemoryRegion, 1);
     memory_region_init_io(iomem, OBJECT(nms), &mbx_ops, NULL, "mbx", 0x1000000);
     memory_region_add_subregion(sysmem, MBX_MEM_BASE, iomem);
+    /*
+     * The MBX event line. The S5L8900 IRQ map in ipod_touch.h has no MBX entry
+     * -- only LCD (0xD), TVOUT_SDO (0x1E) and TVOUT_MIXER (0x26) -- and T1's
+     * belief that MBX completion surfaces through the TVOut SDO IRQ comes from a
+     * guest log line ("AppleMBX: Added swap device: AppleH1TVOut"), not from an
+     * observed acknowledge. So the line is PLUMBED but not bound by default:
+     * IT_MBX_IRQ=<n> attaches it to SoC interrupt n (30 = TVOUT_SDO), which lets
+     * that hypothesis be tested with an env var instead of a rebuild. Left
+     * unbound, mbx_update_irq() is a no-op and nothing can regress -- and note
+     * the guest masks all MBX events (0x130 = 0) on the dismissal path anyway,
+     * so an interrupt is not what that path is waiting for.
+     */
+    const char *mbx_irq_env = getenv("IT_MBX_IRQ");
+    if (mbx_irq_env && mbx_irq_env[0] && mbx_irq_env[0] != '0') {
+        int n = (int)strtol(mbx_irq_env, NULL, 0);
+        if (n > 0 && n < 0x40) {
+            mbx_irq = s5l8900_get_irq(nms, n);
+            fprintf(stderr, "[MBX] event line bound to SoC IRQ %d\n", n);
+        }
+    }
 
     // init the chip ID module
     dev = qdev_new("ipodtouch.chipid");
