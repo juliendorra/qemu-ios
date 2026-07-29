@@ -50,6 +50,7 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -279,7 +280,12 @@ def main() -> int:
 
     env = dict(os.environ, S5L8900_HTTP_BRIDGE="0", S5L8900_HTTPS_BRIDGE="0")
     log = open(logp, "wb")
-    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    # start_new_session + killpg below: the bundle's entry point is a SHELL that
+    # runs QEMU as a CHILD, so terminating `proc` leaves qemu-system-arm alive
+    # holding a ~220 MB NAND clone (and the VNC port). Measured: a probe run left
+    # a 13-minute-old orphan behind.
+    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
     client = None
     report = {"board": args.board, "app": app, "steps": []}
     rc = 0
@@ -380,11 +386,17 @@ def main() -> int:
     finally:
         if client:
             client.stop()
-        proc.terminate()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            proc.terminate()
         try:
             proc.wait(20)
         except Exception:
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
         tmp.unlink(missing_ok=True)
         (args.logs / "report.json").write_text(json.dumps(report, indent=2))
         print(f"\nreport: {args.logs / 'report.json'}  (PNGs alongside)")
