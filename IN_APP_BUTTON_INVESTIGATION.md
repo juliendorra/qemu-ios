@@ -345,6 +345,32 @@ which means something is now waiting on an MBX completion that never arrives
 instead of busy-polling for it. The MBX region still has **no IRQ connected at
 all**, which is the other half of T1.
 
+### Is the change 1.0-specific? No -- all three builds ship the same MBX code
+
+Checked statically against each build's own RELEASE kernelcache (the iPod's root
+volume was reconstructed from its NAND with `extract-hfs-from-nand.py`; it runs
+**iPhone OS 1.1, 3A101a** -- a third build, not 1.1.4):
+
+| build | `mov r1,#0x12c` sites | unbounded spin loops on bit 6 |
+|---|---|---|
+| 1.0 (1A543a) | 6 | **2** -- `0xc0336014`, `0xc0336914` |
+| 1.1.4 (4A102) | 8 | **2** -- `0xc03ba074`, `0xc03ba974` |
+| iPod 1.1 (3A101a) | 8 | **2** -- `0xc03b1074`, `0xc03b1974` |
+
+The two loops are structurally identical in all three, and bit 6 (`0x40`) is
+consulted in exactly three places per build: those two unbounded loops plus one
+further `tst #0x40` that has a *conditional* backward branch (1.0 `0xc0337bec`,
+1.1.4 `0xc03bbc4c`, iPod `0xc03b2c4c`) -- a bounded wait. Every other 0x12C read
+tests something else (`tst #0x100` with an `add #1` / `cmp #0x3e8` retry
+counter, or `and #0xff0000` / `cmp #0x174`, a revision field).
+
+So the driver is the same everywhere and **1.0 is not special in its code** --
+only in the path it takes to reach it. Since 1.1.4 and the iPod demonstrably do
+NOT spin today (they pass every probe step and idle at 6-15%), they cannot be
+reaching the two unbounded loops; for them the change should be a no-op there.
+The one place it could change behaviour on a working build is the third,
+bounded, `tst #0x40` site.
+
 **Not yet checked: 1.1.4 and the iPod with this engine.** Only the 1.0 bundle
 has it; the other two still run the previous engine, so nothing shipped can have
 regressed. Before installing it more widely, re-run `app-button-probe.py` for

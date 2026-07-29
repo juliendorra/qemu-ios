@@ -22,7 +22,11 @@
 > and the guest is now IDLE rather than spinning -- i.e. something waits on an
 > MBX completion that never arrives, which is the other half of T1: the MBX
 > region still has no IRQ connected. Installed in the 1.0 bundle only; 1.1.4 and
-> the iPod have NOT been re-tested with it. Full record:
+> the iPod have NOT been re-tested with it. Note that the MBX driver is the SAME
+> in all three builds: 1.0 (1A543a), 1.1.4 (4A102) and the iPod's **1.1
+> (3A101a)** each contain the same two unbounded bit-6 spin loops plus one
+> bounded `tst #0x40` site, so the stub answer is not 1.0-specific -- the working
+> builds simply never reach the unbounded loops. Full record:
 > [`IN_APP_BUTTON_INVESTIGATION.md`](IN_APP_BUTTON_INVESTIGATION.md).
 
 **Date:** 2026-07-28 · **Branch:** `ipod_touch_1g` · **State:** nothing started —
