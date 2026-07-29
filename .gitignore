@@ -36,3 +36,6 @@ GTAGS
 # Browser/WebAssembly port toolchain (pinned emsdk, wasm64 sysroot)
 /.wasm-toolchain/
 /build-wasm/
+# Session B's parallel wasm build (WASM_BUILD_DIR=build-wasm-b).
+/build-wasm-b/
+/build-wasm-b-tci/
