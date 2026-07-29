@@ -51,6 +51,7 @@ RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
 # A content-addressed NAND chunk: <dir>/chunks/<sha256>.
 CHUNK_PATH = re.compile(r"/chunks/[0-9a-f]{64}$")
 CHUNK_COUNTER = {"requests": 0, "bytes": 0}
+RESULT_PATH: Path | None = None
 COUNTER_LOCK = threading.Lock()
 
 
@@ -94,6 +95,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return
         super().do_GET()
+
+    def do_POST(self):  # noqa: N802 - stdlib API
+        """/__bench-result collects a run's numbers from the page.
+
+        The bench page (web/bench-b/) posts a snapshot at every landmark, so a
+        run that is killed on a timeout still leaves usable data behind -- and
+        so a sweep can be driven headlessly instead of by watching a tab.
+        """
+        if self.path.split("?", 1)[0] != "/__bench-result":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        if RESULT_PATH:
+            RESULT_PATH.write_bytes(body)
+        else:
+            sys.stderr.write(body.decode("utf-8", "replace") + "\n")
+        self.send_response(204)
+        self.end_headers()
 
     def send_head(self):
         chunk = self.send_chunk_head()
@@ -214,9 +234,15 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--root", type=Path, default=REPO / "web")
+    parser.add_argument("--results", type=Path,
+                        help="write POSTs to /__bench-result here "
+                             "(scripts/wasm/bench-run.py uses this)")
     parser.add_argument("--check", action="store_true",
                         help="start, verify the headers, print the result, exit")
     args = parser.parse_args()
+
+    global RESULT_PATH
+    RESULT_PATH = args.results
 
     root = args.root.resolve()
     if not root.is_dir():

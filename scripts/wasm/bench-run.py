@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Run one browser boot to completion and print its numbers.
+
+Measuring the JIT by watching a tab does not work, and the failure is not
+obvious: a browser THROTTLES a hidden page, so a run that looks stalled at
+"compiled=352" is often just a backgrounded tab. This launches Chrome with
+background throttling disabled, points it at web/bench-b/, and waits for the
+page to post its landmarks back (scripts/wasm/serve.py --results).
+
+One run at a time, on an idle machine: an early A/B ran two browser tabs at
+once, halved the CPU available to each, and invalidated itself.
+
+    scripts/wasm/bench-run.py --instantiate 50   --label sweep-50
+    scripts/wasm/bench-run.py --mode chunked --cold --label chunked-cold
+    scripts/wasm/bench-run.py --mode chunked --label chunked-warm
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+
+# Chrome throttles timers, workers and rendering in backgrounded or occluded
+# windows. Every one of these matters for an unattended run.
+CHROME_FLAGS = [
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=CalculateNativeWinOcclusion",
+    "--autoplay-policy=no-user-gesture-required",
+    "--window-size=1000,760",
+]
+
+
+def wait_for_server(port: int, timeout: float = 20.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"http://localhost:{port}/__chunk-stats",
+                                   timeout=1).read()
+            return
+        except (urllib.error.URLError, OSError):
+            time.sleep(0.3)
+    raise SystemExit(f"server on :{port} never came up")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--instantiate", type=int, default=100)
+    parser.add_argument("--max", type=int, default=48000)
+    parser.add_argument("--mode", choices=("pack", "chunked"), default="pack")
+    parser.add_argument("--cold", action="store_true",
+                        help="chunked mode: drop the chunk cache first")
+    parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument("--until", default="launchd",
+                        help="stop once this landmark is reached "
+                             "(iBoot banner/kernel/BSD root/launchd/SpringBoard)")
+    parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--port", type=int, default=8012)
+    parser.add_argument("--label", default="run")
+    parser.add_argument("--out", type=Path, default=Path("/tmp/wasm-bench"))
+    parser.add_argument("--profile", default=None,
+                        help="Chrome profile directory name; SHARE it between "
+                             "a cold and a warm run, or the 'warm' run gets a "
+                             "fresh Cache Storage and is cold again")
+    parser.add_argument("--headed", action="store_true",
+                        help="show the window (default is --headless=new)")
+    args = parser.parse_args()
+
+    if not CHROME.exists():
+        raise SystemExit(f"Chrome not found at {CHROME}")
+    args.out.mkdir(parents=True, exist_ok=True)
+    result_path = args.out / f"{args.label}.json"
+    if result_path.exists():
+        result_path.unlink()
+    profile = args.out / f"profile-{args.profile or args.label}"
+
+    server = subprocess.Popen(
+        [sys.executable, str(REPO / "scripts/wasm/serve.py"),
+         "--port", str(args.port), "--results", str(result_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_for_server(args.port)
+
+        query = (f"?instantiate={args.instantiate}&max={args.max}"
+                 f"&mode={args.mode}")
+        if args.cold:
+            query += "&cold=1"
+        if args.no_prefetch:
+            query += "&prefetch=0"
+        url = f"http://localhost:{args.port}/bench-b/{query}"
+
+        flags = list(CHROME_FLAGS)
+        if not args.headed:
+            flags.append("--headless=new")
+        chrome = subprocess.Popen(
+            [str(CHROME), f"--user-data-dir={profile}", *flags, url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+
+        print(f"[bench] {args.label}: {url}", flush=True)
+        started = time.time()
+        latest: dict = {}
+        last_print = 0.0
+        try:
+            while time.time() - started < args.timeout:
+                time.sleep(2)
+                if result_path.exists():
+                    try:
+                        latest = json.loads(result_path.read_text())
+                    except json.JSONDecodeError:
+                        continue
+                    if time.time() - last_print > 30:
+                        last_print = time.time()
+                        print(f"  {latest.get('elapsed')}s "
+                              f"{latest.get('counters', {}).get('JIT', '')} "
+                              f"{list(latest.get('landmarks', {}))}", flush=True)
+                    if args.until in latest.get("landmarks", {}):
+                        break
+                    if latest.get("failure"):
+                        print(f"  failure: {latest['failure']}", flush=True)
+                        break
+                if chrome.poll() is not None:
+                    print("  chrome exited", flush=True)
+                    break
+        finally:
+            try:
+                os.killpg(os.getpgid(chrome.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+        try:
+            stats = json.loads(urllib.request.urlopen(
+                f"http://localhost:{args.port}/__chunk-stats", timeout=2).read())
+        except OSError:
+            stats = None
+        latest["chunkServerStats"] = stats
+        latest["label"] = args.label
+        latest["wallSeconds"] = round(time.time() - started, 1)
+        result_path.write_text(json.dumps(latest, indent=1) + "\n")
+        print(json.dumps(latest, indent=1))
+    finally:
+        server.terminate()
+
+
+if __name__ == "__main__":
+    main()

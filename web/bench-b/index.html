@@ -15,6 +15,7 @@
 
      Serve with scripts/wasm/serve.py --port 8011 (COOP/COEP required) and
      open /bench-b/. Session A owns web/public/*; nothing here touches it. -->
+<meta charset="utf-8">
 <title>iPhone OS 1.0 — Session B bench</title>
 <style>
   body { font: 13px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem;
@@ -91,18 +92,24 @@
     if (logEl.childElementCount > 400) logEl.firstElementChild.remove();
   }
 
+  // Latest [JIT] and [NANDCHUNK] counters, keyed by tag so the card shows the
+  // current state rather than a scrolling history.
+  const counters = new Map();
+
   function note(text) {
-    // The JIT counters are the measurement; keep the latest visible rather
-    // than scrolling them away in the log.
-    if (text.startsWith('[JIT]') || text.startsWith('[NANDCHUNK]')) {
-      lastJit = `${lastJit.split('\n').filter(l => !l.startsWith(text.slice(0, 6)))
-                        .join('\n')}\n${at()}s ${text}`.trim();
-      jitEl.textContent = lastJit;
+    const tag = text.startsWith('[JIT]') ? 'JIT'
+              : text.startsWith('[NANDCHUNK]') ? 'NANDCHUNK' : null;
+    if (tag) {
+      counters.set(tag === 'JIT' && text.includes('tuning') ? 'tuning' : tag,
+                   `${at()}s ${text}`);
+      jitEl.textContent = [...counters.values()].join('\n');
+      report();
     }
     for (const [name, test] of LANDMARKS) {
       if (!hit.has(name) && test(text)) {
         hit.set(name, at());
         renderMarks();
+        report(true);
         if (name === 'SpringBoard') state('SpringBoard reached', 'ok');
       }
     }
@@ -114,7 +121,35 @@
   addEventListener('error', (e) => {
     state(`emulator failure: ${String(e.message).slice(0, 140)}`, 'fail');
     line(`window error: ${e.message}`, 'err');
+    failure = String(e.message).slice(0, 200);
+    report(true);
   });
+
+  /*
+   * Post the run's numbers to the server (scripts/wasm/serve.py --results),
+   * so a sweep can be driven headlessly by scripts/wasm/bench-run.py and a run
+   * killed on a timeout still leaves its landmarks behind. Rate-limited: the
+   * counters arrive every 16 compiles, which is far more often than anyone
+   * needs a snapshot.
+   */
+  let lastReport = 0;
+  let failure = null;
+  function report(force) {
+    const now = performance.now();
+    if (!force && now - lastReport < 5000) return;
+    lastReport = now;
+    const body = JSON.stringify({
+      instantiate: Number(INSTANTIATE), maxInstances: Number(MAX_INSTANCES),
+      mode: MODE, prefetch: PREFETCH, cold: COLD,
+      elapsed: Number((now / 1000).toFixed(1)),
+      landmarks: Object.fromEntries([...hit].map(([k, v]) => [k, Number(v)])),
+      counters: Object.fromEntries(counters),
+      failure,
+    });
+    navigator.sendBeacon?.('/__bench-result', body) ||
+      fetch('/__bench-result', { method: 'POST', body }).catch(() => {});
+  }
+  setInterval(() => report(true), 15000);
 
   setInterval(() => {
     if (!fsRef) return;

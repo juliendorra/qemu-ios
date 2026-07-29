@@ -253,7 +253,28 @@ same `-icount shift=1`, each run solo: the JIT reaches the first LCD landmark in
 **31.4 s** where TCI had not reached it by **428 s**. Next: a full boot with the
 NAND, then a boot-time number at a sensible clock setting.
 
-## W3 — A pack-access seam in the NAND model
+## W3 — A pack-access seam in the NAND model — DONE (2026-07-29, Session B)
+
+Landed as `hw/arm/ipod_touch_nand_pack.c` + `include/hw/arm/ipod_touch_nand_pack.h`:
+`it_nand_pack_record(pack, vpn)` with a mapped-file source (native, the oracle)
+and a chunk-backed one (browser, opened from `nand.pack.idx`). Selection needs
+no configuration — a chunked NAND directory simply has no `nand.pack`.
+
+Golden fixtures and the promised unit test exist:
+`scripts/wasm/make-pack-fixture.py` writes `tests/data/nand-pack/`, and
+`tests/unit/test-nand-pack.c` (4 tests) proves the two sources agree on every
+page and every absent page, that a non-resident chunk reads as absent rather
+than as neighbouring data, and that malformed packs are rejected at open.
+
+```sh
+ninja -C build-ipod11 tests/unit/test-nand-pack && \
+  (cd build-ipod11 && G_TEST_SRCDIR=$PWD/../tests/unit ./tests/unit/test-nand-pack --tap)
+scripts/wasm/make-pack-fixture.py --check     # fixture still current?
+```
+
+Original section follows.
+
+## W3 (original) — A pack-access seam in the NAND model
 
 `nand_read_packed_page()` in `hw/arm/ipod_touch_nand.c` binary-searches a
 `g_mapped_file` and `memcpy`s straight out of it. Chunked delivery needs the
@@ -267,7 +288,41 @@ both implementations return the same page for the same VPN. **Do this before**
 any frontend work depends on it, and land it with golden pack fixtures — those
 are still owed.
 
-## W4 — Chunker, service worker, prefetch
+## W4 — Chunker, service worker, prefetch — BUILT (2026-07-29, Session B)
+
+All four pieces exist; the measured 1.0 asset set is **68.8 MiB stored total,
+18.5 MiB for the boot working set** (512 of 1,724 chunks), against a 215.2 MiB
+raw pack.
+
+```sh
+# 1. trace a VERIFIED home-screen boot, reduce it to the boot chunk order
+scripts/wasm/analyze-nand-trace.py /tmp/boot.trace <nand.pack> \
+    --pages-per-chunk 62 --prefetch /tmp/prefetch.json
+# 2. build the asset set (brotli q11: ~25 min for a 215 MiB pack)
+scripts/wasm/chunk-pack.py <nand.pack> --out web/chunked/<BUILD> \
+    --pages-per-chunk 62 --base /chunked/<BUILD>/chunks/ \
+    --prefetch /tmp/prefetch.json
+# 3. boot it, cold then warm, and read the SERVER's byte count
+scripts/wasm/bench-run.py --mode chunked --cold --label chunked-cold \
+    --profile chunked
+scripts/wasm/bench-run.py --mode chunked      --label chunked-warm \
+    --profile chunked
+```
+
+**`--profile` must be shared between the cold and warm runs**, or the "warm"
+run gets a fresh Cache Storage and is cold again.
+
+**Use `scripts/wasm/bench-run.py`, not a tab.** A browser throttles a hidden
+page, and the symptom is a run that looks *stalled* — "compiled=352" for
+minutes — when it is only backgrounded. The runner launches Chrome with
+`--disable-background-timer-throttling`,
+`--disable-backgrounding-occluded-windows` and `--disable-renderer-backgrounding`,
+and the page posts its landmarks back to `serve.py --results`, so a run killed
+on a timeout still leaves data.
+
+Original section follows.
+
+## W4 (original) — Chunker, service worker, prefetch
 
 Format and manifest fields are specified in the plan (`ipod-nand-chunks-v1`,
 62 pages/chunk, Brotli, content-addressed, `prefetch` list).
@@ -450,6 +505,10 @@ environment, clock, and harness before suspecting the port.
   directories symlink `scripts/`, so the command resolves but computes the repo
   root as the build directory and reports `native toolchain missing` — a
   misleading error pointing at an unrelated remedy. Run from the repo root.
+- **Don't measure a browser boot in a hidden tab.** Chrome throttles
+  backgrounded and occluded pages, and a throttled run looks exactly like a
+  stalled one — JIT counters freeze mid-boot and nothing else says why. Use
+  `scripts/wasm/bench-run.py`, which disables the three throttles.
 - **Don't judge an upstream by its default branch.** `ktock/qemu-wasm`'s master
   is QEMU 8.2.0; the branch we needed (`wasm64-tcg-b`) is 10.2.50 with our exact
   TCG layout. Enumerate branches and read each `VERSION` before estimating a
