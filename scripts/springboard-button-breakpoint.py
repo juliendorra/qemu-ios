@@ -145,6 +145,82 @@ class Gdb:
     def wait_stop(self, timeout):
         return self._recv(timeout)
 
+    def regs(self):
+        """ARM 'g': r0-r15 (16 x 4 bytes), then FPA regs, then FPS, then CPSR."""
+        self._send("g")
+        raw = self._recv(10)
+        if not raw or len(raw) < 128:
+            return None
+        w = [int.from_bytes(bytes.fromhex(raw[i * 8:(i + 1) * 8]), "little")
+             for i in range(16)]
+        cpsr = None
+        if len(raw) >= 8 * (16 + 8 * 3 + 1 + 1):
+            off = (16 + 8 * 3 + 1) * 8
+            cpsr = int.from_bytes(bytes.fromhex(raw[off:off + 8]), "little")
+        return w, cpsr
+
+    def mem(self, addr, n):
+        self._send(f"m{addr:x},{n:x}")
+        raw = self._recv(10)
+        if not raw or raw.startswith("E"):
+            return None
+        try:
+            return bytes.fromhex(raw)
+        except ValueError:
+            return None
+
+
+def library_map(mnt: Path):
+    """address -> library name, from the guest's own Mach-O load addresses.
+
+    iPhone OS 1.x prebinds its dylibs at fixed preferred addresses and has no
+    ASLR, so a framework's link-time __TEXT vmaddr IS where it lives at runtime.
+    That turns a raw caller address into a name without any guest cooperation.
+    """
+    out = []
+    roots = [mnt / "System/Library/Frameworks",
+             mnt / "System/Library/PrivateFrameworks",
+             mnt / "usr/lib"]
+    for r in roots:
+        if not r.exists():
+            continue
+        for f in r.rglob("*"):
+            if not f.is_file() or f.is_symlink():
+                continue
+            try:
+                head = f.open("rb").read(4)
+            except OSError:
+                continue
+            if head not in (b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce"):
+                continue
+            try:
+                res = subprocess.run(["otool", "-l", str(f)],
+                                     capture_output=True, text=True, timeout=20).stdout
+            except Exception:
+                continue
+            seg = None
+            for line in res.splitlines():
+                line = line.strip()
+                if line == "segname __TEXT":
+                    seg = {}
+                elif seg is not None and line.startswith("vmaddr "):
+                    seg["a"] = int(line.split()[1], 0)
+                elif seg is not None and line.startswith("vmsize "):
+                    seg["s"] = int(line.split()[1], 0)
+                    if seg.get("a"):
+                        out.append((seg["a"], seg["a"] + seg["s"], f.name))
+                    seg = None
+    return sorted(out)
+
+
+def whose(addr, libs):
+    for lo, hi, name in libs:
+        if lo <= addr < hi:
+            return f"{name}+{addr - lo:#x}"
+    if addr < 0x100000:
+        return f"SpringBoard+{addr:#x}"
+    return "?"
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -173,10 +249,11 @@ def main() -> int:
                    capture_output=True)
     binary = args.logs / "SpringBoard"
     args.logs.mkdir(parents=True, exist_ok=True)
-    try:
-        binary.write_bytes((mnt / SB).read_bytes())
-    finally:
-        subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
+    binary.write_bytes((mnt / SB).read_bytes())
+    print("building the guest library address map ...")
+    libs = library_map(mnt)
+    print(f"  {len(libs)} images mapped")
+    subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
 
     imps = {sel.decode(): resolve_imp(binary, sel)
             for sel in (b"menuButtonDown:", b"menuButtonUp:")}
@@ -233,6 +310,31 @@ def main() -> int:
         stop = g.wait_stop(args.wait)
         if stop:
             print(f"\nBREAKPOINT HIT: {stop}")
+            rc_ = g.regs()
+            if rc_:
+                w, cpsr = rc_
+                print(f"  r0(self)={w[0]:#010x} r1(sel)={w[1]:#010x} "
+                      f"r2(GSEvent)={w[2]:#010x}")
+                print(f"  sp={w[13]:#010x} lr={w[14]:#010x} pc={w[15]:#010x}"
+                      + (f" cpsr={cpsr:#010x}" if cpsr else ""))
+                # At the first instruction of the IMP, LR is still the caller.
+                print(f"\n  CALLER (lr): {w[14]:#010x}  {whose(w[14], libs)}")
+                # Walk the r7 frame chain: [r7]=prev r7, [r7+4]=return address.
+                fp = w[7]
+                print("  frames:")
+                for i in range(8):
+                    blk = g.mem(fp, 8)
+                    if not blk or len(blk) < 8:
+                        break
+                    prev, ret = struct.unpack("<II", blk)
+                    if not ret or ret == 0xFFFFFFFF:
+                        break
+                    print(f"    #{i} {ret:#010x}  {whose(ret, libs)}")
+                    if not prev or prev <= fp:
+                        break
+                    fp = prev
+                report_txt = args.logs / "stack.txt"
+                report_txt.write_text(f"lr={w[14]:#x} {whose(w[14], libs)}\n")
             print("=> the event REACHES SpringBoard; the handler decides to do "
                   "nothing.\n   Read the SBSyncController gates and the "
                   "early-return ivar next.")

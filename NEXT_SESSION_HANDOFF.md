@@ -845,3 +845,41 @@ The routing decision is made in the purple/GSEvent layer, not in
 
 A stack read at the 1.1.4 in-app HIT is probably the single most informative
 next measurement: it names the caller that 1.0 is failing to reach.
+
+## The stack at 1.1.4's in-app hit (2026-07-29)
+
+`springboard-button-breakpoint.py` now reads registers (`g`) and memory (`m`) at
+the hit, walks the `r7` frame chain, and resolves addresses against a map built
+from the guest's own Mach-O load addresses (iPhone OS 1.x prebinds its dylibs
+and has no ASLR, so a framework's link-time `__TEXT` vmaddr IS its runtime
+address -- 156 shared images map that way on 4A102).
+
+At the 1.1.4 in-app hit on `-[SpringBoard menuButtonUp:]` (pc 0x79d4):
+
+```
+  r0(self)=0x3898ca94   heap -- the SpringBoard instance
+  r1(sel) =0x310367d0   libobjc.A.dylib -- uniqued selector
+  r2      =0x2ffffe84   the GSEvent
+  lr      =0x30981972   Foundation
+  frames:  0x5c38 -> 0x5b4c -> 0x5a3c   (SpringBoard's OWN __TEXT)
+```
+
+**Resolver caveat, recorded because it produced a wrong answer first:** every
+main executable in this OS links near 0x1000, so a naive
+"which image contains this address" attributes SpringBoard's own frames to
+whatever app happens to be in the map (it said `CommCenter+0x4c38`). Addresses
+below 0x100000 belong to the RUNNING EXECUTABLE; only >=0x30000000 should be
+resolved against the shared-image map.
+
+So on 1.1.4 the delivery path is: Foundation dispatch -> SpringBoard's own event
+code at ~0x5a3c/0x5b4c/0x5c38 -> `menuButtonUp:`. **That chain is what 1.0 fails
+to reach while an app is frontmost.**
+
+### Next
+
+Disassemble SpringBoard 0x5a3c / 0x5b4c / 0x5c38 on 1.1.4, identify the function
+(it is the GSEvent/hardware-button callback plumbing), then find the
+corresponding code in 1.0's SpringBoard and diff. The two binaries' handlers are
+already known to be structurally identical, so the divergence should be in this
+caller layer -- most likely a condition about whether SpringBoard is frontmost
+or holds the event stream.
