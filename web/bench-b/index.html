@@ -168,6 +168,8 @@
    */
   let lastReport = 0;
   let failure = null;
+  let reportFailures = 0;
+  let lastReportError = null;
   function report(force) {
     const now = performance.now();
     if (!force && now - lastReport < 5000) return;
@@ -178,15 +180,18 @@
       mode: MODE, prefetch: PREFETCH, cold: COLD, adaptive: ADAPTIVE,
       elapsed: Number((now / 1000).toFixed(1)),
       landmarks: Object.fromEntries([...hit].map(([k, v]) => [k, Number(v)])),
+      reportFailures, lastReportError,
       counters: Object.fromEntries(counters),
       failure,
     });
-    // fetch(), not sendBeacon(): beacons from a standalone Chrome launched by
-    // bench-run.py were silently dropped (sendBeacon returned true and nothing
-    // arrived), so a chunked run looked dead while its chunk requests were
-    // visibly still flowing at the server.
-    fetch('/__bench-result', { method: 'POST', body, keepalive: true })
-      .catch(() => {});
+    // NOT keepalive, and NOT sendBeacon. Both are capped at 64 KiB of
+    // IN-FLIGHT bytes per origin, and in a cold run every request queues
+    // behind the service worker's hundreds of chunk fetches -- so the quota
+    // fills, every later report is rejected on the spot, and a perfectly
+    // healthy run looks frozen. The rejection was being swallowed, which is
+    // why it read as "the page's main thread stopped".
+    fetch('/__bench-result', { method: 'POST', body })
+      .catch((e) => { reportFailures++; lastReportError = String(e); });
   }
   setInterval(() => report(true), 15000);
 

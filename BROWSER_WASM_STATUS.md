@@ -582,16 +582,40 @@ value must not be shared"), so reading the URL out of the wasm heap needs
 **Build the cheap reproduction first.** Every one of these bugs was a
 three-message protocol defect that a page could exercise in a second.
 
-### Still open: the page's main thread stalls while the SW fetches from network
+### The "service worker freezes the page on a cold run" was never a freeze
 
-Separate from the transport, and it predates it. In a **cold** run with the
-service worker in the path, the page stops running timers seconds in — while
-the emulator keeps going and its chunk requests keep arriving at the server
-(348 requests, 15.8 MB in one such run). A **warm** run with the same service
-worker does not stall, and neither does a cold run with `?sw=0`. So it tracks
-the service worker doing *network* work, not the service worker as such.
+The page was fine and the emulator was fine. **The reports were being thrown
+away by a quota.**
 
-Effect is on measurement, not on the boot: the emulator progresses either way.
+`fetch(..., { keepalive: true })` and `navigator.sendBeacon()` share a **64 KiB
+cap on IN-FLIGHT bytes per origin**. On a cold run every report queued behind
+the service worker's hundreds of chunk fetches, the quota filled, and each
+later report was rejected immediately — into a `.catch(() => {})` that said
+nothing. Warm runs and `?sw=0` runs never filled the quota, which is exactly
+why the symptom looked like "the service worker freezes the page".
+
+Fixed by using a plain `fetch()` for periodic reports and **counting the
+failures** (`reportFailures` / `lastReportError` are now in every report), so a
+dropped report can never again read as a stopped emulator.
+
+Two rules out of it, both general:
+
+- **Do not use `keepalive`/`sendBeacon` for periodic telemetry.** They exist for
+  the unload path, where their quota is the point. For anything sent while the
+  page is alive they convert congestion into silence.
+- **Never swallow a telemetry failure.** The `.catch(() => {})` is what turned a
+  five-minute diagnosis into a multi-run hunt for a phantom main-thread stall.
+
+Same build, same profile, cold then warm, in standalone Chrome:
+
+| run | kernel | BSD root | chunk requests | on the wire | dropped reports |
+| --- | --- | --- | --- | --- | --- |
+| **cold** (prefetch + SW) | 113 s | 125 s | 503 | **18.52 MiB** | 0 |
+| **warm** | 102 s | 114 s | **0** | **0** | 0 |
+
+That is the B3 acceptance criterion met end to end in the target browser: a
+cold boot downloads 18.52 MiB against a 215.6 MiB pack, a warm boot downloads
+nothing, and the boot is no slower than staging the whole pack.
 
 ### The original diagnosis (kept: it is what the fix is built on)
 

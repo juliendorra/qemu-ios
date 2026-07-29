@@ -335,10 +335,15 @@ with **zero bytes and no error**.
 second (`?nested=1` to see the failing arrangement). Use it before rebuilding
 the emulator for anything in this protocol.
 
-**Still open:** in a *cold* run with the service worker fetching from the
-network, the page's main thread stops running timers while the emulator carries
-on. Warm runs and `?sw=0` runs are unaffected; it costs measurement, not the
-boot.
+**Measured, cold then warm, in standalone Chrome:** cold pulls 503 chunks =
+**18.52 MiB** and reaches BSD root at 125 s; warm pulls **0 bytes** and reaches
+it at 114 s — no slower than staging the whole 215.6 MiB pack.
+
+The "service worker freezes the page on a cold run" turned out to be neither:
+`keepalive`/`sendBeacon` share a **64 KiB in-flight quota per origin**, the
+reports queued behind the chunk fetches, the quota filled, and the rejections
+went into a `.catch(() => {})`. Use a plain `fetch()` for periodic telemetry,
+and never swallow its failure.
 
 **Use `scripts/wasm/bench-run.py`, not a tab.** A browser throttles a hidden
 page, and the symptom is a run that looks *stalled* — "compiled=352" for
