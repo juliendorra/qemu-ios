@@ -148,6 +148,47 @@ The restored guest is genuinely executing, not showing a frozen frame: 73 KB of
 serial, `IOMobileFramebufferUserClient::attach(AppleH1CLCD)`, and a Home press
 delivered and processed (`[BTN] keycode=35`/`163`).
 
+#### The restored machine is INTERACTIVE — a tap on a snapshot launches an app
+
+The live panel only proves the LCD came back. `snapshot-probe.py --tap-after`
+proves the machine did: it taps a coordinate known to work, after the restore.
+
+```
+after_tap: 95.993% (was 45.117%)  interactive=True
+```
+
+45.1% (home screen) → 96.0% (an app, filling the panel). That single tap
+exercises everything a snapshot has to bring back but a framebuffer cannot show:
+the multitouch device, the SPI path, the ATN GPIO in sysic, the interrupt
+controller's masks, and the timers driving all of it.
+
+**So the native snapshot path is complete for the instant-boot use case:** boot
+once (~400 s), `migrate file:` into **23.9 MiB**, restore, and the machine comes
+back live, executing and touch-responsive. 23.9 MiB is the same order as the
+18.57 MiB the chunked loader already streams for a cold boot, so the delivery
+cost of a snapshot is roughly one extra cold boot's worth of bytes — in exchange
+for skipping ~250 s of it.
+
+`hw/intc/pl192.c` also gained a `VMStateDescription` (its class_init had
+`//dc->vmsd` and a "TODO save VM"). The priority stack is included, not just the
+registers: pl192 pushes the pre-empted priority on every vector read and pops it
+on EOI, so a snapshot taken with an interrupt in service restores mid-nesting and
+dropping `stack_i` would unbalance the next pop. `post_load` re-runs
+`pl192_update()`, because the CPU's own IRQ input is otherwise left low while the
+VIC believes it is driving it.
+
+**Honest attribution:** the VIC's vmstate is *defensive*, not proven necessary. A
+reset VIC has `intenable == 0`, which would mean no interrupt is ever delivered
+again — but the LCD-only run already showed the guest executing and servicing a
+Home press, so the guest evidently reprograms enough of it. Nothing here A/B's
+pl192 on its own, and the interactive result above was measured with both
+devices migrated.
+
+**What is left for the browser** is delivery and plumbing, not device state:
+restore from `-incoming file:` inside MEMFS with the state file fetched like any
+other asset. That is the next step, and it is the last piece of "full boots from
+scratch AND instant resume".
+
 #### Trap: the resume serial log REPLAYS the whole boot, so it looks like a reboot
 
 This nearly cost the conclusion. `serial-resume.log` **begins with the Darwin

@@ -82,6 +82,25 @@ def wake(qmp, settle: float = 6.0) -> None:
     time.sleep(settle)
 
 
+def tap(qmp, px: int, py: int, hold: float = 0.30) -> None:
+    """One finger down/up at a panel pixel, over the absolute pointer.
+
+    The point of tapping AFTER a restore is that it exercises everything a
+    snapshot has to bring back but the framebuffer cannot show: the multitouch
+    device, the SPI path, the ATN GPIO in sysic, the interrupt controller's
+    masks, and the timers that drive all of it. A live panel proves the LCD came
+    back; only a tap that changes the screen proves the machine did.
+    """
+    qmp.execute("input-send-event", events=[
+        {"type": "abs", "data": {"axis": "x", "value": int(px / FB_W * 32768)}},
+        {"type": "abs", "data": {"axis": "y", "value": int(py / FB_H * 32768)}}])
+    qmp.execute("input-send-event", events=[
+        {"type": "btn", "data": {"down": True, "button": "left"}}])
+    time.sleep(hold)
+    qmp.execute("input-send-event", events=[
+        {"type": "btn", "data": {"down": False, "button": "left"}}])
+
+
 def sample(qmp, out: Path, tag: str) -> dict:
     """Scanout plus each candidate framebuffer base, as non-black percentages."""
     out.mkdir(parents=True, exist_ok=True)
@@ -139,6 +158,12 @@ def main() -> int:
                     help="do not press Home before sampling; the guest "
                          "auto-locks, so a long --boot-wait then measures a "
                          "sleeping panel")
+    ap.add_argument("--tap-after", default=None,
+                    help="after restoring, tap this panel pixel ('x,y') and "
+                         "report whether the screen changed -- the only check "
+                         "that the restored MACHINE works, not just its panel. "
+                         "Use a coordinate known to launch an app; icon row 1 "
+                         "(y~67) never registers on 1.0")
     ap.add_argument("--keep-state", action="store_true",
                     help="do not delete the migration file afterwards")
     m68ap_paths.add_build_argument(ap, required=True)
@@ -236,6 +261,18 @@ def main() -> int:
             report["after_wake"] = sample(qmp, args.logs / "frames",
                                           "after_wake")
             print("after_wake:", json.dumps(report["after_wake"]), flush=True)
+        if args.tap_after:
+            px, py = (int(v) for v in args.tap_after.split(","))
+            before_tap = report.get("after_wake") or report["after"]
+            tap(qmp, px, py)
+            time.sleep(20)
+            report["after_tap"] = sample(qmp, args.logs / "frames", "after_tap")
+            a = before_tap["screenout_nonzero_pct"]
+            b = report["after_tap"]["screenout_nonzero_pct"]
+            report["tap_changed_pct"] = round(abs(b - a), 3)
+            report["tap_interactive"] = report["tap_changed_pct"] >= 1.0
+            print(f"after_tap: {b}% (was {a}%) "
+                  f"interactive={report['tap_interactive']}", flush=True)
         print("after:", json.dumps(report["after"]), flush=True)
         qmp.close()
     except Exception as exc:                       # noqa: BLE001
