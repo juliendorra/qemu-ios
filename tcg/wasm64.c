@@ -736,9 +736,6 @@ static void add_instance(wasm_tb_func tb_func, void *tb_ptr)
 {
     instances[instances_end].tb_func = tb_func;
     instances[instances_end].tb_ptr = tb_ptr;
-    /* Born referenced, so a sweep immediately after compiling does not undo
-     * the work that was just paid for. */
-    instances[instances_end].used = true;
     set_info_local(tb_ptr, &(instances[instances_end]));
     instances_end  = (instances_end + 1) % INSTANCES_BUF_MAX;
 
@@ -770,43 +767,15 @@ static void remove_old_instances(void)
     } else {
         num = instances_end + (INSTANCES_BUF_MAX - instances_begin);
     }
-
-    /*
-     * Second-chance (CLOCK) eviction, aiming to free half the buffer.
-     *
-     * The hand walks from the oldest entry. An instance whose reference bit is
-     * set has run since the last sweep: clear the bit and move it to the back,
-     * giving it another lap. An instance with the bit clear has not run since
-     * the previous sweep and is evicted.
-     *
-     * The buffer holds at most MAX_INSTANCES entries in MAX_INSTANCES+1 slots,
-     * so a slot is always free and re-appending never overruns. Moving an entry
-     * changes its address, so the TB's stored info pointer is updated with it.
-     *
-     * The sweep is bounded to one lap: if every instance is hot, nothing is
-     * freed this time, every bit is now clear, and the next sweep will free.
-     */
-    int target = num / 2;
-    int freed = 0;
-
-    for (int scanned = 0; scanned < num && freed < target; scanned++) {
-        struct WasmInstanceInfo *entry = &instances[instances_begin];
-
-        if (entry->used) {
-            entry->used = false;
-            instances[instances_end] = *entry;
-            set_info_local(entry->tb_ptr, &(instances[instances_end]));
-            instances_end = (instances_end + 1) % INSTANCES_BUF_MAX;
-        } else {
-            EM_ASM({ removeFunction($0); }, entry->tb_func);
-            entry->tb_ptr = NULL;
-            freed++;
-            jit_evictions++;
-        }
+    /* removes the half of the oldest instances in the buffer */
+    num /= 2;
+    for (int i = 0; i < num; i++) {
+        EM_ASM({ removeFunction($0); }, instances[instances_begin].tb_func);
+        instances[instances_begin].tb_ptr = NULL;
         instances_begin = (instances_begin + 1) % INSTANCES_BUF_MAX;
+        jit_evictions++;
     }
-
-    instance_pending_gc += freed;
+    instance_pending_gc += num;
 }
 
 static bool can_add_instance(void)
@@ -830,7 +799,6 @@ static wasm_tb_func get_instance_from_tb(void *tb_ptr)
         set_info_local(tb_ptr, NULL);
         return NULL;
     }
-    elm->used = true;      /* reference bit for the CLOCK sweep */
     return elm->tb_func;
 }
 
