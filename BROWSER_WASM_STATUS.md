@@ -141,15 +141,45 @@ back-to-back with no guest execution in between, so SpringBoard never observes
 a finger. An 800 ms hold produced ~1.5 s of *guest* separation and launched the
 app immediately.
 
-The page therefore floors every release at `MIN_PRESS_MS` (500 ms) — for taps
-and for the Home/Power buttons alike. **This is a browser-speed workaround, not
-a fidelity question, and it should shrink as Session B's work lands.**
+The page therefore floors every release at `MIN_PRESS_MS` — for taps and for
+the Home/Power buttons alike. **This is a browser-speed workaround, not a
+fidelity question, and it should shrink as Session B's work lands.**
 
-**Note the ratio these numbers were taken at.** They come from the throttled
-tab, where the guest ran ~4x slower than it does headless. 500 ms is therefore
-conservative for an unthrottled run and very conservative for a faster engine.
-Re-derive it rather than inheriting it: the test is whether a down and its up
-land on distinguishable guest timestamps in the `[TOUCH]` log. It is
+#### The constant is derived, not guessed (`?sweep=1`)
+
+The page drives its own ladder: after the home screen appears it taps a
+different icon at each hold and reports the shortest one that launches an app
+(45.6% non-black → ~96%). A hold too short to register leaves SpringBoard
+exactly where it was, so failures are free and repeatable, while the first
+success ends the run — which is all one boot affords on 1.0, since there is no
+way back out of an app.
+
+| run | guestRatio | result |
+| --- | --- | --- |
+| 1 | 0.0147 | 30, 60, 120, 250 ms fail · **500 ms launches** |
+| 2 | 0.0170 | 280, 320, 360, 400 ms fail · **450 ms launches** |
+
+**The threshold is ~450 ms of wall time.** The hand-picked 500 ms therefore had
+only ~11% of margin — too little, because run-to-run engine speed varies about
+twofold (boots to the home screen ranged 268–569 s, `guestRatio` 0.0147–0.0357)
+and the threshold scales inversely with it. **`MIN_PRESS_MS` is now 800 ms**,
+~1.8× the measured threshold, which covers the slowest run observed.
+
+#### Two dead ends in getting that number, both worth not repeating
+
+**Do not express the hold in GUEST milliseconds.** The first sweep swept guest
+holds and converted through `guestRatio`. It produced nonsense — 4 ms guest →
+10 ms wall alongside 256 ms guest → 4113 ms wall — because **with `-icount`
+QEMU warps virtual time forward whenever the CPU idles**, and an idle home
+screen is exactly where the sweep runs. The ratio is worth reporting; it is not
+worth steering by. The constant is a wall-clock quantity, so sweep it in wall
+time.
+
+**The ladder must finish inside the auto-lock window.** That same first sweep
+used eight rungs at 45 s each; the guest locked after roughly 260 s of idle and
+the last five rungs tapped a dead panel, every one reading as a clean failure.
+The sweep now aborts and reports `invalid` the moment the panel goes below 5%
+non-black, rather than reporting a threshold the run never established. It is
 also the first place where the engine being slow has a *user-visible* effect
 rather than merely a slow one.
 
@@ -157,6 +187,24 @@ Two smaller input fixes came out of the same test: `setPointerCapture` throws
 for a pointer id with no active pointer and aborted the whole handler before
 any touch was sent (it is now wrapped), and a pointer released outside the
 window never delivers `pointerup`, which would leave a finger down forever.
+
+### The real-time ratio, and why it cannot be trusted at idle
+
+`ui/wasm.c` now publishes `QEMU_CLOCK_VIRTUAL` in milliseconds alongside the
+display geometry, and the page divides its delta by the wall-clock delta. This
+is the metric the handoff asks for: **guest seconds per wall second**, where 1.0
+would mean the guest experiences time as the hardware did. With `-icount`, boot
+DURATION and guest SPEED are different quantities, and a boot time alone cannot
+tell a fast engine from a throttled tab.
+
+Measured on 1.0: **0.015–0.022 while booting** (the CPU is genuinely busy), i.e.
+the guest runs at roughly **2% of real time**, ~50× slower than the hardware.
+
+**The idle figure is not comparable and must not be quoted.** At the home screen
+the sampler reports 0.036 and swings far higher, because QEMU warps virtual time
+forward when all CPUs are halted — the guest is not running faster, it is
+skipping. Only a busy-CPU sample means anything. Published outside the seqlock
+as a single `u32` store, so polling it does not force a repaint.
 
 ### Home from inside an app does nothing on 1.0 — and that is NOT this code
 

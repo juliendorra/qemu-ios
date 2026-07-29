@@ -109,6 +109,9 @@
         [...hit].map(([k, v]) => [k, Number(parseFloat(v).toFixed(1))])),
       frames,
       nonBlackPct,
+      guestRatio: Number(guestRatio.toFixed(4)),
+      guestMs: guestMs(),
+      sweep: sweepResult,
       failure: failed,
     });
     // fetch(), not sendBeacon(): beacons from a standalone headless Chrome are
@@ -126,6 +129,7 @@
   // the distinction that was impossible to draw without it.
   setInterval(() => {
     console.log(`[bench] t=${at()}s frames=${frames} nonBlack=${nonBlackPct}%`
+                + ` guestRatio=${guestRatio.toFixed(4)}`
                 + ` landmarks=${[...hit.keys()].join(',') || 'none'}`);
     report(true);
   }, 15000);
@@ -198,7 +202,7 @@
   //
   // Struct layout (all u32; see WasmDisplayInfo in ui/wasm.c):
   //   0 seq  1 width  2 height  3 stride  4 pixels_lo  5 pixels_hi
-  //   6 damage_x  7 damage_y  8 damage_w  9 damage_h  10 ack
+  //   6 damage_x  7 damage_y  8 damage_w  9 damage_h  10 ack  11 guest_ms
   //
   // `ack` is the one field written from here: the seq this page last painted.
   // The emulator side needs it to know when it may stop accumulating damage
@@ -226,6 +230,36 @@
   let imageWords = null;        // u32 view over imageData.data
   let frames = 0;
   let nonBlackPct = 0;          // reported: the only evidence SpringBoard is up
+
+  // Guest seconds per wall second, sampled from the emulator's own
+  // QEMU_CLOCK_VIRTUAL. With -icount, boot DURATION and guest SPEED are
+  // different quantities and only this ratio answers "is it real-time": 1.0
+  // would mean the guest experiences one second per second, as the hardware
+  // did. It is also what sizes the press hold -- see MIN_PRESS_GUEST_MS.
+  let guestRatio = 0;
+  let ratioSample = null;       // {wallMs, guestMs} taken a while back
+
+  function guestMs() {
+    if (!moduleRef || !runtimeReady || infoBase < 0) return null;
+    try {
+      return moduleRef.HEAPU32[infoBase + 11];
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function sampleRatio() {
+    const g = guestMs();
+    if (g === null) return;
+    const now = performance.now();
+    if (!ratioSample) { ratioSample = { wallMs: now, guestMs: g }; return; }
+    const dWall = now - ratioSample.wallMs;
+    const dGuest = g - ratioSample.guestMs;
+    if (dWall < 3000) return;                  // too short a base to be stable
+    if (dGuest >= 0) guestRatio = dGuest / dWall;
+    ratioSample = { wallMs: now, guestMs: g };
+  }
+  setInterval(sampleRatio, 1000);
 
   function readDisplayInfo(u32) {
     for (let attempt = 0; attempt < 4; attempt++) {
@@ -358,7 +392,33 @@
   //
   // So releases are floored to this. It is a browser-speed workaround, not a
   // device fidelity question, and it should shrink as the engine gets faster.
-  const MIN_PRESS_MS = 500;
+  // How long a press is held, in WALL milliseconds. DERIVED, not guessed:
+  // ?sweep=1 walks a ladder of holds on the home screen and reports the
+  // shortest one that launches an app. Two independent runs:
+  //
+  //   run 1 (ratio 0.0147)   250 ms fail   500 ms LAUNCH
+  //   run 2 (ratio 0.0170)   400 ms fail   450 ms LAUNCH
+  //
+  // So the threshold is ~450 ms at the speeds measured here, and the earlier
+  // hand-picked 500 ms had only ~11% of margin -- too little, because
+  // run-to-run engine speed varies about twofold (boots to the home screen
+  // ranged 268-569 s, guestRatio 0.0147-0.0357) and the threshold scales
+  // inversely with it. 800 ms is roughly 1.8x the measured threshold, which
+  // covers the slowest run observed.
+  //
+  // WHY a hold is needed at all: guest time runs at ~2% of wall time, so a
+  // normal ~100 ms tap is a few guest milliseconds -- less than the multitouch
+  // model's own motion report interval (MT_MOTION_REPORT_HZ = 60, i.e. 16.7 ms
+  // of guest time) -- and the guest never observes a finger.
+  //
+  // SHRINK THIS as the engine gets faster; re-run the sweep rather than
+  // guessing. Do not express it in guest milliseconds: with -icount, QEMU warps
+  // virtual time forward whenever the CPU idles, so guestRatio measured on an
+  // idle home screen is not a usable conversion factor. That was tried and it
+  // produced 4 ms guest -> 10 ms wall alongside 256 ms guest -> 4113 ms wall.
+  const MIN_PRESS_MS = 800;
+
+  function pressWallMs() { return MIN_PRESS_MS; }
 
   let touching = false;
   let pressStart = 0;
@@ -377,10 +437,11 @@
     if (!touching) return;
     touching = false;
     const held = performance.now() - pressStart;
-    if (held >= MIN_PRESS_MS) {
+    const need = pressWallMs();
+    if (held >= need) {
       sendTouch(e, false);
     } else {
-      setTimeout(() => sendTouch(e, false), MIN_PRESS_MS - held);
+      setTimeout(() => sendTouch(e, false), need - held);
     }
   };
   canvas.addEventListener('pointerup', endTouch);
@@ -399,11 +460,11 @@
     if (!moduleRef || !runtimeReady) return;
     // The guest's key handler translates make/break itself, so a tap is a
     // down/up pair rather than a level held for as long as the mouse is.
-    // Same MIN_PRESS_MS reasoning as touch: verified in the browser as
+    // Same hold reasoning as touch: verified in the browser as
     // "[BTN] keycode=25 ... [PMU] ONKEY pressed" followed 1.5 s of GUEST time
     // later by keycode=153 and ONKEY released.
     moduleRef._wasm_input_button(which, 1);
-    setTimeout(() => moduleRef._wasm_input_button(which, 0), MIN_PRESS_MS);
+    setTimeout(() => moduleRef._wasm_input_button(which, 0), pressWallMs());
   }
   document.getElementById('home').onclick = () => pressButton(BUTTON_HOME);
   document.getElementById('power').onclick = () => pressButton(BUTTON_POWER);
@@ -412,6 +473,80 @@
     if (e.key === 'h' || e.key === 'H') pressButton(BUTTON_HOME);
     if (e.key === 'p' || e.key === 'P') pressButton(BUTTON_POWER);
   });
+
+  // ---------------------------------------------------------- press sweep ---
+  //
+  // ?sweep=1 DERIVES the press hold instead of taking it on faith. A headless
+  // page cannot be driven from outside, so it drives itself.
+  //
+  // The ladder is in WALL milliseconds, because that is what the constant IS.
+  // An earlier version swept GUEST milliseconds and converted through
+  // guestRatio; it produced nonsense (4 ms guest -> 10 ms wall, 256 ms ->
+  // 4113 ms) because with -icount QEMU WARPS VIRTUAL TIME FORWARD whenever the
+  // CPU idles, and an idle home screen is exactly where the sweep runs. The
+  // ratio is worth reporting; it is not worth steering by.
+  //
+  // Holds ascend and each rung taps a DIFFERENT icon. That ordering is what
+  // fits a sweep into one boot: a hold too short to register leaves SpringBoard
+  // where it was, so failures are free and repeatable, while the FIRST success
+  // launches an app and ends the run -- and on 1.0 there is no way back out of
+  // an app anyway (the known Home event-routing bug).
+  //
+  // The whole ladder MUST finish inside the auto-lock window. The guest locks
+  // after roughly 260 s of idle and then every tap lands on a dead panel and
+  // reads as a failure -- which is precisely how the first sweep invalidated
+  // itself, five rungs at a stretch.
+  const SWEEP_WALL_MS = (new URLSearchParams(location.search).get('rungs')
+    || '30,60,120,250,500').split(',').map(Number);
+  const SWEEP_SETTLE_MS = 25000;
+  // 4x4 grid, panel coordinates, verified against a real click: the Settings
+  // icon at (274, 248) logged [TOUCH] mouse DOWN at (0.856, 0.481).
+  const SWEEP_TARGETS = [
+    [45, 67], [121, 67], [197, 67], [274, 67],
+    [45, 157], [121, 157], [197, 157], [274, 157],
+  ];
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function tapWall(px, py, wallMs) {
+    moduleRef._wasm_input_touch(px, py, 1);
+    setTimeout(() => moduleRef._wasm_input_touch(px, py, 0), wallMs);
+  }
+
+  async function runSweep() {
+    while (nonBlackPct < 40) await sleep(2000);
+    await sleep(10000);                       // let the home screen settle
+    const baseline = nonBlackPct;
+    const ratioAtStart = guestRatio;
+    console.log(`[sweep] start baseline=${baseline}% ratio=${ratioAtStart.toFixed(4)}`);
+
+    const trials = [];
+    for (let i = 0; i < SWEEP_WALL_MS.length; i++) {
+      const wallMs = SWEEP_WALL_MS[i];
+      const [px, py] = SWEEP_TARGETS[i % SWEEP_TARGETS.length];
+      tapWall(px, py, wallMs);
+      console.log(`[sweep] rung ${wallMs}ms wall at (${px},${py})`);
+      await sleep(SWEEP_SETTLE_MS);
+      const launched = nonBlackPct > 80;
+      // A panel that has gone black means the guest auto-locked and every
+      // remaining rung would read as a spurious failure. Say so and stop
+      // rather than reporting a threshold the run did not establish.
+      const asleep = nonBlackPct < 5;
+      trials.push({ wallMs, nonBlackPct, launched, asleep });
+      console.log(`[sweep] rung ${wallMs}ms -> nonBlack=${nonBlackPct}%`
+                  + ` launched=${launched}${asleep ? ' PANEL ASLEEP' : ''}`);
+      sweepResult = { baseline, ratioAtStart: Number(ratioAtStart.toFixed(4)),
+                      trials, threshold: launched ? wallMs : null,
+                      invalid: asleep || null };
+      report(true);
+      if (asleep) { console.log('[sweep] INVALID: panel asleep'); return; }
+      if (launched) { console.log(`[sweep] THRESHOLD ${wallMs}ms wall`); return; }
+    }
+    console.log('[sweep] no rung registered up to '
+                + SWEEP_WALL_MS[SWEEP_WALL_MS.length - 1] + 'ms');
+  }
+  let sweepResult = null;
+  const SWEEP = new URLSearchParams(location.search).get('sweep') === '1';
 
   // ---------------------------------------------------------------- boot ---
   const { default: Module } = await import('./qemu-system-arm.js');
@@ -443,6 +578,7 @@
       runtimeReady = true;
       line('runtime initialized; painting enabled');
       console.log('[bench] runtime initialized');
+      if (SWEEP) runSweep();
     },
     preRun: [async (mod) => {
       // preRun runs on the MAIN thread, so this is the Module whose exports

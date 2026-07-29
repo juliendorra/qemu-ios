@@ -421,15 +421,31 @@ thread boundary:
 
 **Two traps that will outlive this step:**
 
-1. **Presses must be held ~500 ms of WALL time.** Guest time runs far slower
-   than wall clock in the browser, so a normal 100 ms tap lands as a down and
-   an up at the *same guest timestamp* and SpringBoard never sees a finger.
-   The page floors releases at `MIN_PRESS_MS`. Shrink it as the engine speeds
-   up; do not mistake it for a device-model defect.
+1. **Presses must be held ~800 ms of WALL time** (`MIN_PRESS_MS`). Guest time
+   runs at ~2% of wall time, so a normal 100 ms tap is a few guest milliseconds
+   — less than the multitouch model's own 16.7 ms motion report interval — and
+   the guest never sees a finger. **Derived, not guessed**: `?sweep=1` walks a
+   ladder of holds and reports the shortest that launches an app; two runs put
+   the threshold at ~450 ms, and 800 ms is the margin for a twofold spread in
+   engine speed. Re-run the sweep as the engine gets faster; do not mistake the
+   constant for a device-model defect.
+
+   Two ways that sweep can lie, both paid for already: **never express the hold
+   in guest milliseconds** (with `-icount` QEMU warps virtual time forward when
+   the CPU idles, so `guestRatio` at an idle home screen is not a conversion
+   factor), and **keep the whole ladder inside the ~260 s auto-lock window** or
+   the later rungs tap a dead panel and read as clean failures.
 2. **Home from inside an app does nothing on 1.0.** That is the known event
    *routing* bug (`5f019eac7f`), not the input bridge — the bridge is proven to
    deliver and the guest is proven to service it. Do not re-investigate it from
    the browser.
+
+**The real-time ratio is now measurable.** `ui/wasm.c` publishes
+`QEMU_CLOCK_VIRTUAL` in ms; the page divides by wall time to get guest seconds
+per wall second — the metric this file asks for, where 1.0 is real time. On 1.0
+it is **0.015-0.022 while booting**: the guest runs at ~2% of real time. Sample
+only while the CPU is BUSY — at idle QEMU warps virtual time forward and the
+figure (0.036 and up) means nothing.
 
 Still open here: partial blits (the damage rectangle and its `ack` are
 published but unused — the page repaints all 320x480), and `OffscreenCanvas`.

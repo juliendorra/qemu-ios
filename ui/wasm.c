@@ -80,6 +80,26 @@ typedef struct WasmDisplayInfo {
      * per frame and buys a partial-blit consumer the option of existing.
      */
     uint32_t ack;
+    /*
+     * QEMU_CLOCK_VIRTUAL in milliseconds — the guest's own idea of how much
+     * time has passed. Deliberately OUTSIDE the seqlock: it is a single 32-bit
+     * store, so it cannot tear, and putting it inside would bump `seq` on every
+     * poll and force a full repaint at the poll rate rather than at the panel's.
+     *
+     * The page divides its delta by the wall-clock delta to get guest seconds
+     * per wall second. That ratio is the only honest answer to "is this
+     * real-time" -- with -icount, boot DURATION and guest SPEED are different
+     * quantities, and a boot time alone cannot distinguish a fast engine from a
+     * throttled tab.
+     *
+     * It also sizes input. The multitouch model reports motion at
+     * MT_MOTION_REPORT_HZ (60) in GUEST time, so how long a press must be held
+     * in WALL time is entirely a function of this ratio.
+     *
+     * u32 milliseconds wraps after ~49 days of guest time, which no session
+     * approaches; a delta across the wrap is discarded by the reader.
+     */
+    uint32_t guest_ms;
 } WasmDisplayInfo;
 
 static WasmDisplayInfo wasm_display_info;
@@ -276,6 +296,15 @@ static void wasm_input_drain(void *opaque)
         tail++;
     }
     qatomic_store_release(&wasm_input_tail, tail);
+
+    /*
+     * Published from here rather than from dpy_refresh: this timer runs on a
+     * fixed 15 ms of REAL time whatever the guest is doing, whereas the display
+     * refresh interval is throttled when a console looks idle -- which would
+     * make the sampling rate depend on the very thing being measured.
+     */
+    qatomic_store_release(&wasm_display_info.guest_ms,
+                          (uint32_t)qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
 
     timer_mod(wasm_input_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + WASM_INPUT_POLL_MS);
