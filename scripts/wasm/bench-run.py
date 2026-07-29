@@ -80,6 +80,9 @@ def main() -> None:
     parser.add_argument("--cold", action="store_true",
                         help="chunked mode: drop the chunk cache first")
     parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument("--no-sw", action="store_true",
+                        help="chunked mode: bypass the service worker and let "
+                             "the emulator's XHRs hit the network directly")
     parser.add_argument("--adaptive", action="store_true",
                         help="scale the compile threshold with cap pressure")
     parser.add_argument("--until", default="launchd",
@@ -125,6 +128,8 @@ def main() -> None:
             query += "&prefetch=0"
         if args.adaptive:
             query += "&adaptive=1"
+        if args.no_sw:
+            query += "&sw=0"
         url = f"http://localhost:{args.port}/bench-b/{query}"
 
         flags = list(CHROME_FLAGS)

@@ -72,7 +72,15 @@ configure_args=(
     # with "NODEFS is no longer included by default".
     # NB the literal single quotes: run() evals this array flattened into one
     # string, so a value containing a space must carry its own quoting.
-    "--extra-ldflags='-lnodefs.js -lworkerfs.js'"
+    #
+    # -sFETCH is what the NAND chunk source needs. A synchronous
+    # XMLHttpRequest from an Emscripten pthread -- the obvious way to keep the
+    # emulator's reads synchronous -- is REFUSED by Chrome 149
+    # ("NetworkError: Failed to execute 'send'", request never leaves the
+    # browser), because -sEXPORT_ES6 makes those workers module workers.
+    # emscripten_fetch with EMSCRIPTEN_FETCH_SYNCHRONOUS is the supported way
+    # to block a worker thread on a network read.
+    "--extra-ldflags='-lnodefs.js -lworkerfs.js -sFETCH'"
 )
 
 # -sMEMORY64=2 keeps the address space at 32 bits, which the 128 MiB guest never

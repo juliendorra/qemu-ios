@@ -450,6 +450,60 @@ reports `fetched=320 hits=11095 resident<=64 bytes=39.9 MiB` — a **97% hit rat
 in the 64-slot LRU**, and 39.9 MiB of records consumed for 18.52 MiB
 downloaded, which is the read amplification the chunk size trades away.
 
+### The open blocker: Chrome 149 will not do a SYNCHRONOUS network read here
+
+The chunked design turns on the emulator reading a chunk synchronously from
+inside QEMU's MMIO path. That works in the in-app browser and **fails in
+Chrome 149**, which is the browser that matters:
+
+```
+[NANDCHUNK] fetch failed: chunk 1723 (…/chunks/4242821e…) -> -4
+    NetworkError: Failed to execute 'send' on 'XMLHttpRequest':
+    Failed to load 'http://localhost:8013/chunked/1A543a/chunks/4242821e…'
+```
+
+**The request never reaches the server** — the server's own counter stays at
+zero — so this is a client-side refusal, not a transport error. Two candidate
+causes were tested and eliminated rather than assumed:
+
+| suspected | test | result |
+| --- | --- | --- |
+| the `Content-Encoding: br` response | `serve.py --no-brotli-header` | identical NetworkError |
+| the service worker in the path | `?sw=0`, worker never registered | identical NetworkError |
+
+What remains is that `-sEXPORT_ES6=1` makes Emscripten's pthread workers
+**module workers**, where Chrome does not support synchronous XHR.
+
+**`emscripten_fetch(EMSCRIPTEN_FETCH_SYNCHRONOUS)` does not rescue it** — its
+backend is that same XHR, and it fails *silently*, returning a zero-byte
+result. It was still worth adding (`-sFETCH`, and the fetcher now tries XHR
+then falls back), because it keeps the one configuration that works.
+
+**The fix is the Atomics.wait design, and it is the next piece of work:** the
+emulator thread blocks on a futex in shared memory while a **classic**
+(non-module) worker performs an ordinary async `fetch()` and writes the chunk
+into the wasm heap. The emulator still never awaits, which is the property the
+whole design needs; only the mechanism changes.
+
+Getting the diagnosis at all needed one piece of instrumentation worth keeping:
+**`console.error` from a pthread worker reaches nothing the page can read**, so
+the fetcher returns distinct negative codes *and* copies the exception text
+into a caller buffer. A whole debugging round was spent on a bare `-1`.
+
+**And a second, separate freeze** — with the service worker in the path, a
+standalone Chrome stops running the page's timers seconds into the run, before
+the emulator has touched the NAND at all, while chunk requests keep arriving at
+the server. Not diagnosed. It does not reproduce with `?sw=0`, and it does not
+reproduce in the in-app browser.
+
+### Note for Session A: `configs/meson/emscripten.txt` gained `-sFETCH`
+
+The flag cannot arrive through `--extra-ldflags` — this file overrides
+`LDFLAGS`, the same trap that swallowed `-lnodefs.js` — so the shared cross
+file had to change. **Cross-file options are read at CONFIGURE time**, so
+picking it up needs `build-qemu.sh --configure`; a plain rebuild silently keeps
+the old link line.
+
 ### Two harness traps, both of which produced convincing wrong readings
 
 - **A hidden tab is throttled, and it looks exactly like a hang.** The first

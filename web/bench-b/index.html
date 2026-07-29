@@ -50,6 +50,18 @@
   const PREFETCH = params.get('prefetch') !== '0';
   const COLD = params.get('cold') === '1';           // drop the chunk cache
   const ADAPTIVE = params.get('adaptive') === '1';   // scale the threshold
+  // Wait for the prefetch before starting the emulator. Default ON: booting
+  // WHILE the service worker is still pulling 512 chunks froze the page in a
+  // standalone Chrome every time (reports stopped ~7 s in, chunk requests kept
+  // flowing) -- and it is the wrong shape anyway, since a demand-faulted chunk
+  // stalls the guest for a whole round trip.
+  const AWAIT_PREFETCH = params.get('awaitPrefetch') !== '0';
+  // ?sw=0 takes the service worker out of the path entirely: the emulator's
+  // synchronous XHRs go straight to the network (and the HTTP cache, which
+  // the chunks' immutable Cache-Control makes usable). Diagnostic: it
+  // separates "chunked delivery is broken" from "the service worker and a
+  // synchronous XHR do not get along in this browser".
+  const USE_SW = params.get('sw') !== '0';
 
   const logEl = document.getElementById('log');
   const stateEl = document.getElementById('state');
@@ -119,6 +131,23 @@
     }
   }
 
+  // The emulator's chunk fetcher reports transport failures through
+  // console.error (it runs on a worker, where fprintf does not reach the page's
+  // printErr in time to be useful).
+  const nativeConsoleError = console.error.bind(console);
+  console.error = (...args) => {
+    const text = args.join(' ');
+    if (text.includes('[NANDCHUNK]')) {
+      // Keyed apart from the C-side counter line, which shares the tag and
+      // would otherwise overwrite the transport error in the report.
+      counters.set('NANDCHUNK-JS', `${at()}s ${text}`);
+      jitEl.textContent = [...counters.values()].join('\n');
+      line(text, 'err');
+      report(true);
+    }
+    nativeConsoleError(...args);
+  };
+
   addEventListener('error', (e) => {
     state(`emulator failure: ${String(e.message).slice(0, 140)}`, 'fail');
     line(`window error: ${e.message}`, 'err');
@@ -147,8 +176,12 @@
       counters: Object.fromEntries(counters),
       failure,
     });
-    navigator.sendBeacon?.('/__bench-result', body) ||
-      fetch('/__bench-result', { method: 'POST', body }).catch(() => {});
+    // fetch(), not sendBeacon(): beacons from a standalone Chrome launched by
+    // bench-run.py were silently dropped (sendBeacon returned true and nothing
+    // arrived), so a chunked run looked dead while its chunk requests were
+    // visibly still flowing at the server.
+    fetch('/__bench-result', { method: 'POST', body, keepalive: true })
+      .catch(() => {});
   }
   setInterval(() => report(true), 15000);
 
@@ -188,18 +221,21 @@
 
   let manifest = null;
   if (MODE === 'chunked') {
-    state('registering service worker…');
-    await registerChunkWorker('/sw.js');
-    if (COLD) {
-      postToChunkWorker('clear-cache');
-      await new Promise((r) => setTimeout(r, 500));
+    if (USE_SW) {
+      state('registering service worker…');
+      await registerChunkWorker('/sw.js');
+      if (COLD) {
+        postToChunkWorker('clear-cache');
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      postToChunkWorker('reset-stats');
     }
-    postToChunkWorker('reset-stats');
     await fetch('/__chunk-stats/reset').catch(() => {});
     manifest = await loadManifest(CHUNK_BASE);
     line(`manifest: ${manifest.chunks} chunks of ${manifest.pagesPerChunk} ` +
          `pages, prefetch ${manifest.prefetch.length} chunks = ` +
-         `${(manifest.prefetchBytes / 1048576).toFixed(1)} MiB`);
+         `${(manifest.prefetchBytes / 1048576).toFixed(1)} MiB` +
+         `${USE_SW ? '' : ' — service worker BYPASSED'}`);
   }
 
   await Module({
@@ -238,20 +274,18 @@
       if (MODE === 'chunked') {
         state('staging the pack index…');
         staged += await stageChunkedNand(mod.FS, manifest);
-        if (PREFETCH) {
-          // Deliberately NOT awaited: a chunk the guest asks for before the
-          // prefetch reaches it is demand-faulted correctly, just slower, so
-          // blocking the boot on the prefetch buys nothing -- and a prefetch
-          // that stalls would then stall the boot. (It did: a headless run sat
-          // at 507 of 512 chunks with the emulator never starting.)
+        if (PREFETCH && USE_SW) {
           state('prefetching the boot working set…');
-          prefetchBootSet(manifest, {
+          const pending = prefetchBootSet(manifest, {
             onProgress: (m) => line(`prefetch ${m.done}/${m.total} chunks ` +
               `(${(m.stats.bytesFromNetwork / 1048576).toFixed(1)} MiB)`),
           }).then((done) => line(
             `prefetch complete in ${done.seconds.toFixed(1)}s, ` +
             `${(done.stats.bytesFromNetwork / 1048576).toFixed(2)} MiB`))
             .catch((e) => line(`prefetch failed: ${e}`, 'err'));
+          if (AWAIT_PREFETCH) {
+            await pending;
+          }
         }
       } else {
         mod.FS.mkdir('/fw/nand');

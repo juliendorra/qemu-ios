@@ -312,6 +312,22 @@ scripts/wasm/bench-run.py --mode chunked      --label chunked-warm \
 **`--profile` must be shared between the cold and warm runs**, or the "warm"
 run gets a fresh Cache Storage and is cold again.
 
+**Measured (in-app browser):** cold = 503 chunk requests, **18.52 MiB** on the
+wire; warm = **0 requests, 0 bytes**; the emulator's own LRU reported 11,095
+hits against 320 fetches. Against 216.8 MiB for the whole-pack page.
+
+**Open blocker — the next piece of work.** Chrome 149 refuses a **synchronous**
+network read from an Emscripten pthread (`NetworkError` on `XMLHttpRequest.send`,
+request never leaves the browser; `emscripten_fetch(SYNCHRONOUS)` fails the
+same way, silently, because its backend is that XHR). The cause is
+`-sEXPORT_ES6`, which makes those workers module workers. Ruled out by
+experiment: not the `Content-Encoding`, not the service worker.
+
+The fix is **Atomics.wait**: the emulator thread blocks on a futex while a
+*classic* worker does an async `fetch()` into the shared heap. The emulator
+still never awaits. Details and the eliminated suspects are in
+`BROWSER_WASM_STATUS.md`.
+
 **Use `scripts/wasm/bench-run.py`, not a tab.** A browser throttles a hidden
 page, and the symptom is a run that looks *stalled* — "compiled=352" for
 minutes — when it is only backgrounded. The runner launches Chrome with

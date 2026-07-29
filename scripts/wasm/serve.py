@@ -52,6 +52,12 @@ RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
 CHUNK_PATH = re.compile(r"/chunks/[0-9a-f]{64}$")
 CHUNK_COUNTER = {"requests": 0, "bytes": 0}
 RESULT_PATH: Path | None = None
+# Diagnostic: serve the stored (still-compressed) chunk bodies WITHOUT the
+# Content-Encoding header. The emulator then rejects them for length, but the
+# transport either works or does not -- which is what separates "this browser
+# will not do a synchronous XHR here" from "it will not do one for a
+# content-encoded response".
+NO_BROTLI_HEADER = False
 COUNTER_LOCK = threading.Lock()
 
 
@@ -194,7 +200,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         handle = open(path, "rb")
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Encoding", "br")
+        if not NO_BROTLI_HEADER:
+            self.send_header("Content-Encoding", "br")
         self.send_header("Content-Length", str(size))
         # The page reads this to attribute wire bytes per chunk; Content-Length
         # is not visible to it once the body has been decoded.
@@ -234,6 +241,8 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--root", type=Path, default=REPO / "web")
+    parser.add_argument("--no-brotli-header", action="store_true",
+                        help="diagnostic: omit Content-Encoding on chunks")
     parser.add_argument("--results", type=Path,
                         help="write POSTs to /__bench-result here "
                              "(scripts/wasm/bench-run.py uses this)")
@@ -241,8 +250,9 @@ def main() -> None:
                         help="start, verify the headers, print the result, exit")
     args = parser.parse_args()
 
-    global RESULT_PATH
+    global RESULT_PATH, NO_BROTLI_HEADER
     RESULT_PATH = args.results
+    NO_BROTLI_HEADER = args.no_brotli_header
 
     root = args.root.resolve()
     if not root.is_dir():

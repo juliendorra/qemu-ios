@@ -31,10 +31,7 @@
 #ifdef EMSCRIPTEN
 
 #include <emscripten.h>
-
-/* Emscripten hands pointers to EM_JS as BigInt under -sMEMORY64=1; the same
- * decode the WebAssembly TCG backend uses (tcg/wasm64.c). */
-#define DEC_PTR(p) bigintToI53Checked(p)
+#include <emscripten/fetch.h>
 
 /*
  * Resident chunks. 64 x 130,944 B is ~8 MiB for the default 62-page chunk --
@@ -68,49 +65,143 @@ static struct {
 } chunks;
 
 /*
- * Fetch url into buf; returns the byte count, or -1.
+ * The synchronous XMLHttpRequest path.
  *
- * responseType on a synchronous XHR throws InvalidAccessError on a Window but
- * is allowed on a worker, which is where this runs. The binary-string fallback
- * exists so that a run on the main thread degrades instead of dying.
+ * This is the design Infinite Mac uses and it works in some Chromium builds
+ * (measured: the in-app browser here served 320 fetches and 11,095 LRU hits
+ * through it). Chrome 149 REFUSES it from an Emscripten pthread --
+ *
+ *     NetworkError: Failed to execute 'send' on 'XMLHttpRequest':
+ *     Failed to load '<url>'
+ *
+ * -- and the request never reaches the server. The cause is -sEXPORT_ES6,
+ * which makes Emscripten's pthread workers MODULE workers, where Chrome does
+ * not support synchronous XHR. Ruled out by experiment: not the
+ * Content-Encoding (reproduced with the header removed) and not the service
+ * worker (reproduced with it bypassed).
+ *
+ * Kept as the first choice because where it works it is the cheapest path.
  */
-EM_JS(int, it_nand_fetch_chunk_js, (const char *url, void *buf, int cap), {
+#define EM_JS_PRE(ret, name, args, body...) EM_JS(ret, name, args, body)
+#define DEC_PTR(p) bigintToI53Checked(p)
+
+EM_JS_PRE(int, it_nand_fetch_chunk_xhr, (const char *url, void *buf,
+                                         int cap, char *err, int errcap), {
     const target = UTF8ToString(DEC_PTR(url));
     const dst = DEC_PTR(buf);
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', target, false);
-    let binaryString = false;
-    try {
-        xhr.responseType = 'arraybuffer';
-    } catch (e) {
-        xhr.overrideMimeType('text/plain; charset=x-user-defined');
-        binaryString = true;
+    const report = (e) => stringToUTF8(String(e), DEC_PTR(err), errcap);
+
+    if (typeof XMLHttpRequest === 'undefined') {
+        return -2;
     }
+    const xhr = new XMLHttpRequest();
     try {
+        xhr.open('GET', target, false);
+        xhr.responseType = 'arraybuffer';
         xhr.send(null);
     } catch (e) {
-        return -1;
+        report(e);
+        return -4;
     }
     if (xhr.status !== 200 && xhr.status !== 0) {
-        return -1;
-    }
-    if (binaryString) {
-        const text = xhr.responseText;
-        if (text.length > cap) {
-            return -1;
-        }
-        for (let i = 0; i < text.length; i++) {
-            HEAPU8[dst + i] = text.charCodeAt(i) & 0xff;
-        }
-        return text.length;
+        return -(1000 + xhr.status);
     }
     const bytes = new Uint8Array(xhr.response);
     if (bytes.length > cap) {
-        return -1;
+        return -6;
     }
     HEAPU8.set(bytes, dst);
     return bytes.length;
 });
+
+/*
+ * Fetch url into buf; returns the byte count, or a negative code.
+ *
+ * emscripten_fetch with EMSCRIPTEN_FETCH_SYNCHRONOUS, NOT a synchronous
+ * XMLHttpRequest. The XHR is the obvious way to keep the emulator's reads
+ * synchronous and it is what Infinite Mac uses, but Chrome 149 REFUSES it from
+ * an Emscripten pthread:
+ *
+ *     NetworkError: Failed to execute 'send' on 'XMLHttpRequest':
+ *     Failed to load '<url>'
+ *
+ * and the request never reaches the server at all. The cause is
+ * -sEXPORT_ES6, which makes Emscripten's pthread workers MODULE workers, where
+ * Chrome does not support synchronous XHR. It is not the Content-Encoding
+ * (reproduced with the header removed) and not the service worker (reproduced
+ * with the worker bypassed).
+ *
+ * emscripten_fetch is the supported path: a synchronous fetch is legal on any
+ * thread except the browser main thread, which is exactly our case, and it
+ * needs -sFETCH at link time (scripts/wasm/build-qemu.sh).
+ */
+static int it_nand_fetch_chunk_em(const char *url, void *buf, size_t cap,
+                                  char *err, size_t errcap)
+{
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_t *fetch;
+    int result;
+
+    emscripten_fetch_attr_init(&attr);
+    strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY |
+                      EMSCRIPTEN_FETCH_SYNCHRONOUS |
+                      EMSCRIPTEN_FETCH_REPLACE;
+
+    fetch = emscripten_fetch(&attr, url);
+    if (fetch == NULL) {
+        g_strlcpy(err, "emscripten_fetch returned NULL", errcap);
+        return -3;
+    }
+    if (fetch->status != 200 && fetch->status != 0) {
+        g_snprintf(err, errcap, "HTTP %u", fetch->status);
+        result = -(1000 + (int)fetch->status);
+    } else if ((size_t)fetch->numBytes > cap) {
+        g_snprintf(err, errcap, "%llu bytes, slot holds %zu",
+                   (unsigned long long)fetch->numBytes, cap);
+        result = -6;
+    } else {
+        memcpy(buf, fetch->data, fetch->numBytes);
+        result = (int)fetch->numBytes;
+    }
+    emscripten_fetch_close(fetch);
+    return result;
+}
+
+/*
+ * Try the XHR, then emscripten_fetch. Whichever works first wins for the rest
+ * of the run: both are synchronous, and probing on every chunk would pay the
+ * failing one's cost forever.
+ *
+ * WARNING (2026-07-29): on Chrome 149 BOTH fail -- the XHR with a NetworkError
+ * and emscripten_fetch with a silent zero-byte result, because its backend is
+ * that same XHR. A browser where neither works needs the Atomics.wait design:
+ * the emulator thread blocks on a futex while a CLASSIC (non-module) worker
+ * does an async fetch and writes into the shared heap. That is the known next
+ * step, and it is why this function keeps the failure codes.
+ */
+static int it_nand_fetch_chunk(const char *url, void *buf, size_t cap,
+                               char *err, size_t errcap)
+{
+    static int transport;          /* 0 unknown, 1 xhr, 2 emscripten_fetch */
+    int got;
+
+    if (transport != 2) {
+        got = it_nand_fetch_chunk_xhr(url, buf, (int)cap, err, (int)errcap);
+        if (got > 0) {
+            transport = 1;
+            return got;
+        }
+        if (transport == 1) {
+            return got;            /* it worked before; this is a real error */
+        }
+    }
+    got = it_nand_fetch_chunk_em(url, buf, cap, err, errcap);
+    if (got > 0) {
+        transport = 2;
+    }
+    return got;
+}
 
 static const uint8_t *chunk_fetch(void *opaque, uint32_t chunk,
                                   uint32_t *n_slots)
@@ -119,6 +210,7 @@ static const uint8_t *chunk_fetch(void *opaque, uint32_t chunk,
     char url[640];
     char hex[65];
     uint32_t expected_slots;
+    char error[256];
     size_t capacity = (size_t)chunks.pages_per_chunk * chunks.stride;
     int got;
 
@@ -148,10 +240,13 @@ static const uint8_t *chunk_fetch(void *opaque, uint32_t chunk,
     if (victim->data == NULL) {
         victim->data = g_malloc(capacity);
     }
-    got = it_nand_fetch_chunk_js(url, victim->data, (int)capacity);
+    error[0] = '\0';
+    got = it_nand_fetch_chunk(url, victim->data, capacity, error,
+                              sizeof(error));
     if (got <= 0 || (size_t)got % chunks.stride != 0) {
-        fprintf(stderr, "[NANDCHUNK] fetch failed: chunk %u (%s) -> %d\n",
-                chunk, url, got);
+        fprintf(stderr, "[NANDCHUNK] fetch failed: chunk %u (%s) -> %d %s "
+                "(-3 no fetch, -6 oversize, -10xx HTTP xx)\n",
+                chunk, url, got, error);
         victim->used = 0;
         return NULL;
     }
