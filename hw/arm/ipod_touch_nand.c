@@ -79,13 +79,94 @@ static void nand_note_read(uint32_t bank, uint32_t page)
     }
 }
 
-static bool nand_writable(void)
+/*
+ * ...and a browser cannot set that variable: Emscripten's ENV object is not in
+ * EXPORTED_RUNTIME_METHODS, so a page has no way to reach it. It CAN write a
+ * file, so "writable=1" in <nand>/nand-tune says the same thing.
+ *
+ * In the browser this IS the copy-on-write overlay, in its simplest possible
+ * form: the NAND directory lives in MEMFS, so a written page is a few kilobytes
+ * of heap that the read path prefers over the immutable pack, and it evaporates
+ * with the tab. That is enough to reach SpringBoard, which a read-only NAND
+ * never does -- daemons that must create state spin for ever. It is NOT enough
+ * for persistence across visits; that still wants the real overlay (W6).
+ */
+/*
+ * overlay=ram in <nand>/nand-tune: guest writes go into HEAP, not into files,
+ * and reads prefer them. This is the copy-on-write overlay the browser needs
+ * (W6), in the smallest form that works.
+ *
+ * The file-backed writable mode CANNOT serve the browser, and the reason is
+ * worth keeping: with -sPROXY_TO_PTHREAD every MEMFS syscall is proxied to the
+ * main thread, so the `stat()` this model does before each page read becomes a
+ * cross-thread round trip. Measured: the boot stalled outright -- 816 blocks
+ * compiled in 181 s and no landmarks, against kernel at 113 s without it.
+ *
+ * A hash table of 2,112-byte records costs a few tens of MB across a boot and
+ * touches no filesystem at all -- which also means the bank<N> directories
+ * stop being load-bearing for a packed NAND.
+ */
+static GHashTable *nand_overlay;      /* (bank<<24)|page -> 2112 bytes */
+
+static bool nand_overlay_enabled(ITNandState *s)
 {
     static int cached = -1;
+    char filename[PATH_MAX];
+    g_autofree char *text = NULL;
+    const char *v = getenv("IT_NAND_OVERLAY");
 
-    if (cached < 0) {
-        const char *v = getenv("IT_NAND_WRITABLE");
-        cached = (v && *v && strcmp(v, "0") != 0);
+    if (cached >= 0) {
+        return cached;
+    }
+    cached = 0;
+    if (v && *v) {
+        cached = strcmp(v, "0") != 0;
+    } else {
+        g_snprintf(filename, sizeof(filename), "%s/nand-tune", s->nand_path);
+        if (g_file_get_contents(filename, &text, NULL, NULL) &&
+            strstr(text, "overlay=ram") != NULL) {
+            cached = 1;
+        }
+    }
+    if (cached) {
+        nand_overlay = g_hash_table_new_full(NULL, NULL, NULL, g_free);
+        fprintf(stderr, "[NAND] copy-on-write overlay in RAM: guest writes "
+                "shadow the pack for this session\n");
+    }
+    return cached;
+}
+
+static uint8_t *nand_overlay_lookup(uint32_t bank, uint32_t page)
+{
+    if (nand_overlay == NULL) {
+        return NULL;
+    }
+    return g_hash_table_lookup(nand_overlay,
+                               GUINT_TO_POINTER((bank << 24) | page));
+}
+
+static bool nand_writable(ITNandState *s)
+{
+    static int cached = -1;
+    char filename[PATH_MAX];
+    g_autofree char *text = NULL;
+    const char *v;
+
+    if (cached >= 0) {
+        return cached;
+    }
+    v = getenv("IT_NAND_WRITABLE");
+    if (v && *v) {
+        cached = strcmp(v, "0") != 0;
+        return cached;
+    }
+    cached = 0;
+    g_snprintf(filename, sizeof(filename), "%s/nand-tune", s->nand_path);
+    if (g_file_get_contents(filename, &text, NULL, NULL) &&
+        strstr(text, "writable=1") != NULL) {
+        cached = 1;
+        fprintf(stderr, "[NAND] writable: guest writes shadow the pack "
+                "(%s)\n", filename);
     }
     return cached;
 }
@@ -240,9 +321,25 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
         nand_trace_page(bank, page);
         char filename[200];
         bool present = true;
+        const uint8_t *overlaid = NULL;
+
+        if (nand_overlay_enabled(s)) {
+            overlaid = nand_overlay_lookup(bank, page);
+        }
+        if (overlaid != NULL) {
+            /* A page the guest has written this session shadows the pack, and
+             * costs one hash lookup rather than a proxied stat(). */
+            memcpy(s->page_buffer, overlaid, NAND_BYTES_PER_PAGE);
+            memcpy(s->page_spare_buffer, overlaid + NAND_BYTES_PER_PAGE,
+                   NAND_BYTES_PER_SPARE);
+            s->buffered_page = page;
+            s->buffered_bank = bank;
+            nand_note_read(bank, page);
+            return;
+        }
         sprintf(filename, "%s/bank%d/%d.page", s->nand_path, bank, page);
         struct stat st = {0};
-        if (!(nand_writable() && stat(filename, &st) == 0) &&
+        if (!(nand_writable(s) && stat(filename, &st) == 0) &&
             nand_read_packed_page(s, bank, page)) {
             /* The immutable base pack replaces the per-page open/read path.
              * When writable, a page the guest has written shadows the pack. */
@@ -336,15 +433,32 @@ static void nand_flush_buffered_page(ITNandState *s)
 
     qemu_mutex_lock(&s->lock);
     qemu_mutex_unlock(&s->lock);
-    sprintf(filename, "%s/bank%d/%d%s.page", s->nand_path,
-            s->buffered_bank, s->buffered_page,
-            nand_writable() ? "" : "_new");
-    f = fopen(filename, "wb");
-    if (f == NULL) { hw_error("Unable to read file!"); }
-    nand_note_write(s->buffered_bank, s->buffered_page);
-    fwrite(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
-    fwrite(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
-    fclose(f);
+
+    if (nand_overlay_enabled(s)) {
+        uint8_t *record = nand_overlay_lookup(s->buffered_bank,
+                                              s->buffered_page);
+
+        if (record == NULL) {
+            record = g_malloc(NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE);
+            g_hash_table_insert(nand_overlay,
+                                GUINT_TO_POINTER((s->buffered_bank << 24) |
+                                                 s->buffered_page), record);
+        }
+        memcpy(record, s->page_buffer, NAND_BYTES_PER_PAGE);
+        memcpy(record + NAND_BYTES_PER_PAGE, s->page_spare_buffer,
+               NAND_BYTES_PER_SPARE);
+        nand_note_write(s->buffered_bank, s->buffered_page);
+    } else {
+        sprintf(filename, "%s/bank%d/%d%s.page", s->nand_path,
+                s->buffered_bank, s->buffered_page,
+                nand_writable(s) ? "" : "_new");
+        f = fopen(filename, "wb");
+        if (f == NULL) { hw_error("Unable to read file!"); }
+        nand_note_write(s->buffered_bank, s->buffered_page);
+        fwrite(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
+        fwrite(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
+        fclose(f);
+    }
 
     if (getenv("IT_NAND_WRITE")) {
         /*

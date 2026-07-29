@@ -335,9 +335,28 @@ with **zero bytes and no error**.
 second (`?nested=1` to see the failing arrangement). Use it before rebuilding
 the emulator for anything in this protocol.
 
-**Measured, cold then warm, in standalone Chrome:** cold pulls 503 chunks =
-**18.52 MiB** and reaches BSD root at 125 s; warm pulls **0 bytes** and reaches
-it at 114 s — no slower than staging the whole 215.6 MiB pack.
+**A cold browser boot now reaches the SpringBoard HOME SCREEN from chunked
+assets:** first pixels 10 s, kernel 157 s, BSD root 170 s, **home screen 290 s**,
+verified at **45.2% non-black** in the kernel framebuffer (59.04% natively,
+~1.6% for the Apple logo). 507 chunk requests = **18.63 MiB** for a 215.6 MiB
+pack, with a 97% hit rate in the emulator's chunk LRU. Warm pulls **0 bytes**.
+
+Speed, measured rather than inferred: **55.08 s of guest time in 441.7 s of
+wall clock — 12.5% of real time** at `-icount shift=1`.
+
+Three things that boot needs, and each one was a stall until it was there:
+
+- **`overlay=ram` in `<nand>/nand-tune`.** A read-only NAND never reaches
+  SpringBoard, and the file-backed writable mode is *worse* in a browser: under
+  `-sPROXY_TO_PTHREAD` every MEMFS syscall is proxied to the main thread, so
+  the per-read `stat()` becomes a cross-thread round trip and the boot stalls
+  outright (816 blocks compiled in 181 s, no landmarks).
+- **`hw/arm/ipod_touch_fb_probe.c`** — the home screen has to be seen, and
+  `_it_fb_probe_addr` publishes the same three framebuffer percentages
+  `fb-snapshot.py` reports, sampled on the emulator's thread.
+- **`-display none` for measurement runs.** Verifying through the display
+  backend changes the answer: kernel at 276 s with `-display wasm` against
+  118 s without, and launchd not reached in 1,000 s.
 
 The "service worker freezes the page on a cold run" turned out to be neither:
 `keepalive`/`sendBeacon` share a **64 KiB in-flight quota per origin**, the

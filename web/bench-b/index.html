@@ -36,6 +36,7 @@
 <div class="card" id="marks">(no landmarks yet)</div>
 <div class="card" id="jit">(no JIT stats yet)</div>
 <div class="card" id="net">(no chunk stats yet)</div>
+<div class="card" id="fb">(no framebuffer samples yet)</div>
 <div id="log"></div>
 <script type="module">
   import { registerChunkWorker, loadManifest, stageChunkedNand, prefetchBootSet,
@@ -53,6 +54,11 @@
   // Echoed back in every report so the server can reject posts from another
   // page -- Session A's page posts to the same endpoint.
   const LABEL = params.get('label') || 'bench-b';
+  // Both are bisection handles: the home-screen run needs a display backend
+  // and a writable NAND, and either could be what a stalled boot is stalling
+  // on.
+  const DISPLAY = params.get('display') || 'none';
+  const WRITABLE = params.get('writable') !== '0';
   // Wait for the prefetch before starting the emulator. Default ON: booting
   // WHILE the service worker is still pulling 512 chunks froze the page in a
   // standalone Chrome every time (reports stopped ~7 s in, chunk requests kept
@@ -71,15 +77,20 @@
   const marksEl = document.getElementById('marks');
   const jitEl = document.getElementById('jit');
   const netEl = document.getElementById('net');
+  const fbEl = document.getElementById('fb');
   const t0 = performance.now();
   const at = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(7);
 
+  // Serial landmarks only. SpringBoard NEVER announces itself, so the home
+  // screen is detected from PIXELS below -- grepping serial for it has wasted
+  // two sessions of other people's time.
   const LANDMARKS = [
     ['iBoot banner',   t => t.includes('BUILD_TAG')],
     ['kernel',         t => t.includes('Darwin Kernel Version')],
     ['BSD root',       t => t.includes('BSD root:')],
     ['launchd',        t => t.includes('BOOT_TIME')],
-    ['SpringBoard',    t => t.includes('SpringBoard')],
+    ['first pixels',   () => false],     // set by the framebuffer poll
+    ['home screen',    () => false],     // set by the framebuffer poll
   ];
   const hit = new Map();
   let fsRef = null;
@@ -121,6 +132,21 @@
                    `${at()}s ${text}`);
       jitEl.textContent = [...counters.values()].join('\n');
       report();
+    }
+    // The framebuffer poll marks its own landmarks through these sentinels,
+    // since they have no serial line to match.
+    if (text === '__pixels' && !hit.has('first pixels')) {
+      hit.set('first pixels', at());
+      renderMarks();
+      report(true);
+      return;
+    }
+    if (text === '__home' && !hit.has('home screen')) {
+      hit.set('home screen', at());
+      renderMarks();
+      state(`home screen: ${nonBlackPct.toFixed(1)}% non-black`, 'ok');
+      report(true);
+      return;
     }
     for (const [name, test] of LANDMARKS) {
       if (!hit.has(name) && test(text)) {
@@ -181,6 +207,7 @@
       elapsed: Number((now / 1000).toFixed(1)),
       landmarks: Object.fromEntries([...hit].map(([k, v]) => [k, Number(v)])),
       reportFailures, lastReportError,
+      nonBlackPct: Number(nonBlackPct.toFixed(2)), frames, guestMs,
       counters: Object.fromEntries(counters),
       failure,
     });
@@ -227,6 +254,77 @@
         `${mib(sw.bytesFromNetwork)} MiB fetched` : 'n/a'}`;
   }, 2000);
 
+  /*
+   * Home-screen detection, by framebuffer -- read out of GUEST memory by the
+   * emulator itself (hw/arm/ipod_touch_fb_probe.c), not out of the display
+   * backend.
+   *
+   * Two reasons. SpringBoard never announces itself on serial, so pixels are
+   * the only honest signal; and -display wasm costs enough time to change the
+   * answer (kernel at 276 s with it, 118 s without, on otherwise identical
+   * chunked boots). The probe samples the same three bases fb-snapshot.py
+   * does, on a QEMU timer, and publishes them under a seqlock.
+   *
+   * The bar is fb-snapshot.py's: 1.0's home screen measures 59.04% non-black
+   * natively, the Apple logo about 1.6%. Two consecutive samples over 25% is
+   * the landmark.
+   */
+  const HOME_SCREEN_PCT = 25;
+  const FB_NAMES = ['iboot 0x0fe00000', 'kernel 0x0f400000',
+                    'kernel 0x0f496000'];
+  let probeBase = -1;
+  let probeBroken = false;
+  let nonBlackPct = 0;
+  let frames = 0;
+  let homeStreak = 0;
+  let guestMs = 0;
+
+  function readProbe(u32) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const s0 = Atomics.load(u32, probeBase);
+      if (s0 & 1) continue;                       // writer in progress
+      const samples = u32[probeBase + 1];
+      const permille = [u32[probeBase + 2], u32[probeBase + 3],
+                        u32[probeBase + 4]];
+      const guest = u32[probeBase + 5];
+      if (Atomics.load(u32, probeBase) !== s0) continue;
+      return { seq: s0, samples, permille, guest };
+    }
+    return null;
+  }
+
+  function sampleFramebuffer() {
+    // Every Module property goes through try/catch: reading one Emscripten did
+    // not export calls abort() and takes the emulator with it, and measurement
+    // must never be able to end a run.
+    if (!fsModule || probeBroken) return;
+    try {
+      if (probeBase < 0) {
+        const fn = fsModule._it_fb_probe_addr;
+        if (typeof fn !== 'function') return;
+        probeBase = fn() >>> 2;
+        line(`framebuffer probe at 0x${(probeBase << 2).toString(16)}`);
+      }
+      const probe = readProbe(fsModule.HEAPU32);
+      if (!probe || !probe.samples) return;
+      frames = probe.samples;
+      guestMs = probe.guest;
+      // The kernel bases are what a home screen lands in; iBoot's logo base is
+      // reported but never counted, or the Apple logo would qualify.
+      nonBlackPct = Math.max(probe.permille[1], probe.permille[2]) / 10;
+      if (probe.permille.some((p) => p > 0)) note('__pixels');
+      homeStreak = nonBlackPct >= HOME_SCREEN_PCT ? homeStreak + 1 : 0;
+      if (homeStreak >= 2) note('__home');
+      fbEl.textContent = FB_NAMES
+        .map((name, i) => `${(probe.permille[i] / 10).toFixed(1)}%  ${name}`)
+        .join('\n') + `\nguest ${(probe.guest / 1000).toFixed(1)}s virtual`;
+    } catch (e) {
+      probeBroken = true;
+      line(`framebuffer probe disabled: ${e}`, 'err');
+    }
+  }
+  setInterval(sampleFramebuffer, 2000);
+
   const { default: Module } = await import('./qemu-system-arm.js');
 
   let manifest = null;
@@ -254,7 +352,11 @@
             'nand=/fw/nand,epoch=0',
       '-m', '1G',
       '-pflash', '/fw/nor.bin',
-      '-display', 'none',
+      // -display wasm publishes the surface into the wasm heap (ui/wasm.c,
+      // Session A). This page never paints it; it only measures how much of it
+      // is non-black, which is how a home screen is verified everywhere else in
+      // this repo (scripts/fb-snapshot.py).
+      '-display', DISPLAY,
       '-serial', 'file:/fw/serial.log',
       // Non-negotiable: at anything slower the guest takes timeout paths and
       // panics, natively as well as here.
@@ -285,6 +387,12 @@
       if (MODE === 'chunked') {
         state('staging the pack index…');
         staged += await stageChunkedNand(mod.FS, manifest);
+        // Without an overlay the guest's writes are discarded and the boot
+        // stalls after launchd for ever: daemons that must create state spin.
+        // overlay=ram keeps them in the heap -- the file-backed mode cannot be
+        // used here, because every MEMFS stat() is proxied to the main thread
+        // and the boot stalls outright.
+        if (WRITABLE) mod.FS.writeFile('/fw/nand/nand-tune', 'overlay=ram\n');
         if (PREFETCH && USE_SW) {
           state('prefetching the boot working set…');
           const pending = prefetchBootSet(manifest, {
@@ -305,6 +413,7 @@
         const data = new Uint8Array(
           await (await fetch('/public/jit-boot/nand.pack')).arrayBuffer());
         mod.FS.writeFile('/fw/nand/nand.pack', data);
+        if (WRITABLE) mod.FS.writeFile('/fw/nand/nand-tune', 'overlay=ram\n');
         staged += data.length;
       }
       state(`booting — ${(staged / 1048576).toFixed(1)} MiB staged`);

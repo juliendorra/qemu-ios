@@ -80,6 +80,11 @@ def main() -> None:
     parser.add_argument("--cold", action="store_true",
                         help="chunked mode: drop the chunk cache first")
     parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument("--display", default=None,
+                        choices=("none", "wasm"),
+                        help="display backend (default: the page's, wasm)")
+    parser.add_argument("--read-only", action="store_true",
+                        help="do not mark the NAND writable")
     parser.add_argument("--no-sw", action="store_true",
                         help="chunked mode: bypass the service worker and let "
                              "the emulator's XHRs hit the network directly")
@@ -88,6 +93,10 @@ def main() -> None:
     parser.add_argument("--until", default="launchd",
                         help="stop once this landmark is reached "
                              "(iBoot banner/kernel/BSD root/launchd/SpringBoard)")
+    parser.add_argument("--settle", type=float, default=0,
+                        help="keep running this many seconds after --until is "
+                             "reached; a home screen crossing the threshold is "
+                             "not the same as a home screen finished drawing")
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--port", type=int, default=8012)
     parser.add_argument("--label", default="run")
@@ -131,6 +140,10 @@ def main() -> None:
             query += "&adaptive=1"
         if args.no_sw:
             query += "&sw=0"
+        if args.display:
+            query += f"&display={args.display}"
+        if args.read_only:
+            query += "&writable=0"
         url = f"http://localhost:{args.port}/bench-b/{query}"
 
         flags = list(CHROME_FLAGS)
@@ -145,6 +158,7 @@ def main() -> None:
         started = time.time()
         latest: dict = {}
         last_print = 0.0
+        settling = None
         try:
             while time.time() - started < args.timeout:
                 time.sleep(2)
@@ -159,7 +173,14 @@ def main() -> None:
                               f"{latest.get('counters', {}).get('JIT', '')} "
                               f"{list(latest.get('landmarks', {}))}", flush=True)
                     if args.until in latest.get("landmarks", {}):
-                        break
+                        if not args.settle:
+                            break
+                        if settling is None:
+                            settling = time.time()
+                            print(f"  reached {args.until}; settling "
+                                  f"{args.settle:.0f}s", flush=True)
+                        elif time.time() - settling >= args.settle:
+                            break
                     if latest.get("failure"):
                         print(f"  failure: {latest['failure']}", flush=True)
                         break

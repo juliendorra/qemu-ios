@@ -568,6 +568,72 @@ reports `fetched=320 hits=11095 resident<=64 bytes=39.9 MiB` — a **97% hit rat
 in the 64-slot LRU**, and 39.9 MiB of records consumed for 18.52 MiB
 downloaded, which is the read amplification the chunk size trades away.
 
+### THE HOME SCREEN, IN A BROWSER, FROM CHUNKED ASSETS
+
+A cold browser boot of iPhone OS 1.0 now reaches the **SpringBoard home
+screen**, with the NAND arriving as 130,944-byte chunks over the network:
+
+| landmark | wall clock |
+| --- | --- |
+| first pixels | 10 s |
+| Darwin kernel | 157 s |
+| BSD root | 170 s |
+| **home screen** | **290 s** |
+
+Verified the way this repo always verifies it — by pixels, not by serial:
+**45.2% non-black** in the kernel framebuffer after settling, against 59.04%
+natively and ~1.6% for the Apple logo. 507 chunk requests, **18.63 MiB** on the
+wire, for a 215.6 MiB pack.
+
+The emulator's own chunk cache reports `fetched=768 hits=23310` — a **97% hit
+rate** in the 64-slot LRU, 95.8 MiB of records consumed for 18.6 MiB
+downloaded, which is the read amplification the chunk size trades away.
+
+**Speed, honestly:** 55.08 s of guest virtual time in 441.7 s of wall clock, so
+the guest runs at **12.5% of real time** at `-icount shift=1`. That is the
+number the real-time goal has to move, and it is measured now rather than
+inferred.
+
+### Two things the full boot needed, and one that had to be measured to believe
+
+**1. A copy-on-write overlay — in RAM, not in MEMFS.** A read-only NAND never
+reaches SpringBoard: daemons that must create state spin for ever. The
+file-backed writable mode cannot serve the browser either, and the reason is
+worth remembering: under `-sPROXY_TO_PTHREAD` **every MEMFS syscall is proxied
+to the main thread**, so the `stat()` this model does before each page read
+becomes a cross-thread round trip. Measured, chunked, otherwise identical:
+
+| NAND mode | outcome |
+| --- | --- |
+| read-only | stalls after launchd (documented, and still true) |
+| file-backed writable in MEMFS | **stalls outright** — 816 blocks compiled in 181 s, no landmarks |
+| `overlay=ram` | kernel 118 s, BSD root 129 s, launchd 144 s |
+
+`overlay=ram` in `<nand>/nand-tune` keeps written pages in a hash table
+(2,112 B each, a few tens of MB across a boot) that the read path prefers over
+the pack. It is W6's core in its smallest working form — session-lifetime, not
+persistent — and it also makes the `bank0..bank7` directories stop being
+load-bearing for a packed NAND.
+
+**2. A framebuffer probe inside the emulator**
+(`hw/arm/ipod_touch_fb_probe.c`). SpringBoard announces nothing, so the home
+screen has to be seen. The probe samples the same three bases
+`scripts/fb-snapshot.py` does, on a QEMU timer — i.e. on the emulator's own
+thread, because `cpu_physical_memory_read()` from the page's thread would be an
+unlocked access from outside QEMU's world — and publishes the percentages under
+a seqlock for the page to read.
+
+**3. Do not verify through the display backend.** The obvious approach —
+`-display wasm` and count pixels in the surface — **changes what it measures**:
+
+| | kernel banner | launchd |
+| --- | --- | --- |
+| `-display wasm` | 276 s | not reached in 1,000 s |
+| `-display none` + probe | 118 s | 144 s |
+
+Painting is Session A's business and belongs in their page; a measurement run
+should not pay for it.
+
 ### SOLVED: the chunked boot runs in Chrome — futex + a PAGE-OWNED worker
 
 The synchronous-read blocker described below is fixed. The emulator now writes a request
