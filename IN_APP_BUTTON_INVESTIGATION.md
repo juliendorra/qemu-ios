@@ -70,9 +70,38 @@ IT_PROBE_WAIT=8 python3 scripts/app-button-probe.py --board m68ap-10
    (48% libobjc, 26% libSystem, 18% CoreFoundation — the shape of notification
    dispatch, including an `NSThread` being started).
 
-**So nothing goes wrong synchronously at any level.** The wedge is asynchronous
-and takes seconds: the press is fully handled, and only afterwards does event
-delivery die permanently.
+**So nothing goes wrong synchronously at any level.** The press is fully
+handled, and only afterwards does event delivery die permanently.
+
+9. **THE WEDGE IS A SPIN: SpringBoard burns a full core forever** (2026-07-29,
+   `scripts/gsqueue-poll.py`). Measured on the QEMU process's own CPU time --
+   completely non-invasive -- with the mapped process read from guest memory in
+   the same run:
+
+   | phase | QEMU host CPU | process currently mapped |
+   |---|---|---|
+   | before any press | **0.07 cores** | healthy mix: BTServer 38, BlueTool 14, CommCenter 9, syslogd 4, mediaserverd 4 |
+   | press 1 (the one that works) | **0.12 cores** | healthy mix: BTServer 47, BlueTool 30, CommCenter 11, ... |
+   | press 2 | **0.97 cores** | **SpringBoard 98/98** |
+   | press 3 | **0.98 cores** | **SpringBoard 98/98** |
+
+   From the home screen on the same build the daemon mix returns to normal after
+   a press (BTServer 64, BlueTool 56, CommCenter 41, SpringBoard 9) and the CPU
+   stays low.
+
+   So after the first in-app press SpringBoard enters an **infinite loop** and
+   **starves every other process**. That single fact explains the whole
+   downstream picture at once: nothing else is scheduled, so no further
+   `_GSSendEvent`, so `_PurpleEventCallback` never fires again in any process, so
+   the button and touch both die, the LCD stops flipping and `[MT] frame
+   consumed` stops. It also means the loop most likely IS the CF/libobjc work
+   seen in the after-return walk (48% libobjc, 26% libSystem, 18%
+   CoreFoundation, still going at step 15 000) -- which was read at the time as
+   "carrying on doing ordinary work".
+
+   **This retracts the older "the guest goes IDLE and never wakes / parked at
+   WFI with interrupts masked" conclusion.** That PC-sampling run pressed
+   nothing (qcode `"home"`), so it was sampling an idle machine.
 
 ## Hypotheses killed, with the measurement that killed each
 
@@ -95,6 +124,8 @@ Do not re-try any of these.
 | **The DOWN event is rarely delivered** | An artifact of the instrument — see the QMP trap below. With it fixed, press 1 delivers both edges. |
 | `menuButtonUp:`'s gates swallow it | All gates pass; it dispatches. |
 | `clickedMenuButton` blocks or bails | Runs to completion and returns. |
+| The guest goes IDLE / parks at WFI and never wakes | **Backwards.** It spins at 0.97-0.98 host cores. The PC-sampling run that "showed" the idle loop had pressed nothing. |
+| Events pile up unread (the DRAIN side died) | No persistent backlog: 200 SpringBoard samples over 40 s of wedge, queue head always 0. (See the instrument caveat below before leaning on this.) |
 
 ## Retracted conclusions from earlier sessions
 
@@ -206,18 +237,60 @@ Do not re-try any of these.
 | `scripts/objc-xref.py` | who sends this selector, and `--list-methods` for the whole method table. |
 | `scripts/gsqueue-poll.py` | polls the GSEvent queue head with QMP `memsave` — no gdb, no vCPU stops, so it can watch for minutes. |
 
+## The GSEvent queue poll: what it did and did not settle
+
+`scripts/gsqueue-poll.py` derives the queue-head global from
+`_PurpleEventCallback`'s own prologue (1.0 `0x38988a0c`, 1.1.4 `0x38ab2d00`,
+GraphicsServices `__bss`) and reads it with QMP `memsave` -- guest VIRTUAL
+memory, through the current CPU mapping, with **no vCPU stop**, so it can watch
+for minutes. Every sample also reads the Mach-O header at 0x1000 and
+fingerprints it, because that `__bss` is per-process at a fixed VA and a sample
+means nothing without knowing whose address space it came from.
+
+**Result: the queue head is 0 in every sample** -- 200 SpringBoard samples
+spanning 40 s of the wedge.
+
+**And the control is NEGATIVE, so read that carefully.** With `--burst 40`
+(40 taps flat out, sampling between every event, on the WORKING home-screen
+configuration) the poller caught a non-empty queue **0 times in 240 samples**.
+The queue drains faster than a QMP round-trip, so *this instrument cannot
+observe a queued event at all*. By this project's own rule -- a negative from an
+instrument that cannot produce a positive is not evidence -- "the queue is always
+empty" does **not** establish that nothing is enqueued.
+
+What it does establish is narrower and still useful: **there is no persistent
+backlog.** Had the drain side died while events kept arriving, the head would
+have stayed non-zero for tens of seconds and 200 samples would have caught it.
+Combined with the port watch (no `_GSSendEvent` after press 1), the sender side
+is what stops.
+
+The run's real payoff was accidental: the per-phase process mix and the host CPU
+figure, which is finding 9 above.
+
 ## Where it stands
 
-The wedge is asynchronous and takes seconds, so no stepper can reach it: 15 000
-single steps is microseconds of guest time. The open leads, in order:
+**The bug is an infinite loop in SpringBoard, entered after the first in-app
+press, that starves the whole system.** Everything else observed is downstream
+of that.
 
-1. **Does the queue grow and stop draining?** `scripts/gsqueue-poll.py` answers
-   this without perturbation.
-2. **The `NSThread` started during the unwind.** If deactivation hands off to a
-   worker that then blocks, the main thread looks healthy in every trace taken so
-   far — which is exactly what we see.
-3. **The app side.** On 1.1.4 the dismissed app calls `_ResetEventPortSet` in the
+Now that it is known to be a SPIN rather than a block, the instrument problem
+inverts: a spinning guest reveals its loop immediately, and perturbation no
+longer matters because the guest does not need to make progress. The next steps,
+in order:
+
+1. **Name the loop.** Sample the PC a handful of times during the spin (the
+   guest is in one place, so a few samples suffice) or extend
+   `menubutton-step-trace.py --after-steps` to tens of thousands of steps and
+   look for the repeating cycle. The after-return walk already points at
+   CF/libobjc notification dispatch with `-[NSCFString isEqual:]` against
+   `-[NSCFArray getObjects:range:]`.
+2. **Compare with 1.1.4 at the same point.** The same walk on 1.1.4 will show
+   what it does instead, and the divergence should be visible directly.
+3. **The `NSThread` started during the unwind** may be the loop's owner rather
+   than the main thread.
+4. **The app side.** On 1.1.4 the dismissed app calls `_ResetEventPortSet` in the
    APP process; on 1.0 it never does. Neither UIKit binary imports that symbol
    and GraphicsServices has no direct branch to it, so it is reached through a
-   function pointer — break on it on 1.1.4 (a safe library address) and read the
-   caller from `lr`.
+   function pointer -- break on it on 1.1.4 (a safe library address) and read the
+   caller from `lr`. If 1.0's app never gets far enough to reset its port, the
+   spin may be SpringBoard waiting on that app in a busy loop.
