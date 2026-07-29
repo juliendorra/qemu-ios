@@ -643,7 +643,14 @@ Same pipeline, same defaults, iPhone OS **1.1.4** (`4A102`) beside **1.0**
 | **home screen** | **252 s** | **296 s** |
 | non-black, settled | 45.5% (59.04% native) | **69.4%** (73.96% native) |
 | **downloaded, cold** | **18.57 MiB** | **20.97 MiB** |
+| **warm boot** | 0 requests, **0 bytes** | 2 requests, **71 KiB** |
+| home screen, warm | — | **196 s** (100 s faster: no prefetch in the way) |
 | guest time / wall | 32.5 s / 315 s | 15.5 s / 359 s |
+
+1.1.4's warm run pulling **two** chunks rather than none is not a cache miss to
+chase: a boot does not touch exactly the same page set twice, so a couple of
+chunks outside the recorded prefetch list is the expected shape. 71 KiB against
+299.7 MiB.
 
 **1.1.4's own iBoot prints a banner and 1.0's does not**, which is worth
 remembering when a 1.0 run looks silent for two minutes — it is supposed to.
@@ -785,6 +792,60 @@ Session A found with the display: an `EM_JS` body runs on the calling thread and
 sees *that* thread's `Module`, which under `-sPROXY_TO_PTHREAD` is never the
 page's.
 
+### The sync-read hunt, in order — every attempt and what its failure LOOKED like
+
+Chunked delivery turns on one requirement: the emulator must read a chunk
+synchronously from inside QEMU's MMIO path. Five arrangements were tried before
+one worked, and the reason this took a whole evening is that **four of the five
+failed in a way that did not point at itself**.
+
+| # | attempt | how it failed | what it looked like |
+| --- | --- | --- | --- |
+| 1 | synchronous `XMLHttpRequest` on the emulator's thread | `NetworkError` on `send`, request never leaves the browser | "chunked delivery is broken" |
+| 2 | the same, with `Content-Encoding: br` removed (`serve.py --no-brotli-header`) | identical `NetworkError` | ruled the encoding out |
+| 3 | the same, service worker bypassed (`?sw=0`) | identical `NetworkError` | ruled the worker out |
+| 4 | `emscripten_fetch(EMSCRIPTEN_FETCH_SYNCHRONOUS)` | **zero bytes, no error at all** — its backend is that same XHR | "the fetch succeeded and the chunk is empty" |
+| 5 | the emulator's thread creating the fetch worker itself | fetch never completes; 30 s timeout | "the worker is broken" |
+| 6 | **the page creating the fetch worker, futex handshake** | works | — |
+
+The cause of 1-4 is one thing: **`-sEXPORT_ES6` makes Emscripten's pthread
+workers MODULE workers, and Chrome does not support synchronous XHR there.** The
+cause of 5 is a different thing: **a nested dedicated worker is serviced through
+its parent's context**, and this parent spends its life blocked in
+`Atomics.wait`.
+
+Three smaller defects were found on the way, each of which would have been hard
+to guess and trivial to see with the right probe:
+
+- **`console.error` from a pthread worker reaches nothing the page can read.**
+  Its parent is another worker, whose console goes nowhere either. A whole
+  debugging round was spent on a bare `-1` before the fetcher started returning
+  distinct codes *and* copying the exception text into a caller buffer.
+- **A worker created from a `blob:` URL cannot resolve a root-relative script
+  path**: `new Worker('/chunk-fetch-worker.js')` throws
+  `SyntaxError: '/chunk-fetch-worker.js' is not a valid URL`. Resolve against
+  `self.location.origin` — Emscripten's pthread workers are blob workers.
+- **`TextDecoder` refuses a view onto a `SharedArrayBuffer`** ("The provided
+  ArrayBufferView value must not be shared"), so reading the URL out of the
+  wasm heap needs `.slice()` (a copy), not `.subarray()`.
+
+### Measurement hygiene: three separate ways a run lied
+
+None of these were emulator bugs, and each cost more than the bug it hid.
+
+| what looked wrong | what was actually wrong |
+| --- | --- |
+| JIT counters frozen mid-boot, "the emulator hung" | the tab was **hidden**, and browsers throttle hidden pages |
+| no reports at all from a cold run, "the service worker freezes the page" | `keepalive`/`sendBeacon` share a **64 KiB in-flight quota**; the reports queued behind the chunk fetches, filled it, and were rejected into a swallowed `.catch` |
+| a chunked run reporting `first pixels` and a `nonBlackPct` it does not measure | a **server left behind by a killed run** still owned the port, so the results file belonged to the previous run — and Session A's page posts to the same endpoint |
+| a 1.1.4 run "ending" at 14 s, and a warm run at 120 s | the Chrome binary **handed off to a browser process and exited**; the runner believed it and killed a boot that was still going |
+
+Fixes, in the same order: `scripts/wasm/bench-run.py` disables the three
+throttles; periodic reports use a plain `fetch()` and **count their failures**;
+`serve.py --results-label` accepts only posts carrying the current run's label,
+`bench-run.py` refuses to start on a busy port, and a Chrome exit is only
+believed when the page has ALSO stopped reporting for 60 s.
+
 ### The tool that found it: `web/bench-b/worker-selftest.html`
 
 Three bugs in this protocol were each costing a 5-minute wasm rebuild plus two
@@ -912,6 +973,20 @@ the old link line.
   behind, the next run's bind loses silently, and **its results are written to
   the previous run's file**. `bench-run.py` now refuses to start on a busy
   port.
+
+### Costs and habits worth knowing before the next session
+
+- **A native verification boot costs ~300 MiB of scratch.** `fb-snapshot.py`
+  clones the NAND into `<logs>/stage`, and with `IT_NAND_WRITABLE=1` the clone
+  stops being a near-free APFS clone and becomes real written pages. Three of
+  them plus the chunker took the volume down to **290 MiB free** mid-run. Delete
+  `<logs>/stage` when a run is done.
+- **`chunk-pack.py` now reuses chunks already written** — the filename IS the
+  content hash — so a re-run to add a prefetch list costs a read and a hash
+  pass instead of a fresh 45-minute Brotli sweep over a 300 MiB pack.
+- **Keep `web/chunked/<BUILD>/`.** 72 MiB (1.0) and 102 MiB (1.1.4), and each
+  takes ~35-45 minutes of Brotli q11 to rebuild. Small on disk, expensive in
+  time.
 
 ### Still owed on the browser side
 

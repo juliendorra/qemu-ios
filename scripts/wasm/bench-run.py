@@ -190,8 +190,17 @@ def main() -> None:
                         print(f"  failure: {latest['failure']}", flush=True)
                         break
                 if chrome.poll() is not None:
-                    print("  chrome exited", flush=True)
-                    break
+                    # NOT necessarily the end of the run: the binary launched
+                    # here sometimes hands off to a browser process and exits,
+                    # and killing everything then throws away a boot that is
+                    # still going (one 1.1.4 run died at 14 s that way). Only
+                    # believe it if the page has also stopped reporting.
+                    stale = (time.time() - result_path.stat().st_mtime
+                             if result_path.exists() else 999)
+                    if stale > 60:
+                        print(f"  chrome exited and no report for {stale:.0f}s",
+                              flush=True)
+                        break
         finally:
             try:
                 os.killpg(os.getpgid(chrome.pid), signal.SIGTERM)

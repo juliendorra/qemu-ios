@@ -13,6 +13,37 @@ fast enough to be worth watching.**
 
 ---
 
+## Outcome (2026-07-29) — all three landed, both versions boot
+
+| | 1.0 (`1A543a`) | 1.1.4 (`4A102`) |
+| --- | --- | --- |
+| **home screen, in a browser** | **252 s** | **296 s** |
+| non-black, settled (native) | 45.5% (59.04%) | 69.4% (73.96%) |
+| **downloaded, cold cache** | **18.57 MiB** | **20.97 MiB** |
+| downloaded, warm cache | **0** | **0** |
+| raw pack | 215.2 MiB | 299.7 MiB |
+
+- **B1** — the threshold is now runtime-tunable (`/fw/jit-tune`), the 50/100/300
+  sweep is measured, and the finding is that **the threshold is not what costs
+  the time — saturating `MAX_INSTANCES` is**. The adaptive threshold (scale with
+  cap pressure) is now the DEFAULT: 252 s to the home screen with zero
+  evictions, against 290 s with 72,000 evictions and 4,557 recompiles.
+- **B2** — the seam is `it_nand_pack_record()` in
+  `hw/arm/ipod_touch_nand_pack.c`, with golden fixtures and four unit tests
+  proving mapped and chunk-backed sources agree, including on absent pages.
+- **B3** — chunker, service worker, prefetch and an in-emulator chunk cache all
+  exist and hit the measured targets. The read stays synchronous through a futex
+  handshake with a **page-owned** classic worker; the two obvious alternatives
+  are refused by Chrome, silently.
+
+Two things outside the original scope turned out to be prerequisites, and both
+are recorded in `BROWSER_WASM_STATUS.md`: a **copy-on-write overlay in RAM**
+(W6's core — a read-only NAND never reaches SpringBoard, and a file-backed one
+in MEMFS is worse) and an **in-emulator framebuffer probe**, because verifying
+through the display backend changes the timings it is supposed to measure.
+
+---
+
 ## You own these files
 
 ```

@@ -690,6 +690,36 @@ environment, clock, and harness before suspecting the port.
   directories symlink `scripts/`, so the command resolves but computes the repo
   root as the build directory and reports `native toolchain missing` — a
   misleading error pointing at an unrelated remedy. Run from the repo root.
+- **Don't fetch synchronously from the emulator's own thread.** Chrome refuses a
+  synchronous XHR from an Emscripten pthread (`-sEXPORT_ES6` makes those module
+  workers), and `emscripten_fetch(SYNCHRONOUS)` fails the same way with **zero
+  bytes and no error**. The emulator blocks on a futex; a PAGE-OWNED classic
+  worker does the fetching.
+- **Don't let the emulator create that worker.** A nested dedicated worker is
+  serviced through its parent's context, so a parent blocked in `Atomics.wait`
+  stalls its own fetcher (10 s timeout, versus 5 ms page-owned).
+- **Don't debug a worker protocol through the emulator.** `console.error` from a
+  pthread worker reaches nothing the page can read, and each guess costs a
+  5-minute rebuild plus a 2-minute boot.
+  `web/bench-b/worker-selftest.html` exercises the same handshake in a second.
+- **Don't make the NAND writable via files in a browser.** Every MEMFS syscall is
+  proxied to the main thread under `-sPROXY_TO_PTHREAD`, so the per-read
+  `stat()` becomes a cross-thread round trip and the boot stalls outright. Use
+  `overlay=ram` in `<nand>/nand-tune`.
+- **Don't verify a boot through the display backend.** `-display wasm` costs
+  enough to change the answer: kernel at 276 s with it, 118 s without, and
+  launchd not reached in 1,000 s. Use `hw/arm/ipod_touch_fb_probe.c` and
+  `-display none`.
+- **Don't use `keepalive`/`sendBeacon` for periodic telemetry.** They share a
+  64 KiB in-flight quota per origin; under congestion every later report is
+  rejected, and a swallowed `.catch` turns that into "the page froze".
+- **Don't run `fb-snapshot.py` on M68AP without `--icount 1`.** 1.1.4 panics in
+  `IOIpodUSBDevice::start` and renders nothing, which reads exactly like a
+  broken NAND. The flag exists now; the default is still off for N45AP's sake.
+- **Don't leave a killed run's server behind.** It keeps the port, the next run's
+  bind loses silently, and results land in the previous run's file — and both
+  sessions' pages post to the same endpoint. `bench-run.py` refuses a busy port
+  and `serve.py --results-label` filters foreign posts.
 - **Don't measure a browser boot in a hidden tab.** Chrome throttles
   backgrounded and occluded pages, and a throttled run looks exactly like a
   stalled one — JIT counters freeze mid-boot and nothing else says why. Use
