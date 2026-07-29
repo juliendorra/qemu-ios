@@ -126,6 +126,46 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### A3 started: the LCD now migrates, and a snapshot RESTORES a live panel
+
+First increment of the snapshot work, and the measurement that motivated it is
+now inverted:
+
+| | before | with the LCD's VMStateDescription |
+| --- | --- | --- |
+| scanout after restore | **0.003%** (dead panel) | **45.393%** (live home screen) |
+| RAM `0x0f400000` after restore | 59.03% | 59.043% |
+| state file | 57.0 MiB | 23.9 MiB |
+
+`hw/arm/ipod_touch_lcd.c` gains a `VMStateDescription` covering the register
+block, the panel/input flags and — deliberately — the **refresh timer**, because
+a restored machine whose refresh timer never fires again looks exactly like the
+dead panel this exercise is about. `post_load` forces `invalidate`, since
+`fbsection` is a mapping cached from the last scanout base and dirty tracking
+would otherwise report nothing to repaint.
+
+The restored guest is genuinely executing, not showing a frozen frame: 73 KB of
+serial, `IOMobileFramebufferUserClient::attach(AppleH1CLCD)`, and a Home press
+delivered and processed (`[BTN] keycode=35`/`163`).
+
+#### Trap: the resume serial log REPLAYS the whole boot, so it looks like a reboot
+
+This nearly cost the conclusion. `serial-resume.log` **begins with the Darwin
+kernel banner and 1500 lines of early-boot output**, which reads as "the machine
+rebooted instead of resuming" — and a reboot would invalidate everything.
+
+It did not reboot. The guest's kernel message buffer lives in RAM, and the
+restored kernel re-emits it to the UART. Two checks settle it in seconds:
+
+- the resume log's first 40 lines are **byte-identical** to the boot log's — a
+  replay, not a fresh boot;
+- the resume log **ends** with post-home-screen activity (framebuffer clients
+  attaching), where a fresh boot would end in early init.
+
+**Read the TAIL of a resume log, not the head.** And confirm with
+`query-status`, which reported `paused / running: false` — exactly what
+`-incoming file:` should give before `cont`.
+
 ### Picking up an engine fix, and making that cheap (2026-07-30)
 
 The 1.0 in-app button work landed a device-model fix (`e79971b5e9`: MBX register

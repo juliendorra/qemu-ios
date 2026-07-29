@@ -2,6 +2,7 @@
 #include "ui/pixel_ops.h"
 #include "ui/console.h"
 #include "hw/display/framebuffer.h"
+#include "migration/vmstate.h"
 #include "exec/cpu-common.h"
 #include "system/address-spaces.h"
 
@@ -601,11 +602,87 @@ static void s5l8900_lcd_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
 }
 
+/*
+ * Migration. This is the FIRST device in the machine to get a
+ * VMStateDescription, and it is first for a measured reason: with none of the
+ * 26 ipod_touch devices migratable, `migrate file:` restored guest RAM
+ * byte-identically and the panel came back BLACK -- the rendered home screen was
+ * still in RAM, but w1_framebuffer_base was zero, so the LCD scanned out
+ * nothing. Scanout 45.4% -> 0.003% across a save/restore, with all three
+ * framebuffers in RAM unchanged at 59.03%. See BROWSER_WASM_STATUS.md.
+ *
+ * What is deliberately NOT here:
+ *
+ *   sysmem, con, mt, irq   pointers into objects that realize() rebuilds; they
+ *                          are valid before the incoming state is loaded.
+ *   fbsection              a MemoryRegionSection cached from the LAST scanout
+ *                          base. Migrating it would carry a stale mapping, so
+ *                          post_load forces `invalidate` instead and the next
+ *                          refresh recomputes it from w1/w2.
+ *
+ * The refresh timer IS migrated: it is what drives the panel, and a restored
+ * machine whose refresh timer never fires again looks exactly like a dead
+ * panel -- the same symptom this whole exercise is about.
+ */
+static int s5l8900_lcd_post_load(void *opaque, int version_id)
+{
+    IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
+
+    /*
+     * Recompute the framebuffer mapping and repaint everything. The incoming
+     * scanout base may differ from whatever this freshly realized device had,
+     * and dirty tracking cannot know that: it would report nothing to repaint
+     * and the host window would keep its initial black frame.
+     */
+    s->invalidate = 1;
+    return 0;
+}
+
+static const VMStateDescription vmstate_ipod_touch_lcd = {
+    .name = "ipod-touch-lcd",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = s5l8900_lcd_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(lcd_con, IPodTouchLCDState),
+        VMSTATE_UINT32(lcd_con2, IPodTouchLCDState),
+        VMSTATE_UINT32(int_mask, IPodTouchLCDState),
+        VMSTATE_UINT32(int_status, IPodTouchLCDState),
+        VMSTATE_UINT32(wnd_con, IPodTouchLCDState),
+        VMSTATE_UINT32(vid_con0, IPodTouchLCDState),
+        VMSTATE_UINT32(vid_con1, IPodTouchLCDState),
+        VMSTATE_UINT32(vidt_con0, IPodTouchLCDState),
+        VMSTATE_UINT32(vidt_con1, IPodTouchLCDState),
+        VMSTATE_UINT32(vidt_con2, IPodTouchLCDState),
+        VMSTATE_UINT32(vidt_con3, IPodTouchLCDState),
+        VMSTATE_UINT32(w1_hspan, IPodTouchLCDState),
+        VMSTATE_UINT32(w1_framebuffer_base, IPodTouchLCDState),
+        VMSTATE_UINT32(w1_display_resolution_info, IPodTouchLCDState),
+        VMSTATE_UINT32(w1_display_depth_info, IPodTouchLCDState),
+        VMSTATE_UINT32(w1_qlen, IPodTouchLCDState),
+        VMSTATE_UINT32(w2_hspan, IPodTouchLCDState),
+        VMSTATE_UINT32(w2_framebuffer_base, IPodTouchLCDState),
+        VMSTATE_UINT32(w2_display_resolution_info, IPodTouchLCDState),
+        VMSTATE_UINT32(w2_display_depth_info, IPodTouchLCDState),
+        VMSTATE_UINT32(w2_qlen, IPodTouchLCDState),
+        VMSTATE_TIMER_PTR(refresh_timer, IPodTouchLCDState),
+        VMSTATE_BOOL(input_ready, IPodTouchLCDState),
+        VMSTATE_BOOL(input_ever_ready, IPodTouchLCDState),
+        VMSTATE_INT32(input_ready_frames, IPodTouchLCDState),
+        VMSTATE_BOOL(retained_input_wait, IPodTouchLCDState),
+        VMSTATE_BOOL(panel_off, IPodTouchLCDState),
+        VMSTATE_BOOL(retained_resume, IPodTouchLCDState),
+        VMSTATE_BOOL(relight_input_fast, IPodTouchLCDState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void s5l8900_lcd_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = s5l8900_lcd_realize;
+    dc->vmsd = &vmstate_ipod_touch_lcd;
 }
 
 static const TypeInfo ipod_touch_lcd_info = {
