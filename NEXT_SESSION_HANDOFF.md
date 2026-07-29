@@ -1189,3 +1189,93 @@ due, so a dropped edge in the model is a live possibility.
 New tools: `scripts/menubutton-step-trace.py` (step-trace + branch diff),
 `scripts/objc-method-disasm.py` (disassembly with every selector named),
 `scripts/objc-xref.py` (who sends this selector; `--list-methods`).
+
+## THE SHAPE OF THE BUG: 1.0's event machinery dies after ONE in-app press (2026-07-29)
+
+`gsevent-type-probe.py --presses N` presses HOME repeatedly, each press with its
+own recording window, and counts the menu **DOWN (type1000)** and **UP
+(type1001)** GSEvents actually delivered, per process.
+
+| configuration | DOWN | UP | per-press |
+| --- | --- | --- | --- |
+| 1.0, home screen (`--no-app`) | **10** | **10** | every press |
+| **1.0, in-app** | **1** | **1** | **press 1 only** |
+| 1.1.4, in-app | **10** | **10** | every press |
+
+The model received all 20 key edges in every one of those runs
+(`[KEYTRACE] keycode=35 x10, keycode=163 x10`), with zero retries, and the
+liveness check said the guest was running throughout the 1.0 runs.
+
+**What happens on 1.0 with an app frontmost.** Press 1 works completely:
+
+```
+  p1 | MENU-BUTTON-DOWN -> SpringBoard    -[SpringBoard menuButtonDown:] REAL HIT
+     | MENU-BUTTON-UP   -> SpringBoard    -[SpringBoard menuButtonUp:]   REAL HIT
+     | type2002         -> Preferences    (the app is told)
+  p2..p10 | ZERO GSEvents. To ANY process.
+```
+
+Presses 2-10 produce **nothing at all** -- not to SpringBoard, not to the
+foreground app, not to anyone. The whole GSEvent delivery machinery goes silent
+after the first in-app press, and it does not come back. From the home screen on
+the same build it never goes silent, and 1.1.4 in-app never goes silent.
+
+That matches the user's original report exactly -- *"once H is pressed it
+doesn't work, and touch is blocked too"* -- and it matches the older observation
+that `[MT] frame consumed` and the LCD window-base flips both stop on the line
+after the keypress. Those were not separate symptoms; they are this one.
+
+So the question is no longer "why is the button ignored" (it is not: the first
+press is delivered and handled end to end). It is **what the first in-app press
+breaks such that no process receives another GSEvent.**
+
+### RETRACTED: "the DOWN event is rarely delivered"
+
+That lead came from a run showing a strict UP/DOWN/UP/DOWN alternation, one
+event per press. It was an artifact of the instrument, and the mechanism is
+worth knowing because it is silent and it will bite again:
+
+```c
+/* ui/input.c, qmp_input_send_event() */
+if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+    error_setg(errp, "VM not running");
+    return;
+}
+```
+
+**QMP `input-send-event` REFUSES the event outright whenever the VM is
+stopped** -- and a probe's `QMP.cmd` does not look at the reply, so the refusal
+is invisible. A breakpoint landing inside the 150 ms key hold therefore
+swallows the RELEASE. Measured: **10 downs but only 5 ups** reached
+`ipod_touch_key_event` under gdb, against **10/10** with `--no-gdb`.
+
+Fixed in `gsevent-type-probe.py`: `key_edge()` checks the QMP reply, and on
+refusal services (and records) the pending breakpoint, resumes, and retries; the
+report prints the retry count per press, and `--no-gdb` is a first-class control
+that presses without any breakpoints and only counts `[KEYTRACE]` edges.
+
+**Rule this generalises to:** any harness that drives input over QMP while
+holding the guest under gdb must check the QMP reply. Silence from the guest is
+otherwise indistinguishable from input that was never delivered.
+
+### Where to look next
+
+Something the first in-app press does wedges event delivery process-wide. The
+candidates, in the order the evidence favours:
+
+* **The purple/system event port itself.** Delivery stops for EVERY process at
+  once, which points at the shared mechanism rather than at SpringBoard's
+  runloop -- though a wedged SpringBoard could stop pumping a port others wait
+  on. `_GSGetPurpleSystemEventPort` / `_ResetEventPortSet` are the anchors, and
+  this time the question is about the port's state AFTER a press, not about
+  routing.
+* **`-[SBUIController clickedMenuButton]`** (1.0: `0xd794`), which press 1 does
+  reach: it runs the app-teardown path, and it is the last thing that runs
+  before the silence. Trace it with
+  `menubutton-step-trace.py --board m68ap-10 --only-up --trace-sel clickedMenuButton`
+  -- but note the press that reaches it is the FIRST one, so arm before pressing.
+* **Whether the kernel still posts.** If the GPIO IRQ is still raised and ACKed
+  on presses 2-10 (it was, for a single press, byte-identical to 1.1.4) but no
+  GSEvent appears, the break is between the kernel HID path and the event port.
+  `IT_SYSIC_TRACE=1` plus this probe in one run answers that; mind that the
+  SYSIC trace suppresses a register after its 8th access.

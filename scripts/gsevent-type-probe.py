@@ -40,10 +40,16 @@ investigation has produced SILENCE rather than an error:
     running -- a wedged RSP session leaves the vCPU stopped, which reads exactly
     like "no events".
 
+`--presses N` presses repeatedly and counts the menu DOWN (type1000) and UP
+(type1001) events delivered per press. Measured 2026-07-29, 10 presses each:
+1.0 home screen 10/10, 1.1.4 in-app 10/10, but **1.0 IN-APP 1/1** -- press 1 is
+delivered and handled end to end, and then NO process receives another GSEvent
+at all. See NEXT_SESSION_HANDOFF.md.
+
 Usage:
-  scripts/gsevent-type-probe.py --board m68ap-10
-  scripts/gsevent-type-probe.py --board m68ap-10  --no-app     # the control
-  scripts/gsevent-type-probe.py --board m68ap-114             # known-good
+  scripts/gsevent-type-probe.py --board m68ap-10 --presses 10
+  scripts/gsevent-type-probe.py --board m68ap-10 --no-app --presses 10
+  scripts/gsevent-type-probe.py --board m68ap-10 --no-gdb --presses 10  # control
 """
 from __future__ import annotations
 
@@ -91,6 +97,7 @@ TYPE_NAMES = {
     1: "LeftMouseDown", 2: "LeftMouseUp", 3: "RightMouseDown",
     4: "RightMouseUp", 5: "MouseMoved", 6: "LeftMouseDragged",
     10: "KeyDown", 11: "KeyUp",
+    1000: "MENU-BUTTON-DOWN", 1001: "MENU-BUTTON-UP",
 }
 
 
@@ -212,6 +219,18 @@ def main() -> int:
     ap.add_argument("--wait", type=float, default=60,
                     help="seconds of event traffic to record after the press")
     ap.add_argument("--max-hits", type=int, default=4000)
+    ap.add_argument("--presses", type=int, default=1,
+                    help="how many HOME presses to make, each with its own "
+                         "recording window -- the menu DOWN/UP delivery count")
+    ap.add_argument("--press-interval", type=float, default=6,
+                    help="seconds of recording after each press")
+    ap.add_argument("--no-gdb", action="store_true",
+                    help="CONTROL: skip the gdbstub entirely and only count "
+                         "[KEYTRACE] edges. Stopping the vCPU at a breakpoint "
+                         "can itself lose a key edge (virtual time does not "
+                         "advance while the guest is stopped, and this session "
+                         "runs under -icount), so a dropped release must be "
+                         "reproduced WITHOUT gdb before it means anything.")
     ap.add_argument("--no-app", action="store_true",
                     help="press HOME from the home screen -- the control that "
                          "is known to reach SpringBoard's handler on 1.0")
@@ -318,6 +337,25 @@ def main() -> int:
             btn.tap(q, *icon, 0.12)
             time.sleep(args.settle)
 
+        if args.no_gdb:
+            print(f"CONTROL run: no gdbstub. {args.presses} presses ...")
+            for i in range(args.presses):
+                btn.key(q, "h")
+                time.sleep(args.press_interval)
+            log = logp.read_bytes().decode("utf8", "replace")
+            keys = [l for l in log.splitlines() if "[KEYTRACE]" in l]
+            n_dn = sum(1 for l in keys if "keycode=35 " in l)
+            n_upk = sum(1 for l in keys if "keycode=163 " in l)
+            print(f"\n=== {args.board} "
+                  f"{'--no-app' if args.no_app else 'in-app'}, NO GDB ===")
+            print(f"  the MODEL saw: keycode=35 (down) x{n_dn}, "
+                  f"keycode=163 (up) x{n_upk}, for {args.presses} presses")
+            print("  => edges are dropped WITHOUT gdb too" if
+                  (n_dn != args.presses or n_upk != args.presses) else
+                  "  => every edge arrives; the losses seen under gdb are the "
+                  "INSTRUMENT")
+            return 0
+
         print(f"attaching gdbstub on :{args.gdb_port} ...")
         g = brk.Gdb(args.gdb_port)
         for addr, name in bps.items():
@@ -335,61 +373,64 @@ def main() -> int:
                 g.cont()
                 state["stopped"] = False
 
+        def service(phase):
+            """Record the stop we are sitting on, then step off and resume."""
+            rc_ = g.regs()
+            if not rc_:
+                go()
+                return
+            w, _cpsr = rc_
+            pc = w[15]
+            which = bps.get(pc, bps.get(pc | 1, f"?{pc:#x}"))
+            rec = {"t": round(time.time() - t0, 2), "phase": phase,
+                   "at": which, "pc": pc}
+            # WHICH PROCESS -- on every hit, not just event hits. The
+            # SpringBoard handler breakpoints sit at 0x6ae0/0x6bd8, and
+            # EVERY main executable in this OS links its __TEXT at 0x1000,
+            # so those addresses exist in every process and a hit is not by
+            # itself proof that SpringBoard ran.
+            hdr = g.mem(EXEC_BASE, 0x40)
+            rec["proc"] = fps.get(hdr, "?" if hdr else "??")
+            if which == "event":
+                ev = w[8]
+                blk = g.mem(ev, 0x40)
+                if blk and len(blk) >= 0x3C:
+                    t8, = struct.unpack_from("<I", blk, 8)
+                    sub, = struct.unpack_from("<I", blk, 0x38)
+                    rec.update(ev=ev, raw=t8, sub=sub,
+                               type=gs_type(t8, sub))
+            else:
+                rec["lr"] = w[14]
+                rec["lr_in"] = brk.whose(w[14], libs)
+                # Is the code at this address actually SpringBoard's?
+                code = g.mem(pc, 16)
+                rec["real"] = bool(code and code == sb_code.get(pc))
+                # The handler's own early-return gate. Both builds open with
+                #   ldrsb r3, [self, #0x40]   (1.1.4: #0x44)
+                #   cmp r3, #0 ; movne/strbne/popne
+                # so a NON-ZERO byte there means the press is swallowed
+                # before any of the SBSyncController checks are reached.
+                rec["self"] = w[0]
+                blk = g.mem(w[0], 0x48)
+                if blk and len(blk) >= 0x45:
+                    rec["ivar40"] = blk[0x40]
+                    rec["ivar44"] = blk[0x44]
+            records.append(rec)
+            # Step off the breakpoint before continuing, or it re-traps.
+            g.del_break(pc)
+            g.step()
+            g.set_break(pc)
+            go()
+
         def drain(seconds, phase):
             """Run the guest, recording every breakpoint hit, for `seconds`."""
             end = time.time() + seconds
             go()
             while time.time() < end and len(records) < args.max_hits:
-                stop = g.wait_stop(max(0.2, min(2.0, end - time.time())))
-                if stop is None:
+                if g.wait_stop(max(0.2, min(2.0, end - time.time()))) is None:
                     continue
                 state["stopped"] = True
-                rc_ = g.regs()
-                if not rc_:
-                    go()
-                    continue
-                w, _cpsr = rc_
-                pc = w[15]
-                which = bps.get(pc, bps.get(pc | 1, f"?{pc:#x}"))
-                rec = {"t": round(time.time() - t0, 2), "phase": phase,
-                       "at": which, "pc": pc}
-                # WHICH PROCESS -- on every hit, not just event hits. The
-                # SpringBoard handler breakpoints sit at 0x6ae0/0x6bd8, and
-                # EVERY main executable in this OS links its __TEXT at 0x1000,
-                # so those addresses exist in every process and a hit is not by
-                # itself proof that SpringBoard ran.
-                hdr = g.mem(EXEC_BASE, 0x40)
-                rec["proc"] = fps.get(hdr, "?" if hdr else "??")
-                if which == "event":
-                    ev = w[8]
-                    blk = g.mem(ev, 0x40)
-                    if blk and len(blk) >= 0x3C:
-                        t8, = struct.unpack_from("<I", blk, 8)
-                        sub, = struct.unpack_from("<I", blk, 0x38)
-                        rec.update(ev=ev, raw=t8, sub=sub,
-                                   type=gs_type(t8, sub))
-                else:
-                    rec["lr"] = w[14]
-                    rec["lr_in"] = brk.whose(w[14], libs)
-                    # Is the code at this address actually SpringBoard's?
-                    code = g.mem(pc, 16)
-                    rec["real"] = bool(code and code == sb_code.get(pc))
-                    # The handler's own early-return gate. Both builds open with
-                    #   ldrsb r3, [self, #0x40]   (1.1.4: #0x44)
-                    #   cmp r3, #0 ; movne/strbne/popne
-                    # so a NON-ZERO byte there means the press is swallowed
-                    # before any of the SBSyncController checks are reached.
-                    rec["self"] = w[0]
-                    blk = g.mem(w[0], 0x48)
-                    if blk and len(blk) >= 0x45:
-                        rec["ivar40"] = blk[0x40]
-                        rec["ivar44"] = blk[0x44]
-                records.append(rec)
-                # Step off the breakpoint before continuing, or it re-traps.
-                g.del_break(pc)
-                g.step()
-                g.set_break(pc)
-                go()
+                service(phase)
             # Leave the guest running.
             go()
             # LIVENESS. A wedged RSP session leaves the vCPU stopped, and a
@@ -417,21 +458,100 @@ def main() -> int:
         n_before = len(records)
         print(f"  {n_before} hits, guest running: {live_before}")
 
-        print("pressing HOME ...")
-        btn.key(q, "h")
-        press_t = round(time.time() - t0, 2)
-        live_after = drain(args.wait, "after")
-        print(f"  {len(records) - n_before} hits after the press, "
+        def key_edge(down, phase, tries=40):
+            """Send ONE key edge, and make sure the model actually gets it.
+
+            `qmp_input_send_event` REFUSES the event outright while the VM is
+            not running ("VM not running", ui/input.c), and QMP.cmd does not
+            look at the reply -- so a breakpoint landing inside the 150 ms hold
+            silently swallows the RELEASE. Measured: 10 downs but only 5 ups
+            reached ipod_touch_key_event under gdb, against 10/10 with no gdb.
+            That alone produced a fake "the DOWN event is rarely delivered"
+            result, so this retries until the edge is accepted, servicing (and
+            RECORDING) any breakpoint that is in the way.
+            """
+            for n in range(tries):
+                go()
+                r = q.cmd("input-send-event", {"events": [
+                    {"type": "key", "data": {"down": down, "key": {
+                        "type": "qcode", "data": "h"}}}]})
+                if "error" not in r:
+                    return n
+                # Refused: the guest is stopped at a breakpoint. Deal with it.
+                if g.wait_stop(0.5) is not None:
+                    state["stopped"] = True
+                    service(phase)
+                else:
+                    state["stopped"] = True      # stopped, but nothing pending
+                    go()
+                time.sleep(0.02)
+            print(f"  !! key edge down={down} NEVER accepted -- run is INVALID")
+            return -1
+
+        def press(phase, hold=0.15):
+            a = key_edge(True, phase)
+            end = time.time() + hold
+            while time.time() < end:          # keep recording during the hold
+                if g.wait_stop(end - time.time()) is not None:
+                    state["stopped"] = True
+                    service(phase)
+            b = key_edge(False, phase)
+            return a, b
+
+        press_times = []
+        live_after = True
+        retries = []
+        for i in range(args.presses):
+            print(f"pressing HOME ({i + 1}/{args.presses}) ...")
+            retries.append(press(f"p{i + 1}"))
+            press_times.append(round(time.time() - t0, 2))
+            live_after = drain(args.press_interval, f"p{i + 1}") and live_after
+        n_pressed = len(records) - n_before
+        if args.wait:
+            live_after = drain(args.wait, "after") and live_after
+        print(f"  {len(records) - n_before} hits after the presses "
+              f"({n_pressed} within the press windows), "
               f"guest running: {live_after}")
 
         (args.logs / "events.json").write_text(json.dumps(
-            {"board": args.board, "no_app": args.no_app, "press_t": press_t,
+            {"board": args.board, "no_app": args.no_app,
+             "press_times": press_times,
              "live_before": live_before, "live_after": live_after,
              "records": records}, indent=1))
 
-        # ---- report -------------------------------------------------------
-        print(f"\n=== {args.board} {'--no-app' if args.no_app else 'in-app'} ===")
-        for phase in ("before", "after"):
+        # ---- the menu-button delivery count -------------------------------
+        # THE question this mode exists for: SpringBoard must receive a DOWN
+        # (type1000) and an UP (type1001) for each press. `menuButtonUp:` gates
+        # on `_menuButtonTimer`, which only `menuButtonDown:` sets -- so a
+        # missing DOWN silently swallows the press.
+        press_phases = [f"p{i + 1}" for i in range(args.presses)]
+        sb_ev = [r for r in records if r["at"] == "event"
+                 and r.get("proc") == "SpringBoard"]
+        print(f"\n=== {args.board} {'--no-app' if args.no_app else 'in-app'}: "
+              f"{args.presses} presses ===")
+        print("\n  press | DOWN(1000) | UP(1001) | other types to SpringBoard")
+        n_down = n_up = 0
+        for ph in press_phases:
+            evs = [r for r in sb_ev if r["phase"] == ph]
+            d = sum(1 for r in evs if r.get("type") == 1000)
+            u = sum(1 for r in evs if r.get("type") == 1001)
+            other = sorted({r.get("type") for r in evs} - {1000, 1001})
+            n_down += d
+            n_up += u
+            print(f"   {ph:>4} |     {d:^6} |   {u:^4} | {other}")
+        bad = [r for r in retries if -1 in r]
+        print(f"\n  key edges: retries per press (down, up) = {retries}")
+        if bad:
+            print(f"  !! {len(bad)} press(es) had an edge that was never "
+                  f"accepted -- those rows are INVALID")
+        print(f"\n  TOTAL over {args.presses} presses:  "
+              f"DOWN(type1000) = {n_down}   UP(type1001) = {n_up}")
+        if n_up and not n_down:
+            print("  => the DOWN event is NEVER delivered: _menuButtonTimer can "
+                  "never be set,\n     so every UP is swallowed at the "
+                  "`_menuButtonTimer == nil` gate.")
+
+        for phase in ("before",) + tuple(press_phases) + ("after",):
             c = Counter((r.get("proc", "-"), r.get("type"))
                         for r in records if r["phase"] == phase
                         and r["at"] == "event")
@@ -451,15 +571,21 @@ def main() -> int:
                   f"[{h['phase']}] in {h.get('proc')}  {h['at']}  "
                   f"lr={h.get('lr', 0):#x} {h.get('lr_in', '')}{gate}")
         new = {(r.get("proc"), r.get("type")) for r in records
-               if r["phase"] == "after" and r["at"] == "event"} - \
+               if r["phase"] != "before" and r["at"] == "event"} - \
               {(r.get("proc"), r.get("type")) for r in records
                if r["phase"] == "before" and r["at"] == "event"}
-        print(f"\n  (process, type) pairs seen ONLY after the press: "
+        print(f"\n  (process, type) pairs seen ONLY after a press: "
               f"{sorted(str(x) for x in new)}")
         # The control: did the press reach the hardware model at all?
         log = logp.read_bytes().decode("utf8", "replace")
         keys = [l for l in log.splitlines() if "[KEYTRACE]" in l]
-        print(f"\n  [KEYTRACE] lines (the press reaching the model): {len(keys)}")
+        n_dn = sum(1 for l in keys if "keycode=35 " in l)
+        n_upk = sum(1 for l in keys if "keycode=163 " in l)
+        print(f"\n  [KEYTRACE] the MODEL saw: keycode=35 (down) x{n_dn}, "
+              f"keycode=163 (up) x{n_upk}, for {args.presses} presses")
+        if n_dn != args.presses or n_upk != args.presses:
+            print("  !! the model itself dropped an edge -- the guest cannot be "
+                  "blamed for what\n     ipod_touch_key_event never saw")
         for l in keys[-4:]:
             print(f"    {l.strip()}")
         if not keys:
