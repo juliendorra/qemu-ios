@@ -49,6 +49,10 @@ tests = {
   'test-interval-tree': [],
   'test-fifo': [],
   'test-envlist': [],
+  # The browser port's pack-access seam: mapped file vs chunk cache. The
+  # source deliberately has no device-model dependencies so it can be linked
+  # here directly (BROWSER_WASM_SESSION_B.md, B2).
+  'test-nand-pack': ['../../hw/arm/ipod_touch_nand_pack.c'],
 }
 
 if have_system or have_tools

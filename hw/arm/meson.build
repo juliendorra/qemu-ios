@@ -20,6 +20,8 @@ arm_ss.add(when: 'CONFIG_IPOD_TOUCH', if_true: [files(
   'ipod_touch_mv8686.c',
   'ipod_touch_nand.c',
   'ipod_touch_nand_ecc.c',
+  'ipod_touch_nand_pack.c',
+  'ipod_touch_nand_chunks.c',
   'ipod_touch_pcf50633_pmu.c',
   'ipod_touch_sdio.c',
   'ipod_touch_sha1.c',

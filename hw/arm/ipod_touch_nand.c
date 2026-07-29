@@ -4,9 +4,8 @@
 #include "trace.h"
 
 #define NAND_PACK_FILENAME "nand.pack"
-#define NAND_PACK_MAGIC "IPODNAND"
-#define NAND_PACK_VERSION 1
-#define NAND_PACK_HEADER_SIZE 20
+/* Header + index only, no payload: what a chunk-backed source needs up front. */
+#define NAND_PACK_INDEX_FILENAME "nand.pack.idx"
 
 static int get_bank(ITNandState *s) {
     uint32_t bank_bitmap = (s->fmctrl0 >> 1) & 0xFF;
@@ -91,62 +90,83 @@ static bool nand_writable(void)
     return cached;
 }
 
+/*
+ * A browser build serves records from a chunk cache instead of a mapped file
+ * (BROWSER_WASM_SESSION_B.md, B2/B3). Installing a source here before machine
+ * init makes nand_open_pack() map the small INDEX file -- header plus one u32
+ * per page, 428 KiB for iPhone OS 1.0 -- rather than the 215 MiB pack, and
+ * route every record through the chunk fetcher.
+ *
+ * Native installs nothing and keeps the mapped-file path, which stays the
+ * correctness oracle; tests/unit/test-nand-pack.c proves the two agree.
+ */
+static struct {
+    uint32_t pages_per_chunk;
+    ITNandChunkFetch fetch;
+    void *opaque;
+} nand_chunk_source;
+
+void it_nand_set_chunk_source(uint32_t pages_per_chunk, ITNandChunkFetch fetch,
+                              void *opaque)
+{
+    nand_chunk_source.pages_per_chunk = pages_per_chunk;
+    nand_chunk_source.fetch = fetch;
+    nand_chunk_source.opaque = opaque;
+}
+
 static void nand_open_pack(ITNandState *s)
 {
     char filename[PATH_MAX];
     const uint8_t *contents;
-    uint32_t version;
-    uint32_t page_size;
-    uint32_t entry_count;
-    uint64_t expected_size;
+    bool chunked;
     gsize length;
-    GError *error = NULL;
+    GError *gerror = NULL;
+    Error *error = NULL;
 
     if (s->pack_checked) {
         return;
     }
     s->pack_checked = true;
+
+    /*
+     * A chunked NAND directory has no nand.pack at all -- that is the whole
+     * point -- so the presence of the small index file plus a chunk config is
+     * what selects the browser path. Nothing to configure, and a native tree
+     * (which has the pack and no chunk config) can never take it by accident.
+     */
+#ifdef EMSCRIPTEN
+    it_nand_chunks_init(s->nand_path);
+#endif
+    chunked = nand_chunk_source.fetch != NULL;
+
     g_snprintf(filename, sizeof(filename), "%s/%s", s->nand_path,
-               NAND_PACK_FILENAME);
-    s->pack_file = g_mapped_file_new(filename, false, &error);
+               chunked ? NAND_PACK_INDEX_FILENAME : NAND_PACK_FILENAME);
+    s->pack_file = g_mapped_file_new(filename, false, &gerror);
     if (s->pack_file == NULL) {
-        if (error == NULL) {
+        if (gerror == NULL) {
             hw_error("Unable to map NAND pack %s", filename);
         }
-        if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+        if (!g_error_matches(gerror, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
             hw_error("Unable to map NAND pack %s: %s", filename,
-                     error->message);
+                     gerror->message);
         }
-        g_clear_error(&error);
+        g_clear_error(&gerror);
         return;
     }
 
     contents = (const uint8_t *)g_mapped_file_get_contents(s->pack_file);
     length = g_mapped_file_get_length(s->pack_file);
-    if (length < NAND_PACK_HEADER_SIZE ||
-        memcmp(contents, NAND_PACK_MAGIC, 8) != 0) {
-        hw_error("Invalid NAND pack header in %s", filename);
-    }
-    version = ldl_le_p(contents + 8);
-    page_size = ldl_le_p(contents + 12);
-    entry_count = ldl_le_p(contents + 16);
-    expected_size = NAND_PACK_HEADER_SIZE + (uint64_t)entry_count * 4 +
-                    (uint64_t)entry_count *
-                    (NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE);
-    if (version != NAND_PACK_VERSION ||
-        page_size != NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE ||
-        expected_size != length) {
-        hw_error("Unsupported or truncated NAND pack %s", filename);
-    }
 
-    s->pack_entry_count = entry_count;
-    s->pack_entries = contents + NAND_PACK_HEADER_SIZE;
-    s->pack_data = s->pack_entries + (uint64_t)entry_count * 4;
-    for (uint32_t index = 1; index < entry_count; index++) {
-        if (ldl_le_p(s->pack_entries + (index - 1) * 4) >=
-            ldl_le_p(s->pack_entries + index * 4)) {
-            hw_error("Unsorted or duplicate NAND pack index in %s", filename);
-        }
+    if (chunked
+        ? !it_nand_pack_open_chunked(&s->pack, contents, length,
+                                     NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE,
+                                     nand_chunk_source.pages_per_chunk,
+                                     nand_chunk_source.fetch,
+                                     nand_chunk_source.opaque, &error)
+        : !it_nand_pack_open_mapped(&s->pack, contents, length,
+                                    NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE,
+                                    &error)) {
+        hw_error("%s: %s", filename, error_get_pretty(error));
     }
 }
 
@@ -154,34 +174,16 @@ static bool nand_read_packed_page(ITNandState *s, uint32_t bank,
                                   uint32_t page)
 {
     uint32_t vpn = page * NAND_NUM_BANKS + bank;
-    uint32_t low = 0;
-    uint32_t high;
+    const uint8_t *record;
 
     nand_open_pack(s);
-    high = s->pack_entry_count;
-    while (low < high) {
-        uint32_t middle = low + (high - low) / 2;
-        uint32_t candidate = ldl_le_p(s->pack_entries + middle * 4);
-
-        if (candidate < vpn) {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    if (low == s->pack_entry_count ||
-        ldl_le_p(s->pack_entries + low * 4) != vpn) {
+    record = it_nand_pack_record(&s->pack, vpn);
+    if (record == NULL) {
         return false;
     }
 
-    memcpy(s->page_buffer,
-           s->pack_data + (uint64_t)low *
-           (NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE),
-           NAND_BYTES_PER_PAGE);
-    memcpy(s->page_spare_buffer,
-           s->pack_data + (uint64_t)low *
-           (NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE) +
-           NAND_BYTES_PER_PAGE,
+    memcpy(s->page_buffer, record, NAND_BYTES_PER_PAGE);
+    memcpy(s->page_spare_buffer, record + NAND_BYTES_PER_PAGE,
            NAND_BYTES_PER_SPARE);
     return true;
 }

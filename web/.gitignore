@@ -17,3 +17,15 @@ node_modules/
 /public/*/nand.pack
 /public/*/qemu-system-arm.js
 /public/*/qemu-system-arm.wasm
+
+# Session B's bench harness (web/bench-b/index.html) is SOURCE; the firmware
+# and emulator symlinked beside it are not, same rule as public/*.
+/bench-b/bootrom
+/bench-b/iboot.bin
+/bench-b/nor.bin
+/bench-b/qemu-system-arm.js
+/bench-b/qemu-system-arm.wasm
+
+# Chunked NAND asset sets: produced by scripts/wasm/chunk-pack.py, ~64 MiB per
+# firmware version.
+/chunked/

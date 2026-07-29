@@ -1,0 +1,232 @@
+<!-- Session B's measurement harness: one page, two experiments.
+
+     B1  JIT tuning. ?instantiate=50|100|300 (and ?max=<n>) is written into
+         /fw/jit-tune, which tcg/wasm64.c reads at startup -- so a sweep is
+         three page loads, not three 20-minute wasm rebuilds. The page shows
+         the [JIT] counters (compiled/recompiled/evicted/live) next to the
+         landmark times, because a landmark time without the counters cannot
+         tell "compiled more" from "thrashed more".
+
+     B2/B3  Chunked delivery. ?mode=chunked stages only the pack INDEX and
+         lets the emulator demand-fault 130,944-byte chunks through the
+         service worker; ?mode=pack stages the whole 215.6 MiB pack, which is
+         the thing being replaced. The byte counter comes from the SERVER
+         (/__chunk-stats), so the page cannot flatter itself.
+
+     Serve with scripts/wasm/serve.py --port 8011 (COOP/COEP required) and
+     open /bench-b/. Session A owns web/public/*; nothing here touches it. -->
+<title>iPhone OS 1.0 — Session B bench</title>
+<style>
+  body { font: 13px ui-monospace, Menlo, monospace; margin: 0; padding: 1rem;
+         background: #14161a; color: #d7dae0; }
+  h1 { font-size: 14px; margin: 0 0 .75rem; color: #9aa4b2; font-weight: 600; }
+  .card { padding: .5rem .75rem; border-radius: 4px; background: #22262e;
+          margin-bottom: .5rem; white-space: pre; }
+  #marks { background: #1b1f26; color: #8fd694; }
+  #jit { background: #1b1f26; color: #d6c48f; }
+  #net { background: #1b1f26; color: #8fb8d6; }
+  .ok   { border-left: 3px solid #4ac26b; }
+  .fail { border-left: 3px solid #e5534b; }
+  #log { white-space: pre-wrap; line-height: 1.4; }
+  .err { color: #e5a3a0; }
+</style>
+<h1>iPhone OS 1.0 (1A543a) — WebAssembly JIT bench</h1>
+<div class="card" id="state">loading…</div>
+<div class="card" id="marks">(no landmarks yet)</div>
+<div class="card" id="jit">(no JIT stats yet)</div>
+<div class="card" id="net">(no chunk stats yet)</div>
+<div id="log"></div>
+<script type="module">
+  import { registerChunkWorker, loadManifest, stageChunkedNand, prefetchBootSet,
+           chunkStats, postToChunkWorker }
+    from '../src/emulator/chunk-loader.js';
+
+  const params = new URLSearchParams(location.search);
+  const INSTANTIATE = params.get('instantiate') || '100';
+  const MAX_INSTANCES = params.get('max') || '48000';
+  const MODE = params.get('mode') || 'pack';         // pack | chunked
+  const CHUNK_BASE = params.get('chunks') || '/chunked/1A543a/';
+  const PREFETCH = params.get('prefetch') !== '0';
+  const COLD = params.get('cold') === '1';           // drop the chunk cache
+
+  const logEl = document.getElementById('log');
+  const stateEl = document.getElementById('state');
+  const marksEl = document.getElementById('marks');
+  const jitEl = document.getElementById('jit');
+  const netEl = document.getElementById('net');
+  const t0 = performance.now();
+  const at = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(7);
+
+  const LANDMARKS = [
+    ['iBoot banner',   t => t.includes('BUILD_TAG')],
+    ['kernel',         t => t.includes('Darwin Kernel Version')],
+    ['BSD root',       t => t.includes('BSD root:')],
+    ['launchd',        t => t.includes('BOOT_TIME')],
+    ['SpringBoard',    t => t.includes('SpringBoard')],
+  ];
+  const hit = new Map();
+  let fsRef = null;
+  let serialSeen = 0;
+  let lastJit = '';
+
+  const renderMarks = () => {
+    marksEl.textContent =
+      `instantiate=${INSTANTIATE} max=${MAX_INSTANCES} mode=${MODE}\n` +
+      LANDMARKS.map(([name]) =>
+        `${hit.has(name) ? hit.get(name).padStart(8) : '       —'}  ${name}`)
+      .join('\n');
+  };
+  renderMarks();
+
+  const state = (text, cls) => {
+    stateEl.textContent = text;
+    stateEl.className = `card ${cls || ''}`;
+  };
+
+  function line(text, cls) {
+    const el = document.createElement('div');
+    if (cls) el.className = cls;
+    el.textContent = `[${at()}s] ${text}`;
+    logEl.appendChild(el);
+    if (logEl.childElementCount > 400) logEl.firstElementChild.remove();
+  }
+
+  function note(text) {
+    // The JIT counters are the measurement; keep the latest visible rather
+    // than scrolling them away in the log.
+    if (text.startsWith('[JIT]') || text.startsWith('[NANDCHUNK]')) {
+      lastJit = `${lastJit.split('\n').filter(l => !l.startsWith(text.slice(0, 6)))
+                        .join('\n')}\n${at()}s ${text}`.trim();
+      jitEl.textContent = lastJit;
+    }
+    for (const [name, test] of LANDMARKS) {
+      if (!hit.has(name) && test(text)) {
+        hit.set(name, at());
+        renderMarks();
+        if (name === 'SpringBoard') state('SpringBoard reached', 'ok');
+      }
+    }
+    if (/panic\(|kernel abort|hardware error/.test(text)) {
+      state(`guest failure: ${text.slice(0, 120)}`, 'fail');
+    }
+  }
+
+  addEventListener('error', (e) => {
+    state(`emulator failure: ${String(e.message).slice(0, 140)}`, 'fail');
+    line(`window error: ${e.message}`, 'err');
+  });
+
+  setInterval(() => {
+    if (!fsRef) return;
+    let data;
+    try {
+      data = fsRef.readFile('/fw/serial.log', { encoding: 'utf8' });
+    } catch (e) { return; }
+    if (data.length <= serialSeen) return;
+    const fresh = data.slice(serialSeen);
+    serialSeen = data.length;
+    for (const text of fresh.split('\n')) {
+      if (text.trim()) { note(text); line(text); }
+    }
+  }, 1000);
+
+  // Server-side byte count: what actually crossed the wire, cold or warm.
+  async function serverBytes() {
+    try {
+      const r = await fetch('/__chunk-stats', { cache: 'no-store' });
+      return await r.json();
+    } catch (e) { return null; }
+  }
+  setInterval(async () => {
+    const server = await serverBytes();
+    const sw = await chunkStats().catch(() => null);
+    const mib = (n) => (n / 1048576).toFixed(2);
+    netEl.textContent =
+      `server: ${server ? `${server.requests} chunk requests, ` +
+        `${mib(server.bytes)} MiB on the wire` : 'n/a'}\n` +
+      `worker: ${sw ? `${sw.hits} cache hits, ${sw.misses} misses, ` +
+        `${mib(sw.bytesFromNetwork)} MiB fetched` : 'n/a'}`;
+  }, 2000);
+
+  const { default: Module } = await import('./qemu-system-arm.js');
+
+  let manifest = null;
+  if (MODE === 'chunked') {
+    state('registering service worker…');
+    await registerChunkWorker('/sw.js');
+    if (COLD) {
+      postToChunkWorker('clear-cache');
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    postToChunkWorker('reset-stats');
+    await fetch('/__chunk-stats/reset').catch(() => {});
+    manifest = await loadManifest(CHUNK_BASE);
+    line(`manifest: ${manifest.chunks} chunks of ${manifest.pagesPerChunk} ` +
+         `pages, prefetch ${manifest.prefetch.length} chunks = ` +
+         `${(manifest.prefetchBytes / 1048576).toFixed(1)} MiB`);
+  }
+
+  await Module({
+    arguments: [
+      '-M', 'iPhone-2G,bootrom=/fw/bootrom,iboot=/fw/iboot.bin,' +
+            'nand=/fw/nand,epoch=0',
+      '-m', '1G',
+      '-pflash', '/fw/nor.bin',
+      '-display', 'none',
+      '-serial', 'file:/fw/serial.log',
+      // Non-negotiable: at anything slower the guest takes timeout paths and
+      // panics, natively as well as here.
+      '-icount', 'shift=1',
+    ],
+    preRun: [async (mod) => {
+      fsRef = mod.FS;
+      globalThis.__fs = mod.FS;
+      mod.FS.mkdir('/fw');
+
+      // tcg/wasm64.c reads this: a browser cannot set an environment
+      // variable, but it can write a file before startup.
+      mod.FS.writeFile('/fw/jit-tune',
+        `instantiate=${INSTANTIATE}\nmax_instances=${MAX_INSTANCES}\n`);
+
+      let staged = 0;
+      for (const [dst, src] of [['/fw/bootrom', 'bootrom'],
+                                ['/fw/iboot.bin', 'iboot.bin'],
+                                ['/fw/nor.bin', 'nor.bin']]) {
+        state(`downloading ${src}…`);
+        const data = new Uint8Array(await (await fetch(src)).arrayBuffer());
+        mod.FS.writeFile(dst, data);
+        staged += data.length;
+      }
+
+      if (MODE === 'chunked') {
+        state('staging the pack index…');
+        staged += await stageChunkedNand(mod.FS, manifest);
+        if (PREFETCH) {
+          state('prefetching the boot working set…');
+          const done = await prefetchBootSet(manifest, {
+            onProgress: (m) => state(
+              `prefetch ${m.done}/${m.total} chunks ` +
+              `(${(m.stats.bytesFromNetwork / 1048576).toFixed(1)} MiB)`),
+          });
+          line(`prefetch complete in ${done.seconds.toFixed(1)}s, ` +
+               `${(done.stats.bytesFromNetwork / 1048576).toFixed(2)} MiB`);
+        }
+      } else {
+        mod.FS.mkdir('/fw/nand');
+        for (let b = 0; b < 8; b++) mod.FS.mkdir(`/fw/nand/bank${b}`);
+        state('downloading nand.pack (215.6 MiB)…');
+        const data = new Uint8Array(
+          await (await fetch('/public/jit-boot/nand.pack')).arrayBuffer());
+        mod.FS.writeFile('/fw/nand/nand.pack', data);
+        staged += data.length;
+      }
+      state(`booting — ${(staged / 1048576).toFixed(1)} MiB staged`);
+    }],
+    print: (t) => { note(t); line(t); },
+    printErr: (t) => {
+      if (/unsupported syscall/.test(t)) return;
+      note(t);
+      line(t, 'err');
+    },
+  });
+</script>

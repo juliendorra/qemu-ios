@@ -40,7 +40,56 @@
  * zero evictions and zero recompiles. Watch those two counters when changing
  * this -- if they stay at zero while `compiled` rises, the trade is free.
  */
-#define INSTANTIATE_NUM 100
+#define INSTANTIATE_NUM_DEFAULT 100
+
+/*
+ * ...and it is tunable at RUN TIME, because sweeping it otherwise costs one
+ * full wasm rebuild per value. jit_instantiate_num is resolved once, in
+ * init_wasm(), from (in order):
+ *
+ *   1. IT_WASM_INSTANTIATE_NUM     -- native and Node
+ *   2. instantiate=<n> in /fw/jit-tune   -- the browser
+ *
+ * The second exists only because Emscripten's ENV object is not in
+ * EXPORTED_RUNTIME_METHODS, so a page cannot set an environment variable; it
+ * CAN write a file into MEMFS before startup. The same file carries
+ * max_instances=<n> (clamped to the compile-time MAX_INSTANCES, which sizes a
+ * static array). Absent file, absent variable: the defaults below, i.e. the
+ * measured settings.
+ */
+static int jit_instantiate_num = INSTANTIATE_NUM_DEFAULT;
+#define INSTANTIATE_NUM jit_instantiate_num
+
+#define JIT_TUNE_FILE "/fw/jit-tune"
+
+static long jit_tune_lookup(const char *key, long fallback)
+{
+    char line[128];
+    size_t keylen = strlen(key);
+    long value = fallback;
+    FILE *f = fopen(JIT_TUNE_FILE, "r");
+
+    if (f == NULL) {
+        return fallback;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, key, keylen) == 0 && line[keylen] == '=') {
+            value = strtol(line + keylen + 1, NULL, 10);
+        }
+    }
+    fclose(f);
+    return value;
+}
+
+static long jit_tunable(const char *env, const char *key, long fallback)
+{
+    const char *v = getenv(env);
+
+    if (v != NULL && *v != '\0') {
+        return strtol(v, NULL, 10);
+    }
+    return jit_tune_lookup(key, fallback);
+}
 
 #define EM_JS_PRE(ret, name, args, body...) EM_JS(ret, name, args, body)
 
@@ -719,6 +768,10 @@ static uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
  */
 #define MAX_INSTANCES 48000
 
+/* Effective cap: MAX_INSTANCES sizes the static ring, so this may be lowered
+ * at run time (max_instances= in /fw/jit-tune) but never raised past it. */
+static int jit_max_instances = MAX_INSTANCES;
+
 static int instances_global;
 
 /* Avoid overwrapping of begin/end pointers */
@@ -761,7 +814,7 @@ static void add_instance(wasm_tb_func tb_func, void *tb_ptr)
                 (unsigned long long)jit_compiles,
                 (unsigned long long)jit_recompiles,
                 (unsigned long long)jit_evictions,
-                qatomic_read(&instances_global), MAX_INSTANCES);
+                qatomic_read(&instances_global), jit_max_instances);
     }
 }
 
@@ -792,7 +845,7 @@ static void remove_old_instances(void)
 
 static bool can_add_instance(void)
 {
-    return qatomic_read(&instances_global) < MAX_INSTANCES;
+    return qatomic_read(&instances_global) < jit_max_instances;
 }
 
 static wasm_tb_func get_instance_from_tb(void *tb_ptr)
@@ -857,6 +910,19 @@ static int thread_idx_max;
 
 static void init_wasm(void)
 {
+    if (qatomic_read(&thread_idx_max) == 0) {
+        long n = jit_tunable("IT_WASM_INSTANTIATE_NUM", "instantiate",
+                             INSTANTIATE_NUM_DEFAULT);
+        long cap = jit_tunable("IT_WASM_MAX_INSTANCES", "max_instances",
+                               MAX_INSTANCES);
+
+        jit_instantiate_num = (n > 0 && n <= INT32_MAX) ? (int)n
+                                                        : INSTANTIATE_NUM_DEFAULT;
+        jit_max_instances = (cap > 0 && cap <= MAX_INSTANCES) ? (int)cap
+                                                              : MAX_INSTANCES;
+        fprintf(stderr, "[JIT] tuning: instantiate=%d max_instances=%d\n",
+                jit_instantiate_num, jit_max_instances);
+    }
     thread_idx = qatomic_fetch_inc(&thread_idx_max);
     ctx.stack = g_malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
     ctx.buf128 = g_malloc(16);

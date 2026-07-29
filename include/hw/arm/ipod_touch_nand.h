@@ -5,6 +5,7 @@
 #include "hw/core/platform-bus.h"
 #include "hw/core/irq.h"
 #include "qemu/lockable.h"
+#include "hw/arm/ipod_touch_nand_pack.h"
 
 #define NAND_NUM_BANKS 8
 #define NAND_BYTES_PER_PAGE 2048
@@ -85,12 +86,25 @@ typedef struct ITNandState {
     char *nand_path;
     bool pack_checked;
     GMappedFile *pack_file;
-    const uint8_t *pack_entries;
-    const uint8_t *pack_data;
-    uint32_t pack_entry_count;
+    ITNandPack pack;
     uint8_t last_spare_type;
     uint8_t num_banks;
 } ITNandState;
+
+/*
+ * Serve pack records from a chunk cache instead of the mapped nand.pack.
+ * Call before machine init; the model then maps "nand.pack.idx" (header +
+ * index) and asks `fetch` for each chunk. Browser-only -- native leaves this
+ * unset and keeps the mapped-file path.
+ */
+void it_nand_set_chunk_source(uint32_t pages_per_chunk, ITNandChunkFetch fetch,
+                              void *opaque);
+
+#ifdef EMSCRIPTEN
+/* Install the browser chunk source if <nand_path> holds a chunked NAND
+ * (chunk-config.txt + chunk-hashes.bin). See hw/arm/ipod_touch_nand_chunks.c. */
+bool it_nand_chunks_init(const char *nand_path);
+#endif
 
 void nand_set_buffered_page(ITNandState *s, uint32_t page);
 void nand_begin_multi_write(ITNandState *s, uint32_t num_pages);

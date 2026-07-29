@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import functools
 import http.server
+import json
 import os
 import re
 import socketserver
@@ -47,6 +48,11 @@ EXTRA_TYPES = {
 
 RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
+# A content-addressed NAND chunk: <dir>/chunks/<sha256>.
+CHUNK_PATH = re.compile(r"/chunks/[0-9a-f]{64}$")
+CHUNK_COUNTER = {"requests": 0, "bytes": 0}
+COUNTER_LOCK = threading.Lock()
+
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     """Static handler with cross-origin isolation and byte-range support."""
@@ -54,8 +60,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self) -> None:
         for name, value in ISOLATION_HEADERS.items():
             self.send_header(name, value)
-        # Development server: never let a stale emulator.wasm survive a rebuild.
-        self.send_header("Cache-Control", "no-store")
+        # Development server: never let a stale emulator.wasm survive a
+        # rebuild. Chunks are exempt -- they are content-addressed, and send
+        # their own immutable Cache-Control.
+        if not CHUNK_PATH.search(self.path.split("?", 1)[0]):
+            self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
     def guess_type(self, path):  # noqa: N802 - stdlib API
@@ -64,7 +73,33 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return EXTRA_TYPES[suffix]
         return super().guess_type(path)
 
+    def do_GET(self):  # noqa: N802 - stdlib API
+        """/__chunk-stats reports what this server has actually shipped.
+
+        The independent measurement: the page under test cannot flatter it.
+        """
+        if self.path.split("?", 1)[0] == "/__chunk-stats":
+            with COUNTER_LOCK:
+                body = json.dumps(dict(CHUNK_COUNTER)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.split("?", 1)[0] == "/__chunk-stats/reset":
+            with COUNTER_LOCK:
+                CHUNK_COUNTER.update(requests=0, bytes=0)
+            self.send_response(204)
+            self.end_headers()
+            return
+        super().do_GET()
+
     def send_head(self):
+        chunk = self.send_chunk_head()
+        if chunk is not None:
+            return chunk
+
         header = self.headers.get("Range")
         if not header:
             return super().send_head()
@@ -111,6 +146,43 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             remaining -= len(block)
         handle.close()
         return None
+
+    def send_chunk_head(self):
+        """Serve a NAND chunk: stored Brotli, declared as Content-Encoding.
+
+        scripts/wasm/chunk-pack.py writes each chunk already compressed, so the
+        BROWSER decompresses it on the way in and the emulator carries no
+        Brotli decoder. A CDN does exactly this with a pre-compressed object;
+        here it is one header.
+
+        Also the byte counter: GET /__chunk-stats reports how much a run
+        actually pulled, which is the independent check on "a cold boot downloads
+        18.6 MiB, a warm boot downloads nothing" -- independent because it is
+        measured by the server rather than by the page under test.
+        """
+        if not CHUNK_PATH.search(self.path.split("?", 1)[0]):
+            return None
+        path = self.translate_path(self.path)
+        if not os.path.isfile(path):
+            return None
+
+        size = os.path.getsize(path)
+        with COUNTER_LOCK:
+            CHUNK_COUNTER["requests"] += 1
+            CHUNK_COUNTER["bytes"] += size
+
+        handle = open(path, "rb")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Encoding", "br")
+        self.send_header("Content-Length", str(size))
+        # The page reads this to attribute wire bytes per chunk; Content-Length
+        # is not visible to it once the body has been decoded.
+        self.send_header("X-Encoded-Length", str(size))
+        # Content-addressed: the bytes can never change under this name.
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        return handle
 
     def log_message(self, fmt, *fmt_args):  # quieter default log
         sys.stderr.write("  %s\n" % (fmt % fmt_args))
