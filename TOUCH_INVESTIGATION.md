@@ -312,6 +312,73 @@ Related: the display path's remaining hacks, and why the same kext-symbols
 approach that cracked this should work there, are in
 [`MBX_HANDOFF.md`](MBX_HANDOFF.md).
 
+## OPEN (2026-07-29): icon row 1 on iPhone OS 1.0 never registers a tap
+
+Found from the browser port, but **this is a device-model or guest-mapping
+question, not a browser one** — nothing in the wasm input bridge is implicated,
+because the LCD's own handler logs the touch and the coordinates it logs are
+correct.
+
+**Symptom.** On 1.0's SpringBoard home screen, taps on the TOP icon row (Text,
+Calendar, Photos, Camera) never launch anything. Taps on row 2 and row 3 launch
+normally.
+
+**Evidence.** Ten attempts across four runs, spanning every press duration
+tried, all on the top row; three successes on row 2 and one on row 3:
+
+| target (panel y) | `fy` the model computes | holds tried (ms) | launches |
+| --- | --- | --- | --- |
+| **67** (row 1) | **0.860** | 30, 60, 120, 250, 280, 320, 360, 400, 500, 800 | **0 / 10** |
+| 157 (row 2) | 0.673 | 450, 500, 500 | 3 / 3 |
+| 157 (row 2) | 0.673 | 30 | 0 / 1 |
+| 249 (row 3) | 0.481 | ~700 | 1 / 1 |
+
+**What is ruled out.**
+
+- *Bad coordinates from the host side.* A row-brightness profile of a native
+  home-screen framebuffer (`pmemsave` of `0x0f400000`) puts icon row 1 at rows
+  40–94, centre ~67, row 2 at 132–186 and row 3 at 220–276. The tap coordinate
+  is dead centre on the row-1 icons.
+- *A broken host→guest mapping.* `ipod_touch_lcd_mouse_event` logs
+  `fy = 1 - y/2^15`, and the round trip is exact in the cases that WORK:
+  panel y=249 → `fy=0.481` → `(1-0.481)*480 = 249`, and that tap launched
+  Settings. The same arithmetic gives 67 for `fy=0.860`.
+- *The readiness gate.* Every attempt above is after
+  `[LCD] Touch input ready` and the model logs `[TOUCH] mouse DOWN`/`mouse UP`
+  for each one, so the LCD handler accepted them.
+- *Press duration.* Row 1 fails at 800 ms as readily as at 30 ms.
+
+**What is NOT yet known:** whether the guest ever *consumes* the frame. The
+decisive counter is `[MT] frame consumed` under `IT_MT_TRACE=1` (see the header
+of this file) and it was not enabled for these runs. **That is the next step**,
+and it splits the question cleanly:
+
+- frame consumed → the model delivered it and the guest/SpringBoard rejected the
+  position, pointing at the sensor-region descriptor or the coordinate scaling
+  inside `get_frame()`;
+- frame not consumed → the model queued a frame the driver never took, and the
+  ATN/queue path is where to look.
+
+**Worth checking whether it is really "row 1" or "near the extremes".** `fy`
+0.860 is close to the top of the range while both working rows sit mid-panel
+(0.481–0.673). If the sensor coordinate space is narrower than the screen, the
+dock (`fy` ≈ 0.14) should fail too — which would also make the status bar and
+the dock unreachable, i.e. a much bigger usability hole than one icon row. One
+tap on a dock icon settles it.
+
+**Reproduce it** with the browser boot page, which drives itself:
+
+```sh
+scripts/wasm/serve.py --port 8013 --results /tmp/r.json &
+# ...launch headless Chrome at /public/jit-boot/?sweep=1&rungs=500,250,120,60,30
+# (full command in BROWSER_WASM_STATUS.md); rungs 1-4 land on row 1
+```
+
+Natively, `scripts/lock-unlock-probe.py` and QMP `input-send-event` are the
+equivalent instruments, and `IT_MT_TRACE=1` should be on for both.
+
+---
+
 ## Dead ends and mistakes
 
 Recorded so nobody spends the time twice.

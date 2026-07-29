@@ -147,74 +147,101 @@ a fidelity question, and it should shrink as Session B's work lands.** The value
 is conservative rather than measured; the correction below explains why, and it
 is worth reading before trusting any number in this area.
 
-#### CORRECTION: the "derived" 450 ms threshold was an artifact. WITHDRAWN.
+#### Sizing the hold: six runs, three conclusions, two of them wrong
 
-An earlier version of this section reported a swept threshold of ~450 ms and
-called it derived. **It was not.** Three sweeps, with the ladder in different
-orders, all succeeded at **rung index 5**:
+Kept in full because the two wrong conclusions were each *reasonable on the
+evidence available*, and the thing that finally separated them was not another
+run — it was cross-tabulating the runs already done on a variable nobody was
+tracking.
 
-| run | ladder | success |
+| # | ladder (ms) | gate wait | outcome |
+| --- | --- | --- | --- |
+| A | 2–256 **guest** ms, ascending | fixed 10 s | **INVALID** — panel auto-locked from rung 4; conversions nonsense |
+| B | 30, 60, 120, 250, 500 | fixed 10 s | rung 5 (500 ms @ y=157) launched |
+| C | 280, 320, 360, 400, 450 | fixed 10 s | rung 5 (450 ms @ y=157) launched |
+| D | 800 via the real pointer path @ y=67 | after gate | **failed** |
+| E | 30, 60, 120, 250, 500 | after gate message | rung 5 (500 ms @ y=157) launched |
+| F | **500, 250, 120, 60, 30** (descending) | after gate message | **all failed**, including 30 ms @ y=157 |
+
+**Wrong conclusion 1 — "the threshold is ~450 ms, derived by sweep."** B and C
+agreed on ~450 ms, so it was written up as measured. But they also agreed on
+something else: both succeeded at rung *index* 5.
+
+**Wrong conclusion 2 — "it is a clock, not a threshold."** Three runs (B, C, E)
+succeeding at index 5 with holds of 500, 450 and 500 looked conclusive, and
+there was a real mechanism to hang it on (see the gate below). Run F killed it:
+run the ladder **descending** and rung 5 is 30 ms — and it failed. Elapsed time
+cannot explain that.
+
+**The right conclusion came from re-tabulating every run by TARGET, not hold:**
+
+| target | holds tried | launches |
 | --- | --- | --- |
-| 1 | 30, 60, 120, 250, **500** | rung 5 (500 ms) |
-| 2 | 280, 320, 360, 400, **450** | rung 5 (450 ms) |
-| 3 | 30, 60, 120, 250, **500** | rung 5 (500 ms) |
+| **y=67** (icon row 1) | 30, 60, 120, 250, 280, 320, 360, 400, 500, 800 | **0 / 10** |
+| y=157 (row 2) | 450, 500, 500 | **3 / 3** |
+| y=157 (row 2) | 30 | 0 / 1 |
+| y=249 (row 3) | ~700 (interactive) | 1 / 1 |
 
-**Success tracked position in the ladder, not hold length.** Three for three at
-the same index is not a threshold; it is a clock. Every rung ran 25 s apart, so
-rung 5 is simply ~100 s of wall time after the sweep began — about 2 s of guest
-time at the measured ratio.
+Two independent effects, and the sweep confounded them:
 
-Two candidate confounds were checked and ONE was confirmed:
+1. **Icon row 1 never registers, at any hold** — 10 attempts across 4 runs.
+   This is a device-model finding, not a browser one; it is written up in
+   [`TOUCH_INVESTIGATION.md`](TOUCH_INVESTIGATION.md).
+2. **The hold does matter** where taps work at all: y=157 launches at 450/500 ms
+   (3/3) and not at 30 ms (0/1). **The threshold is somewhere in (30, 450] ms**
+   — a wide bracket, and that is all the data supports.
 
-- **Geometry: ruled out.** Every failure was at panel y=67 and every success at
-  y=157, which looked like a bad coordinate grid. It is not: a row-brightness
-  profile of a native home-screen framebuffer puts icon row 1 at rows 40–94
-  (centre 67), and the guest's own log confirms the mapping end to end — panel
-  y=249 arrives as `fy=0.481` and launched Settings.
-- **The guest's input gate: confirmed, and it is real.**
-  `lcd_update_input_ready()` refuses ALL touch until it has seen
-  `2 * LCD_REFRESH_RATE_FREQUENCY` frames of a stable OS image — **two seconds
-  of GUEST time**, which at a ratio of ~0.02 is ~100 s of wall time. The page
-  now mirrors `[LCD] Touch input ready` and every `[TOUCH]` verdict to the
-  console, and waits for that message before the first rung.
+Every ascending ladder put rungs 1–4 on y=67 and rung 5 on y=157, so "rung 5
+wins" was never a clock: **rung 5 was simply the first rung aimed somewhere
+that works.** Run D's 800 ms "failure" is the same artifact — it was aimed at
+y=67.
 
-**But gating on the message was not enough**: run 3 waited for
-`[LCD] Touch input ready (4/6 visible after 120 frames)` and *still* succeeded
-only at rung 5. So something settles for a further ~100 s of wall time (~2 s of
-guest) after the gate opens, or the effect is tap-count rather than time.
+**The methodological error is the transferable part.** Each rung deliberately
+used a *different icon*, so that a hold too short to register left SpringBoard
+untouched and failures stayed free and repeatable. That was a good idea for
+isolation and a bad one for attribution: it varied **two** things per rung.
+Vary one; if the design forces two, cross-tabulate before concluding.
 
-A verification of 800 ms through the real pointer-event path (`?sweep=real`,
-a normal 50 ms click floored by `endTouch`) **failed** — but it fired ~5 s after
-the gate armed, i.e. inside that same settling window, so it does not disprove
-800 ms either. It is confounded identically.
+`MIN_PRESS_MS` is **800 ms** — above the (30, 450] bracket, with margin for the
+twofold run-to-run spread in engine speed. Now genuinely supported, but still
+not a measured threshold: narrowing it needs a ladder that holds the target
+fixed at a position known to work.
 
-#### What is actually known about the hold
+#### The gate is real, even though it did not explain the sweep
 
-Only the original interactive observation, which remains unconfounded because it
-happened long after boot: a fast click logged `[TOUCH] mouse DOWN` and
-`mouse UP` at the same guest timestamp and launched nothing, and a ~700 ms hold
-at the same coordinates launched Settings immediately. **That is n=1.** It is
-why a hold exists at all; it does not size one.
+Found while chasing wrong conclusion 2, and worth keeping regardless:
+`lcd_update_input_ready()` refuses **all** touch until it has seen
+`2 * LCD_REFRESH_RATE_FREQUENCY` frames of a stable OS image — **two seconds of
+GUEST time**, which at a ratio of ~0.02 is ~100 s of wall clock. Waiting a fixed
+wall time before tapping is therefore a coin flip.
 
-**`MIN_PRESS_MS` is therefore 800 ms as a CONSERVATIVE CHOICE, not a measured
-one.** It is comfortably above anything observed to work and costs only tap
-latency. Do not cite a threshold for it.
+The page now mirrors `[LCD] Touch input ready` and every `[TOUCH]` verdict to the
+console and blocks the sweep on that message. **Do this even though the gate was
+not the confound** — it removes a genuine source of false failures, and the
+`[TOUCH]` mirror is what makes a refused touch distinguishable from an
+unregistered one at all.
 
-#### The experiment that would settle it
+#### Two dead ends in the sweep harness itself
 
-Run the ladder **descending** (500, 250, 120, 60, 30). The elapsed-time effect
-and the hold effect then push in opposite directions:
+**Do not express the hold in GUEST milliseconds.** Run A swept guest holds and
+converted through `guestRatio`, producing 4 ms guest → 10 ms wall alongside
+256 ms guest → 4113 ms wall. **With `-icount` QEMU warps virtual time forward
+whenever the CPU idles**, and an idle home screen is exactly where the sweep
+runs. The ratio is worth reporting; it is not worth steering by. The constant is
+a wall-clock quantity — sweep it in wall time.
 
-- success at rung 1 → the hold matters and 500 ms suffices early;
-- success at rung 5 (30 ms) → it was never the hold, only elapsed time.
+**The ladder must finish inside the auto-lock window.** Run A used eight rungs
+at 45 s each; the guest locked after roughly 260 s of idle and the last five
+rungs tapped a dead panel, every one reading as a clean failure. The sweep now
+aborts and reports `invalid` as soon as the panel drops below 5% non-black.
 
-That run was attempted and did not complete: the emulator **wedged with
-`guestRatio` at 0.0000** — guest virtual time not advancing at all — about
-1170 s in, having reached BSD root but never launchd. Worth knowing that a
-browser boot can hang this way; the heartbeat is what made it visible.
+#### A browser boot can wedge outright
 
-Better still, characterise the settling window first (constant hold, varying
-delay after the gate), then sweep holds from beyond it.
+The first attempt at run F never reached the ladder: **`guestRatio` went to
+0.0000** — guest virtual time not advancing at all — about 1170 s in, having
+passed BSD root but never launchd. A second attempt booted cleanly in 403 s. So
+this is intermittent, and the 15 s heartbeat is what distinguishes it from
+"still working"; without that the page just sits there.
 
 ### The real-time ratio, and why it cannot be trusted at idle
 

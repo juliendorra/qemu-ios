@@ -452,33 +452,40 @@ thread boundary:
 
 **Two traps that will outlive this step:**
 
-1. **Presses are held 800 ms of WALL time** (`MIN_PRESS_MS`) — a CONSERVATIVE
-   choice, **not** a measured threshold. Guest time runs at ~2% of wall time, so
-   a normal 100 ms tap is a few guest milliseconds, less than the multitouch
-   model's own 16.7 ms motion report interval, and the guest never sees a
-   finger. That a hold is needed rests on one clean observation (a fast click
-   logged DOWN and UP at the same guest timestamp and launched nothing; ~700 ms
-   launched Settings at once). **How long it must be is NOT established** —
-   `BROWSER_WASM_STATUS.md` withdraws an earlier "derived ~450 ms" claim and
-   explains the confound.
+1. **Presses are held 800 ms of WALL time** (`MIN_PRESS_MS`). Guest time runs at
+   ~2% of wall time, so a normal 100 ms tap is a few guest milliseconds — less
+   than the multitouch model's own 16.7 ms motion report interval — and the
+   guest never sees a finger. Measured support: a tap at a working position
+   launches an app at 450 and 500 ms (3/3) and not at 30 ms (0/1), so **the
+   threshold is somewhere in (30, 450] ms**. 800 ms clears that bracket with
+   margin for the twofold run-to-run spread in engine speed. Narrowing it needs
+   a ladder that holds the TARGET fixed — see the trap below.
 
-   **Before sweeping input timing, know these three.** All three cost a run:
+   **Before sweeping input timing, know these four.** Each cost a run:
 
+   - **Icon row 1 on 1.0 never registers a tap, at any hold** (0/10 attempts,
+     30–800 ms). This is an open device-model question, written up in
+     `TOUCH_INVESTIGATION.md`; the next step there is `IT_MT_TRACE=1` to see
+     whether the frame is consumed. **Aim sweeps at row 2 or 3.**
+   - **Vary ONE thing per rung.** The sweep gave each rung a different icon so
+     that a too-short hold left SpringBoard untouched and failures stayed free
+     — good for isolation, fatal for attribution. Rungs 1–4 all landed on the
+     dead row 1 and rung 5 on a working row, so three runs "agreed" that rung 5
+     wins and produced two confident, wrong conclusions in a row (first "the
+     threshold is 450 ms", then "it is a clock, not a threshold"). A DESCENDING
+     ladder is what broke the tie. If the design forces two variables,
+     cross-tabulate before concluding.
    - **`lcd_update_input_ready()` refuses ALL touch** until it has seen
      `2 * LCD_REFRESH_RATE_FREQUENCY` frames of a stable OS image — two seconds
-     of GUEST time, ~100 s of wall time. Wait for `[LCD] Touch input ready` on
-     stderr; the boot page mirrors it and every `[TOUCH]` verdict to the
-     console. Waiting a fixed wall time instead invalidated two sweeps.
-   - **Something settles for a further ~100 s of wall time after that gate
-     opens.** Three sweeps in different ladder orders all succeeded at rung
-     index 5, which is a clock, not a threshold. Run the ladder DESCENDING to
-     separate the two effects.
-   - **Never express the hold in guest milliseconds.** With `-icount` QEMU warps
-     virtual time forward when the CPU idles, so `guestRatio` at an idle home
-     screen is not a conversion factor: converting through it produced 4 ms
-     guest -> 10 ms wall alongside 256 ms -> 4113 ms.
-   - **Keep the whole ladder inside the ~260 s auto-lock window**, or later
-     rungs tap a dead panel and read as clean failures.
+     of GUEST time, ~100 s of wall clock. Wait for `[LCD] Touch input ready`;
+     the boot page mirrors it and every `[TOUCH]` verdict to the console.
+   - **Never express the hold in guest milliseconds**, and **keep the ladder
+     inside the ~260 s auto-lock window.** With `-icount` QEMU warps virtual
+     time forward when the CPU idles, so `guestRatio` at an idle home screen is
+     not a conversion factor (it produced 4 ms guest → 10 ms wall next to
+     256 ms → 4113 ms); and past auto-lock every rung taps a dead panel and
+     reads as a clean failure.
+
 2. **Home from inside an app does nothing on 1.0.** That is the known event
    *routing* bug (`5f019eac7f`), not the input bridge — the bridge is proven to
    deliver and the guest is proven to service it. Do not re-investigate it from
@@ -655,6 +662,13 @@ environment, clock, and harness before suspecting the port.
   Meson reads them only at configure time, so editing
   `configs/meson/emscripten.txt` and running a build is a silent no-op. Use
   `build-qemu.sh --configure`.
+- **Don't assume a silent browser boot is still working.** One run wedged with
+  guest virtual time not advancing at all (`guestRatio` 0.0000) ~1170 s in, past
+  BSD root but never launchd; a rerun booted cleanly in 403 s. It is
+  intermittent, and only a heartbeat distinguishes it from slow progress — the
+  boot page logs one every 15 s.
+- **Don't aim a browser input test at icon row 1 on 1.0.** It never registers,
+  at any press duration (0/10). Open item in `TOUCH_INVESTIGATION.md`.
 - **Don't send a normal-length tap.** Guest time runs far slower than wall clock
   in the browser: a ~100 ms click arrives as a down and an up at the *same guest
   timestamp* and the guest sees no touch at all. Hold ~500 ms.

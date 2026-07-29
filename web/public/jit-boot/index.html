@@ -407,18 +407,24 @@
   //
   // So releases are floored to this. It is a browser-speed workaround, not a
   // device fidelity question, and it should shrink as the engine gets faster.
-  // How long a press is held, in WALL milliseconds. A CONSERVATIVE CHOICE, not
-  // a measured threshold -- an earlier revision claimed ~450 ms "derived by
-  // sweep" and that claim is WITHDRAWN. Three sweeps in different ladder orders
-  // all succeeded at rung INDEX 5 (holds 500, 450, 500), which is a clock, not
-  // a threshold: lcd_update_input_ready() refuses all touch for two seconds of
-  // GUEST time (~100 s of wall), and something settles for about that long
-  // again afterwards. See BROWSER_WASM_STATUS.md.
+  // How long a press is held, in WALL milliseconds.
   //
-  // What IS known: a fast click logs [TOUCH] mouse DOWN and mouse UP at the
-  // same guest timestamp and launches nothing, while a ~700 ms hold launches an
-  // app at once. That is why a floor exists. 800 ms is comfortably above
-  // anything observed to work and costs only tap latency.
+  // Guest time runs at ~2% of wall time, so a normal 100 ms tap is a few guest
+  // milliseconds -- less than the multitouch model's own motion report interval
+  // (MT_MOTION_REPORT_HZ = 60, i.e. 16.7 ms of guest time) -- and the guest
+  // logs [TOUCH] mouse DOWN and mouse UP at the SAME guest timestamp, having
+  // never observed a finger.
+  //
+  // Measured, at a target position that works: launches at 450 and 500 ms
+  // (3/3), not at 30 ms (0/1). So the threshold is in (30, 450] ms and 800 ms
+  // clears it with margin for the ~2x run-to-run spread in engine speed.
+  //
+  // Narrowing it needs a ladder that keeps the TARGET FIXED. ?sweep=1 gives
+  // each rung a different icon, which kept failures repeatable but confounded
+  // two variables: icon row 1 on 1.0 never registers at any hold (see
+  // TOUCH_INVESTIGATION.md), and that alone produced two confident wrong
+  // conclusions before a descending ladder broke the tie. The story is in
+  // BROWSER_WASM_STATUS.md.
   //
   // WHY a hold is needed at all: guest time runs at ~2% of wall time, so a
   // normal ~100 ms tap is a few guest milliseconds -- less than the multitouch
@@ -515,9 +521,14 @@
   const SWEEP_SETTLE_MS = 25000;
   // 4x4 grid, panel coordinates, verified against a real click: the Settings
   // icon at (274, 248) logged [TOUCH] mouse DOWN at (0.856, 0.481).
+  //
+  // ROW 1 (y=67) IS DELIBERATELY ABSENT. Taps there never register on 1.0 at
+  // any hold -- 0 of 10 attempts, 30 to 800 ms -- which is an open device-model
+  // question (TOUCH_INVESTIGATION.md), and including it made every ladder's
+  // first four rungs unfalsifiable. Rows 2 and 3 are verified to launch apps.
   const SWEEP_TARGETS = [
-    [45, 67], [121, 67], [197, 67], [274, 67],
     [45, 157], [121, 157], [197, 157], [274, 157],
+    [45, 249], [121, 249], [197, 249], [274, 249],
   ];
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
