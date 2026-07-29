@@ -347,32 +347,72 @@ scripts/wasm/analyze-nand-trace.py /tmp/boot.trace \
   m68ap-artifacts/builds/<BUILD>/nand/nand.pack --pages-per-chunk 62
 ```
 
-## W5 — Display and input bridges
+## W5 — Display and input bridges — DONE (2026-07-29)
 
-Nothing produces frames or consumes input yet; `web/src/workers/emulator-worker.js`
-has the message protocol but no producer.
+**iPhone OS 1.0 reaches its home screen in a browser and launches an app when
+you tap its icon.** `ui/wasm.c` plus `web/public/jit-boot/index.html`; the full
+account, including what the committed backend got wrong, is in
+`BROWSER_WASM_STATUS.md`.
 
-**Display.** The LCD is a normal QEMU graphic console:
-`hw/arm/ipod_touch_lcd.c` registers `GraphicHwOps s5l8900_gfx_ops`, resizes with
-`qemu_console_resize(con, 320, 480)` and calls `dpy_gfx_update()` on dirty
-lines. So the browser needs a **DisplayChangeListener**, not SDL: take the
-surface from `qemu_console_surface()`, push dirty rectangles to an
-`OffscreenCanvas` in the worker. One full frame is 614,400 B; the panel refreshes
-at 10 Hz, so even whole-frame updates are affordable — dirty rects and a reused
-buffer are still the target.
+The shape, because it generalises to anything else that has to cross the
+thread boundary:
 
-**Input.** Two separate paths, both already present natively:
+- **Do not use `EM_JS` to reach the page.** Under `-sPROXY_TO_PTHREAD=1` the
+  emulator runs on a worker whose `Module` is a *different object* from the
+  page's, so an `EM_JS` assignment there is invisible. Put the data in memory
+  and export an accessor; exported wasm functions are callable from any thread
+  and every thread sees the same linear memory.
+- **Display**: a `WasmDisplayInfo` struct (geometry, surface address, damage,
+  a seqlock) read straight out of `HEAPU32`. The seqlock is not fastidiousness —
+  a torn *pointer* read is an arbitrary index into the heap.
+- **Input**: exported entry points only write a slot in an SPSC ring; a 15 ms
+  `QEMU_CLOCK_REALTIME` timer on the emulator thread drains and dispatches,
+  because QEMU's input queue expects the BQL and its owning thread.
+- **`HEAPU8`/`HEAPU32` must be in `EXPORTED_RUNTIME_METHODS`**, and reading an
+  unexported runtime method calls `abort()` rather than returning `undefined` —
+  it kills the emulator. Reach `Module` properties through a try/catch.
 
-- **Touch** — `qemu_add_mouse_event_handler(ipod_touch_lcd_mouse_event, …, 1, …)`
-  in `ipod_touch_lcd.c`; absolute coordinates. The frontend already normalises
-  pointer events into the panel's 320×480 space.
-- **Home / Power** — key events through `ipod_touch_input_event()` in
-  `hw/arm/ipod_touch.c`, which maps `Q_KEY_CODE_H`/`Q_KEY_CODE_P` to guest
-  keycodes. The web shell already emits these as `home`/`power` and binds `H`/`P`.
+**Two traps that will outlive this step:**
 
-**Acceptance:** tap an icon and it launches; Home returns to SpringBoard; Power
-sleeps and wakes. Compare against the native oracle, which is what the still-owed
-native regression baseline is for.
+1. **Presses must be held ~500 ms of WALL time.** Guest time runs far slower
+   than wall clock in the browser, so a normal 100 ms tap lands as a down and
+   an up at the *same guest timestamp* and SpringBoard never sees a finger.
+   The page floors releases at `MIN_PRESS_MS`. Shrink it as the engine speeds
+   up; do not mistake it for a device-model defect.
+2. **Home from inside an app does nothing on 1.0.** That is the known event
+   *routing* bug (`5f019eac7f`), not the input bridge — the bridge is proven to
+   deliver and the guest is proven to service it. Do not re-investigate it from
+   the browser.
+
+Still open here: partial blits (the damage rectangle and its `ack` are
+published but unused — the page repaints all 320x480), and `OffscreenCanvas`.
+Neither is on the critical path; one frame is 614,400 B at 10 Hz.
+
+## W5a — Skip the boot with a snapshot (A3): worth a session, not a step
+
+Measured 2026-07-29 with `scripts/wasm/snapshot-probe.py`, natively, on 1.0.
+
+`migrate file:` works mechanically — `completed`, 475 ms, a **57.0 MiB** state
+file for 128 MiB of guest RAM. And it restores **guest RAM byte-identically and
+no device state whatsoever**: the three framebuffer bases come back unchanged
+(59.03%) while the **scanout goes from 45.4% to 0.003%**, because
+`w1_framebuffer_base` returns as zero.
+
+Cause: **not one of the 26 `hw/arm/ipod_touch*.c` models defines a
+`VMStateDescription`.** No LCD window bases, no PMU, no VIC, no FTL controller,
+no multitouch.
+
+The prize is worth the work — 24-57 MiB of state replaces a ~20 minute browser
+boot, the same order as the 18.6 MiB chunked first-boot working set — but it is
+device-model work in files Session B also touches.
+
+- **Start with the LCD**: its loss alone makes a restore look completely dead.
+  The VIC is the next suspect — a lost mask means no interrupt ever fires again.
+- **Snapshot an AWAKE machine.** Left idle the guest auto-locks and the PMU
+  powers the panel off, so a long `--boot-wait` measures a sleeping device at
+  ~0% and the comparison is meaningless. `--no-wake` disables the Home press
+  that avoids it. On a device already parked in "awaiting Power/Home", a QMP
+  `send-key h` did not wake it within 6 s.
 
 ## W6 — Copy-on-write overlay
 
@@ -495,12 +535,36 @@ environment, clock, and harness before suspecting the port.
 - **Don't trust `builds/<BUILD>/nand` without checking its provenance
   `recipe` field.** A tree built from an unpatched root boots and renders
   nothing; only `"recipe": "home-screen"` is the product NAND.
+- **Don't use `EM_JS` to publish anything to the page.** With
+  `-sPROXY_TO_PTHREAD=1` the emulator runs on a worker whose `Module` is a
+  different JavaScript object from the page's, so the assignment is invisible.
+  Export a C accessor and read shared memory instead. The committed display
+  backend did this and could never have worked; nobody noticed because the boot
+  page ran `-display none`.
+- **Don't read a `Module` property you have not exported.** `HEAPU8`,
+  `HEAPU32`, `wasmMemory` and `wasmExports` are stubs that call `abort()` —
+  not `undefined` — so a missing display feature takes the whole emulator down.
+- **Don't expect a cross file's `[built-in options]` to be re-read on rebuild.**
+  Meson reads them only at configure time, so editing
+  `configs/meson/emscripten.txt` and running a build is a silent no-op. Use
+  `build-qemu.sh --configure`.
+- **Don't send a normal-length tap.** Guest time runs far slower than wall clock
+  in the browser: a ~100 ms click arrives as a down and an up at the *same guest
+  timestamp* and the guest sees no touch at all. Hold ~500 ms.
 - **Don't run `meson`, `ninja` or `configure` on the wasm build by hand.** A
   reconfigure outside the toolchain environment re-probes dependencies without
   the wasm sysroot's `PKG_CONFIG_PATH`, finds **host Homebrew** libraries, and
   enables curl/zstd/libssh for a WebAssembly build — which then fails on
   `curl/curl.h`. Always go through `scripts/wasm/build-qemu.sh [--configure]`.
   A correct reconfigure says `libcurl found: NO (tried pkgconfig)`.
+
+  **But this advice is not sufficient on its own, and 2026-07-29 proved it:**
+  ninja re-runs `meson --internal regenerate` BY ITSELF whenever any
+  `meson.build` changes, which escapes `emconfigure` and did exactly this
+  without anyone running meson by hand. The fix was `PKG_CONFIG_LIBDIR` (which
+  *replaces* pkg-config's search path) rather than `PKG_CONFIG_PATH` (which
+  only prepends to it) in `build-qemu.sh`. With two sessions in one tree,
+  `meson.build` changes constantly.
 - **Don't invoke the build scripts from inside `build-wasm`.** QEMU build
   directories symlink `scripts/`, so the command resolves but computes the repo
   root as the build directory and reports `native toolchain missing` — a

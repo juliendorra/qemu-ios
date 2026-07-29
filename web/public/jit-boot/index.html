@@ -285,10 +285,27 @@
     moduleRef._wasm_input_touch(x, y, down ? 1 : 0);
   }
 
+  // A press has to stay down long enough for the GUEST to observe it, and
+  // guest time runs far slower than wall clock in the browser: at the speeds
+  // measured here an 800 ms wall-clock hold was ~1.5 s of guest time, so a
+  // normal 100 ms tap collapses into a single guest instant and the down/up
+  // pair is dispatched back-to-back with nothing in between. SpringBoard then
+  // sees no touch at all -- which is exactly how a real click on an icon
+  // behaved before this: [TOUCH] mouse DOWN and mouse UP at the same guest
+  // timestamp, and no app launch.
+  //
+  // So releases are floored to this. It is a browser-speed workaround, not a
+  // device fidelity question, and it should shrink as the engine gets faster.
+  const MIN_PRESS_MS = 500;
+
   let touching = false;
+  let pressStart = 0;
   canvas.addEventListener('pointerdown', (e) => {
-    canvas.setPointerCapture(e.pointerId);
+    // Throws for a pointer id with no active pointer (synthetic events), and
+    // an exception here would abort the handler before the touch is ever sent.
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
     touching = true;
+    pressStart = performance.now();
     sendTouch(e, true);
   });
   canvas.addEventListener('pointermove', (e) => {
@@ -297,7 +314,12 @@
   const endTouch = (e) => {
     if (!touching) return;
     touching = false;
-    sendTouch(e, false);
+    const held = performance.now() - pressStart;
+    if (held >= MIN_PRESS_MS) {
+      sendTouch(e, false);
+    } else {
+      setTimeout(() => sendTouch(e, false), MIN_PRESS_MS - held);
+    }
   };
   canvas.addEventListener('pointerup', endTouch);
   canvas.addEventListener('pointercancel', endTouch);
@@ -315,8 +337,11 @@
     if (!moduleRef || !moduleRef._wasm_input_button) return;
     // The guest's key handler translates make/break itself, so a tap is a
     // down/up pair rather than a level held for as long as the mouse is.
+    // Same MIN_PRESS_MS reasoning as touch: verified in the browser as
+    // "[BTN] keycode=25 ... [PMU] ONKEY pressed" followed 1.5 s of GUEST time
+    // later by keycode=153 and ONKEY released.
     moduleRef._wasm_input_button(which, 1);
-    setTimeout(() => moduleRef._wasm_input_button(which, 0), 80);
+    setTimeout(() => moduleRef._wasm_input_button(which, 0), MIN_PRESS_MS);
   }
   document.getElementById('home').onclick = () => pressButton(BUTTON_HOME);
   document.getElementById('power').onclick = () => pressButton(BUTTON_POWER);

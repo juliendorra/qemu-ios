@@ -18,8 +18,124 @@ comes after.
 ## Session — 2026-07-29 (Session A): making it visible and interactive
 
 Parallel session A (`BROWSER_WASM_SESSION_A.md`): paint the framebuffer, take
-input, skip the boot. **The browser now renders the guest panel** — the Apple
-logo appears at ~17 s of a cold JIT boot, in correct colours.
+input, skip the boot.
+
+**A1 and A2 are done. iPhone OS 1.0 reaches its home screen in a browser and
+launches an app when you tap its icon.** A3 was measured rather than built: a
+`migrate file:` snapshot restores guest RAM byte-for-byte and no device state
+at all, so it is a worthwhile session of its own rather than a step in this one.
+
+### It works: the home screen renders in a browser and takes touch
+
+A cold JIT boot of iPhone OS 1.0 (`1A543a`, whole 215.6 MiB pack staged into
+MEMFS, `-icount shift=1`), measured by the page itself:
+
+| landmark | at |
+| --- | --- |
+| first pixels published and painted | **6.7 s** |
+| Apple logo visible | ~17 s |
+| Darwin kernel | 755.0 s |
+| BSD root | 815.8 s |
+| launchd | 935.0 s |
+| **SpringBoard home screen** (45.6% non-black) | **1206.3 s** |
+
+Then, in the page:
+
+- **tapping the Settings icon launched Settings** — `[TOUCH] mouse DOWN at
+  (0.856, 0.481)`, which is exactly the panel coordinate clicked (274/320 =
+  0.856), followed by the app's own `IOMobileFramebufferUserClient::attach`
+  and a fully rendered settings list at 99.9% non-black;
+- **Power reached the guest and was serviced**: `[BTN] keycode=25 ... [PMU]
+  ONKEY pressed ... nIRQ assert`, then `keycode=153 ... ONKEY released`, then
+  the kernel reading and clearing INT1/INT2. keycodes 25/153 are exactly
+  `ipod_touch_input_event`'s Power mapping.
+
+**Caveat on the boot time: it is not a clean measurement.** Two native QEMU
+probes were running for the first ~600 s of it, and the log shows the cost —
+a 284 s stretch with no new compiles at all. Treat 1206 s as an upper bound
+and re-measure solo. (This is the repo's own already-learned lesson about
+running two engines at once, repeated.)
+
+### Guest time is far slower than wall time, and that breaks normal taps
+
+The first real click on an icon did nothing, and the log said why:
+
+```
+[1515.8s] [TOUCH] mouse DOWN at (0.856, 0.481)
+[1515.8s] [TOUCH] mouse UP   at (0.856, 0.481)
+```
+
+**Same guest timestamp.** A ~100 ms wall-clock click is, at these speeds, a
+single guest instant: the drain timer dispatches the down and the up
+back-to-back with no guest execution in between, so SpringBoard never observes
+a finger. An 800 ms hold produced ~1.5 s of *guest* separation and launched the
+app immediately.
+
+The page therefore floors every release at `MIN_PRESS_MS` (500 ms) — for taps
+and for the Home/Power buttons alike. **This is a browser-speed workaround, not
+a fidelity question, and it should shrink as Session B's work lands.** It is
+also the first place where the engine being slow has a *user-visible* effect
+rather than merely a slow one.
+
+Two smaller input fixes came out of the same test: `setPointerCapture` throws
+for a pointer id with no active pointer and aborted the whole handler before
+any touch was sent (it is now wrapped), and a pointer released outside the
+window never delivers `pointerup`, which would leave a finger down forever.
+
+### Home from inside an app does nothing on 1.0 — and that is NOT this code
+
+The one unmet acceptance criterion. It is the **already-diagnosed 1.0 event
+ROUTING bug** (commit `5f019eac7f`, measured natively on this branch the same
+day): on 1.0 the handler runs when SpringBoard is frontmost and stops running
+when an app is, while 1.1.4 works from inside an app. The GPIO pin, the IRQ,
+INTEN, the interrupt-controller ACK, `AppleM68Buttons` and SpringBoard's
+handlers were all exonerated there by measurement.
+
+The browser evidence agrees and adds nothing new: the button path is proven to
+reach the guest and be serviced (the Power trace above), so nothing in the
+wasm input bridge is implicated. **Do not re-investigate this from the browser
+side.**
+
+### A3 — a snapshot restores RAM perfectly and NO device state
+
+`scripts/wasm/snapshot-probe.py` boots 1.0 natively, samples, migrates to a
+file, restores in a fresh process and samples again — by framebuffer, because
+SpringBoard never announces itself.
+
+`migrate file:` works mechanically: `status: completed`, 475 ms, a **57.0 MiB**
+state file for 128 MiB of guest RAM (23.9 MiB on a second, less-dirty run).
+
+And the result is exactly the failure the zero-VMState survey predicted:
+
+| | before | after restore |
+| --- | --- | --- |
+| **scanout** | **45.4%** | **0.003%** |
+| RAM `0x0fe00000` | 59.03% | 59.03% |
+| RAM `0x0f400000` | 59.03% | 59.03% |
+| RAM `0x0f496000` | 59.041% | 59.041% |
+
+**Guest RAM comes back byte-identical — the rendered home screen survives — and
+the scanout is dead**, because `w1_framebuffer_base` came back as zero. Not one
+of the 26 `hw/arm/ipod_touch*.c` device models defines a `VMStateDescription`,
+so migration saves RAM and the CPU and nothing else: no LCD window bases, no
+PMU, no VIC, no FTL controller, no multitouch.
+
+**Verdict: A3 is worth doing and is NOT a quick win.** The prize is real —
+24-57 MiB of state replaces a ~20 minute browser boot, which is the same order
+as the 18.6 MiB chunked first-boot working set already measured for 1.0. But it
+needs VMState descriptors written for the device models, which is device-model
+work of its own and overlaps files Session B holds. It is a session, not a step.
+
+Two notes for whoever takes it:
+
+- **Start with the LCD.** The scanout base is provably lost and provably
+  sufficient to make a restore look completely dead. The VIC is the next
+  suspect (a lost mask means no interrupts ever fire again).
+- **Snapshot an AWAKE machine.** Left alone the guest auto-locks and the PMU
+  powers the panel off, so a long `--boot-wait` measures a sleeping device at
+  ~0% non-black and the comparison becomes meaningless. `--no-wake` turns off
+  the Home press that avoids this. Note that on a device already parked in
+  "awaiting Power/Home", a QMP `send-key h` did **not** wake it within 6 s.
 
 ### The display seam as committed could never have worked
 
