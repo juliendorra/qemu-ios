@@ -643,3 +643,49 @@ tracing are both ruled out: measure the LATENCY from keypress to the first
 wait to pass). If 1.0's failure is really "much slower" rather than "never", the
 question becomes a timer/clock one rather than a button one -- and that is
 cheap to test by simply waiting far longer on 1.0 before declaring failure.
+
+### Latency theory: DEAD (2026-07-29)
+
+`home-wedge-probe.py --watch N` presses HOME from inside an app and then polls
+the three framebuffers every 15 s at low cost (`pmemsave` is a memory read, not
+a stop-the-world register query, so unlike PC sampling it does not starve the
+guest).
+
+iPhone OS 1.0, watched for **7 minutes** after the press:
+
+```
+  t=   0s  lit [99.2, 99.2, 99.2]   (app on screen)
+  t=  32s  lit [ 4.0, 99.1, 99.1]   iBoot's buffer goes dark
+  t=  63s  lit [ 4.0, 99.1, 99.1]
+  ...
+  t= 423s  lit [ 4.0, 99.1, 99.1]   unchanged for the rest of the 7 minutes
+```
+
+The two KERNEL buffers hold the app at 99.1% throughout and nothing ever
+approaches the home screen's ~45% signature. **1.0 does not return slowly; it
+does not return.** (Note the trap this nearly became: a first version of the
+watcher stopped at the first big change and would have reported "RETURNED after
+60s -- this was LATENCY". The change was one buffer going near-black, not a
+return. Require the home-screen signature, not merely movement.)
+
+### Everything now ruled out for the 1.0 in-app HOME failure
+
+Each with the measurement that killed it, so none of these get re-tried:
+
+| hypothesis | how it died |
+| --- | --- |
+| Wrong GPIO pin / IRQ | Both device trees encode `function-button_menu` identically: GPIO 0x1600, IRQ 0x28. Only the phandle differs. |
+| INTLEVEL always reads 0 | Implemented the real pin level; `3_home_returns` still 0.00%. Reverted. |
+| Interrupt not delivered/acked | Byte-identical SYSIC sequence to 1.1.4 and the iPod, press and release. |
+| Host presenter stops | Runs 1:1 with the guest frame timer on the cocoa path (`present:8 vsync:8`). VNC-only artifact. |
+| Guest polls a GPIO we do not drive | 1.1.4 makes ZERO GPIO accesses after the press and returns to SpringBoard fine. |
+| It is a BOARD problem | 1.1.4 passes all five steps on the same board once its first-launch modal is dismissed. |
+| The event never reaches userland | 1.0 runs EIGHT distinct userland PCs after the press, against 1.1.4's three. |
+| It is just slow | 7 minutes, no return. |
+
+**What is left** is what iPhone OS 1.0's own software does with the event, and
+the two tractable ways in are: (a) 1A543a's binaries keep full C++ symbols, so
+SpringBoard's menu-button path can be read directly the way `AppleMRVL868x` was;
+(b) find where 1.0's kernel posts the button HID event and confirm whether it
+posts at all -- the PC data says something runs, so the interesting question is
+what it decides.

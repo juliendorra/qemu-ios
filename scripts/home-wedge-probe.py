@@ -59,6 +59,9 @@ def main() -> int:
     ap.add_argument("--logs", type=Path, default=Path("/tmp/home-wedge"))
     ap.add_argument("--app")
     ap.add_argument("--samples", type=int, default=40)
+    ap.add_argument("--watch", type=float, default=0,
+                    help="after HOME, poll the framebuffers for this many "
+                         "seconds instead of PC-sampling (latency test)")
     ap.add_argument("--interval", type=float, default=0.02,
                     help="seconds between PC samples")
     ap.add_argument("--settle", type=float, default=40.0,
@@ -117,6 +120,52 @@ def main() -> int:
         print("opening an app ...")
         btn.tap(q, *icon, 0.12)
         time.sleep(args.settle)
+
+        if args.watch:
+            # LATENCY TEST. 1.1.4's HOME needs a ~64 s wait to pass, so
+            # "1.0 never returns" may really be "1.0 is much slower". Poll the
+            # framebuffers at a LOW rate -- pmemsave is a memory read, not a
+            # stop-the-world register query, and 15 s apart it costs nothing --
+            # and report the first sample at which the screen leaves the app.
+            def lit3():
+                out = []
+                for nm, a in (("iboot", 0x0fe00000), ("k0", 0x0f400000),
+                              ("k1", 0x0f496000)):
+                    raw = args.logs / f"watch_{nm}.raw"
+                    q.cmd("pmemsave", {"val": a, "size": 320 * 480 * 4,
+                                       "filename": str(raw)})
+                    d = raw.read_bytes()
+                    nz = sum(1 for i in range(0, len(d), 4 * 97)
+                             if d[i] or d[i + 1] or d[i + 2])
+                    out.append(round(100.0 * nz / (len(d) // (4 * 97)), 1))
+                return out
+
+            base = lit3()
+            print(f"  t=0s   lit {base}   (app on screen)")
+            btn.key(q, "home")
+            print("  -> HOME pressed; watching ...")
+            t0 = time.time()
+            report["watch"] = [{"t": 0, "lit": base}]
+            while time.time() - t0 < args.watch:
+                time.sleep(15)
+                cur = lit3()
+                el = int(time.time() - t0)
+                report["watch"].append({"t": el, "lit": cur})
+                moved = max(abs(c - b) for c, b in zip(cur, base))
+                # A drop to near-black is the panel auto-sleeping after idle,
+                # NOT a return to SpringBoard. The home screen has a specific
+                # signature (~45% lit on 1.0, ~47% on 1.1.4), so require a
+                # buffer to land near it before calling this a return.
+                home = any(20 < v < 70 for v in cur)
+                tag = ""
+                if home:
+                    tag = "   <== HOME-SCREEN-LIKE"
+                elif moved > 8:
+                    tag = "   (changed, but not home-like -- panel asleep?)"
+                print(f"  t={el:4d}s  lit {cur}{tag}")
+            print(f"\nwatched {args.watch}s")
+            (args.logs / "report.json").write_text(json.dumps(report, indent=2))
+            return 0
 
         # Sample ACROSS the press, not after it. The after-state is just the
         # idle loop on both builds and says nothing; the interesting window is
