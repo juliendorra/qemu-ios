@@ -218,7 +218,29 @@ git show FETCH_HEAD:tcg/tcg.c | grep -oE "^static [a-z0-9_ ]+\**tcg_out_[a-z0-9_
 
 Both are wired under `#ifdef EMSCRIPTEN` so native builds stay bit-identical.
 
-**Status: working, and ≥13.6× faster than TCI.** Same page, same artifacts,
+### Tuning it (measured 2026-07-29)
+
+Two constants in `tcg/wasm64.c`, and they must be tuned **as a pair**:
+
+| constant | upstream | here | why |
+| --- | --- | --- | --- |
+| `INSTANTIATE_NUM` | 1500 | **100** | at 1500 only 208 blocks compiled in a whole boot; a boot is a long cold tail, not a few hot loops |
+| `MAX_INSTANCES` | 12000 | **48000** | at the cap `can_add_instance()` fails and the JIT stops compiling *entirely*, waiting on a JS GC that may not run |
+
+Keep the instrumented counters (`compiled/recompiled/evicted/live`) when
+touching either — they turned every guess here into a measurement.
+
+**Do not retry second-chance eviction without new evidence.** It was tried and
+reverted (427cfb972e): the recompile rate went from 22% (FIFO) to 41%, and the
+run crashed with `memory access out of bounds` at the cap, in the rewritten
+path. Details in `BROWSER_WASM_STATUS.md`.
+
+**Boot and app use want different settings.** A boot needs eager compilation; a
+running app is a small working set that tolerates a high threshold. Expect an
+adaptive threshold, or a post-boot snapshot that skips the boot phase, rather
+than one static value.
+
+**Status: working, and ≥13.6× faster than TCI** (hot loops; see the caveat). Same page, same artifacts,
 same `-icount shift=1`, each run solo: the JIT reaches the first LCD landmark in
 **31.4 s** where TCI had not reached it by **428 s**. Next: a full boot with the
 NAND, then a boot-time number at a sensible clock setting.

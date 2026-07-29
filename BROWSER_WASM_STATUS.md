@@ -191,6 +191,81 @@ landmark-to-landmark engine comparison, not a boot time. A boot-time number
 needs the NAND and a faster clock setting, and should be taken once the JIT
 completes a full boot.
 
+### Tuning the JIT: what was measured, what failed
+
+Getting the backend to build was not the end of it. Once it ran, the browser
+boot was still slow, and four experiments were needed to find out why. The
+instrumented counters (`compiled / recompiled / evicted / live`, in
+`tcg/wasm64.c`, reported every 16 compiles) are what made each of these a
+measurement rather than a guess — **add them back first if this is ever
+revisited.**
+
+**1. Instance thrashing — hypothesis, disproved.** The obvious suspicion for
+"mysteriously slow JIT" is the browser's cap on live WebAssembly instances,
+with the backend evicting and recompiling in a loop. The counters said no:
+
+```
+[ 4.8s] compiled=176 recompiled=0 evicted=0 live=176/12000
+[22.0s] compiled=208 recompiled=0 evicted=0 live=208/12000   ← and then nothing
+```
+
+Zero evictions, zero recompiles, **1.7% of the cap in use**.
+
+**2. The real cause: the compile threshold.** `INSTANTIATE_NUM` was upstream's
+1500 — a TB must execute 1500 times before it is compiled. That suits a
+long-running Linux guest; a **boot** is thousands of moderately-warm blocks and
+few very hot ones, so only 208 qualified and essentially the whole boot ran on
+the forked TCI interpreter, the engine already measured at ~13× slower than
+native.
+
+Lowered to **100**, and the boot went from never reaching the kernel to:
+
+| landmark | threshold 1500 | threshold 100 |
+| --- | --- | --- |
+| kernel banner | never (silent past 500 s) | **524.6 s** |
+| BSD root | never | **584.7 s** |
+| launchd | never | **791.0 s** (with the cap raised) |
+
+This also qualifies the earlier "≥13.6× faster than TCI" figure: that was taken
+on a smoke test dominated by iBoot polling loops, which *do* cross 1500 quickly.
+It describes hot loops, not boot code.
+
+**3. Second-chance (CLOCK) eviction — tried, worse, REVERTED (427cfb972e).**
+FIFO eviction drops the oldest half of the ring, which discards by *age*: the
+kernel and libc blocks hot since early boot are the oldest, while one-shot
+driver-matching code compiled seconds ago survives. A reference bit per instance
+should have fixed that. It did the opposite:
+
+| policy | at first eviction | recompile rate |
+| --- | --- | --- |
+| FIFO | compiled=19840 recompiled=4399 | 22% |
+| CLOCK | compiled=20688 recompiled=8483 | **41%** |
+
+Most likely because skipping hot entries frees far less per sweep than FIFO's
+unconditional half, so the cap is re-hit almost immediately — more sweeps, more
+total evictions (12513 vs 12000), more recompiles. **That run also crashed**
+with `RuntimeError: memory access out of bounds`, exactly as `live` reached the
+cap, inside the rewritten eviction path; FIFO never crashed. The fault was not
+found by inspection, which is a reason to keep it reverted rather than a reason
+to trust it.
+
+**4. The cap itself — the actual fix.** Hitting `MAX_INSTANCES` is far worse
+than it sounds: `can_add_instance()` then returns false, so the JIT **stops
+compiling entirely** and every newly-hot block runs interpreted, while reclaim
+waits on a JS `FinalizationRegistry` that may not run for a long time. The
+threshold-100 run saturated 12000 during driver matching and then made no
+further progress for ~500 s. Raised to **48000** — it is a heuristic guard
+against a browser limit, not the limit itself, so this trades resident memory
+for keeping compilation alive.
+
+**Standing advice:** treat `INSTANTIATE_NUM` and `MAX_INSTANCES` as a pair.
+Lowering the threshold without headroom in the cap just moves the stall. And
+note the workload split — a **boot** wants eager compilation (long cold tail),
+while **app use** is a small working set hammered repeatedly and tolerates a
+high threshold. One static value cannot be right for both; an adaptive
+threshold, or a post-boot snapshot that skips the boot phase entirely, is the
+real answer.
+
 ### Testing wasm64: use a browser, not Node
 
 `-sMEMORY64=1` requires **Node v23** ("This emscripten-generated code requires
