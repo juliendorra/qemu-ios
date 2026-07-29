@@ -59,6 +59,11 @@ def main() -> int:
     ap.add_argument("--logs", type=Path, default=Path("/tmp/home-wedge"))
     ap.add_argument("--app")
     ap.add_argument("--samples", type=int, default=40)
+    ap.add_argument("--interval", type=float, default=0.02,
+                    help="seconds between PC samples")
+    ap.add_argument("--settle", type=float, default=40.0,
+                    help="seconds to let each tap settle (the guest is slow "
+                         "in wall-clock terms under -icount)")
     ap.add_argument("--vnc-port", type=int, default=5970)
     ap.add_argument("--gate-timeout", type=int, default=420)
     args = ap.parse_args()
@@ -100,16 +105,30 @@ def main() -> int:
             print("FAIL: never reached a home screen -- run is INVALID")
             return 1
 
+        # iPhone OS 1.1.4 shows an educational "Edit Home Screen" modal on
+        # first launch -- and every launch is a first launch, the launcher
+        # clones a pristine NAND. Until it is dismissed no icon can be tapped.
+        dismiss = btn.DISMISS.get(args.board)
+        if dismiss:
+            print(f"dismissing the first-launch modal at {dismiss} ...")
+            btn.tap(q, *dismiss, 0.12)
+            time.sleep(args.settle)
+
         print("opening an app ...")
-        btn.tap(q, *icon)
-        time.sleep(8)
+        btn.tap(q, *icon, 0.12)
+        time.sleep(args.settle)
 
-        print("pressing HOME (held) ...")
-        btn.key(q, "home")
-
-        print(f"PC-sampling {args.samples}x ...")
+        # Sample ACROSS the press, not after it. The after-state is just the
+        # idle loop on both builds and says nothing; the interesting window is
+        # the handful of milliseconds in which 1.1.4 runs its button path and
+        # 1.0 apparently runs nothing.
+        print(f"PC-sampling across the press ({args.samples} samples, "
+              f"HOME at sample {args.samples // 3}) ...")
+        press_at = args.samples // 3
         for i in range(args.samples):
-            time.sleep(0.25)
+            if i == press_at:
+                print("  -> HOME")
+                btn.key(q, "home")
             r = q.cmd("human-monitor-command",
                       {"command-line": "info registers"})
             regs = r.get("return", "") or ""
@@ -120,7 +139,9 @@ def main() -> int:
                     pc = part[4:]
                 if part.startswith("PSR="):
                     cpsr = part[4:]
-            report["samples"].append({"i": i, "pc": pc, "cpsr": cpsr})
+            report["samples"].append({"i": i, "pc": pc, "cpsr": cpsr,
+                                      "phase": "before" if i < press_at
+                                      else "after"})
         # Is the home screen actually RENDERED but not scanned out? The LCD
         # scans out whatever w1_framebuffer_base points at; if SpringBoard
         # repainted into one of the other buffers and the base was never
@@ -141,11 +162,23 @@ def main() -> int:
         (args.logs / "report.json").write_text(json.dumps(report, indent=2))
 
         from collections import Counter
-        hist = Counter(s["pc"] for s in report["samples"] if s["pc"])
-        print("\nPC histogram after the HOME press:")
-        for pc, n in hist.most_common(10):
-            where = "kernel" if pc and pc.lower() >= "c0000000" else "user/low"
-            print(f"  {pc}  x{n:<3} {where}")
+        for phase in ("before", "after"):
+            hist = Counter(s["pc"] for s in report["samples"]
+                           if s["pc"] and s["phase"] == phase)
+            print(f"\nPC histogram {phase.upper()} the press "
+                  f"({sum(hist.values())} samples):")
+            for pc, n in hist.most_common(8):
+                print(f"  {pc}  x{n}")
+        seen_before = {s["pc"] for s in report["samples"]
+                       if s["phase"] == "before"}
+        only_after = Counter(s["pc"] for s in report["samples"]
+                             if s["phase"] == "after"
+                             and s["pc"] not in seen_before)
+        print("\nPCs seen ONLY after the press (the button path, if any):")
+        for pc, n in only_after.most_common(12):
+            print(f"  {pc}  x{n}")
+        if not only_after:
+            print("  (none -- the guest never left the code it was already in)")
         print(f"\nreport: {args.logs / 'report.json'}  (qemu.log alongside)")
     finally:
         if client:

@@ -601,3 +601,45 @@ already-acknowledged button while an app is frontmost. The next probe has to see
 into that: PC-sample DURING the press rather than after it (the after-state is
 just the idle loop), or find where 1.0's kernel posts the button event and check
 whether it posts at all.
+
+## PC-sampling across the press: what it showed, and why it cannot decide this
+
+`home-wedge-probe.py` now dismisses the first-launch modal, opens an app, and
+samples the PC **across** the press (`--samples`, `--interval`), splitting the
+histogram into before/after and listing PCs seen only after.
+
+**The instrument perturbs the thing it measures.** Each sample is a QMP
+`human-monitor-command "info registers"`, which stops the vCPU. At 50 Hz over
+32 s, **1.1.4 did not return to SpringBoard either** -- its framebuffers still
+read 98.94% (the app) at the end, though the same build passes the same step at
+97% when left alone. So neither run reached the transition, and the comparison
+cannot discriminate. Any future PC sampling here needs a much lower rate, or an
+instrument that does not stop the CPU.
+
+With that caveat, the data (2400 samples, press at 1/3, 20 ms apart):
+
+| | 1.1.4 (works unperturbed) | 1.0 (fails) |
+| --- | --- | --- |
+| dominant PC after press | `c005a9cc` x1574 (idle WFI) | `c005a2ec` x1504 (idle WFI) |
+| counter reads | `c0061654/58/5c` | `c0060654/58/5c` |
+| distinct USERLAND PCs after press | 3 (`0x30...`) | **8** (`30e980b0`, `30af7150`, `3045fd94`, `30e928fc`, `30e99ce4`, `303f232c`, `303f5152`, `326d9968`) |
+| kernel PCs only after press | -- | `c041065c`, `c0435adc`, `c0435474` |
+
+The one thing worth carrying forward: **1.0 is not ignoring the button.** It runs
+*more* distinct userland and kernel code after the press than 1.1.4 does. So
+"the event never reaches userland" is not supported -- something runs and then
+gives up.
+
+**Also dead: the GPIO lead.** With `IT_GPIO_TRACE=stderr`, 1.1.4 makes **zero**
+GPIO accesses after the press despite returning to SpringBoard normally. So the
+button path does not consult the GPIO data register at all, and diffing GPIO
+traffic between the boards cannot explain anything. (The 1.0 half of that run was
+invalid -- both boards were given the same VNC port -- but the 1.1.4 result alone
+kills the hypothesis.)
+
+**Suggested next instrument**, given that stop-the-world sampling and GPIO
+tracing are both ruled out: measure the LATENCY from keypress to the first
+`[LCD] w1 base` write on 1.1.4. It is known to be long (the step needs a 64 s
+wait to pass). If 1.0's failure is really "much slower" rather than "never", the
+question becomes a timer/clock one rather than a button one -- and that is
+cheap to test by simply waiting far longer on 1.0 before declaring failure.
