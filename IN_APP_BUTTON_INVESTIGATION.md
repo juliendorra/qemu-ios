@@ -370,6 +370,46 @@ Two things this adds rather than repeats:
   press duration are all exercised end to end there, so the remaining failure is
   confined to display/compositing on both hosts.
 
+### DEAD: "1.0 uses MBX because it lacks the software-compositing knob" (2026-07-30)
+
+The obvious explanation for why 1.0 reaches the MBX loops and 1.1.4 does not was
+`LK_ENABLE_MBX2D=0`, the guest plist edit that forces LayerKit to composite in
+software. **It is set in BOTH shipped bundles**, read out of each one's own NAND:
+
+```
+1.0   bundle: com.apple.SpringBoard.plist EnvironmentVariables {'LK_ENABLE_MBX2D': '0'}
+1.1.4 bundle: com.apple.SpringBoard.plist EnvironmentVariables {'LK_ENABLE_MBX2D': '0'}
+```
+
+(Check the BUNDLE, not `m68ap-artifacts/builds/<BUILD>/root.img` -- the 4A102
+artifact has no `EnvironmentVariables` at all, because the plist edit is applied
+by `build-m68ap-homescreen-nand.py`, which only the packaging script runs.)
+1.0's LayerKit also contains the `LK_ENABLE_MBX2D` string, so it understands the
+key.
+
+So: same MBX driver code in all three builds, same knob set in both bundles, and
+still only 1.0 enters the spin. **The knob is not the difference, and the
+difference remains unknown.**
+
+### CAUTION: the TVOut half of T1 is inherited, not verified for 1.0
+
+T1 reads "model MBX swap completion / the TVOut SDO IRQ", and the coupling comes
+from a guest log line seen during the RENDER investigation --
+`AppleMBX: Added swap device: AppleH1TVOut id: c09c8400`. That is the basis for
+believing MBX completion is signalled through the TVOut block. **It has not been
+observed on 1.0 in this investigation**: no `AppleMBX` or `Added swap device`
+line appears in any of the 1.0 logs collected here (those runs did not enable
+`S5L8900_DEBUG=1`, so this is "unconfirmed", not "contradicted").
+
+Before implementing an IRQ, confirm the mechanism for THIS failure. The button
+path is healthy and is not what needs fixing; what fails is the app -> SpringBoard
+display transition, and the question is **who asks the MBX to do work at that
+moment**. That is directly measurable: with `IT_MBX_READY=0` the guest spins
+deterministically inside the MBX poll, so attaching gdb and walking the kernel
+stack names the CALLER -- the driver or subsystem that requested the operation --
+and then one can check whether 1.1.4 ever calls the same entry. Do that before
+building hardware on an assumption.
+
 ### Is the change 1.0-specific? No -- all three builds ship the same MBX code
 
 Checked statically against each build's own RELEASE kernelcache (the iPod's root
