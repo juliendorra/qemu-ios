@@ -411,6 +411,16 @@ scripts/wasm/analyze-nand-trace.py /tmp/boot.trace \
   m68ap-artifacts/builds/<BUILD>/nand/nand.pack --pages-per-chunk 62
 ```
 
+## W4a — The last join: chunked delivery in the VISIBLE page
+
+The page that paints still stages the whole pack; the page that streams chunks
+does not paint. Joining them is five calls and one reconfigure, written up as a
+pasteable brief in
+[`BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md`](BROWSER_WASM_CHUNKED_IN_THE_VIEWER.md).
+
+It belongs to whoever owns `web/public/*/index.html` — Session A — because that
+file is under active edit; the seam itself is done and measured.
+
 ## W5 — Display and input bridges — DONE (2026-07-29)
 
 **iPhone OS 1.0 reaches its home screen in a browser in 270-330 s, and launches
