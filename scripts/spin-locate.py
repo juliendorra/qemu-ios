@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Name the loop SpringBoard spins in after the first in-app HOME press.
+
+Established (IN_APP_BUTTON_INVESTIGATION.md, finding 9): on iPhone OS 1.0, after
+the first press taken with an app frontmost, QEMU goes from 0.07 to 0.97 host
+cores and SpringBoard is the only process ever mapped. It SPINS, starving every
+other process -- which is why no further GSEvent is sent and touch dies with the
+button.
+
+A spin is the easy case, and it inverts the instrument problem that dogged this
+investigation. Nothing needs to make progress any more, so stopping the vCPU is
+free; and the guest is in one place, so a handful of samples finds it.
+
+Two passes, both after the spin is established:
+
+  1. **Sample.** Interrupt, read pc, resume, repeat. A histogram over ~40
+     samples names the hot function.
+  2. **Step.** Single-step a few thousand instructions and report the distinct
+     addresses in order, plus the detected period. That is the loop BODY, not
+     just a point in it.
+
+Every pc is resolved against real symbols: SpringBoard and UIKit ObjC metadata
+plus the full `LC_SYMTAB` of CoreFoundation (2879 symbols), Foundation (5343),
+libSystem (4994), libobjc (630) and GraphicsServices. `nm` cannot read these
+binaries, which is why they looked stripped; `macho-symbols.py` can.
+
+Ordering matters: the press must be sent BEFORE gdb attaches, because QMP
+`input-send-event` is refused outright while the VM is stopped, and attaching
+stops it.
+
+Usage:
+  scripts/spin-locate.py --board m68ap-10
+  scripts/spin-locate.py --board m68ap-114     # control: must NOT spin
+"""
+from __future__ import annotations
+
+import argparse
+import bisect
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+
+SB = "System/Library/CoreServices/SpringBoard.app/SpringBoard"
+
+# Binaries worth naming addresses in, at their guest link addresses.
+SYM_LIBS = [
+    ("CoreFoundation", "System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"),
+    ("Foundation", "System/Library/Frameworks/Foundation.framework/Foundation"),
+    ("UIKit", "System/Library/Frameworks/UIKit.framework/UIKit"),
+    ("GraphicsServices", "System/Library/Frameworks/GraphicsServices.framework/GraphicsServices"),
+    ("libobjc", "usr/lib/libobjc.A.dylib"),
+    ("libSystem", "usr/lib/libSystem.B.dylib"),
+]
+
+
+def _load(name, path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--board", choices=["m68ap-10", "m68ap-114"], required=True)
+    ap.add_argument("--logs", type=Path, default=None)
+    ap.add_argument("--gdb-port", type=int, default=1234)
+    ap.add_argument("--vnc-port", type=int, default=5930)
+    ap.add_argument("--settle", type=float, default=45)
+    ap.add_argument("--spin-wait", type=float, default=25,
+                    help="seconds after the press before sampling, so the spin "
+                         "is established and measurable")
+    ap.add_argument("--samples", type=int, default=40)
+    ap.add_argument("--sample-gap", type=float, default=0.1)
+    ap.add_argument("--steps", type=int, default=6000)
+    ap.add_argument("--no-app", action="store_true")
+    args = ap.parse_args()
+
+    tag = "noapp" if args.no_app else "inapp"
+    args.logs = args.logs or Path(f"/tmp/spin-{args.board}-{tag}")
+    args.logs.mkdir(parents=True, exist_ok=True)
+
+    brk = _load("sbbreak", REPO / "scripts" / "springboard-button-breakpoint.py")
+    btn = _load("appbuttonprobe", REPO / "scripts" / "app-button-probe.py")
+    lock = _load("lockprobe", REPO / "scripts" / "lock-unlock-probe.py")
+    gsp = _load("gsprobe", REPO / "scripts" / "gsevent-type-probe.py")
+    msym = _load("machosym", REPO / "scripts" / "macho-symbols.py")
+    xref = _load("objcxref", REPO / "scripts" / "objc-xref.py")
+    dis = _load("objcdis", REPO / "scripts" / "objc-method-disasm.py")
+    app, icon = btn.BOARDS[args.board]
+
+    mnt = Path(f"/tmp/spin-root-{os.getpid()}")
+    mnt.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse",
+                    "-mountpoint", str(mnt), str(brk.ROOTS[args.board])],
+                   capture_output=True)
+    symmap = []
+    try:
+        sb_bin = args.logs / "SpringBoard"
+        sb_bin.write_bytes((mnt / SB).read_bytes())
+        fps = gsp.exec_fingerprints(mnt)
+        libs = brk.library_map(mnt)
+        for i, n in xref.methods(dis.Image(sb_bin)):
+            symmap.append((i, n))
+        for nm, rel in SYM_LIBS:
+            src = mnt / rel
+            if not src.is_file():
+                continue
+            dst = args.logs / nm
+            dst.write_bytes(src.read_bytes())
+            data = dst.read_bytes()
+            try:
+                for v, s, d in msym.symbols(data):
+                    if d and v:
+                        symmap.append((v, f"{nm}:{s}"))
+            except Exception:
+                pass
+            if nm in ("UIKit", "Foundation"):
+                try:
+                    for i, n in xref.methods(dis.Image(dst)):
+                        symmap.append((i, n))
+                except Exception:
+                    pass
+    finally:
+        subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
+
+    symmap.sort()
+    addrs = [a for a, _ in symmap]
+    print(f"  {len(symmap)} symbols, {len(libs)} images, "
+          f"{len(fps)} executables fingerprinted")
+
+    def name_of(addr):
+        if addr >= 0xC0000000:
+            return "KERNEL"
+        i = bisect.bisect_right(addrs, addr) - 1
+        if i >= 0 and addr - symmap[i][0] < 0x8000:
+            return f"{symmap[i][1]}+{addr - symmap[i][0]:#x}"
+        return brk.whose(addr, libs)
+
+    def func_of(addr):
+        n = name_of(addr)
+        return n.rsplit("+", 1)[0] if "+" in n else n
+
+    logp = args.logs / "qemu.log"
+    qmp_path = f"/tmp/spin-{os.getpid()}.sock"
+    env = dict(os.environ, S5L8900_HTTP_BRIDGE="0", S5L8900_HTTPS_BRIDGE="0",
+               IT_KEY_TRACE="1")
+    cmd = [f"{app}/Contents/MacOS/iPod Touch",
+           "-qmp", f"unix:{qmp_path},server,nowait",
+           "-vnc", f"127.0.0.1:{args.vnc_port - 5900}",
+           "-gdb", f"tcp::{args.gdb_port}"]
+    proc = subprocess.Popen(cmd, env=env, stdout=open(logp, "wb"),
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    client = None
+    out = {}
+    try:
+        client = lock.DisplayClient(args.vnc_port)
+        client.start()
+        time.sleep(3)
+        q = btn.QMP(qmp_path)
+        for _ in range(420):
+            time.sleep(1)
+            if "Touch input ready" in logp.read_bytes().decode("utf8", "replace"):
+                break
+        else:
+            print("FAIL: no home screen; run is INVALID")
+            return 1
+        print("home screen up")
+
+        dismiss = btn.DISMISS.get(args.board)
+        if dismiss:
+            print("dismissing the first-launch modal ...")
+            btn.tap(q, *dismiss, 0.12)
+            time.sleep(args.settle)
+        if args.no_app:
+            print("NOT opening an app")
+        else:
+            print("opening an app ...")
+            btn.tap(q, *icon, 0.12)
+            time.sleep(args.settle)
+
+        # The QEMU pid, for the CPU control.
+        qpid = None
+        for cand in subprocess.run(["pgrep", "-f", qmp_path],
+                                   capture_output=True, text=True).stdout.split():
+            cl = subprocess.run(["ps", "-o", "command=", "-p", cand],
+                                capture_output=True, text=True).stdout
+            if "qemu-system-arm" in cl:
+                qpid = int(cand)
+
+        def cputime():
+            if not qpid:
+                return None
+            t = subprocess.run(["ps", "-o", "cputime=", "-p", str(qpid)],
+                               capture_output=True, text=True).stdout.strip()
+            if not t:
+                return None
+            sec = 0.0
+            for x in t.replace("-", ":").split(":"):
+                try:
+                    sec = sec * 60 + float(x)
+                except ValueError:
+                    return None
+            return sec
+
+        # PRESS FIRST, gdb second: QMP input is refused while the VM is stopped,
+        # and attaching a gdb client stops it.
+        print("pressing HOME (before attaching gdb) ...")
+        for down in (True, False):
+            r = q.cmd("input-send-event", {"events": [
+                {"type": "key", "data": {"down": down,
+                                         "key": {"type": "qcode",
+                                                 "data": "h"}}}]})
+            if "error" in r:
+                print(f"  !! key edge refused: {r['error'].get('desc')}")
+            if down:
+                time.sleep(0.15)
+
+        c0 = cputime()
+        t0 = time.time()
+        print(f"waiting {args.spin_wait:.0f}s for the spin to establish ...")
+        time.sleep(args.spin_wait)
+        c1 = cputime()
+        cores = None
+        if c0 is not None and c1 is not None:
+            cores = (c1 - c0) / (time.time() - t0)
+            print(f"  QEMU host CPU since the press: {cores:.2f} cores")
+        out["cores"] = cores
+        # THE CONTROL. Everything below only means something if it is spinning.
+        if cores is not None and cores < 0.5:
+            print("  NOT SPINNING -- there is no loop to name in this run. "
+                  "(Expected on 1.1.4.)")
+
+        print(f"attaching gdbstub on :{args.gdb_port} ...")
+        g = brk.Gdb(args.gdb_port)
+        g.wait_stop(2)                      # attaching stops the VM
+
+        # ---- pass 1: sample ------------------------------------------------
+        hist, procs, sampled = Counter(), Counter(), []
+        for i in range(args.samples):
+            w = g.regs()
+            if w:
+                pc = w[0][15]
+                hdr = g.mem(gsp.EXEC_BASE, 0x40)
+                pr = fps.get(hdr, "?" if hdr else "unmapped")
+                hist[func_of(pc)] += 1
+                procs[pr] += 1
+                sampled.append({"pc": pc, "name": name_of(pc), "proc": pr,
+                                "cpsr": w[1]})
+            g.cont()
+            time.sleep(args.sample_gap)
+            g.interrupt()
+        print(f"\n  --- {args.samples} samples during the spin ---")
+        print(f"  process: {dict(procs.most_common(5))}")
+        for k, v in hist.most_common(12):
+            print(f"    x{v:<4} {k}")
+        out["samples"] = sampled
+
+        # ---- pass 2: step, and find the period -----------------------------
+        print(f"\n  --- single-stepping {args.steps} instructions ---")
+        seq = []
+        for _ in range(args.steps):
+            g.step()
+            w = g.regs()
+            if not w:
+                break
+            seq.append(w[0][15])
+        out["seq"] = seq
+        prof = Counter(func_of(p) for p in seq)
+        print(f"  instruction profile over {len(seq)} steps:")
+        for k, v in prof.most_common(12):
+            print(f"    {v:6d}  {100 * v / max(1, len(seq)):5.1f}%  {k}")
+
+        # period: distance between repeats of the first pc, verified
+        period = None
+        if seq:
+            first = seq[0]
+            for j in range(1, len(seq)):
+                if seq[j] == first:
+                    p = j
+                    if all(seq[k] == seq[k % p] for k in range(min(len(seq), 4 * p))):
+                        period = p
+                        break
+        out["period"] = period
+        if period:
+            print(f"\n  LOOP DETECTED: period {period} instructions, "
+                  f"repeating {len(seq) // period} times in the sample")
+            body = seq[:period]
+            print("  loop body (in execution order):")
+            last = None
+            for k, pc in enumerate(body):
+                nm = name_of(pc)
+                f = func_of(pc)
+                if f != last:
+                    print(f"    [{k:>4}] {pc:#010x}  {nm}")
+                    last = f
+        else:
+            uniq = sorted(set(seq))
+            print(f"\n  no exact period; {len(uniq)} distinct addresses. "
+                  f"Function transitions:")
+            last = None
+            shown = 0
+            for pc in seq:
+                f = func_of(pc)
+                if f != last:
+                    print(f"    {pc:#010x}  {name_of(pc)}")
+                    last = f
+                    shown += 1
+                    if shown > 40:
+                        print("    ...")
+                        break
+
+        (args.logs / "spin.json").write_text(json.dumps(out, indent=1))
+        keys = [l for l in logp.read_bytes().decode("utf8", "replace").splitlines()
+                if "[KEYTRACE]" in l]
+        print(f"\n  [KEYTRACE] edges the model saw: {len(keys)} (want 2)")
+        print(f"  raw: {args.logs / 'spin.json'}")
+    finally:
+        if client:
+            client.stop()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

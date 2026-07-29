@@ -1,5 +1,20 @@
 # MBX (PowerVR) — session handoff: the stub, and the two hacks that stand on it
 
+
+> **2026-07-29 — the in-app HOME/POWER bug on iPhone OS 1.0 is an MBX symptom.**
+> After the first in-app press, `com.apple.driver.AppleMBX` enters
+> `do { v = mbx_read(base, 0x12C); } while (!(v & 0x40));` and spins forever at
+> 0.97 host cores, starving every other process — which is why no further
+> GSEvent is delivered, why touch dies with the button, and why the LCD stops
+> flipping. Verified by PC-sampling the spin (30/30 samples in the kernel, an
+> exact 9-instruction cycle) and resolving the addresses through the RELEASE
+> kernelcache's `kmod_info` list (`scripts/spin-locate.py`,
+> `scripts/kernel-addr-symbolize.py`). So **T1 has a second, much more visible
+> symptom than the swap-device window**, and the cheapest experiment is to make
+> bit 6 of register 0x12C readable-as-set in the stub and re-run
+> `app-button-probe.py --board m68ap-10`. Full record:
+> [`IN_APP_BUTTON_INVESTIGATION.md`](IN_APP_BUTTON_INVESTIGATION.md).
+
 **Date:** 2026-07-28 · **Branch:** `ipod_touch_1g` · **State:** nothing started —
 this is the short path *into* the problem, not a report of work done.
 

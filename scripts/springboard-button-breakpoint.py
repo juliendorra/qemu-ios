@@ -184,6 +184,12 @@ class Gdb:
     def wait_stop(self, timeout):
         return self._recv(timeout)
 
+    def interrupt(self, timeout=5):
+        """Ctrl-C the target: a bare 0x03 byte, NOT a packet. Needed to sample a
+        RUNNING guest -- which is the only way to look at a spin."""
+        self.s.sendall(b"\x03")
+        return self._recv(timeout)
+
     def regs(self):
         """ARM 'g': r0-r15 (16 x 4 bytes), then FPA regs, then FPS, then CPSR."""
         self._send("g")

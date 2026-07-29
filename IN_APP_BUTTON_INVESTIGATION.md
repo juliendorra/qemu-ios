@@ -103,6 +103,45 @@ handled, and only afterwards does event delivery die permanently.
    WFI with interrupts masked" conclusion.** That PC-sampling run pressed
    nothing (qcode `"home"`), so it was sampling an idle machine.
 
+10. **THE LOOP IS NAMED: `com.apple.driver.AppleMBX` polling a register bit that
+    our MBX stub never sets** (2026-07-29, `scripts/spin-locate.py` +
+    `scripts/kernel-addr-symbolize.py`).
+
+    30 PC samples during the spin all land at `0xc033563c`, and 6000 single
+    steps are **100% kernel**, in an exact 9-instruction cycle:
+
+    ```
+    0xc0336010  MOV r0, r4
+    0xc0336014  MOV r1, #0x12c
+    0xc0336018  BLX r5          -> 0xc0335638: LDR r0,[r0,r1] ; BX lr   (register read)
+    0xc033601c  STR r0, [sp]
+    0xc0336020  LDR r3, [sp]
+    0xc0336024  TST r3, #0x40
+    0xc0336028  BEQ 0xc0336010  -- loop while bit 6 is CLEAR
+    ```
+
+    i.e. `do { v = mbx_read(base, 0x12C); } while (!(v & 0x40));`
+
+    Both addresses are inside **`com.apple.driver.AppleMBX`**
+    (`0xc0329000..0xc033c000`), resolved from the kernelcache's `kmod_info`
+    list. **The MBX region in this emulator is a do-nothing stub with no IRQ
+    connected at all** (tasks T1/T2, [`MBX_HANDOFF.md`](MBX_HANDOFF.md)), so bit
+    6 of register 0x12C can never become set and the driver spins forever.
+
+    So this is **not an iPhone OS 1.0 software bug at all** -- it is our
+    unimplemented MBX, reached by 1.0's app-dismissal path.
+
+    **Attribution trap, recorded because it nearly produced a wrong answer:**
+    the first symbolization used
+    `m68ap-artifacts/unpacked/1.0_1A543a/kernelcache.restore.release.s5l8900xrb`
+    -- the RESTORE cache, which the device does not boot. Its kext ranges are
+    shifted (AppleMBX `0xc0327000` vs `0xc0329000`), and under it the documented
+    `AppleM68Buttons` anchor at `0xc032792c` fell inside AppleMBX, which is what
+    exposed the mistake. Use the RELEASE cache from the root filesystem,
+    `/System/Library/Caches/com.apple.kernelcaches/kernelcache.release.s5l8900xrb`,
+    and check the anchor: with it, `0xc032792c` correctly resolves to
+    `com.apple.driver.AppleM68Buttons`.
+
 ## Hypotheses killed, with the measurement that killed each
 
 Do not re-try any of these.
@@ -267,30 +306,35 @@ is what stops.
 The run's real payoff was accidental: the per-phase process mix and the host CPU
 figure, which is finding 9 above.
 
-## Where it stands
+## Where it stands: this is the MBX gap (T1), not a 1.0 software bug
 
-**The bug is an infinite loop in SpringBoard, entered after the first in-app
-press, that starves the whole system.** Everything else observed is downstream
-of that.
+**Root cause: `AppleMBX` spins on `(mbx[0x12C] & 0x40)`, which our do-nothing
+MBX stub never sets.** Everything else this investigation chased -- the pin, the
+IRQ, the port, the routing, both SpringBoard handlers, `clickedMenuButton` -- is
+downstream or irrelevant. The correct home for the fix is
+[`MBX_HANDOFF.md`](MBX_HANDOFF.md) / task **T1**, which already reads: *"the MBX
+region is currently a do-nothing stub with no IRQ connected at all."*
 
-Now that it is known to be a SPIN rather than a block, the instrument problem
-inverts: a spinning guest reveals its loop immediately, and perturbation no
-longer matters because the guest does not need to make progress. The next steps,
-in order:
+Why 1.1.4 and the iPod do not hit it: both are run with
+`LK_ENABLE_MBX2D=0` (a guest plist edit that forces LayerKit to composite in
+software -- see `build-m68ap-homescreen-nand.py`). That is a userland knob,
+whereas this spin is in the KERNEL driver, so the first thing to establish is
+which path on 1.0 still asks the MBX to do work. Note the honest reading: the
+difference is not that 1.0 is "harder", it is that 1.0 exercises hardware we
+never modelled.
 
-1. **Name the loop.** Sample the PC a handful of times during the spin (the
-   guest is in one place, so a few samples suffice) or extend
-   `menubutton-step-trace.py --after-steps` to tens of thousands of steps and
-   look for the repeating cycle. The after-return walk already points at
-   CF/libobjc notification dispatch with `-[NSCFString isEqual:]` against
-   `-[NSCFArray getObjects:range:]`.
-2. **Compare with 1.1.4 at the same point.** The same walk on 1.1.4 will show
-   what it does instead, and the divergence should be visible directly.
-3. **The `NSThread` started during the unwind** may be the loop's owner rather
-   than the main thread.
-4. **The app side.** On 1.1.4 the dismissed app calls `_ResetEventPortSet` in the
-   APP process; on 1.0 it never does. Neither UIKit binary imports that symbol
-   and GraphicsServices has no direct branch to it, so it is reached through a
-   function pointer -- break on it on 1.1.4 (a safe library address) and read the
-   caller from `lr`. If 1.0's app never gets far enough to reset its port, the
-   spin may be SpringBoard waiting on that app in a busy loop.
+Next steps, in order of cost:
+
+1. **Set bit 6 of MBX register 0x12C** (a completion/ready bit) in the model and
+   re-run `app-button-probe.py --board m68ap-10`. This is a few lines in the MBX
+   stub and it either fixes step 3/4 outright or moves the spin to the next
+   unmodelled bit -- either outcome is progress, and it is cheap.
+2. **Then do T1 properly**: model swap completion and wire the TVOut SDO IRQ, so
+   the driver clears the swap-device field itself. That also retires the
+   address-dependent TVOut window hack and the `LK_ENABLE_MBX2D=0` plist edit.
+3. **Check whether the 1.0 bundle actually carries `LK_ENABLE_MBX2D=0`**, and
+   whether 1.0's LayerKit honours the same key. Cheap, and it explains the
+   build-to-build difference.
+4. Re-check, once MBX responds, whether POWER-in-app (step 4) and the "touch is
+   blocked too" symptom clear at the same time. They should: they are all
+   downstream of the same starvation.
