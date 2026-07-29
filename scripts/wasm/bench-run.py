@@ -115,13 +115,14 @@ def main() -> None:
 
     server = subprocess.Popen(
         [sys.executable, str(REPO / "scripts/wasm/serve.py"),
-         "--port", str(args.port), "--results", str(result_path)],
+         "--port", str(args.port), "--results", str(result_path),
+         "--results-label", args.label],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_for_server(args.port)
 
         query = (f"?instantiate={args.instantiate}&max={args.max}"
-                 f"&mode={args.mode}")
+                 f"&mode={args.mode}&label={args.label}")
         if args.cold:
             query += "&cold=1"
         if args.no_prefetch:

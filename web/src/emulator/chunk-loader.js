@@ -86,6 +86,59 @@ export async function stageChunkedNand(FS, manifest, dir = '/fw/nand') {
 }
 
 /*
+ * Start the worker that actually fetches chunks, and point it at the
+ * emulator's mailbox.
+ *
+ * THE PAGE HAS TO OWN THIS WORKER. The emulator's own thread cannot create it:
+ * a nested dedicated worker is serviced through its parent's context, and the
+ * parent here spends its time blocked in Atomics.wait, so its child's fetch
+ * never completes (measured: 10 s timeout nested, 5 ms page-owned --
+ * web/bench-b/worker-selftest.html). Nor can the emulator fetch on its own
+ * thread: Chrome refuses a synchronous XHR from a module worker, which is what
+ * -sEXPORT_ES6 makes Emscripten's pthreads.
+ *
+ * Call after the runtime is initialised: it needs the exported
+ * `_it_nand_chunk_mailbox_addr`, and the module's heap buffer, which is the
+ * SharedArrayBuffer both sides write into.
+ */
+export function startChunkFetcher(Module, {
+  script = '/chunk-fetch-worker.js', onError,
+} = {}) {
+  const addr = Module._it_nand_chunk_mailbox_addr?.();
+  if (!addr) {
+    throw new Error('emulator exports no chunk mailbox: rebuild, or the ' +
+                    'EMSCRIPTEN_KEEPALIVE export was dropped');
+  }
+  const buffer = Module.HEAPU8?.buffer;
+  if (!buffer || buffer.constructor.name !== 'SharedArrayBuffer') {
+    throw new Error('the wasm heap is not shared; the page is not ' +
+                    'cross-origin isolated');
+  }
+
+  const worker = new Worker(script);
+  worker.onmessage = (event) => {
+    const message = event.data || {};
+    if (message.type === 'error') {
+      onError?.(message);
+    }
+  };
+  return new Promise((resolve, reject) => {
+    worker.onerror = (event) => reject(new Error(`${script}: ${event.message}`));
+    const listener = (event) => {
+      const message = event.data || {};
+      if (message.type === 'watching') {
+        worker.removeEventListener('message', listener);
+        resolve(worker);
+      } else if (message.type === 'ready' && !message.haveMemory) {
+        reject(new Error('fetch worker got no memory'));
+      }
+    };
+    worker.addEventListener('message', listener);
+    worker.postMessage({ type: 'init', buffer, mailbox: addr });
+  });
+}
+
+/*
  * Hand the boot chunk order to the service worker. Resolves when the prefetch
  * finishes; callers that want the boot to start immediately should not await
  * it -- a demand-faulted chunk is served correctly either way, just slower.

@@ -1,0 +1,144 @@
+<meta charset="utf-8">
+<title>chunk-fetch-worker self-test</title>
+<!-- Exercises the futex handshake WITHOUT the emulator.
+
+     The emulator side of this takes ~5 minutes to rebuild and ~2 minutes of
+     booting to reach the first NAND read, which is a terrible loop for
+     debugging a two-message protocol. This reproduces it in a second, and
+     faithfully: a requester worker plays the emulator's pthread — it creates
+     the fetcher as a NESTED worker and blocks in Atomics.wait, exactly as
+     hw/arm/ipod_touch_nand_chunks.c does — over a shared WebAssembly.Memory.
+
+     Serve with scripts/wasm/serve.py (COOP/COEP required) and open
+     /bench-b/worker-selftest.html. -->
+<style>
+  body { font: 13px ui-monospace, Menlo, monospace; background: #14161a;
+         color: #d7dae0; padding: 1rem; line-height: 1.5; }
+  .ok { color: #8fd694; } .fail { color: #e5a3a0; }
+</style>
+<h1 style="font-size:14px;color:#9aa4b2">chunk-fetch-worker self-test</h1>
+<div id="out"></div>
+<script type="module">
+  const out = document.getElementById('out');
+  const log = (text, cls) => {
+    const el = document.createElement('div');
+    el.textContent = text;
+    if (cls) el.className = cls;
+    out.appendChild(el);
+  };
+
+  const url = new URLSearchParams(location.search).get('url') ||
+    '/chunked/1A543a/chunk-config.txt';
+
+  log(`crossOriginIsolated=${crossOriginIsolated}`);
+
+  // Same shape as the emulator's: shared memory, a mailbox of two i32 at a
+  // known offset, the URL and the destination buffer inside that memory.
+  const memory = new WebAssembly.Memory({ initial: 4, maximum: 4, shared: true });
+  log(`memory.buffer is ${memory.buffer.constructor.name}`);
+
+  // Mailbox words, as in ITNandChunkMailbox: request, state, status, ready,
+  // url, urlLen, buffer, capacity.
+  const MAILBOX = 1024;
+  const W_REQUEST = 0, W_STATE = 1, W_STATUS = 2;
+  const URL_AT = 2048;
+  const BUF_AT = 8192;
+  const CAP = 65536;
+
+  const bytes = new Uint8Array(memory.buffer);
+  const encoded = new TextEncoder().encode(url);
+  bytes.set(encoded, URL_AT);
+
+  // Two arrangements, because which one works is the whole question:
+  //
+  //   ?nested=1  the blocked worker creates the fetcher itself (what the
+  //              emulator did first)
+  //   default    the PAGE creates the fetcher, and only the request is sent
+  //              while the requester is blocked
+  //
+  // A nested worker is serviced through its parent's context in Chromium, so
+  // a parent blocked in Atomics.wait can stall it -- which is exactly the
+  // failure being chased.
+  const nested = new URLSearchParams(location.search).get('nested') === '1';
+
+  const requesterSource = `
+    self.onmessage = (e) => {
+      const m = e.data;
+      const words = new Int32Array(m.memory.buffer);
+      const index = (m.mailbox >> 2) + m.stateWord;
+      if (m.script) {
+        const script = new URL(m.script, self.location.origin + '/').href;
+        let fetcher;
+        try {
+          fetcher = new Worker(script);
+        } catch (err) {
+          self.postMessage({ stage: 'new Worker', error: String(err) });
+          return;
+        }
+        fetcher.postMessage({ type: 'init', memory: m.memory });
+        Atomics.store(words, index + 1, 0);
+        Atomics.store(words, index, 1);
+        fetcher.postMessage({
+          type: 'fetch', statePointer: m.mailbox, urlPointer: m.urlAt,
+          urlLength: m.urlLength, bufferPointer: m.bufAt, capacity: m.cap,
+        });
+      } else {
+        Atomics.store(words, index + 1, 0);
+        Atomics.store(words, index, 1);
+        self.postMessage({ stage: 'armed' });
+      }
+      const started = Date.now();
+      const woke = Atomics.wait(words, index, 1, 10000);
+      self.postMessage({
+        woke, ms: Date.now() - started,
+        state: Atomics.load(words, index),
+        status: Atomics.load(words, index + 1),
+      });
+    };
+  `;
+  const requester = new Worker(
+    URL.createObjectURL(new Blob([requesterSource], { type: 'text/javascript' })));
+
+  const fetcher = nested ? null : new Worker('/chunk-fetch-worker.js');
+  if (fetcher) {
+    fetcher.onmessage = (e) => log(`fetcher -> ${JSON.stringify(e.data)}`);
+    fetcher.onerror = (e) => log(`fetcher error: ${e.message}`, 'fail');
+    fetcher.postMessage({ type: 'init', memory });
+  }
+
+  requester.onmessage = (e) => {
+    const r = e.data;
+    if (r.stage === 'armed') {
+      log('requester armed and blocking; page sends the request');
+      fetcher.postMessage({
+        type: 'fetch', statePointer: MAILBOX, urlPointer: URL_AT,
+        urlLength: encoded.length, bufferPointer: BUF_AT, capacity: CAP,
+      });
+      return;
+    }
+    if (r.error) {
+      log(`${r.stage}: ${r.error}`, 'fail');
+      return;
+    }
+    if (r.woke === undefined) {
+      return;
+    }
+    log(`Atomics.wait -> ${r.woke} after ${r.ms} ms; state=${r.state} ` +
+        `status=${r.status}`, r.status > 0 ? 'ok' : 'fail');
+    if (r.status > 0) {
+      const text = new TextDecoder()
+        .decode(bytes.slice(BUF_AT, BUF_AT + r.status));
+      log(`bytes read back: ${JSON.stringify(text.slice(0, 80))}`, 'ok');
+      log(`PASS — ${nested ? 'nested' : 'page-owned'} fetcher works here`, 'ok');
+    } else {
+      log('FAIL — worker status codes: -30 no memory, -31 internal, ' +
+          '-20 network, -6 oversize, -10xx HTTP', 'fail');
+    }
+  };
+
+  requester.postMessage({
+    memory, script: nested ? '/chunk-fetch-worker.js' : null,
+    mailbox: MAILBOX, stateWord: W_STATE, urlAt: URL_AT,
+    urlLength: encoded.length, bufAt: BUF_AT, cap: CAP,
+  });
+</script>

@@ -32,6 +32,7 @@
 
 #include <emscripten.h>
 #include <emscripten/fetch.h>
+#include <emscripten/threading.h>
 
 /*
  * Resident chunks. 64 x 130,944 B is ~8 MiB for the default 62-page chunk --
@@ -51,6 +52,10 @@ typedef struct {
 
 static struct {
     char base[512];              /* URL prefix, e.g. "/chunked/1A543a/chunks/" */
+    /* The page creates the fetch worker, so this is only advisory -- it
+     * travels in chunk-config.txt so an asset set can name its own fetcher,
+     * and web/src/emulator/chunk-loader.js is what reads it. */
+    char fetcher[256];
     uint32_t pages_per_chunk;
     uint32_t stride;
     uint32_t chunk_count;
@@ -63,6 +68,133 @@ static struct {
     uint64_t hits;
     uint64_t bytes;
 } chunks;
+
+/*
+ * Transport 1: block on a futex while a PAGE-OWNED classic worker fetches.
+ *
+ * The emulator writes a request into a mailbox in its own heap and sleeps on
+ * it; web/chunk-fetch-worker.js -- created by the page, watching the same
+ * mailbox with Atomics.waitAsync -- fetches the chunk, writes it straight into
+ * the heap, and wakes the emulator. Nothing is copied through postMessage,
+ * and the emulator never awaits.
+ *
+ * Two arrangements were measured and rejected first, both failing quietly:
+ *
+ *   - a synchronous XHR on this thread: Chrome refuses it, because
+ *     -sEXPORT_ES6 makes Emscripten's pthread workers MODULE workers;
+ *   - this thread creating the fetch worker itself: a NESTED worker is
+ *     serviced through its parent's context, so a parent blocked in
+ *     Atomics.wait stalls its own fetcher. web/bench-b/worker-selftest.html
+ *     reproduces both in a second -- nested times out at 10 s, page-owned
+ *     answers in 5 ms -- which is why that file exists.
+ */
+#define EM_JS_PRE(ret, name, args, body...) EM_JS(ret, name, args, body)
+#define DEC_PTR(p) bigintToI53Checked(p)
+
+/*
+ * Layout is shared with web/chunk-fetch-worker.js, as a plain array of i32 so
+ * both sides can address it by word index with no struct-layout guesswork.
+ */
+typedef struct {
+    int32_t request;             /* bumped to signal a request */
+    int32_t state;               /* 0 idle, 1 pending, 2 done */
+    int32_t status;              /* bytes written, or a negative code */
+    int32_t ready;               /* set by the worker once it is watching */
+    int32_t url;                 /* address of the URL bytes */
+    int32_t url_len;
+    int32_t buffer;              /* address to write the chunk to */
+    int32_t capacity;
+    char url_bytes[512];
+} ITNandChunkMailbox;
+
+#define CHUNK_STATE_IDLE    0
+#define CHUNK_STATE_PENDING 1
+#define CHUNK_STATE_DONE    2
+
+#define CHUNK_ERR_NO_WORKER (-19)
+#define CHUNK_ERR_TIMEOUT   (-21)
+
+/* A chunk fetch that takes longer than this is not going to arrive. Hanging
+ * the emulator for ever is worse than failing the read and saying so. */
+#define CHUNK_FETCH_TIMEOUT_MS 30000
+
+/* One mailbox: NAND reads are serialised by the device model, and a second
+ * in-flight request would need a second watcher anyway. */
+static ITNandChunkMailbox chunk_mailbox;
+
+/*
+ * The page needs this address to point the fetch worker at the mailbox, and an
+ * EXPORTED FUNCTION is the only way to hand it over: an EM_JS body runs on
+ * whichever thread called it and sees that thread's `Module`, which under
+ * -sPROXY_TO_PTHREAD is never the page's. Same pattern as ui/wasm.c's
+ * wasm_display_info_addr().
+ */
+EMSCRIPTEN_KEEPALIVE uint32_t it_nand_chunk_mailbox_addr(void)
+{
+    return (uint32_t)(uintptr_t)&chunk_mailbox;
+}
+
+static int it_nand_fetch_chunk_worker(const char *url, void *buf, size_t cap,
+                                      char *err, size_t errcap)
+{
+    ITNandChunkMailbox *mb = &chunk_mailbox;
+    size_t url_len = strlen(url);
+    double deadline;
+    int got;
+
+    if (!qatomic_read(&mb->ready)) {
+        g_strlcpy(err, "no fetch worker is watching the mailbox", errcap);
+        return CHUNK_ERR_NO_WORKER;
+    }
+    /*
+     * Atomics.wait is illegal on the browser's main thread. Under
+     * -sPROXY_TO_PTHREAD the emulator never runs there, but a build that
+     * changed would otherwise throw instead of falling back.
+     */
+    if (emscripten_is_main_browser_thread()) {
+        g_strlcpy(err, "cannot block on the main browser thread", errcap);
+        return CHUNK_ERR_NO_WORKER;
+    }
+    if (url_len >= sizeof(mb->url_bytes)) {
+        g_strlcpy(err, "chunk URL is too long for the mailbox", errcap);
+        return CHUNK_ERR_NO_WORKER;
+    }
+
+    memcpy(mb->url_bytes, url, url_len);
+    qatomic_set(&mb->url, (int32_t)(uintptr_t)mb->url_bytes);
+    qatomic_set(&mb->url_len, (int32_t)url_len);
+    qatomic_set(&mb->buffer, (int32_t)(uintptr_t)buf);
+    qatomic_set(&mb->capacity, (int32_t)cap);
+    qatomic_set(&mb->status, 0);
+    qatomic_set(&mb->state, CHUNK_STATE_PENDING);
+
+    /* Publish the request last, and wake the watcher on it: everything above
+     * has to be visible before the worker looks. */
+    qatomic_inc(&mb->request);
+    emscripten_futex_wake(&mb->request, 1);
+
+    deadline = emscripten_get_now() + CHUNK_FETCH_TIMEOUT_MS;
+    while (qatomic_read(&mb->state) == CHUNK_STATE_PENDING) {
+        /* Woken by the worker's Atomics.notify; the slice is a safety net, not
+         * a poll interval. */
+        emscripten_futex_wait(&mb->state, CHUNK_STATE_PENDING, 1000);
+        if (qatomic_read(&mb->state) != CHUNK_STATE_PENDING) {
+            break;
+        }
+        if (emscripten_get_now() > deadline) {
+            g_snprintf(err, errcap, "no answer in %d ms",
+                       CHUNK_FETCH_TIMEOUT_MS);
+            qatomic_set(&mb->state, CHUNK_STATE_IDLE);
+            return CHUNK_ERR_TIMEOUT;
+        }
+    }
+    got = qatomic_read(&mb->status);
+    qatomic_set(&mb->state, CHUNK_STATE_IDLE);
+    if (got <= 0) {
+        g_snprintf(err, errcap, "worker reported %d", got);
+    }
+    return got;
+}
 
 /*
  * The synchronous XMLHttpRequest path.
@@ -80,11 +212,9 @@ static struct {
  * Content-Encoding (reproduced with the header removed) and not the service
  * worker (reproduced with it bypassed).
  *
- * Kept as the first choice because where it works it is the cheapest path.
+ * Kept only as a fallback for an engine where the page has not started the
+ * fetch worker.
  */
-#define EM_JS_PRE(ret, name, args, body...) EM_JS(ret, name, args, body)
-#define DEC_PTR(p) bigintToI53Checked(p)
-
 EM_JS_PRE(int, it_nand_fetch_chunk_xhr, (const char *url, void *buf,
                                          int cap, char *err, int errcap), {
     const target = UTF8ToString(DEC_PTR(url));
@@ -169,36 +299,56 @@ static int it_nand_fetch_chunk_em(const char *url, void *buf, size_t cap,
 }
 
 /*
- * Try the XHR, then emscripten_fetch. Whichever works first wins for the rest
- * of the run: both are synchronous, and probing on every chunk would pay the
- * failing one's cost forever.
+ * Pick a transport once, then stay on it. All three are synchronous from the
+ * emulator's point of view; probing on every chunk would pay the failing
+ * ones' cost for the whole run.
  *
- * WARNING (2026-07-29): on Chrome 149 BOTH fail -- the XHR with a NetworkError
- * and emscripten_fetch with a silent zero-byte result, because its backend is
- * that same XHR. A browser where neither works needs the Atomics.wait design:
- * the emulator thread blocks on a futex while a CLASSIC (non-module) worker
- * does an async fetch and writes into the shared heap. That is the known next
- * step, and it is why this function keeps the failure codes.
+ *   1. the futex + page-owned-worker path -- works in Chrome, and is the design
+ *   2. a synchronous XHR -- fewer moving parts, but Chrome refuses it from a
+ *      module worker (which -sEXPORT_ES6 makes these)
+ *   3. emscripten_fetch(SYNCHRONOUS) -- same XHR underneath, so it fails the
+ *      same way, silently; kept because it costs nothing and a future
+ *      Emscripten may back it differently
  */
 static int it_nand_fetch_chunk(const char *url, void *buf, size_t cap,
                                char *err, size_t errcap)
 {
-    static int transport;          /* 0 unknown, 1 xhr, 2 emscripten_fetch */
+    static int transport;          /* 0 unknown, 1 worker, 2 xhr, 3 fetch */
     int got;
 
-    if (transport != 2) {
-        got = it_nand_fetch_chunk_xhr(url, buf, (int)cap, err, (int)errcap);
+    if (transport == 0 || transport == 1) {
+        got = it_nand_fetch_chunk_worker(url, buf, cap, err, errcap);
         if (got > 0) {
+            if (transport == 0) {
+                fprintf(stderr, "[NANDCHUNK] transport: futex + the page's "
+                        "fetch worker\n");
+            }
             transport = 1;
             return got;
         }
         if (transport == 1) {
-            return got;            /* it worked before; this is a real error */
+            return got;            /* it worked before: this is a real error */
+        }
+    }
+    if (transport == 0 || transport == 2) {
+        got = it_nand_fetch_chunk_xhr(url, buf, (int)cap, err, (int)errcap);
+        if (got > 0) {
+            if (transport == 0) {
+                fprintf(stderr, "[NANDCHUNK] transport: synchronous XHR\n");
+            }
+            transport = 2;
+            return got;
+        }
+        if (transport == 2) {
+            return got;
         }
     }
     got = it_nand_fetch_chunk_em(url, buf, cap, err, errcap);
     if (got > 0) {
-        transport = 2;
+        if (transport == 0) {
+            fprintf(stderr, "[NANDCHUNK] transport: emscripten_fetch\n");
+        }
+        transport = 3;
     }
     return got;
 }
@@ -305,7 +455,13 @@ static bool read_config(const char *path)
             chunks.stride = strtoul(value, NULL, 10);
         } else if (g_str_equal(*line, "base")) {
             g_strlcpy(chunks.base, value, sizeof(chunks.base));
+        } else if (g_str_equal(*line, "fetcher")) {
+            g_strlcpy(chunks.fetcher, value, sizeof(chunks.fetcher));
         }
+    }
+    if (chunks.fetcher[0] == '\0') {
+        g_strlcpy(chunks.fetcher, "/chunk-fetch-worker.js",
+                  sizeof(chunks.fetcher));
     }
     return chunks.pages_per_chunk > 0 && chunks.chunk_count > 0 &&
            chunks.entry_count > 0 && chunks.stride > 0 &&

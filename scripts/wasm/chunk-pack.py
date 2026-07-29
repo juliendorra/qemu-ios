@@ -9,7 +9,7 @@ Output layout (format `ipod-nand-chunks-v1`):
 
     nand.pack.idx        header + index, no payload -- downloaded up front
     chunk-hashes.bin     32-byte SHA-256 per chunk, in chunk order
-    chunk-config.txt     pagesPerChunk / base, read by the emulator
+    chunk-config.txt     pagesPerChunk / base / fetcher, read by the emulator
     chunk-manifest.json  the same, for the JS loader, plus sizes and prefetch
     chunks/<sha256>      the chunk payload, stored ALREADY Brotli-compressed
 
@@ -66,6 +66,9 @@ def main() -> None:
                              "for a 215 MiB pack)")
     parser.add_argument("--base", default="chunks/",
                         help="URL prefix the emulator prepends to a chunk hash")
+    parser.add_argument("--fetcher", default="/chunk-fetch-worker.js",
+                        help="classic worker the emulator blocks on for chunk "
+                             "reads (web/chunk-fetch-worker.js)")
     parser.add_argument("--prefetch", type=Path,
                         help="prefetch.json from analyze-nand-trace.py "
                              "--prefetch; its chunk order is copied into the "
@@ -130,7 +133,8 @@ def main() -> None:
         f"chunks={total_chunks}\n"
         f"entries={count}\n"
         f"stride={stride}\n"
-        f"base={args.base}\n")
+        f"base={args.base}\n"
+        f"fetcher={args.fetcher}\n")
 
     prefetch: list[int] = []
     if args.prefetch:
@@ -154,6 +158,7 @@ def main() -> None:
         "chunks": total_chunks,
         "uniqueChunks": len(unique),
         "base": args.base,
+        "fetcher": args.fetcher,
         "encoding": "br",
         "storedBytes": stored_total,
         "rawBytes": raw_total,

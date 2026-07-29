@@ -520,7 +520,82 @@ reports `fetched=320 hits=11095 resident<=64 bytes=39.9 MiB` — a **97% hit rat
 in the 64-slot LRU**, and 39.9 MiB of records consumed for 18.52 MiB
 downloaded, which is the read amplification the chunk size trades away.
 
-### The open blocker: Chrome 149 will not do a SYNCHRONOUS network read here
+### SOLVED: the chunked boot runs in Chrome — futex + a PAGE-OWNED worker
+
+The synchronous-read blocker described below is fixed. The emulator now writes a request
+into a mailbox in its own heap and sleeps on it with `emscripten_futex_wait`;
+**`web/chunk-fetch-worker.js`, created by the page**, watches that mailbox with
+`Atomics.waitAsync`, fetches the chunk, writes it straight into the wasm heap
+and wakes the emulator. Nothing goes through `postMessage`, and the emulator
+still never awaits — it blocks — so QEMU's MMIO path is untouched.
+
+Measured in **standalone Chrome 149**, which is where every earlier attempt
+failed:
+
+| run | kernel | BSD root | chunk requests | on the wire |
+| --- | --- | --- | --- | --- |
+| chunked, demand only (no prefetch, no SW) | 113 | 124 | 63 | 4.2 MB |
+| chunked, warm (SW cache) | 116 | 128 | **0** | **0** |
+| whole-pack, for comparison | 114 | 125 | — | 216.8 MiB staged |
+
+**Chunked delivery costs nothing in boot time** — the landmarks match the
+whole-pack run within noise — and a boot that only demand-faults reaches BSD
+root having pulled **4.2 MB**.
+
+**Two arrangements were tried and rejected first, and both failed quietly:**
+
+| arrangement | what happens |
+| --- | --- |
+| synchronous XHR on the emulator's thread | `NetworkError: Failed to execute 'send'`, request never leaves the browser |
+| `emscripten_fetch(SYNCHRONOUS)` | returns **zero bytes, no error** — its backend is that same XHR |
+| the emulator's thread creating the fetch worker itself | fetch never completes; 30 s timeout |
+
+That last one is the subtle one and it cost the most: **a nested dedicated
+worker is serviced through its parent's context**, and this parent spends its
+life blocked in `Atomics.wait`, so its own fetcher can never run. The page has
+to own the worker.
+
+Getting the mailbox address to the page needs an **exported function**
+(`it_nand_chunk_mailbox_addr`, `EMSCRIPTEN_KEEPALIVE`), for exactly the reason
+Session A found with the display: an `EM_JS` body runs on the calling thread and
+sees *that* thread's `Module`, which under `-sPROXY_TO_PTHREAD` is never the
+page's.
+
+### The tool that found it: `web/bench-b/worker-selftest.html`
+
+Three bugs in this protocol were each costing a 5-minute wasm rebuild plus two
+minutes of booting to reach the first NAND read. The self-test reproduces the
+whole handshake — shared `WebAssembly.Memory`, a requester worker blocking in
+`Atomics.wait`, the real `chunk-fetch-worker.js` — **in about a second**, and
+`?nested=1` switches between the two arrangements:
+
+```
+nested:      Atomics.wait -> timed-out after 10017 ms; state=1 status=0
+page-owned:  Atomics.wait -> ok after 4 ms; state=2 status=116   PASS
+```
+
+It also caught the bug that would have been hardest to guess: **`TextDecoder`
+refuses a view onto a `SharedArrayBuffer`** ("The provided ArrayBufferView
+value must not be shared"), so reading the URL out of the wasm heap needs
+`.slice()` (a copy) rather than `.subarray()`.
+
+**Build the cheap reproduction first.** Every one of these bugs was a
+three-message protocol defect that a page could exercise in a second.
+
+### Still open: the page's main thread stalls while the SW fetches from network
+
+Separate from the transport, and it predates it. In a **cold** run with the
+service worker in the path, the page stops running timers seconds in — while
+the emulator keeps going and its chunk requests keep arriving at the server
+(348 requests, 15.8 MB in one such run). A **warm** run with the same service
+worker does not stall, and neither does a cold run with `?sw=0`. So it tracks
+the service worker doing *network* work, not the service worker as such.
+
+Effect is on measurement, not on the boot: the emulator progresses either way.
+
+### The original diagnosis (kept: it is what the fix is built on)
+
+**Chrome 149 will not do a SYNCHRONOUS network read here**
 
 The chunked design turns on the emulator reading a chunk synchronously from
 inside QEMU's MMIO path. That works in the in-app browser and **fails in

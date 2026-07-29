@@ -316,17 +316,29 @@ run gets a fresh Cache Storage and is cold again.
 wire; warm = **0 requests, 0 bytes**; the emulator's own LRU reported 11,095
 hits against 320 fetches. Against 216.8 MiB for the whole-pack page.
 
-**Open blocker — the next piece of work.** Chrome 149 refuses a **synchronous**
-network read from an Emscripten pthread (`NetworkError` on `XMLHttpRequest.send`,
-request never leaves the browser; `emscripten_fetch(SYNCHRONOUS)` fails the
-same way, silently, because its backend is that XHR). The cause is
-`-sEXPORT_ES6`, which makes those workers module workers. Ruled out by
-experiment: not the `Content-Encoding`, not the service worker.
+**The synchronous read works in Chrome now** (2026-07-29): the emulator blocks
+on a futex in a mailbox in its own heap, and `web/chunk-fetch-worker.js` — **a
+classic worker created by the PAGE** — fetches the chunk, writes it into the
+wasm heap and wakes it. Measured in standalone Chrome: kernel 113 s, BSD root
+124 s, 63 demand-faulted chunks = 4.2 MB; a warm run pulls **0 bytes**. Boot
+time matches the whole-pack run, so chunking costs nothing.
 
-The fix is **Atomics.wait**: the emulator thread blocks on a futex while a
-*classic* worker does an async `fetch()` into the shared heap. The emulator
-still never awaits. Details and the eliminated suspects are in
-`BROWSER_WASM_STATUS.md`.
+**Do not let the emulator create that worker.** A nested dedicated worker is
+serviced through its parent's context, and this parent is blocked in
+`Atomics.wait` — its own fetcher then never runs (10 s timeout, versus 5 ms
+page-owned). Nor can the emulator fetch on its own thread: Chrome refuses a
+synchronous XHR from a module worker, which is what `-sEXPORT_ES6` makes
+Emscripten's pthreads, and `emscripten_fetch(SYNCHRONOUS)` fails the same way
+with **zero bytes and no error**.
+
+`web/bench-b/worker-selftest.html` exercises the whole handshake in about a
+second (`?nested=1` to see the failing arrangement). Use it before rebuilding
+the emulator for anything in this protocol.
+
+**Still open:** in a *cold* run with the service worker fetching from the
+network, the page's main thread stops running timers while the emulator carries
+on. Warm runs and `?sw=0` runs are unaffected; it costs measurement, not the
+boot.
 
 **Use `scripts/wasm/bench-run.py`, not a tab.** A browser throttles a hidden
 page, and the symptom is a run that looks *stalled* — "compiled=352" for

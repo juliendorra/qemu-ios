@@ -52,6 +52,7 @@ RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
 CHUNK_PATH = re.compile(r"/chunks/[0-9a-f]{64}$")
 CHUNK_COUNTER = {"requests": 0, "bytes": 0}
 RESULT_PATH: Path | None = None
+RESULT_LABEL: str | None = None
 # Diagnostic: serve the stored (still-compressed) chunk bodies WITHOUT the
 # Content-Encoding header. The emulator then rejects them for length, but the
 # transport either works or does not -- which is what separates "this browser
@@ -114,6 +115,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length)
+        if RESULT_LABEL:
+            # Both sessions' pages post here now, and a foreign snapshot
+            # silently REPLACES the run being measured -- which is how a
+            # chunked-boot run came back reporting "first pixels" and a
+            # non-black percentage it does not measure.
+            try:
+                if json.loads(body).get("label") != RESULT_LABEL:
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+            except (ValueError, AttributeError):
+                pass
         if RESULT_PATH:
             RESULT_PATH.write_bytes(body)
         else:
@@ -241,6 +254,9 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--root", type=Path, default=REPO / "web")
+    parser.add_argument("--results-label",
+                        help="only accept /__bench-result posts carrying this "
+                             "label (both sessions' pages post here)")
     parser.add_argument("--no-brotli-header", action="store_true",
                         help="diagnostic: omit Content-Encoding on chunks")
     parser.add_argument("--results", type=Path,
@@ -250,8 +266,9 @@ def main() -> None:
                         help="start, verify the headers, print the result, exit")
     args = parser.parse_args()
 
-    global RESULT_PATH, NO_BROTLI_HEADER
+    global RESULT_PATH, RESULT_LABEL, NO_BROTLI_HEADER
     RESULT_PATH = args.results
+    RESULT_LABEL = args.results_label
     NO_BROTLI_HEADER = args.no_brotli_header
 
     root = args.root.resolve()
