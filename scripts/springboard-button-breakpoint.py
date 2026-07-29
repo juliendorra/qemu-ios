@@ -155,6 +155,10 @@ def main() -> int:
     ap.add_argument("--vnc-port", type=int, default=5930)
     ap.add_argument("--settle", type=float, default=45)
     ap.add_argument("--wait", type=float, default=90)
+    ap.add_argument("--no-app", action="store_true",
+                    help="press HOME from the home screen instead of from "
+                         "inside an app -- isolates whether the frontmost app "
+                         "is what changes the routing")
     args = ap.parse_args()
 
     btn = _load("appbuttonprobe", REPO / "scripts" / "app-button-probe.py")
@@ -210,9 +214,12 @@ def main() -> int:
             print("dismissing the first-launch modal ...")
             btn.tap(q, *dismiss, 0.12)
             time.sleep(args.settle)
-        print("opening an app ...")
-        btn.tap(q, *icon, 0.12)
-        time.sleep(args.settle)
+        if args.no_app:
+            print("NOT opening an app -- pressing HOME from SpringBoard itself")
+        else:
+            print("opening an app ...")
+            btn.tap(q, *icon, 0.12)
+            time.sleep(args.settle)
 
         print(f"attaching gdbstub on :{args.gdb_port} ...")
         g = Gdb(args.gdb_port)

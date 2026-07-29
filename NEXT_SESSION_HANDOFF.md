@@ -802,3 +802,46 @@ That interval is `AppleM68Buttons`' interrupt handler and the HID event posting
 above it. Registration and enablement are both ruled out, so the next thing to
 read is the handler itself -- anchor on `AppleM68Buttons`' class name and vtable
 rather than on `function-button_%s`, which is registration-time only.
+
+## THE DISCRIMINATOR: it is event ROUTING, not the button (2026-07-29)
+
+`springboard-button-breakpoint.py --no-app` presses HOME from the home screen
+instead of from inside an app. Same build, same binary, same breakpoint address:
+
+| build | HOME from SpringBoard | HOME from inside an app |
+| --- | --- | --- |
+| 1.0 | **HIT** | **NO HIT** |
+| 1.1.4 | (works) | **HIT** |
+
+**On 1.0 the handler runs when SpringBoard is frontmost and stops running when
+an app is.** So every layer below is exonerated by direct measurement, not by
+argument: the GPIO pin, the IRQ, INTEN, the interrupt-controller ACK,
+`AppleM68Buttons` (which attaches, starts and is byte-identical between builds),
+`IOHIDUserClientIniter` (attaches on both), and SpringBoard's own handlers
+(structurally identical, and they DO run -- just not while an app is up).
+
+The bug is in how the hardware-button GSEvent is ROUTED once a foreground
+application owns the event stream. On iPhone OS 1.x, hardware button events must
+reach SpringBoard regardless of which app is frontmost; on 1.0 under this
+emulator they do not, and on 1.1.4 they do.
+
+This also explains, at last, why POWER fails in the same situation (step 4) and
+why the other session's interrupt-path investigation correctly found nothing: it
+was looking below the layer where the divergence lives.
+
+### What to read next, with the anchors
+
+The routing decision is made in the purple/GSEvent layer, not in
+`AppleM68Buttons`. Two tractable entry points:
+
+* **SpringBoard's event source.** It registers for hardware button events
+  somewhere; `-[SpringBoard menuButtonDown:]` is only the callback. Find who
+  calls it (its address is a known constant, 0x6ae0 on 1.0 / 0x78dc on 1.1.4,
+  so a breakpoint plus a stack read at the hit gives the caller directly).
+* **The GraphicsServices/purple event port.** Compare which process holds the
+  event-routing port with an app frontmost on the two builds. `IOHIDUserClient`
+  is created by `IOHIDUserClientIniter` on both, so the divergence is in who
+  connects to it and with what priority.
+
+A stack read at the 1.1.4 in-app HIT is probably the single most informative
+next measurement: it names the caller that 1.0 is failing to reach.
