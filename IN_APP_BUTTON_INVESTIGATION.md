@@ -951,3 +951,42 @@ repeatedly earlier in the day.
 
 **Current bundle state:** 1.0 on today's engine (works, except the transition),
 1.1.4 on the pre-session engine (5/5), iPod on today's engine (untested since).
+
+
+## CORRECTION: SpringBoard DOES render after the dismissal (2026-07-30)
+
+I said one step earlier that SpringBoard "is not producing a repaint". That was
+wrong, and watching LayerKit's own dirty/render path says so plainly. 1.0, two
+presses in-app:
+
+| phase | LayerKit call | process | count |
+| --- | --- | --- | --- |
+| p1 | `-[LKLayer setNeedsDisplay]` | **SpringBoard** | 3 |
+| p1 | `_LKLayerDisplayIfNeeded` | **SpringBoard** | **20** |
+| p1 | `_LKBackingStoreGetRenderImage` | **SpringBoard** | 2 |
+| p1 | `_LKBackingStoreSwap` | **SpringBoard** | 2 |
+
+So after the press SpringBoard marks layers dirty, displays them, takes render
+images and swaps its backing stores. **It renders.** The pixels simply never
+reach the scanned-out framebuffer, and `AppleH1CLCD+0x1edc` is still never
+called.
+
+### The break, now pinned to one hop
+
+Chain after the press on 1.0, each link measured:
+
+```
+SpringBoard renders (LayerKit)                                   OK
+  -> IOMobileFramebufferSwapBegin / SwapEnd / SwapWait  x3       OK  (userland submits)
+     -> IOMobileFramebuffer user client -> IOMobileGraphicsFamily   ??
+        -> AppleH1CLCD+0x1edc  (programs the window base)        NEVER REACHED
+```
+
+On 1.1.4 the identical submission produces ~522 base programs through
+`IOMobileGraphicsFamily+0x3d34 -> +0x254c -> +0x23b4 -> AppleH1CLCD+0x1eec`.
+
+So the failure is inside the KERNEL swap path, between the user client and the
+CLCD, on a build whose MBX is registered as the *legacy* swap device. That is
+the one hop nobody has instrumented yet, and it is instrumentable the same way
+the 1.1.4 chain was: `spin-locate.py --break-kaddr <IOMobileGraphicsFamily addr>
+--kernelcache`, using 1.0's own kext offsets.
