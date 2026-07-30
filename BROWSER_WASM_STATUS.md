@@ -126,6 +126,78 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### INSTANT BOOT WORKS: a restored snapshot is interactive in the browser
+
+`?resume=1` fetches a natively-produced 57 MiB migration stream, restores it, and
+the page is at a **live, interactive iPhone OS 1.0 home screen** — tapping the
+Settings icon launches Settings (45.4% → 99.9% non-black). Natively the same
+stream reports `interactive=True`, 45.1% → 96.3%.
+
+| | cold chunked boot | snapshot resume |
+| --- | --- | --- |
+| home screen | ~250 s | **18.4 s** (resume itself at ~3 s) |
+| download | 18.57 MiB | 57 MiB (one-off) |
+
+#### The root cause was QEMU's sticky "suspended" flag, migrated
+
+Everything else was a real fix but not *the* fix. The machine kept coming back
+in `RUN_STATE_SUSPENDED`, and the reason is a QEMU semantic our sleep emulation
+had quietly borrowed:
+
+```c
+/* system/cpus.c, vm_prepare_start() */
+RunState state = vm_was_suspended ? RUN_STATE_SUSPENDED : RUN_STATE_RUNNING;
+```
+
+`vm_was_suspended` is **sticky** — only a system reset clears it
+(`vm_set_suspended(false)` at the end of `qemu_system_reset`) — and
+`migration/global_state.c` **ships it in the stream**:
+
+```c
+global_state.vm_was_suspended = vm_get_suspended();
+...
+vm_set_suspended(s->vm_was_suspended || r == RUN_STATE_SUSPENDED);
+```
+
+Our PMU parks the guest with `vm_stop(RUN_STATE_SUSPENDED)`. So **any device
+that had ever slept carried the flag for the rest of its life**, and every
+snapshot of it restored to a suspended machine: a live-looking panel — the
+restored frame, painted once — with no vCPU behind it, and touch delivered to
+the model and never acted on.
+
+**Fix: park with `RUN_STATE_PAUSED`.** The park only ever needed "vCPUs stopped,
+resumable by `vm_start()`". `SUSPENDED` additionally asserts "the guest performed
+a system suspend", which drags in the wakeup protocol and that sticky flag, and
+nothing here uses those semantics — the wake path calls `vm_start()` directly
+rather than `qemu_system_wakeup_request()`.
+
+Live, this was nearly invisible: the common wake path on iBoot-159 issues a
+system reset, which clears the flag on its way through. **Migration is what made
+it observable**, which is a good argument for snapshot support as a correctness
+instrument and not just a feature.
+
+#### The five device VMStates were still necessary
+
+Each was found by measuring a distinct failure, and each is still required:
+
+| device | symptom without it |
+| --- | --- |
+| LCD | scanout 45.4% → 0.003%, black panel |
+| PMU | pre-warm state restarted from the wrong place |
+| multitouch | `firmware_loaded` false — controller looks unprogrammed |
+| sysic + SPI | driver re-enumerates: a burst of Z1 `get-report`/`report-info` |
+| pl192 (VIC) | defensive; a reset VIC has `intenable == 0` |
+
+#### A wrong turn worth recording
+
+The dead touch was chased for two rounds as a *device* problem, and two devices
+were added on the strength of it. That was not wasted — sysic+SPI demonstrably
+took the Z1 re-enumeration from many to zero — but the framing was wrong: the
+guest was not mis-reading the touch controller, it **was not executing at all**.
+The tell was there the whole time and was misread: `guest_ms` frozen while
+`run_state` said something other than running. **Check that the vCPU is running
+before attributing anything to a device.**
+
 ### Snapshot state: five devices migrated, panel and machine restore, touch does not
 
 Where the device-by-device loop stands. Each was found by measuring, not by

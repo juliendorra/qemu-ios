@@ -144,6 +144,7 @@ static bool tvout_wa_enabled(void)
 }
 
 static MemoryRegion *tvout_wa_region;
+static bool tvout_wa_mapped;        /* nothing is mapped until the guest says where */
 static hwaddr tvout_wa_addr;
 static uint64_t tvout_wa_reads;
 static bool tvout_wa_derived;
@@ -173,17 +174,41 @@ static const MemoryRegionOps tvout_workaround_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/*
+ * Place (or move) the window. NOTHING IS MAPPED UNTIL THE KERNEL SAYS WHERE.
+ *
+ * The per-board constant used to be installed at machine init, before the guest
+ * had announced anything. Since T3 the real address is DERIVED from the kernel's
+ * own "AppleMBX: Added swap device: ... id: ..." line, so a blind default has no
+ * remaining job -- it is four bytes of guessed kernel heap, and MBX_HANDOFF.md
+ * is blunt about what that silence cost once. Worse, it is now known to be
+ * actively harmful: the same offset that is inert on a TVOut object lands inside
+ * a LIVE AppleH1CLCD on iPhone OS 1.0, where the kernel dereferences the zero it
+ * reads and panics (fault_addr=0x0, 2 of 2 boots).
+ *
+ * So 1.0 and the iPod carry no window at all unless a TVOut device is announced,
+ * and 1.1.4 gets one only at an address the kernel supplied.
+ */
 static void tvout_workaround_move(hwaddr pa)
 {
     if (!tvout_wa_region || pa == tvout_wa_addr) {
         return;
     }
-    memory_region_del_subregion(get_system_memory(), tvout_wa_region);
+    if (tvout_wa_mapped) {
+        memory_region_del_subregion(get_system_memory(), tvout_wa_region);
+    }
     memory_region_add_subregion_overlap(get_system_memory(), pa,
                                         tvout_wa_region, 1);
-    fprintf(stderr, "[TVOUT-WA] window moved 0x%08x -> 0x%08x "
-            "(derived from the guest's own announcement)\n",
-            (uint32_t)tvout_wa_addr, (uint32_t)pa);
+    if (tvout_wa_mapped) {
+        fprintf(stderr, "[TVOUT-WA] window moved 0x%08x -> 0x%08x "
+                "(derived from the guest's own announcement)\n",
+                (uint32_t)tvout_wa_addr, (uint32_t)pa);
+    } else {
+        fprintf(stderr, "[TVOUT-WA] window PLACED at 0x%08x (first placement; "
+                "derived from the guest's own announcement -- nothing was "
+                "mapped before this)\n", (uint32_t)pa);
+    }
+    tvout_wa_mapped = true;
     tvout_wa_addr = pa;
 }
 
@@ -1166,6 +1191,31 @@ static void ipod_touch_key_event(void *opaque, int keycode)
             pmu->prewarm_parked = false;
             pmu->prewarm_active = false;
             pmu->retained_int2_reexposed = true;
+            /*
+             * Undo the SUSPEND, not just the stop.
+             *
+             * The park uses vm_stop(RUN_STATE_SUSPENDED), and QEMU records that
+             * in a separate, sticky flag: vm_prepare_start() reads
+             *
+             *     RunState state = vm_was_suspended ? RUN_STATE_SUSPENDED
+             *                                       : RUN_STATE_RUNNING;
+             *
+             * so a bare vm_start() on a machine that has ever parked puts it
+             * straight back to SUSPENDED and never resumes the vCPUs. Only a
+             * system reset clears the flag (vm_set_suspended(false) at the end
+             * of qemu_system_reset), which is why the reset-based wake branch
+             * below has always worked and the plain resume branch has not.
+             *
+             * Live, the damage was invisible: the reset branch is the common
+             * one on iBoot-159, and the resume branch left the flag set on a
+             * machine that then ran anyway because vm_start() had already been
+             * called once before. It becomes visible the moment the machine is
+             * MIGRATED -- migration/global_state.c ships vm_was_suspended, so
+             * every snapshot of a device that had ever slept restored to a
+             * suspended machine: a live-looking panel (the restored frame,
+             * painted once) with no vCPU running behind it.
+             */
+            vm_set_suspended(false);
             if (pmu->prewarm_no_park) {
                 /* Parked without a type-4 commit (iBoot-159), so the guest is
                  * sitting in its power-off spin rather than just before the
@@ -1719,10 +1769,12 @@ static void ipod_touch_machine_init(MachineState *machine)
     nms->tvout3_state = tvout_state;
     memory_region_add_subregion(sysmem, TVOUT3_MEM_BASE, &tvout_state->iomem);
 
-    // setup workaround for TVOut. The per-board constant is only the initial
-    // placement, used until the kernel announces the real object address; the
-    // console tap then moves the window and reports any mismatch (see the
-    // block comment above tvout_workaround_read).
+    /*
+     * The TVOut swap-device window. The region is CREATED here but deliberately
+     * NOT MAPPED: the address comes from the kernel's own announcement (see
+     * tvout_workaround_move). The per-board constants survive only as the
+     * expected value, so a mismatch can still be reported.
+     */
     if (tvout_wa_enabled()) {
         iomem = g_new(MemoryRegion, 1);
         memory_region_init_io(iomem, OBJECT(nms), &tvout_workaround_ops, NULL, "tvoutworkaround", 0x4);
@@ -1730,7 +1782,9 @@ static void ipod_touch_machine_init(MachineState *machine)
         tvout_wa_addr = (nms->board_id == BOARD_ID_M68AP) ?
                         TVOUT_WORKAROUND_M68AP_MEM_BASE :
                         TVOUT_WORKAROUND_MEM_BASE;
-        memory_region_add_subregion_overlap(sysmem, tvout_wa_addr, iomem, 1);
+        fprintf(stderr, "[TVOUT-WA] armed but NOT mapped; expecting 0x%08x, "
+                "waiting for the guest to announce a TVOut swap device\n",
+                (uint32_t)tvout_wa_addr);
     } else {
         fprintf(stderr, "[TVOUT-WA] disabled by IT_TVOUT_WA=0\n");
     }

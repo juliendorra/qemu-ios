@@ -437,7 +437,33 @@ static void pcf50633_prewarm_park(void *opaque)
         return;
     }
     s->prewarm_parked = true;
-    vm_stop(RUN_STATE_SUSPENDED);
+    /*
+     * PAUSED, not SUSPENDED.
+     *
+     * All this park needs is "vCPUs stopped, resumable by vm_start()".
+     * RUN_STATE_SUSPENDED additionally means "the guest performed a system
+     * suspend", and QEMU tracks that in a STICKY flag which only a system reset
+     * clears -- vm_prepare_start() reads
+     *
+     *     RunState state = vm_was_suspended ? RUN_STATE_SUSPENDED
+     *                                       : RUN_STATE_RUNNING;
+     *
+     * so once the machine has parked, every later vm_start() puts it back to
+     * SUSPENDED instead of running.
+     *
+     * Live that was nearly invisible, because the common wake path issues a
+     * system reset which clears the flag on its way through. It became visible
+     * through MIGRATION: migration/global_state.c ships vm_was_suspended, so a
+     * snapshot of any device that had ever slept restored to a SUSPENDED
+     * machine -- a live-looking panel (the restored frame, painted once) with
+     * no vCPU behind it, and touch that is delivered to the model and never
+     * acted on.
+     *
+     * Nothing here uses the suspend semantics: the wake path calls vm_start()
+     * directly rather than qemu_system_wakeup_request(), which is the API that
+     * would require SUSPENDED.
+     */
+    vm_stop(RUN_STATE_PAUSED);
     fprintf(stderr, "[WAKE] Pre-warmed wake parked; awaiting Power/Home\n");
 }
 
