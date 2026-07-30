@@ -446,6 +446,49 @@ So before re-running the comparison: establish which pack that chunk set came
 from, or regenerate the product NAND (W7a). Session B reports 1.1.4 reaching the
 home screen in `web/bench-b/`, so their asset path may differ from this one.
 
+### Measured home-screen geometry (1.0), and a method for hit-box work
+
+Taken from a column/row brightness profile of the real scanout, so it is not an
+assumption. **The bright runs are exactly 57 px — the visual icons ARE the
+57x57 tap targets**, which makes the geometry unambiguous:
+
+| | extent |
+| --- | --- |
+| icon rows | **39..95**, **129..185**, **219..275** (centres 67, 157, 247) |
+| icon columns | **23..69**, **94..150**, **170..226**, **246..302** (centres 46, 122, 198, 274) |
+| dock row | 392..455 |
+| gaps (columns) | 70..93, 151..169, 227..245 |
+
+**Method that works, and is cheap.** Restore the shipped snapshot rather than
+booting: an identical machine state every run, interactive in ~20 s instead of
+~250 s, so a tap costs ~1.5 min end to end. `scripts/wasm/snapshot-probe.py`
+produced the snapshot; the A/B harness is a dozen lines around `-incoming` plus
+`input-send-event`.
+
+**Method that does NOT work: tapping icon centres.** Two attempts at the
+sensor-scale A/B tapped centres and both arms launched, which discriminates
+nothing. Aim at a GAP, or at a target edge.
+
+#### An under-powered probe, recorded so it is not mistaken for a result
+
+Hunting a vertical shift at column 4 with single trials and a 25 s settle:
+
+| tap | result |
+| --- | --- |
+| (274, 215) — just ABOVE the 219..275 target | 45.1% -> **70.6%** |
+| (274, 225) — INSIDE the target | 45.4% -> 45.4% (nothing) |
+| (274, 249) — centre | 45.1% -> 99.95% (launched) |
+
+70.6% is neither the home screen nor a settled app — almost certainly a launch
+animation caught mid-flight, i.e. 215 DID activate something. But 225 being
+inert while 249 launches does not fit any simple shift, and **one trial per
+point with a 25 s settle cannot separate that from timing noise** (a launch
+animation has been seen to take far longer). Repeat each point several times
+with a longer settle before drawing anything from it.
+
+The horizontal boundary probe was better behaved: x=240 did not launch, x=250
+did, and the target edge is 245.5 — so **no gross horizontal shift at column 4**.
+
 ### The sensor-scale "bug" is NOT a bug — a wrong fix, caught by measurement
 
 **Do not "fix" the mismatch between the advertised and internal sensor
