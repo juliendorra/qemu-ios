@@ -400,6 +400,52 @@ the Z1 firmware upload completed in this boot (`IT_MT_TRACE=1` logs the
 transitions). Only once a native tap is consumed at ALL does the row-1 versus
 near-the-extremes question become answerable natively.
 
+### touch-probe.py was testing a STOPPED machine (fixed 2026-07-30)
+
+Every `touch-probe.py` result in this file's earlier sections that reports
+"not delivered" or "0 frames consumed" should be **discounted**, and the reason
+is not subtle once seen: **the probe tapped a machine whose vCPUs were stopped.**
+
+The guest auto-locks after a few minutes idle and the PMU park then calls
+`vm_stop()`. With a fixed `--boot-wait` of 300-400 s the probe was routinely
+tapping a parked machine, where the LCD's mouse handler cannot run because
+nothing runs — so the tap produced no `[TOUCH]` line at all and looked exactly
+like a device fault.
+
+Proof it was never the injection: restoring a snapshot of an AWAKE machine and
+sending the same QMP events delivers fine, in both shapes —
+
+| pattern | `[TOUCH]` lines |
+| --- | --- |
+| abs, then btn, as separate `input-send-event` commands | **2** (DOWN + UP) |
+| abs + btn in one command | **2** |
+
+so the "separate vs combined command" theory is dead too.
+
+`touch-probe.py` now polls `query-status` and the panel before tapping, presses
+Home if the machine is parked, and reports `machine not interactive before the
+tap` rather than a touch verdict about a machine that was never running. Same
+lesson as `--require-live` in `scripts/wasm/build-snapshot.py`: **check the vCPU
+is running before attributing anything to a device.**
+
+### Is the dead zone 1.0-only? BLOCKED on 4A102's NAND, not on touch
+
+The browser viewer takes `?build=` now, so the comparison is one page load. But
+1.1.4 in the browser reaches launchd and then renders nothing — 2.2% non-black
+(the Apple logo) with `guestRatio` at ~0.5, which under `-icount` means the CPU
+is IDLE, not fast.
+
+That is the documented signature of a NAND built from an unpatched root, and the
+provenance supports it: **`m68ap-artifacts/builds/4A102/nand` does not exist**
+(W7a is open); only `nand-prepack-not-product` and `nand-metadata-only` do. The
+two candidate 1.1.4 packs are the same SIZE but **different content**
+(`8afaebbd…` vs the app bundle's `e4ace192…`), and nothing records which one
+`web/chunked/4A102` was built from — neither carries a `recipe` field.
+
+So before re-running the comparison: establish which pack that chunk set came
+from, or regenerate the product NAND (W7a). Session B reports 1.1.4 reaching the
+home screen in `web/bench-b/`, so their asset path may differ from this one.
+
 ### A real coordinate mismatch, found 2026-07-30 (not yet shown to be THE cause)
 
 The model **scales touch coordinates by one surface and advertises another**:

@@ -631,6 +631,27 @@
                 + `${asleep ? ' PANEL ASLEEP - INVALID' : ''}`);
   }
 
+  // ?tap=x,y taps ONE panel coordinate after the guest's input gate arms, and
+  // reports whether the screen changed. Exists because the sweep deliberately
+  // excludes icon row 1, which is the coordinate under investigation.
+  async function runSingleTap(spec) {
+    const [px, py] = spec.split(',').map(Number);
+    await awaitTouchGate();
+    const before = nonBlackPct;
+    console.log(`[tap] ${BUILD} at (${px},${py}) baseline=${before}%`);
+    tapWall(px, py, MIN_PRESS_MS);
+    for (let i = 0; i < 24; i++) {
+      await sleep(5000);
+      if (nonBlackPct > 80) break;
+    }
+    const launched = nonBlackPct > 80;
+    sweepResult = { mode: 'tap', build: BUILD, tap: spec, before,
+                    after: nonBlackPct, launched };
+    report(true);
+    console.log(`[tap] ${BUILD} (${px},${py}) -> ${nonBlackPct}% `
+                + `launched=${launched}`);
+  }
+
   async function runSweep() {
     await awaitTouchGate();
     const baseline = nonBlackPct;
@@ -920,6 +941,8 @@
       if (SWEEP_MODE === '1') runSweep();
       else if (SWEEP_MODE === 'real') runVerify();
       else if (SWEEP_MODE === 'home') runHomeCheck();
+      const tapSpec = new URLSearchParams(location.search).get('tap');
+      if (tapSpec) runSingleTap(tapSpec);
     },
     preRun: [async (mod) => {
       // preRun runs on the MAIN thread, so this is the Module whose exports

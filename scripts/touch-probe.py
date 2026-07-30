@@ -105,6 +105,26 @@ class QMP:
             pass
 
 
+def key(q: QMP, name: str, hold: float = 0.3):
+    """Press and release a hardware button (h = home, p = power)."""
+    for down in (True, False):
+        q.cmd("input-send-event", {"events": [
+            {"type": "key", "data": {"down": down,
+                                     "key": {"type": "qcode", "data": name}}}]})
+        if down:
+            time.sleep(hold)
+
+
+def measure_nonzero(path: Path) -> float:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return -1.0
+    if not data:
+        return -1.0
+    return sum(1 for b in data if b) / len(data) * 100.0
+
+
 def tap(q: QMP, px: int, py: int, hold: float = 0.12):
     """One finger down/up at a panel pixel, via the absolute pointer.
 
@@ -185,6 +205,10 @@ def main() -> int:
     ap.add_argument("--boot-wait", type=float, default=200)
     ap.add_argument("--settle", type=float, default=12,
                     help="seconds to wait after the tap before re-grabbing")
+    ap.add_argument("--live-pct", type=float, default=20.0,
+                    help="non-black percentage that counts as an awake panel")
+    ap.add_argument("--wake-attempts", type=int, default=6)
+    ap.add_argument("--wake-settle", type=float, default=8.0)
     ap.add_argument("--icount", default=None,
                     help="icount shift (e.g. 1). OFF by default -- it appears "
                          "to suppress multitouch frame consumption; see the "
@@ -255,6 +279,33 @@ def main() -> int:
     try:
         time.sleep(args.boot_wait)
         q = QMP(qmp_path)
+
+        # Do not tap a machine that is not RUNNING.
+        #
+        # The guest auto-locks after a few minutes idle, and the PMU park then
+        # calls vm_stop() -- so after a long --boot-wait the vCPUs are stopped
+        # and a tap reaches nothing. It does not even reach the LCD handler, so
+        # the probe reported "not-delivered" and looked like a device fault,
+        # which cost a round of investigation. Wake it first, and say so when it
+        # cannot be woken rather than reporting a touch verdict about a machine
+        # that was never running.
+        for attempt in range(args.wake_attempts):
+            st = q.cmd("query-status", {}).get("return", {})
+            shot = args.logs / "live.ppm"
+            q.cmd("screendump", {"filename": str(shot)})
+            pct = measure_nonzero(shot)
+            if st.get("running") and pct >= args.live_pct:
+                break
+            print(f"[touch-probe] status={st.get('status')} panel={pct:.1f}% "
+                  "-- pressing Home", flush=True)
+            key(q, "h")
+            time.sleep(args.wake_settle)
+        else:
+            st = q.cmd("query-status", {}).get("return", {})
+            result["error"] = (f"machine not interactive before the tap "
+                               f"(status={st.get('status')})")
+            print(f"[touch-probe] {result['error']}", file=sys.stderr)
+
         before, label, kind = grab(q, args.logs / "before")
         result["before"] = {"fb": label, **kind}
         write_png(before, args.logs / "before.png")
