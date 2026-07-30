@@ -1198,6 +1198,40 @@ first failure, and which already show six independent edges moving onto 1.1.4's
 values. The default `MT_FAMILY_ID` is therefore left at `0x51` until the two
 outstanding runs are done.
 
+#### The 1.0 slope confirmation: PASSED. Both builds now agree.
+
+Three rows, `IT_MT_FAMILY_ID=0x50`, 177 taps:
+
+```
+digit  centre(drawn)    dL    dR    dT    dB  shift x  shift y  slop x  slop y
+    7   41.0, 223.5   -     7.0   1.0  22.0      -       11.5     -      10.5
+    5  120.0, 294.0 -12.0  10.0   1.0  24.0     -1.0     12.5    11.0    11.5
+    1   41.0, 366.0   -     7.0   2.0  23.0      -       12.5     -      10.5
+```
+
+| | slope | verdict | shift_y by row |
+| --- | --- | --- | --- |
+| 1.0 default (`0x51`) | **−0.0527** | **SCALE** | 21.0 / 18.0 / 13.5 |
+| 1.0 with `0x50` | **+0.0070** | **CONSTANT** | 11.5 / 12.5 / 12.5 |
+| 1.1.4 with `0x50` | **+0.0070** | **CONSTANT** | 11.0 / 12.5 / 12.0 |
+
+**The two firmwares now produce the same slope to four decimal places**, and
+every shift agrees within ±0.5 px — the resolution limit of a 1 px binary
+search. What remains on both is the constant ~11–12 px, which is
+`SBFingerProjection` plus hit-box asymmetry: Apple's deliberate design, not ours.
+
+#### The fix, as landed
+
+`MT_FAMILY_ID_Z1 = 0x50` for Zephyr 1 (M68AP / iPhone 2G). **`MT_FAMILY_ID`
+stays `0x51` for Zephyr 2 (N45AP / iPod touch 1G)**, which is *different
+silicon*, is inside 1.1.x's accepted range, has never been mapped, and is
+deliberately not disturbed.
+
+That split is **board-awareness, which the machine is entitled to** — it knows
+which board it is, and two different chips legitimately report two different
+family ids. It is **not** firmware-awareness, which stays forbidden: neither
+value depends on which OS boots.
+
 #### What was and was NOT fixed in the emulator this session
 
 Worth stating plainly, because the diagnosis is strong enough to be mistaken for
@@ -1211,9 +1245,13 @@ measurement knob or an opt-in, and every default is unchanged:
 | `IT_MT_FAMILY_ID` | measurement knob | off (`0x51` unchanged) |
 | `IT_MT_TIP_CORRECTION` | UX alternative | `0` = faithful |
 
-One bug was **diagnosed** (the family id) and is one confirmation run from being
-fixed. Real fixes landed only in tooling — the map's clear check, its
-fingerprint check, its row profiler, and `wait_live()`.
+*(Superseded the same day: both confirmation runs passed, and the family-id fix
+**has now landed** — `MT_FAMILY_ID_Z1 = 0x50`. So one real emulator bug WAS
+fixed this session. The table above still describes the four knobs, which all
+remain off by default.)*
+
+Real fixes also landed in tooling — the map's clear check, its fingerprint
+check, its row profiler, and `wait_live()`.
 
 **The most valuable outcome was negative:** a bug was *prevented*. `aspect`
 looked like an obvious fix, repaired 1.0 exactly, and would have broken 1.1.4 —

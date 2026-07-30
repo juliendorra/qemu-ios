@@ -17,7 +17,24 @@ typedef struct IPodTouchLCDState IPodTouchLCDState;
 OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
 
 #define MT_INTERFACE_VERSION     0x1
-#define MT_FAMILY_ID             81
+/*
+ * Family id, reported by report 0xD1 -- and it is NOT metadata: MultitouchSupport
+ * dispatches its sensor PITCH constants on it, so this value chooses the guest's
+ * coordinate system. See TOUCH_INVESTIGATION.md, "FOUND: the family id".
+ *
+ * Zephyr 1 (iPhone 2G / M68AP) must be a value iPhone OS 1.0 recognises, since
+ * 1.0 shipped on that phone. 1.0 accepts 0x41, 0x50, 0x42 EXACTLY; 1.1.4 accepts
+ * 0x41, 0x42 and the range 0x50-0x52. 0x50 is the only sane choice: measured, it
+ * makes both firmwares agree to within +-0.5 px on every hit-box edge.
+ *
+ * Zephyr 2 (iPod touch 1G / N45AP) is DIFFERENT SILICON and keeps the historical
+ * 81 = 0x51 -- inside 1.1.x's accepted range, never measured, and deliberately
+ * not disturbed. Two chips legitimately reporting two ids is BOARD-awareness,
+ * which the machine is entitled to; it is not firmware-awareness, which is
+ * forbidden.
+ */
+#define MT_FAMILY_ID             0x51   /* Zephyr 2 / N45AP -- unchanged */
+#define MT_FAMILY_ID_Z1          0x50   /* Zephyr 1 / M68AP -- measured  */
 #define MT_ENDIANNESS            0x1
 #define MT_SENSOR_ROWS           15
 #define MT_SENSOR_COLUMNS        10
@@ -53,33 +70,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
  * IT_MT_SENSOR_SCALE=advertised reproduces the wrong behaviour for anyone who
  * wants to re-run the comparison.
  *
- * The HEIGHT, however, is a separate question, and that one is open.
- * `scripts/calc-touch-map.py` measured the hit box of five Calculator buttons on
- * iPhone OS 1.0 and found the vertical error is not a constant: it is
- * 21.0 px at panel y 223.5, 18.0 at 294 and 13.5 at 366, a straight line
- * (max residual 0.6 px) of slope -0.0527. That is a SCALE error of
- * 1/(1-0.0527) = 1.0556, i.e. the driver behaves as if the surface were
- * 7306 / 1.0556 = 6922 tall, not 7306. Horizontally over the same map the
- * error is flat and under 3.5 px, so the WIDTH is right and only the height
- * disagrees.
+ * The HEIGHT was also suspected, and that suspicion is now CLOSED -- it was
+ * wrong. iPhone OS 1.0 used to show a vertical SCALE error here (21.0 px at
+ * panel y 223.5, 18.0 at 294, 13.5 at 366, slope -0.0527) that 1.1.4 did not.
+ * The cause was never these constants: it was MT_FAMILY_ID. 1.0 did not
+ * recognise the id this model reported, so MultitouchSupport fell through to a
+ * generic branch with different sensor PITCH constants and computed a different
+ * normalisation range. Fixed by reporting an id 1.0 knows; see the comment on
+ * MT_FAMILY_ID_Z1 above and TOUCH_INVESTIGATION.md.
  *
- * 6922 is, within the fit's uncertainty (+-18), the height that gives the
- * internal surface the PANEL's aspect ratio: 4602 * 480/320 = 6903. That is
- * also the ratio of the sensor GRID this model advertises (MT_SENSOR_ROWS 15 /
- * MT_SENSOR_COLUMNS 10 = 1.5), while 4602 x 7306 is 1.588 -- so the model
- * describes its sensor two ways and the two disagree.
- *
- * IT_MT_SENSOR_SCALE=aspect selects the grid-consistent height, and it was
- * measured on BOTH firmwares. It is NOT a fix, and must not become the default:
- *
- *   1.0   slope -0.0527 -> -0.0000   fixed  (residual flat +7.6 px)
- *   1.1.4 slope +0.0070 -> +0.0631   BROKEN (9 px swing across the keypad)
- *
- * 1.1.4's driver already agrees with 7306, so changing the height trades a 1.0
- * defect for a 1.1.4 one. The two drivers derive the mapping differently and no
- * single pair of constants satisfies both; the fix is to find what 1.1.4
- * actually divides by and make the advertised grid and the surface agree, not
- * to tune a constant until one build looks right.
+ * IT_MT_SENSOR_SCALE=aspect remains ONLY as a warning. It gives the surface the
+ * panel's aspect ratio, which repaired 1.0's symptom exactly (slope -0.0527 ->
+ * -0.0000) and BROKE 1.1.4 by a comparable amount (+0.0070 -> +0.0631). It was
+ * a plausible fix aimed at the wrong constant, caught by measuring both builds
+ * instead of one. Do not adopt it, and do not repeat the shape of the mistake:
+ * a positional error is almost always in what this model DECLARES (family id,
+ * sensor grid), not in how it PLACES the contact.
  */
 #define MT_ADVERTISED_SENSOR_SURFACE_WIDTH  MT_SENSOR_SURFACE_WIDTH
 #define MT_ADVERTISED_SENSOR_SURFACE_HEIGHT MT_SENSOR_SURFACE_HEIGHT
