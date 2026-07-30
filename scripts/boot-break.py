@@ -55,6 +55,11 @@ def main() -> int:
     ap.add_argument("--max-hits", type=int, default=200)
     ap.add_argument("--gdb-port", type=int, default=1234)
     ap.add_argument("--vnc-port", type=int, default=5997)
+    ap.add_argument("--capture-return", action="store_true",
+                    help="on each hit, also run to the caller's return address "
+                         "and read r0 -- the RETURN VALUE. Entry args alone "
+                         "cannot tell 'the open failed' from 'it succeeded for "
+                         "a context nobody swaps on'.")
     ap.add_argument("--logs", type=Path, default=None)
     args = ap.parse_args()
 
@@ -161,6 +166,41 @@ def main() -> int:
                 g.del_break(pc)
                 g.step()
                 g.set_break(pc)
+                if args.capture_return:
+                    # lr at function entry is the caller's return address, so a
+                    # temporary breakpoint there catches the return and r0 is
+                    # the value. Bounded and validated: a shared return address
+                    # can be reached by somebody else first, and a breakpoint we
+                    # did not ask for is how this script grew 156 phantom hits.
+                    ret = regs[14] & ~1
+                    got = None
+                    if ret and ret not in bps:
+                        g.set_break(ret)
+                        for _try in range(60):
+                            g.cont()
+                            if g.wait_stop(5) is None:
+                                break
+                            w2 = g.regs()
+                            if not w2:
+                                break
+                            if w2[0][15] == ret:
+                                got = w2[0][0]
+                                break
+                            # somebody else's stop: step it off and carry on
+                            if w2[0][15] in bps:
+                                p2 = w2[0][15]
+                                g.del_break(p2)
+                                g.step()
+                                g.set_break(p2)
+                            else:
+                                g.step()
+                        g.del_break(ret)
+                        if got is not None:
+                            g.step()
+                    rec["ret"] = got
+                    rec["ret_addr"] = ret
+                    print(f"           -> returned r0={got if got is None else hex(got)} "
+                          f"to {ret:#010x}")
             else:
                 # An unexpected stop. Do NOT set_break(pc) here: that would
                 # CREATE a breakpoint at an address we never asked for, and it

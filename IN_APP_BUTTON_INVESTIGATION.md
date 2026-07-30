@@ -1177,3 +1177,52 @@ same attempt:
   SETS a breakpoint at an address never asked for. One spurious stop in BlueTool
   became 156 recurring hits and capped the run at its hit limit before the
   interesting window. Fixed: only re-arm when the stop address is one of ours.
+
+
+## The open SUCCEEDS (2026-07-30, `boot-break.py --capture-return`)
+
+`--capture-return` puts a temporary breakpoint on the caller's return address
+(`lr` at function entry) and reads r0 there, so entry args are no longer the only
+thing available. On 1.0, armed from boot:
+
+```
+t=14.9   _IOMobileFramebufferOpen  r0=0x1e03 r1=0x0807  lr=GraphicsServices+0x7904  -> r0=0x0
+t=14.9   _IOMobileFramebufferOpen  r0=0x1e03 r1=0x0807  lr=LayerKit+0x383bc          -> r0=0x0
+t=18.3   _IOMobileFramebufferOpen  r0=0x1e03 r1=0x0103  lr=GraphicsServices+0x7904  -> r0=0x0
+   ... the same three again at t=163-167 (a second process)
+```
+
+**Every call returns 0 = `KERN_SUCCESS`.** So "the open fails" is dead too. The
+handle comes back through an out-parameter, not the return value, and the callers
+are `_GSHeartbeatCreate+0x204` and **`_new_display+0x80`** -- the latter being
+LayerKit building a display object, which is exactly where `d->fb` is set.
+
+Note `r1` differs between calls: `0x0807` twice and `0x0103` once. Two different
+displays are being opened, which makes the "multiple display contexts" reading
+concrete rather than speculative.
+
+### Caveat that weakens an earlier claim in this document
+
+"`SwapBegin` and `SwapEnd` never reach the kernel on 1.0" was read off a
+histogram printed with `most_common(6)`. That run had **74** IOConnect hits in
+the press window and the six shown account for 59 of them, so ~15 were never
+displayed -- `SwapBegin+0x48` (which would appear as `IOMobileFramebuffer+0x13c0`)
+could be among them. The NULL-handle measurement stands on its own -- r0 was read
+directly at the entry -- but "never reaches the kernel" should be re-derived from
+the full histogram before anyone builds on it.
+
+### Where this leaves the hunt
+
+Both simple explanations are now excluded by measurement: the open is called, and
+it succeeds. So the live question is which display object LayerKit swaps on:
+
+* `_new_display` is called at least twice (r1 `0x0807` and `0x0103`), so there are
+  at least two display objects.
+* The `SwapBegin` seen with a NULL handle came from `LayerKit+0x39400`; whether
+  that is the main display or the second one is undetermined.
+
+The next measurement is to break in `_new_display` and record, per call, the r1
+selector together with the fb handle it stores -- then compare against the handle
+`LayerKit+0x39400` passes to `SwapBegin`. That identifies whether the swap is
+being issued on a display that was never opened, or on one whose open result was
+dropped.
