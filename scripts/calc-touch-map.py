@@ -158,6 +158,31 @@ class Machine:
                 if px[i] or px[i + 1] or px[i + 2])
         return 100.0 * n / (FB_W * FB_H)
 
+    def wait_live(self, timeout: float, pct: float = 40.0,
+                  poll: float = 8.0) -> float:
+        """Proceed the MOMENT the panel is live, rather than after a fixed wait.
+
+        A fixed boot-wait is how every earlier probe here ended up measuring a
+        sleeping device: 1.1.4 reaches its home screen at ~250 s and auto-locks
+        shortly after, and once the Merlot panel has slept, Home alone does not
+        bring it back (it comes up on the lock screen, which then wants a
+        slide).  Polling removes the race instead of tuning around it -- and the
+        map itself taps continuously, so nothing sleeps once it starts.
+
+        Requires two consecutive live samples: a boot flashes bright frames on
+        the way past.
+        """
+        deadline = time.time() + timeout
+        good = 0
+        live = 0.0
+        while time.time() < deadline:
+            live = self.nonblack(self.shot("wake"))
+            good = good + 1 if live >= pct else 0
+            if good >= 2:
+                return live
+            time.sleep(poll)
+        return live
+
     def ensure_awake(self, tries=4) -> float:
         """Wake the panel if the guest auto-locked, before anything is tapped.
 
@@ -512,8 +537,10 @@ def main() -> int:
                          "--env IT_MT_SENSOR_SCALE=aspect for the A/B)")
     ap.add_argument("--home-only", action="store_true",
                     help="stop after the home screen shot, for reconnaissance")
-    ap.add_argument("--boot-wait", type=float, default=25.0,
-                    help="seconds before the home screen is expected")
+    ap.add_argument("--boot-wait", type=float, default=60.0,
+                    help="how long to wait for a LIVE panel; the run proceeds "
+                         "as soon as one appears, so a cold boot just needs a "
+                         "generous value (~400)")
     ap.add_argument("--launch-wait", type=float, default=20.0)
     ap.add_argument("--digits", default="7,9,1,3,5",
                     help="which digit buttons to probe (never 0)")
@@ -549,9 +576,14 @@ def main() -> int:
     try:
         print(f"waiting {args.boot_wait:.0f}s for the home screen ...",
               flush=True)
-        time.sleep(args.boot_wait)
-        live = m.ensure_awake()
+        live = m.wait_live(args.boot_wait)
+        if live < 40.0:
+            live = m.ensure_awake()
         print(f"panel {live:.1f}% non-black, status {m.status()}", flush=True)
+        if live < 10.0:
+            print("panel never came up -- refusing to tap a dark device",
+                  file=sys.stderr)
+            return 1
         m.shot("home")
         shutil.copy(args.logs / "home.ppm", args.logs / "home-keep.ppm")
         for spec in args.pre_tap:

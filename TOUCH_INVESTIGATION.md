@@ -578,21 +578,96 @@ corner conflates shift with slop. Decomposed: at digit 5 the bottom edge sits
 right edge sits +7 px right = **−2 of shift plus +9 of slop**. The horizontal
 11.5 px is slop almost entirely.
 
+#### Then 1.1.4 was measured, and it says the opposite
+
+Same instrument, same Calculator (its keypad profiles **byte-identically** on the
+two firmwares, so the maps are directly comparable), 326 taps:
+
+```
+digit  centre(drawn)    dL    dR    dT    dB  shift x  shift y  slop x  slop y
+    7   41.0, 223.5   -     7.0   0.0  22.0      -       11.0     -      11.0
+    9  200.0, 223.5 -10.0  12.0   0.0  22.0      1.0     11.0    11.0    11.0
+    1   41.0, 366.0   -     7.0   1.0  23.0      -       12.0     -      11.0
+    3  200.0, 366.0 -10.0  12.0   1.0  23.0      1.0     12.0    11.0    11.0
+    5  120.0, 294.0 -12.0  10.0   1.0  24.0     -1.0     12.5    11.0    11.5
+```
+
+| build | x shift | y shift | verdict on y | slop |
+| --- | --- | --- | --- | --- |
+| 1.0 (1A543a) | −2.0 … −3.5 | 21.0 → 18.0 → 13.5 | **SCALE**, slope −0.0527 | 9 |
+| 1.1.4 (4A102) | −1.0 … +1.0 | 11.0 → 12.5 → 12.0 | **CONSTANT**, slope +0.0070 | 11 |
+
+**On 1.1.4 there is no scale error at all.** What is left is a **constant** ~11–12
+px up-shift with a symmetric ±11 px slop — which is precisely the signature the
+discriminator assigns to *design compensation*, not to a coordinate bug. On 1.0,
+the same constant is there and a scale is stacked on top of it.
+
+**This reverses the reported symptom.** It was reported as "not uniform across
+the screen on 1.1.4"; measured, **1.1.4 is the uniform one and 1.0 is the one
+that varies**. (Caveat on scope: the Calculator keypad only spans y 199…390, so
+this says nothing about the status bar or the dock. A scale shows up worst at the
+extremes, and over the full 0…480 panel 1.1.4's slope is still only ±3 px.)
+
+**And it kills the tempting fix.** The model's constants are what 1.1.4's driver
+already agrees with, on both axes. So the height cannot simply be changed to suit
+1.0 — that would flatten 1.0 and introduce into 1.1.4 exactly the error 1.0 has
+now. The two drivers derive the sensor→screen mapping differently, and no single
+pair of constants satisfies both. That is the real finding, and it is the same
+trap as the advertised-scale "fix": a change that is obviously right against one
+firmware, measured wrong against another.
+
 #### What 6922 probably is, and how to test it rather than assume it
 
-`6922 ± 18` is, within the fit, `4602 × 480/320 = 6903` — **the height that gives
-the internal sensor surface the panel's own aspect ratio**. The width (4602) is
-already measured correct, so the model's height being derived by a different
-expression (`(13850 − 7500) × 84/73`) rather than from the width is exactly the
-shape of defect this would be.
+The number 1.0's driver behaves as if it had is `7306 / 1.0556 = 6922 ± 18`.
+Within that, `4602 × 480/320 = 6903` — **the height that would give the internal
+surface the panel's own aspect ratio**. That is not arbitrary: the model also
+advertises a sensor grid of `MT_SENSOR_ROWS 15 × MT_SENSOR_COLUMNS 10`, whose
+ratio is exactly 1.5, while `4602 × 7306` has a ratio of 1.588. So the model
+describes its sensor two ways and the two disagree, and **1.0's driver appears to
+believe the grid while 1.1.4's believes the surface** — which is exactly the
+shape that produces one firmware with a scale error and one without.
 
-That is a hypothesis, and the last time a sensor-surface constant "obviously"
-needed fixing the fix was measured **wrong** (see below). So it is behind
-`IT_MT_SENSOR_SCALE=aspect` and **nothing is changed by default**. The
-difference from last time is that there is now a falsifiable prediction and an
-instrument that can refute it: with `aspect`, `shift_y`'s slope must collapse to
-~0 (residual under ~1 px across all three rows) while `shift_x` and both slops
-stay where they are. Anything else and the hypothesis is dead.
+That is a hypothesis with a prediction, not a fix, and the last time a
+sensor-surface constant "obviously" needed changing the change measured
+**wrong**. So it lives behind `IT_MT_SENSOR_SCALE=aspect`, **nothing is changed
+by default**, and the prediction is stated in advance and in both directions:
+
+| arm | predicted with `aspect` |
+| --- | --- |
+| 1.0 | `shift_y` slope collapses to ~0; the residual constant lands near +6 |
+| 1.1.4 | slope goes the OTHER way, ~+0.058, ±4 px across the keypad — i.e. broken |
+
+If 1.1.4 does break, the conclusion is not "apply it anyway" — it is that the
+model needs to report a self-consistent sensor geometry (grid ratio and surface
+ratio agreeing) rather than have one constant tuned to one firmware. Anything
+else and the hypothesis is dead and the 1.0 scale error needs a different cause.
+
+**Arm 1 — 1.0 with `aspect`: the prediction held, to the pixel.** 343 taps, same
+snapshot, same everything else:
+
+```
+digit  centre(drawn)    dL    dR    dT    dB  shift x  shift y  slop x  slop y
+    7   41.0, 223.5   -     9.0  -3.0  18.0      -        7.5     -      10.5
+    9  200.0, 223.5 -13.0   6.0  -3.0  18.0     -3.5      7.5     9.5    10.5
+    1   41.0, 366.0   -     9.0  -3.0  18.0      -        7.5     -      10.5
+    3  200.0, 366.0 -13.0   6.0  -3.0  18.0     -3.5      7.5     9.5    10.5
+    5  120.0, 294.0 -11.0   7.0  -3.0  19.0     -2.0      8.0     9.0    11.0
+```
+
+| | slope | shifts |
+| --- | --- | --- |
+| 1.0 default | −0.0527 | 21.0, 18.0, 13.5 |
+| 1.0 `aspect` | **−0.0000** (max resid 0.4) | **7.5, 8.0, 7.5** |
+
+The vertical scale error is gone; the residual constant is +7.6, against a
+predicted +6.4. And the control holds: **every horizontal edge is byte-identical
+to the default run** (−13/+6, +9, −11/+7), which is what the change is supposed
+to do, since it touches only the height.
+
+So the 1.0 vertical scale error is **real, is ours, and its cause is identified**:
+the model's sensor surface height disagrees with what 1.0's driver derives. What
+is left on 1.0 after correcting it — a flat +7.6 px up-shift with symmetric
+±10.5 slop — is the same shape 1.1.4 shows untouched, i.e. design compensation.
 
 #### Method notes worth keeping
 
@@ -620,6 +695,30 @@ stay where they are. Anything else and the hypothesis is dead.
   still registers as `7`, twice, in two runs — the column-1 hit box reaches the
   screen edge. Its `shift_x` is therefore unmeasurable and is reported as `-`
   rather than guessed.
+
+#### Which 1.1.4 images the comparison used, and why that question had an answer
+
+The open provenance worry ("`m68ap-artifacts/builds/4A102/nand` does not exist,
+the two candidate packs differ, nothing records which one `web/chunked/4A102`
+came from") is real, and it is **sidestepped rather than solved**: the shipped
+`iPhone 2G (iOS 1.1.4).app` carries a NAND with **full recorded provenance** —
+`firmware-provenance.json` names the constructor (`build-m68ap-nand.py`
+`0bcb211e8b`), the IPSW (`iPhone1,1` build `4A102`), the HFS hashes, and the
+five-step home-screen recipe. That is the pack that boots to a home screen, and
+`nand.pack` there is `e4ace192…`, one of the two candidates. So the map was run
+against a **`cp -Rc` clone** of it, never the bundle itself.
+
+`scripts/wasm/build-snapshot.py` grew `--nand/--nor/--iboot` and `--out-name` for
+this, and records the actual image paths plus an `overridden` list in the
+snapshot metadata, so an override-built snapshot can never be mistaken for one
+built from the product tree. Regenerating 4A102's product NAND (W7a) is still
+the right thing to do; it is not a blocker for measuring touch.
+
+**One caveat on the clone:** pointing QEMU at it means guest writes land in it,
+so successive runs do not start from identical state (the bundle's own launcher
+clones per launch precisely to avoid this). For a hit-box map that is harmless —
+nothing measured depends on stored state — but re-clone before anything that
+does.
 
 ### Measured home-screen geometry (1.0), and a method for hit-box work
 
