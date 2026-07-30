@@ -798,7 +798,15 @@ static void mbx_trace(const char *dir, hwaddr addr, uint64_t val)
     }
     uint32_t slot = (uint32_t)((addr >> 2) & 0x3FF);
     uint32_t n = ++counts[slot];
-    if (n > 12 && (n & 0x3FF) != 0) {
+    /* IT_MBX_TRACE=all removes the per-register collapse: the swap command
+     * descriptor is written once per swap, so a cap of 12 hides exactly the
+     * writes that carry the destination surface. */
+    static int all = -1;
+    if (all < 0) {
+        const char *e = getenv("IT_MBX_TRACE");
+        all = e && e[0] == 'a';
+    }
+    if (!all && n > 12 && (n & 0x3FF) != 0) {
         return;
     }
     fprintf(stderr, "[MBX] %s 0x%05x = 0x%08x (n=%u)\n",

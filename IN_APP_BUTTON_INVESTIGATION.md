@@ -861,3 +861,54 @@ cause is in this document already (trap 2/7): the probe printed
 `gfx_update`, so every touch is refused. The very next run, with the client
 attached, was normal. **Read that line before believing a touch verdict** -- and
 note host load (18-62 during these runs) makes the client attach flakier.
+
+
+## T1 attempt, 2026-07-30: the MBX-swap fix is WRONG, and so is the LCD IRQ
+
+Went to implement "model the MBX swap" and stopped, because two measurements
+taken first killed it. Recording them so nobody writes that code.
+
+**1. The MBX traffic after the press is IDENTICAL to before it.** With
+`IT_MBX_TRACE=all` (new: removes the per-register collapse, because the swap
+descriptor is written once per swap and a cap of 12 hid exactly it), the whole
+post-press sequence is the same one seen at idle:
+
+```
+WR 0x130=0  WR 0x134=0xfff  WR 0x080=0x111  WR 0x85c=0x80  WR 0x81c=0
+WR 0x1000..0x101c = 0x08ae3000, 0x08ac4000, ... 0x08aac000   (an MMU page list)
+WR 0x1020=0x00010001   WR 0x824=0x1d000  0x828=0x22  0x82c=0x25
+WR 0x838=1  0x83c=0x21000  WR 0x6d8=0x09000000   (the kick)
+```
+
+**None of those values is a framebuffer base** (0x0FE00000 / 0x0F400000 /
+0x0F496000), and the sequence does not change across the dismissal. So this is
+not the display flip, and "make the MBX perform the swap" would have been
+emulating the wrong thing -- with a destination address I could not identify
+because there isn't one here.
+
+**2. The LCD frame interrupt is alive and being serviced.** `IT_FB_TRACE=1`
+after the press, every second:
+
+```
+[FB] vsync status=0x00000000 mask=0x00003f01 irq=0 acked_since_last=yes
+```
+
+`mask = 0x3f01` -- **bit 0 IS enabled** -- and the guest acks every tick. So the
+frame interrupt is delivered and consumed, which confirms the earlier retraction
+(bit 0 is the frame interrupt) and rules the LCD IRQ out as the gap.
+
+### What that leaves
+
+Everything below the compositor is now measured healthy after the press: events
+delivered, both handlers run, `clickedMenuButton` completes, the display stack
+unwinds, vsync alive and acked, MBX behaving exactly as it does at idle. And
+still: **no buffer anywhere changes** (`diff_any_buffer` 0.00) and
+`AppleH1CLCD+0x1edc` is never reached.
+
+So SpringBoard is not failing to *present* a repaint -- it is not *producing*
+one. The remaining question is a guest-software one at the LayerKit/CoreSurface
+level: after the app is dismissed, why is the home screen's layer tree never
+rendered? Candidates: its window/layers released when the app went fullscreen
+and not restored, or a render context still bound to the app's surface. Note
+`_LKImageQueueFlush` and `_LKRenderImageQueueShow` never fire on EITHER build,
+so the presentation path in use is `_LKBackingStoreSwap` -- start there.
