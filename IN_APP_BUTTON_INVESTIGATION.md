@@ -1385,3 +1385,38 @@ The kernel's own DT names the MBX interrupt: node `mbx`, `interrupts = 0x0C`
 (`IT_MBX_EVENTS=1`: kick at 0x6d8/0x1020 sets event bit 6, host-clear at 0x134,
 enable at 0x130) and an unbound IRQ line (`IT_MBX_IRQ=<n>`). A/B in flight:
 `IT_MBX_EVENTS=1 IT_MBX_IRQ=12 app-button-probe --board m68ap-10`.
+
+
+## FIRST EVER 3_home_returns PASS on 1.0 (2026-07-31): the missing register is a WRITE to 0x12C
+
+The `IT_MBX_EVENTS=1 IT_MBX_IRQ=12` A/B failed, but its trace (30 MILLION MBX
+lines -- which also filled the disk; `IT_MBX_TRACE=all` output must be deleted
+after reading) showed exactly why. After the 0x6d8 command completes and is
+acked, the guest runs a start sequence and then:
+
+```
+WR 0x00108 = 3            ; start
+WR 0x00130 = 0xffff       ; enable ALL events
+WR 0x0012c = 0x00000001   ; <-- HOST WRITES THE STATUS REGISTER (soft event)
+WR 0x00130 = 0
+rd 0x0012c = 0x100 ...    ; then polls for the response, 5.1M times
+```
+
+A WRITE to 0x12C is the host raising a soft event at the microkernel; the model
+dropped it on the floor, so the response event never appeared and the
+conversation died there -- as an idle sleep under the ready-bit lie, as a
+5M-read spin under the events model. Fix: `0x12c` write ORs into event status
+(the do-nothing microkernel "completes" the soft event instantly).
+
+With that (engine rebuilt AND installed into the 1.0 bundle -- the bundle
+carries its own binary; pre-fix copy at /tmp/qemu-1.0-engine.pre-mbx12c.bak):
+
+| run | result |
+| --- | --- |
+| IT_PROBE_WAIT=8  | 3_home_returns **PASS 68.32%** -- the FIRST pass ever on this step; the PNG catches the zoom-out mid-animation (Settings title bar over SpringBoard pinstripe) |
+| IT_PROBE_WAIT=14 | 3_home_returns 0.00% but 4_power_sleeps window shows 99->45.4% lit = the HOME SCREEN arriving late |
+
+So the dismissal now COMPLETES but takes >10 s -- consistent with the app
+still being watchdog-killed (or another timeout) before SpringBoard recovers,
+where before the fix SpringBoard never recovered at all. Latency measurement in
+flight. Env used: IT_MBX_EVENTS=1 IT_MBX_IRQ=12 (DT: mbx interrupts = 0x0C).

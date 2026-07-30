@@ -865,6 +865,20 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             mbx_update_irq();
             break;
         /*
+         * A WRITE to the status register is the host RAISING a soft event at
+         * the microkernel. Measured (IT_MBX_TRACE, 1.0 app dismissal): after
+         * the 0x6d8 command completes, the guest writes 0x108=3, enables all
+         * events (0x130=0xffff), writes 0x12C = 0x00000001, and then polls
+         * 0x12C forever for a response bit -- 5.1 million reads in one run.
+         * Ignoring the write is what turned the whole conversation into that
+         * spin. There is no microkernel here, so the soft event "completes"
+         * immediately: reflect the bits back as status.
+         */
+        case 0x12c:
+            mbx_event_status |= (uint32_t)val;
+            mbx_update_irq();
+            break;
+        /*
          * The KICK. Derived from the trace, not guessed: with IT_MBX_EVENTS=1
          * and completion tied to 0x1020 bit 0 the guest span 46 MILLION times on
          * `rd 0x12c = 0x100`, which disproved that guess outright. The ordered
