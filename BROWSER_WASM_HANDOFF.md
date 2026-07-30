@@ -570,7 +570,42 @@ HFS signature of zero and drop into recovery.
 sizes (the prefetch working set, not the pack size), offline warm boot, and
 switching versions cheaply enough that comparing them is the point.
 
-## W7a — Regenerate 4A102's product NAND
+## W7a — Regenerate 4A102's product NAND — DONE (2026-07-30)
+
+`scripts/build-m68ap-homescreen-nand.py --build 4A102` produced
+`m68ap-artifacts/builds/4A102/nand` (600 MB). **Verified natively: 74.32%
+non-black at `kernel_0x0f496000`**, against the documented 73.95% acceptance —
+and against 0.0% for the `nand-prepack-not-product` tree it replaces. The
+provenance now carries a full structured `recipe` (activation patch,
+`LK_ENABLE_MBX2D=0`, bridge CA, `/var` from the root's own template, seeded
+AddressBook), which is what makes "is this the product NAND?" answerable without
+booting it.
+
+Re-measured from the new NAND, and it matches the figures recorded from the
+bundle's: **31,524 page fetches, 25,254 distinct pages = 17.0% of the pack, 605
+of 2,401 chunks, 21.0 MiB first-boot download** (documented: 16.8% / 20.97 MiB).
+
+`web/chunked/4A102` was rebuilt from it. **Note for anyone rebuilding a chunk
+set: pass `--base`.** Omitting it defaults to a RELATIVE `chunks/`, where the
+working 1A543a set uses `/chunked/1A543a/chunks/`; the emulator then requests
+the wrong URLs and the guest starves — observed as a boot reaching the iBoot
+banner and stopping, with **6 chunk requests in 9 minutes**. With the absolute
+base the same boot serves 661 chunks and reaches BSD root.
+
+### Still open: 1.1.4 does not finish booting in THIS viewer
+
+With the verified NAND and a correct chunk base, `?build=4A102` reaches
+first pixels 0.8 s, iBoot banner 27 s, kernel 88 s, **BSD root 102 s** — and then
+stalls before launchd, panel at 2.2%, `guestRatio` ~0.5 (which under `-icount`
+means the CPU is idle, not fast).
+
+**It is not the NAND**: the same tree renders 74.32% natively. Session B reports
+1.1.4 reaching the home screen in `web/bench-b/`, so the difference is between
+the two PAGES, not the assets — the obvious suspects being this page's
+`overlay=ram` tune file and its snapshot plumbing. Compare the two pages' machine
+lines and `nand-tune` before looking anywhere else.
+
+## W7a (original) — Regenerate 4A102's product NAND
 
 `builds/4A102/nand` does not exist: what the migration filed there was built
 from an unpatched root and rendered nothing, so it was renamed to
