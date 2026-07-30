@@ -709,26 +709,22 @@
   let sweepResult = null;
   const SWEEP_MODE = new URLSearchParams(location.search).get('sweep');
 
-  // 1A543a only, for now. The chunk set for 4A102 exists, but this page's
-  // bootrom/iBoot/NOR are 1.0's and the security epoch is firmware-keyed --
-  // booting 1.1.4's NAND against 1.0's epoch wedges iBoot with an EMPTY serial
-  // log, which looks exactly like a hang. A version picker needs those three
-  // artifacts staged per build first.
-  const BUILD = '1A543a';
-  const EPOCH = 0;
+  // Which firmware. The three artifacts below are per-build and the security
+  // EPOCH is firmware-keyed, not board-keyed: booting one build's NAND against
+  // another's epoch wedges iBoot with an EMPTY serial log, which looks exactly
+  // like a hang. So they travel together, in one table, and ?build= picks a row.
+  const BUILDS = {
+    '1A543a': { epoch: 0, label: 'iPhone OS 1.0' },
+    '4A102':  { epoch: 3, label: 'iPhone OS 1.1.4' },
+  };
+  const BUILD = new URLSearchParams(location.search).get('build') || '1A543a';
+  if (!BUILDS[BUILD]) {
+    throw new Error(`unknown build ${BUILD}; have ${Object.keys(BUILDS)}`);
+  }
+  const EPOCH = BUILDS[BUILD].epoch;
+  document.querySelector('h1').textContent =
+    `${BUILDS[BUILD].label} (${BUILD}) — WebAssembly JIT`;
 
-  // ?resume=1 restores a post-boot snapshot instead of booting, so the page
-  // reaches an interactive home screen in seconds rather than ~250 s.
-  //
-  // The stream is produced NATIVELY (scripts/wasm/snapshot-probe.py --keep-state)
-  // and restored here: same QEMU version, same machine, same device set, so the
-  // vmstate format matches. Whether a native-host stream loads in a
-  // WebAssembly host is exactly what this proves or disproves.
-  //
-  // It must be a stream captured from a RUNNING guest. QEMU records the source's
-  // runstate in the global-state section and only auto-starts the destination
-  // when that says "running"; a snapshot of a stopped guest comes up PAUSED and
-  // needs a monitor `cont`, which this page has no way to send.
   const RESUME = new URLSearchParams(location.search).get('resume') === '1';
 
   // ------------------------------------------------------- persistence ---
@@ -830,10 +826,12 @@
 
   // Only the small artifacts are still fetched whole; the NAND arrives as
   // chunks, on demand, through the service worker.
+  // Per-build, for the same reason the epoch is: an iBoot and a NOR from
+  // different firmwares do not mix. `bootrom` is shared across builds.
   const FILES = [
     ['/fw/bootrom', 'bootrom'],
-    ['/fw/iboot.bin', 'iboot.bin'],
-    ['/fw/nor.bin', 'nor.bin'],
+    ['/fw/iboot.bin', `fw/${BUILD}/iboot.bin`],
+    ['/fw/nor.bin', `fw/${BUILD}/nor.bin`],
   ];
 
   // The service worker has to be CONTROLLING the page before the first chunk

@@ -23,6 +23,8 @@ node_modules/
 # Per-build snapshots from scripts/wasm/build-snapshot.py: a ~57 MiB migration
 # stream (11 MiB Brotli'd), reproducible from the firmware and the engine.
 /public/*/snapshots/
+# Per-build firmware staged beside the page (symlinks into m68ap-artifacts).
+/public/*/fw/
 
 # Session B's bench harness (web/bench-b/index.html) is SOURCE; the firmware
 # and emulator symlinked beside it are not, same rule as public/*.

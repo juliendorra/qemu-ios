@@ -400,6 +400,38 @@ the Z1 firmware upload completed in this boot (`IT_MT_TRACE=1` logs the
 transitions). Only once a native tap is consumed at ALL does the row-1 versus
 near-the-extremes question become answerable natively.
 
+### A real coordinate mismatch, found 2026-07-30 (not yet shown to be THE cause)
+
+The model **scales touch coordinates by one surface and advertises another**:
+
+```c
+#define MT_SENSOR_SURFACE_WIDTH  5000       /* reported to the guest */
+#define MT_SENSOR_SURFACE_HEIGHT 7500
+#define MT_INTERNAL_SENSOR_SURFACE_HEIGHT (13850 - 7500) * 84 / 73   /* = 7306 */
+```
+
+`get_frame()` writes `finger_data.y = fy * MT_INTERNAL_SENSOR_SURFACE_HEIGHT`
+(7306), while `MT_REPORT_SENSOR_DIMENSIONS` hands the guest 7500. If the driver
+maps sensor→screen with the dimensions it was given, every touch is compressed
+by 7306/7500 = **2.6%**, i.e. displaced toward the bottom by an amount that
+grows with height:
+
+| panel y | intended | guest sees | error |
+| --- | --- | --- | --- |
+| 67 (row 1) | 67 | ~78 | **+11 px** |
+| 157 (row 2) | 157 | ~165 | +8 px |
+| 249 (row 3) | 249 | ~255 | +6 px |
+| 437 (dock) | 437 | ~438 | +1 px |
+
+**This is a defect on its own** — scaling by a surface you do not advertise has
+no defensible reading — and it is the right shape for a remembered "shift in
+touch". **But it does not explain the dead row 1**: the icons are 54 px tall and
+an 11 px displacement stays well inside them.
+
+So: fix it, but do not expect it to resurrect row 1, and do not fix it blind —
+changing the scale affects every build and every tap, and the working rows are
+currently working. Establish a passing tap test first.
+
 **Worth checking whether it is really "row 1" or "near the extremes".** `fy`
 0.860 is close to the top of the range while both working rows sit mid-panel
 (0.481–0.673). If the sensor coordinate space is narrower than the screen, the
