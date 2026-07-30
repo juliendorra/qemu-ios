@@ -1111,3 +1111,69 @@ in place, no swap needed) while the dismissal repaint can never be presented.
 * **Why `SwapWait` reaches the kernel while `SwapBegin` does not**, if both take
   the same handle. Either `SwapWait` has no NULL guard, or it is called on a
   different context. Worth reading before concluding.
+
+
+## IOMobileFramebufferOpen IS called (2026-07-30, `scripts/boot-break.py`)
+
+The previous entry left "never called" and "called at startup and failed"
+undecided, because every probe here attaches gdb only once the home screen is
+up -- they need to tap an icon first -- and the open happens long before that.
+`scripts/boot-break.py` exists for that gap: it arms breakpoints **before the
+guest boots**, sends no input at all (so nothing depends on the VM being
+resumable by QMP), and logs every hit with its argument registers.
+
+Result on 1.0, armed from t=0:
+
+```
+  8 hits   IOMobileFramebuffer:_IOMobileFramebufferOpen
+ 36 hits   LayerKit:_LKBackingStoreSwap   in SpringBoard
+```
+
+**So the open IS called** -- eight times -- and the handle LayerKit later passes
+to `SwapBegin` is still NULL. "Never called" is dead. What remains is the pair:
+the open fails, or it succeeds for some contexts while the one LayerKit swaps on
+is a different, never-opened context.
+
+The next measurement is the return value, not the entry: break on the open, step
+to its return, and read r0. `boot-break.py` records entry args only, so that
+needs a small extension -- and note the caller (`lr`) is worth capturing at the
+same time, since it distinguishes which display context is being opened.
+
+### Dead end recorded: kext offsets are not transferable between builds
+
+Before this, the plan was to reuse 1.1.4's kernel chain offsets
+(`IOMobileGraphicsFamily+0x3d34 -> +0x254c -> +0x23b4`) on 1.0, since both kexts
+are 0x5000 bytes. **They share only 5.4% of their bytes** -- measured -- and the
+words at all three offsets differ. So the two builds' graphics kexts are not the
+same binary and offsets must be derived per build. Two related facts from the
+same attempt:
+
+* Nothing branches to the LCD base-programming address `0xc0300edc`, because that
+  is an instruction INSIDE the function, not its entry. The entry is
+  `0xc0300c6c` (`AppleH1CLCD+0x1c6c`), reached from four call sites in the same
+  kext (`0xc0301bec`, `0xc03021ac`, `0xc03021fc`, `0xc0302238`).
+* Breaking at that entry after the press: **no hit in 60 s**. So the base
+  programmer is not entered and bailing -- it is never called at all, which is
+  consistent with the NULL handle upstream.
+* 1.0's `IOMobileGraphicsFamily` has **no C++ symbol table** (`_ZN22IOMobile...`
+  count 0; only two plain `IOMobileFramebufferUserClient` strings, from the
+  OSMetaClass registration). The "1.0 kexts keep full C++ symbols" note in this
+  project applies to other kexts, not this one.
+
+### Two harness bugs found and fixed this session
+
+* **`scripts/guest_root.py`** -- a disk image can only be attached ONCE, and the
+  other session keeps the root images mounted at `/private/tmp/m68_10` and
+  `/private/tmp/m68_114`. Every probe had its own `hdiutil attach` and so failed
+  with "Resource busy", then died later on a `FileNotFoundError` naming a path
+  inside a mountpoint nobody populated -- which reads like missing firmware, not
+  a busy image. The helper reuses an existing attachment and detaches only what
+  it attached. It also records the parsing detail that got it wrong first time:
+  the mountpoint line can have only TWO fields
+  (`/dev/disk5\t\t/private/tmp/m68_10`), so a `len(parts) >= 3` test never
+  matches.
+* **`boot-break.py` created phantom breakpoints.** On an unexpected stop it ran
+  the same del/step/set sequence used to step off a real breakpoint -- which
+  SETS a breakpoint at an address never asked for. One spurious stop in BlueTool
+  became 156 recurring hits and capped the run at its hit limit before the
+  interesting window. Fixed: only re-arm when the stop address is one of ours.
