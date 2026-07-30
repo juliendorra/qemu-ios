@@ -191,7 +191,17 @@ static const MemoryRegionOps tvout_workaround_ops = {
  */
 static void tvout_workaround_move(hwaddr pa)
 {
-    if (!tvout_wa_region || pa == tvout_wa_addr) {
+    /*
+     * Note `tvout_wa_mapped &&`. Without it this early-returns whenever the
+     * derived address equals the board default -- which is the NORMAL case on
+     * 1.1.4 and the iPod, whose kernels announce a TVOut swap device at exactly
+     * the address the board constant predicts. Once nothing is mapped at init
+     * any more, that meant the window was never placed AT ALL: the log shows
+     * "derived ... matches the board default" and then no placement, and the
+     * guest never reaches a stable home screen. The board default is now only a
+     * prediction to check against, so it must not double as "already there".
+     */
+    if (!tvout_wa_region || (tvout_wa_mapped && pa == tvout_wa_addr)) {
         return;
     }
     if (tvout_wa_mapped) {
