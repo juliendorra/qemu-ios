@@ -497,6 +497,130 @@ good (the same harness launches Settings from (274, 249)), so this is either a
 settle that is too short or a display-strip probe aimed at the wrong rows. The
 calibration and boundary-search stages are designed but NOT written.
 
+*(Superseded 2026-07-30 — the tool is finished and the map is measured. See
+"The touch map, measured" below. The stage-1 failure above did not reproduce:
+the tap and the threshold were both fine, so the run that produced it had
+simply not launched Calculator. Calculator's top strip reads **149** and the
+home screen **102**, so the 120 threshold was correctly placed.)*
+
+### The touch map, measured (2026-07-30) — the shift is VERTICAL and it is a SCALE
+
+`scripts/calc-touch-map.py` is finished and ran end to end on iPhone OS 1.0
+(1A543a), 357 taps in one restored-snapshot session, ~15 minutes. It measures,
+per button, the four edges of the ACTUAL hit box by binary search, against a
+button grid profiled from the real framebuffer.
+
+**Drawn grid, measured off the scanout** (rows profiled inside column 4, columns
+profiled inside row 1 — see "the profile has to be taken where the buttons are
+light" below):
+
+| | extent |
+| --- | --- |
+| keypad rows | 127..176, 199..248, 270..318, 342..390, 412..461 |
+| keypad columns | 16..66, 95..145, 175..225, 254..302 |
+
+**The map.** `dL`…`dB` are hit-box edge minus drawn edge; positive means the hit
+box sits right of / below the drawn edge, i.e. **the guest receives a point left
+of / above the cursor**.
+
+```
+digit  centre(drawn)    dL    dR    dT    dB  shift x  shift y  slop x  slop y
+    7   41.0, 223.5   -     9.0  12.0  30.0      -       21.0     -       9.0
+    9  200.0, 223.5 -13.0   6.0  12.0  30.0     -3.5     21.0     9.5     9.0
+    1   41.0, 366.0   -     9.0   5.0  22.0      -       13.5     -       8.5
+    3  200.0, 366.0 -13.0   6.0   5.0  22.0     -3.5     13.5     9.5     8.5
+    5  120.0, 294.0 -11.0   7.0   9.0  27.0     -2.0     18.0     9.0     9.0
+```
+
+`shift = (dL+dR)/2` is the hit box's **centre** displacement — the candidate
+coordinate error. `slop = (dR-dL)/2` is how much **larger** than drawn the box
+is — the guest's own tap-target expansion, which is design and not ours.
+
+**Four independent consistency checks passed**, which is why the numbers are
+worth building on:
+
+* buttons in the same row give **identical** vertical edges (7 and 9 both 211 /
+  278; 1 and 3 both 347 / 412), and buttons in the same column give identical
+  horizontal edges (7 and 1 both R=75; 9 and 3 both 162 / 231);
+* every edge measured on the first run reproduced **exactly** on the second;
+* digit 5's bottom edge measures **345** — the same value the user reached by
+  hand ("the lowest click still registering as 5 was at (157.5, **345**)");
+* the drawn boxes agree with the hand-measured ones (5 at x 95..145 y 270..318
+  versus "about x 94..146, y 269..321").
+
+#### The verdict: vertical is ours, horizontal is not
+
+`scripts/calc-touch-map-fit.py` fits `shift(C) = slope·C + intercept` per axis:
+
+| axis | measured shifts | slope | swing over the probed span | verdict |
+| --- | --- | --- | --- | --- |
+| x | 120→−2.0, 200→−3.5 | −0.0188 | −1.5 px over 80 px | **CONSTANT** |
+| y | 223.5→+21.0, 294→+18.0, 366→+13.5 | −0.0527 | −7.5 px over 142 px | **SCALE** |
+
+The three vertical points are collinear to **0.6 px**. This is the
+discriminator the whole exercise was built around, and it comes out clean:
+
+* **Vertically there is a real scale error, and it is ours.** `1/(1−0.0527) =
+  1.0556`: the driver behaves as if the sensor surface were `7306 / 1.0556 =
+  6922` tall, not the 7306 the model uses. The error is *largest at the top of
+  the panel* and shrinks downward, because the model inverts y
+  (`fy = 1 − y/2^15`), so the scale pivots about the BOTTOM of the screen.
+* **Horizontally there is no scale to speak of**, and the constant is ~2–3 px in
+  the direction *opposite* to the reported symptom (the guest lands slightly
+  RIGHT of the cursor). The reported "and to the left" is not a coordinate
+  error: it is the ±9 px of hit-box **slop**, which is the guest's own target
+  expansion and must not be touched.
+
+**So the single hand measurement was right about the magnitude and wrong about
+the split.** It inferred `offset ≥ (−11.5, −24)` from one corner point, but a
+corner conflates shift with slop. Decomposed: at digit 5 the bottom edge sits
++27 px below the drawn button = **+18 of real shift plus +9 of slop**, and the
+right edge sits +7 px right = **−2 of shift plus +9 of slop**. The horizontal
+11.5 px is slop almost entirely.
+
+#### What 6922 probably is, and how to test it rather than assume it
+
+`6922 ± 18` is, within the fit, `4602 × 480/320 = 6903` — **the height that gives
+the internal sensor surface the panel's own aspect ratio**. The width (4602) is
+already measured correct, so the model's height being derived by a different
+expression (`(13850 − 7500) × 84/73`) rather than from the width is exactly the
+shape of defect this would be.
+
+That is a hypothesis, and the last time a sensor-surface constant "obviously"
+needed fixing the fix was measured **wrong** (see below). So it is behind
+`IT_MT_SENSOR_SCALE=aspect` and **nothing is changed by default**. The
+difference from last time is that there is now a falsifiable prediction and an
+instrument that can refute it: with `aspect`, `shift_y`'s slope must collapse to
+~0 (residual under ~1 px across all three rows) while `shift_x` and both slops
+stay where they are. Anything else and the hypothesis is dead.
+
+#### Method notes worth keeping
+
+* **The profile has to be taken where the buttons are light.** The digit buttons
+  are dark circles carrying a bright glyph, so a column profile across a digit
+  row profiles the GLYPH (~30 px), not the button (~51 px) — and a global
+  threshold clips the dark rows by 10–15 px, which would have injected exactly
+  the kind of systematic error the tool exists to measure. Rows are profiled
+  inside column 4 (`÷ × + − =`, light in every row) and columns inside row 1
+  (`m+ m− mrc ÷`, light in every column). Both then come out 49–51 px.
+* **`-display none` is fine here, contrary to the earlier warning**, because the
+  harness screendumps constantly: `screendump` drives `gfx_update`, which is
+  what arms the LCD's input-ready gate. A probe that taps without ever taking a
+  screenshot is the one that sees every touch refused.
+* **Do not use `0` as a probe digit.** A cleared display already reads `0`, so it
+  is indistinguishable from "the tap hit nothing".
+* **The oracle must not compare bytes exactly.** One pixel at the display's
+  bottom bevel flipped mid-run and every later `c` press was then read as "the
+  display would not clear", which killed a 12-minute map with two buttons done.
+  It also must not use a MEAN difference: the display is a big pale gradient
+  carrying one glyph, so `7` and `9` differ by ~5% of *pixels* but almost
+  nothing on average, and a mean-based check declared them identical. Count
+  changed bytes, and treat "cleared" as a tolerance.
+* **The leftmost keypad column cannot be bracketed on the left.** A tap at x=1
+  still registers as `7`, twice, in two runs — the column-1 hit box reaches the
+  screen edge. Its `shift_x` is therefore unmeasurable and is reported as `-`
+  rather than guessed.
+
 ### Measured home-screen geometry (1.0), and a method for hit-box work
 
 Taken from a column/row brightness profile of the real scanout, so it is not an

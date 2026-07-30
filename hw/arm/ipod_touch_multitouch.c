@@ -981,19 +981,33 @@ void ipod_touch_multitouch_transaction_end(IPodTouchMultitouchState *s)
  * advertised switches to scaling by the advertised dimensions, which shifts
  * every touch ~8% horizontally -- kept only so the comparison can be re-run.
  */
-static bool mt_sensor_scale_advertised(void)
+enum {
+    MT_SCALE_DEFAULT = 0,   /* internal surface; measured correct horizontally */
+    MT_SCALE_ADVERTISED,    /* the wrong fix, kept so it can be re-run          */
+    MT_SCALE_ASPECT,        /* candidate: give the surface the panel's ratio    */
+};
+
+static int mt_sensor_scale_mode(void)
 {
     static int cached = -1;
 
     if (cached < 0) {
         const char *e = getenv("IT_MT_SENSOR_SCALE");
-        cached = (e && strcmp(e, "advertised") == 0);
-        if (cached) {
+        cached = MT_SCALE_DEFAULT;
+        if (e && strcmp(e, "advertised") == 0) {
+            cached = MT_SCALE_ADVERTISED;
             fprintf(stderr, "[MT] sensor scale: ADVERTISED (%u x %u) -- this is "
                     "the MEASURED-WRONG setting; touches land ~8%% right of "
                     "where they were aimed\n",
                     MT_ADVERTISED_SENSOR_SURFACE_WIDTH,
                     MT_ADVERTISED_SENSOR_SURFACE_HEIGHT);
+        } else if (e && strcmp(e, "aspect") == 0) {
+            cached = MT_SCALE_ASPECT;
+            fprintf(stderr, "[MT] sensor scale: ASPECT (%u x %u) -- candidate "
+                    "for the measured vertical scale error; see "
+                    "scripts/calc-touch-map.py\n",
+                    MT_DEFAULT_SENSOR_SURFACE_WIDTH,
+                    MT_ASPECT_SENSOR_SURFACE_HEIGHT);
         }
     }
     return cached;
@@ -1001,14 +1015,19 @@ static bool mt_sensor_scale_advertised(void)
 
 uint32_t mt_sensor_surface_width(void)
 {
-    return mt_sensor_scale_advertised() ? MT_ADVERTISED_SENSOR_SURFACE_WIDTH
-                                        : MT_DEFAULT_SENSOR_SURFACE_WIDTH;
+    /* Only the HEIGHT is under question; the width measured correct. */
+    return mt_sensor_scale_mode() == MT_SCALE_ADVERTISED
+        ? MT_ADVERTISED_SENSOR_SURFACE_WIDTH
+        : MT_DEFAULT_SENSOR_SURFACE_WIDTH;
 }
 
 uint32_t mt_sensor_surface_height(void)
 {
-    return mt_sensor_scale_advertised() ? MT_ADVERTISED_SENSOR_SURFACE_HEIGHT
-                                        : MT_DEFAULT_SENSOR_SURFACE_HEIGHT;
+    switch (mt_sensor_scale_mode()) {
+    case MT_SCALE_ADVERTISED: return MT_ADVERTISED_SENSOR_SURFACE_HEIGHT;
+    case MT_SCALE_ASPECT:     return MT_ASPECT_SENSOR_SURFACE_HEIGHT;
+    default:                  return MT_DEFAULT_SENSOR_SURFACE_HEIGHT;
+    }
 }
 
 static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, float y, uint16_t radius1, uint16_t radius2, uint16_t radius3, uint16_t contactDensity) {

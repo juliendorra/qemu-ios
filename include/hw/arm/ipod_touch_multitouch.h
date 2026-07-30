@@ -52,11 +52,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
  *
  * IT_MT_SENSOR_SCALE=advertised reproduces the wrong behaviour for anyone who
  * wants to re-run the comparison.
+ *
+ * The HEIGHT, however, is a separate question, and that one is open.
+ * `scripts/calc-touch-map.py` measured the hit box of five Calculator buttons on
+ * iPhone OS 1.0 and found the vertical error is not a constant: it is
+ * 21.0 px at panel y 223.5, 18.0 at 294 and 13.5 at 366, a straight line
+ * (max residual 0.6 px) of slope -0.0527. That is a SCALE error of
+ * 1/(1-0.0527) = 1.0556, i.e. the driver behaves as if the surface were
+ * 7306 / 1.0556 = 6922 tall, not 7306. Horizontally over the same map the
+ * error is flat and under 3.5 px, so the WIDTH is right and only the height
+ * disagrees.
+ *
+ * 6922 is, within the fit's uncertainty (+-18), the height that gives the
+ * internal surface the PANEL's aspect ratio: 4602 * 480/320 = 6903.
+ * IT_MT_SENSOR_SCALE=aspect selects that, so the prediction "the vertical
+ * slope collapses to zero and nothing else moves" can be tested with the same
+ * instrument that found it. Nothing is changed by default until it is.
  */
 #define MT_ADVERTISED_SENSOR_SURFACE_WIDTH  MT_SENSOR_SURFACE_WIDTH
 #define MT_ADVERTISED_SENSOR_SURFACE_HEIGHT MT_SENSOR_SURFACE_HEIGHT
 #define MT_DEFAULT_SENSOR_SURFACE_WIDTH  ((9000 - MT_SENSOR_SURFACE_WIDTH) * 84 / 73)
 #define MT_DEFAULT_SENSOR_SURFACE_HEIGHT ((13850 - MT_SENSOR_SURFACE_HEIGHT) * 84 / 73)
+/* The panel is 320x480; this is the width carrying that same ratio. */
+#define MT_ASPECT_SENSOR_SURFACE_HEIGHT (MT_DEFAULT_SENSOR_SURFACE_WIDTH * 3 / 2)
 
 uint32_t mt_sensor_surface_width(void);
 uint32_t mt_sensor_surface_height(void);

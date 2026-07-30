@@ -108,11 +108,35 @@ def main() -> int:
     ap.add_argument("--quality", type=int, default=11)
     ap.add_argument("--work", type=Path, default=None,
                     help="scratch directory; defaults to a temp dir")
+    # Overrides, for a build whose product artifacts do not exist yet. 4A102 is
+    # the live case: `m68ap-artifacts/builds/4A102/nand` has never been
+    # generated (W7a), while the shipped 1.1.4 app bundle carries a NAND with
+    # full provenance. The staging copy below means the source tree is only
+    # ever read, so pointing this at a bundle is safe here -- but nothing else
+    # in this repo may do that (see TOUCH_INVESTIGATION.md, "Never point QEMU
+    # at a bundle's shipped NAND").
+    ap.add_argument("--nand", type=Path, help="override the NAND tree")
+    ap.add_argument("--nor", type=Path, help="override the NOR image")
+    ap.add_argument("--iboot", type=Path, help="override the iBoot image")
+    ap.add_argument("--out-name", default=None,
+                    help="write to <out>/<name>/ instead of <out>/<BUILD>/, so "
+                         "an override-built snapshot cannot be mistaken for "
+                         "one built from the product artifacts")
     m68ap_paths.add_build_argument(ap, required=True)
     args = ap.parse_args()
 
     paths = m68ap_paths.get(args.build)
-    paths.require("iboot_sb", "nor", "nand")
+    overridden = {k: v for k, v in (("nand", args.nand), ("nor", args.nor),
+                                    ("iboot", args.iboot)) if v}
+    if overridden:
+        missing = [f"{k}: {v}" for k, v in overridden.items() if not v.exists()]
+        if missing:
+            raise SystemExit("missing override artifact(s):\n  "
+                             + "\n  ".join(missing))
+        print("[build-snapshot] OVERRIDES: "
+              + ", ".join(f"{k}={v}" for k, v in overridden.items()))
+    paths.require(*[n for n in ("iboot_sb", "nor", "nand")
+                    if n.replace("iboot_sb", "iboot") not in overridden])
     print(f"[build-snapshot] {m68ap_paths.describe(args.build)}")
 
     work = args.work or Path(
@@ -122,13 +146,16 @@ def main() -> int:
     staged_nand = stage / "nand"
     if staged_nand.exists():
         shutil.rmtree(staged_nand)
-    subprocess.run(["cp", "-Rc", str(paths.nand), str(staged_nand)], check=True)
+    src_nand = args.nand or paths.nand
+    src_nor = args.nor or paths.nor
+    src_iboot = args.iboot or paths.iboot_sb
+    subprocess.run(["cp", "-Rc", str(src_nand), str(staged_nand)], check=True)
     for bank in range(8):
         (staged_nand / f"bank{bank}").mkdir(exist_ok=True)
     staged_nor = stage / "nor.bin"
-    shutil.copy2(paths.nor, staged_nor)
+    shutil.copy2(src_nor, staged_nor)
 
-    machine = (f"iPhone-2G,bootrom={paths.bootrom},iboot={paths.iboot_sb},"
+    machine = (f"iPhone-2G,bootrom={paths.bootrom},iboot={src_iboot},"
                f"nand={staged_nand},epoch={paths.epoch}")
     sock_dir = "/var/tmp" if os.path.isdir("/var/tmp") else "/tmp"
     sock = f"{sock_dir}/snapbuild-{os.getpid()}.sock"
@@ -190,13 +217,18 @@ def main() -> int:
             os.unlink(sock)
 
     raw = state.read_bytes()
-    out = args.out / args.build
+    out = args.out / (args.out_name or args.build)
     out.mkdir(parents=True, exist_ok=True)
     (out / "state").write_bytes(raw)
     meta = {
         "build": args.build,
         "bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
+        # Which images this actually came from, so a snapshot built from
+        # overrides can never be mistaken for one built from the product tree.
+        "artifacts": {"nand": str(src_nand), "nor": str(src_nor),
+                      "iboot": str(src_iboot)},
+        "overridden": sorted(overridden),
         **engine_provenance(),
     }
     print(f"state: {len(raw) / 1048576:.2f} MiB -> {out / 'state'}")
