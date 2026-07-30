@@ -446,37 +446,63 @@ So before re-running the comparison: establish which pack that chunk set came
 from, or regenerate the product NAND (W7a). Session B reports 1.1.4 reaching the
 home screen in `web/bench-b/`, so their asset path may differ from this one.
 
-### A real coordinate mismatch, found 2026-07-30 (not yet shown to be THE cause)
+### The sensor-scale "bug" is NOT a bug — a wrong fix, caught by measurement
 
-The model **scales touch coordinates by one surface and advertises another**:
+**Do not "fix" the mismatch between the advertised and internal sensor
+surfaces.** It was tried on 2026-07-30 and measured wrong, in the direction that
+would have shifted every touch on all three apps by ~8%.
 
-```c
-#define MT_SENSOR_SURFACE_WIDTH  5000       /* reported to the guest */
-#define MT_SENSOR_SURFACE_HEIGHT 7500
-#define MT_INTERNAL_SENSOR_SURFACE_HEIGHT (13850 - 7500) * 84 / 73   /* = 7306 */
-```
+**The apparent defect.** `MT_REPORT_SENSOR_DIMENSIONS` hands the guest
+5000 x 7500, while `get_frame()` places a finger at `fx * 4602, fy * 7306`
+(`MT_INTERNAL_SENSOR_SURFACE_*`). Scaling by a surface you do not advertise
+reads like an obvious bug, and it is the right *shape* for a reported "touch
+shift" — which is on 1.1.4 as well as 1.0, so it lives in this shared model
+rather than in one firmware.
 
-`get_frame()` writes `finger_data.y = fy * MT_INTERNAL_SENSOR_SURFACE_HEIGHT`
-(7306), while `MT_REPORT_SENSOR_DIMENSIONS` hands the guest 7500. If the driver
-maps sensor→screen with the dimensions it was given, every touch is compressed
-by 7306/7500 = **2.6%**, i.e. displaced toward the bottom by an amount that
-grows with height:
+**The prediction, and why it was wrong.** If the driver mapped sensor→screen
+with the dimensions it was told, every touch would be compressed by 4602/5000
+horizontally — displaced ~22 px left at the right-hand column. Making the two
+agree would remove that. Both halves of that turned out to be false.
 
-| panel y | intended | guest sees | error |
-| --- | --- | --- | --- |
-| 67 (row 1) | 67 | ~78 | **+11 px** |
-| 157 (row 2) | 157 | ~165 | +8 px |
-| 249 (row 3) | 249 | ~255 | +6 px |
-| 437 (dock) | 437 | ~438 | +1 px |
+**The measurement.** A/B on ONE binary via `IT_MT_SENSOR_SCALE`, restoring the
+SAME snapshot each run so the machine state is identical, tapping x=235 — which
+a column profile of the real framebuffer places in a GAP. Icon columns in row 3
+are 23..69, 94..150, 170..226, 246..302 (centres 46, 122, 198, 274); with
+**57x57 tap targets** the hit boxes are 17.5..74.5, 93.5..150.5, 169.5..226.5
+and 245.5..302.5, so 235 falls between the last two.
 
-**This is a defect on its own** — scaling by a surface you do not advertise has
-no defensible reading — and it is the right shape for a remembered "shift in
-touch". **But it does not explain the dead row 1**: the icons are 54 px tall and
-an 11 px displacement stays well inside them.
+| scale used | where x=235 should land | result |
+| --- | --- | --- |
+| internal 4602 (the default) | 235 — in the gap | **nothing launched** |
+| advertised 5000 ("the fix") | 255 — inside Settings | **Settings launched** |
 
-So: fix it, but do not expect it to resurrect row 1, and do not fix it blind —
-changing the scale affects every build and every tap, and the working rows are
-currently working. Establish a passing tap test first.
+**Both are the opposite of the arithmetic prediction**, and they are only
+consistent if the driver maps with something very close to the INTERNAL scale:
+`235/320*4602 = 3380`, and `3380/4602*320 = 235` (gap, no launch); while the
+"fixed" `235/320*5000 = 3672` gives `3672/4602*320 = 255` (on Settings,
+launches). Both observations fall out of that, and neither falls out of
+"the guest divides by what it was advertised".
+
+So the two constants disagreeing is what makes a tap land where it was aimed.
+Reverted; `IT_MT_SENSOR_SCALE=advertised` reproduces the wrong behaviour for
+anyone who wants to re-run it.
+
+**The transferable part:** a mismatch that looks indefensible on inspection was
+load-bearing, and the check that caught it was an A/B against a *measured*
+target — the framebuffer column profile — not against an assumed geometry. Two
+earlier attempts at the same test tapped icon CENTRES and both modes launched,
+which proved nothing; only a target in a gap discriminated.
+
+**The reported touch shift therefore still has no identified cause.** This was
+the leading candidate and it is now excluded.
+
+### Two contaminated results from the same day, discounted
+
+* **The row-1 tap on a restored snapshot** reported `launched=false`, but the
+  panel read **0% non-black** at the end: the device had auto-locked during the
+  ~2 minute wait, so the tap landed on a sleeping machine. It says nothing.
+* **Every `touch-probe.py` result** in the sections above — see the harness fix
+  below; the probe was tapping machines whose vCPUs were stopped.
 
 **Worth checking whether it is really "row 1" or "near the extremes".** `fy`
 0.860 is close to the top of the range while both working rows sit mid-panel

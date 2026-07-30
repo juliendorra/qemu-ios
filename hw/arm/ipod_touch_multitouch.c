@@ -975,6 +975,42 @@ void ipod_touch_multitouch_transaction_end(IPodTouchMultitouchState *s)
     s->in_buffer_ind = 0;
 }
 
+/*
+ * The DEFAULT is the internal scale, which measurement says is the correct one
+ * (see the block comment in ipod_touch_multitouch.h). IT_MT_SENSOR_SCALE=
+ * advertised switches to scaling by the advertised dimensions, which shifts
+ * every touch ~8% horizontally -- kept only so the comparison can be re-run.
+ */
+static bool mt_sensor_scale_advertised(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("IT_MT_SENSOR_SCALE");
+        cached = (e && strcmp(e, "advertised") == 0);
+        if (cached) {
+            fprintf(stderr, "[MT] sensor scale: ADVERTISED (%u x %u) -- this is "
+                    "the MEASURED-WRONG setting; touches land ~8%% right of "
+                    "where they were aimed\n",
+                    MT_ADVERTISED_SENSOR_SURFACE_WIDTH,
+                    MT_ADVERTISED_SENSOR_SURFACE_HEIGHT);
+        }
+    }
+    return cached;
+}
+
+uint32_t mt_sensor_surface_width(void)
+{
+    return mt_sensor_scale_advertised() ? MT_ADVERTISED_SENSOR_SURFACE_WIDTH
+                                        : MT_DEFAULT_SENSOR_SURFACE_WIDTH;
+}
+
+uint32_t mt_sensor_surface_height(void)
+{
+    return mt_sensor_scale_advertised() ? MT_ADVERTISED_SENSOR_SURFACE_HEIGHT
+                                        : MT_DEFAULT_SENSOR_SURFACE_HEIGHT;
+}
+
 static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, float y, uint16_t radius1, uint16_t radius2, uint16_t radius3, uint16_t contactDensity) {
     MTFrame *frame = calloc(1, sizeof(*frame));
 

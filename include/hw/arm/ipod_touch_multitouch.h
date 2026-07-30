@@ -28,9 +28,41 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
 #define MT_SENSOR_SURFACE_WIDTH  5000
 #define MT_SENSOR_SURFACE_HEIGHT 7500
 
-// internal surface width/height
-#define MT_INTERNAL_SENSOR_SURFACE_WIDTH  (9000 - MT_SENSOR_SURFACE_WIDTH) * 84 / 73
-#define MT_INTERNAL_SENSOR_SURFACE_HEIGHT (13850 - MT_SENSOR_SURFACE_HEIGHT) * 84 / 73
+/*
+ * The internal surface is NOT the advertised one, and that is CORRECT -- do not
+ * "fix" it. This was tried on 2026-07-30 and measured wrong.
+ *
+ * MT_REPORT_SENSOR_DIMENSIONS hands the guest 5000 x 7500 while a finger is
+ * placed at fx * 4602, fy * 7306, which reads like an obvious bug. It is not:
+ * the DRIVER maps sensor->screen with the internal scale, not with the
+ * dimensions it was told, so the two disagreeing is what makes a tap land where
+ * it was aimed.
+ *
+ * Measured, A/B on one binary, restoring the same snapshot each time and
+ * tapping x=235 -- which a column profile of the real framebuffer puts in the
+ * GAP between the row-3 icons at 170..226 and 246..302:
+ *
+ *   internal scale (this)   lands 235, in the gap   -> nothing launches  CORRECT
+ *   advertised scale        lands 255, on Settings  -> Settings launches WRONG
+ *
+ * Predicting from "the guest divides by what it was advertised" gets both
+ * results backwards. Whatever the driver actually uses, it agrees with these
+ * expressions, so changing them introduces an ~8% horizontal shift on every
+ * build -- the opposite of the intended repair.
+ *
+ * IT_MT_SENSOR_SCALE=advertised reproduces the wrong behaviour for anyone who
+ * wants to re-run the comparison.
+ */
+#define MT_ADVERTISED_SENSOR_SURFACE_WIDTH  MT_SENSOR_SURFACE_WIDTH
+#define MT_ADVERTISED_SENSOR_SURFACE_HEIGHT MT_SENSOR_SURFACE_HEIGHT
+#define MT_DEFAULT_SENSOR_SURFACE_WIDTH  ((9000 - MT_SENSOR_SURFACE_WIDTH) * 84 / 73)
+#define MT_DEFAULT_SENSOR_SURFACE_HEIGHT ((13850 - MT_SENSOR_SURFACE_HEIGHT) * 84 / 73)
+
+uint32_t mt_sensor_surface_width(void);
+uint32_t mt_sensor_surface_height(void);
+
+#define MT_INTERNAL_SENSOR_SURFACE_WIDTH  mt_sensor_surface_width()
+#define MT_INTERNAL_SENSOR_SURFACE_HEIGHT mt_sensor_surface_height()
 
 // report IDs
 #define MT_REPORT_UNKNOWN1            0x70
