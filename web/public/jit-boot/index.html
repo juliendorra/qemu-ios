@@ -361,6 +361,13 @@
   // takes the emulator with it. Painting is a nice-to-have; it must never be
   // able to kill the boot, so every module property is reached through this and
   // the paint loop switches itself off after the first failure.
+  // ?paint=0 keeps -display wasm and the non-black measurement but skips the
+  // per-frame blit. Under -sPROXY_TO_PTHREAD the MAIN thread both paints and
+  // services the emulator thread's proxied MEMFS syscalls, so a heavy blit can
+  // in principle starve a guest that is doing a lot of filesystem work -- which
+  // is exactly the difference between this page and web/bench-b/ (which never
+  // paints) on the 1.1.4 chunked boot.
+  const PAINT = new URLSearchParams(location.search).get('paint') !== '0';
   let displayBroken = false;
   function moduleProp(name) {
     try {
@@ -412,7 +419,7 @@
 
     const nonBlack = blit(u32, info.ptr >>> 2, info.stride >>> 2,
                           info.width, info.height);
-    ctx.putImageData(imageData, 0, 0);
+    if (PAINT) ctx.putImageData(imageData, 0, 0);
     Atomics.store(u32, infoBase + 10, info.seq);   // ack: painted through seq
 
     frames++;

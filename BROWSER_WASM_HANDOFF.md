@@ -594,16 +594,49 @@ base the same boot serves 661 chunks and reaches BSD root.
 
 ### Still open: 1.1.4 does not finish booting in THIS viewer
 
-With the verified NAND and a correct chunk base, `?build=4A102` reaches
-first pixels 0.8 s, iBoot banner 27 s, kernel 88 s, **BSD root 102 s** — and then
-stalls before launchd, panel at 2.2%, `guestRatio` ~0.5 (which under `-icount`
-means the CPU is idle, not fast).
+With the verified NAND and a correct chunk base, `?build=4A102` reaches first
+pixels 0.8 s, iBoot 27 s, kernel 96 s, **BSD root 114 s** — then stalls before
+launchd, panel 2.2%, `guestRatio` ~0.5 (which under `-icount` means the CPU is
+idle, not fast).
 
-**It is not the NAND**: the same tree renders 74.32% natively. Session B reports
-1.1.4 reaching the home screen in `web/bench-b/`, so the difference is between
-the two PAGES, not the assets — the obvious suspects being this page's
-`overlay=ram` tune file and its snapshot plumbing. Compare the two pages' machine
-lines and `nand-tune` before looking anywhere else.
+**What has been excluded, each by measurement:**
+
+| candidate | how it was excluded |
+| --- | --- |
+| the NAND | the same tree renders **74.32%** natively |
+| the chunk set | **`web/bench-b/` boots it to the home screen** — first pixels 14 s, kernel 98 s, BSD root 113 s, launchd 129 s, **home screen 214 s at 69.7%** |
+| firmware images | bootrom, iBoot and NOR are **byte-identical** between the two pages (same sha256) |
+| the `nand-tune` / machine line | both write `overlay=ram`; both pass the same `-M`, `-m 1G`, `-pflash`, `-icount shift=1` |
+| **painting** | `?paint=0` skips the per-frame blit and it **still stalls** at BSD root |
+
+Painting was the leading theory — under `-sPROXY_TO_PTHREAD` the main thread
+both paints and services the emulator's proxied MEMFS syscalls, so a heavy blit
+could starve a guest doing filesystem work, and bench-b never paints. **It is
+not that.** `?paint=0` is kept; it is a useful knob and it cost one run to earn.
+
+**Two variables remain, and they are confounded:**
+
+1. **This page's other plumbing** — the overlay-persistence `preRun` read, the
+   snapshot code paths, the serial and chunk-stats polling. bench-b has none.
+2. **The engine build.** `build-wasm-b` is from **2026-07-29 21:26** and
+   predates every engine change made on the 30th; `build-wasm` is current. Note
+   that today's engine boots 1.1.4 **fine natively**, so if this is the cause it
+   is browser-and-timing specific.
+
+**The decisive next experiment** is to separate those: rebuild `build-wasm-b`
+from current sources (`WASM_BUILD_DIR=build-wasm-b scripts/wasm/build-qemu.sh`)
+and re-run bench-b on chunked 4A102.
+
+* still reaches the home screen → the engine is fine and it is **this page**;
+  bisect its plumbing by disabling the overlay read, then the pollers.
+* now stalls → **today's engine regressed the browser 1.1.4 path**, and the
+  suspects are the day's `hw/arm/ipod_touch.c` changes (the TVOut window is now
+  lazily mapped) and the PMU `vm_stop(RUN_STATE_PAUSED)` change.
+
+Repointing bench-b's engine symlink would have answered it in one run, but
+`web/bench-b/` belongs to Session B and the change was refused — correctly.
+Rebuilding their build directory is the equivalent move that stays inside the
+normal workflow.
 
 ## W7a (original) — Regenerate 4A102's product NAND
 
