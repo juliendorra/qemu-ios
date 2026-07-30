@@ -607,10 +607,43 @@ completion -- and no new frame appears. The next candidates, in order:
    the guest idles, and SpringBoard simply never repaints -- the screen stays at
    99% lit. So the compositor decides not to draw, rather than being blocked in
    the MBX or starved of events.
-4. The next instrument therefore has to look at the CoreSurface/LayerKit
-   decision itself -- what SpringBoard asks CoreSurface for after the dismissal,
-   and why it produces no pixels -- rather than at the MBX registers, which are
-   now answering.
+4. ~~The next instrument has to look at the CoreSurface/LayerKit decision~~
+   **DONE -- and it found the discriminator.**
+
+### THE DISCRIMINATOR: 1.0 never re-points the display (2026-07-30)
+
+`gsevent-type-probe.py --break-sym LIB:SYMBOL` breaks on arbitrary library
+symbols (unambiguous across processes, unlike an executable's IMPs). LayerKit
+carries **1843** defined symbols and CoreSurface **118**, so the compositing
+entry points can be watched by name. Two presses in-app, both builds:
+
+| | `_LKBackingStoreSwap` after the press | `_LKImageQueueFlush` / `_LKRenderImageQueueShow` / `CoreSurfaceClientBufferFlushProcessorCaches` | **LCD base programs, whole run** |
+|---|---|---|---|
+| 1.0 | **yes**, in SpringBoard | never fire, on either build | **2** |
+| 1.1.4 | **yes**, in SpringBoard | never fire | **182** |
+
+**Both builds composite. Only 1.1.4 ever tells the display controller.** 1.0
+programs the LCD window base twice in an entire boot-plus-session; 1.1.4 does it
+182 times. That is why the app opens fine on 1.0 (it draws into the CURRENT
+base, in place) and why the dismissal shows nothing: SpringBoard repaints into a
+backing store, swaps it, and the base is never re-pointed at the result.
+
+### The hypothesis this hands over, and why it is credible
+
+Recall the swap-device announcements: **1.0 uses `AppleH1CLCD` as its "legacy
+swap device"**, while 1.1.4 and the iPod also register `AppleH1TVOut`. So on 1.0
+the MBX's swap target IS THE DISPLAY ITSELF -- which suggests the flip on 1.0 is
+supposed to be performed BY THE MBX SWAP, and our MBX performs no swaps at all.
+1.1.4 does not depend on that: it re-points the base itself, 182 times.
+
+That is a single mechanism explaining every remaining symptom, it is consistent
+with everything measured, and it is exactly T1's "model MBX swap completion" --
+but for the **legacy CLCD** path, not the TVOut one.
+
+**Next:** find what 1.0 expects the MBX swap to do to the CLCD (which register
+write or base program), by tracing what 1.1.4's 182 base programs come from and
+what 1.0 does instead at the same point. `IT_LCD_TRACE=1` plus a breakpoint on
+the CLCD's base-programming path is the instrument.
 
 ### Is the change 1.0-specific? No -- all three builds ship the same MBX code
 

@@ -224,6 +224,10 @@ def main() -> int:
                          "recording window -- the menu DOWN/UP delivery count")
     ap.add_argument("--press-interval", type=float, default=6,
                     help="seconds of recording after each press")
+    ap.add_argument("--break-sym", action="append", default=[],
+                    help="break on LIB:SYMBOL, e.g. LayerKit:_LKBackingStoreSwap. "
+                         "Repeatable. Library addresses are unambiguous across "
+                         "processes, unlike an executable's IMPs.")
     ap.add_argument("--watch-port", action="store_true",
                     help="also break on the GraphicsServices event-PORT calls "
                          "(_GSGetPurpleSystemEventPort, _ResetEventPortSet, "
@@ -272,8 +276,13 @@ def main() -> int:
         print(f"  {len(libs)} images mapped")
         fps = exec_fingerprints(mnt)
         print(f"  {len(fps)} executables fingerprinted at {EXEC_BASE:#x}")
+        mnt_saved = str(mnt) if args.break_sym else None
+        if args.break_sym:
+            # resolve before detaching
+            pass
     finally:
-        subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
+        if not args.break_sym:
+            subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
 
     syms = {n: v for v, n, d in msym.symbols(gs_bin.read_bytes()) if d}
     cb = syms.get("_PurpleEventCallback")
@@ -297,6 +306,33 @@ def main() -> int:
     # that could make that happen, and they are ordinary GraphicsServices
     # addresses (>= 0x30000000), so unlike the SpringBoard IMPs they are not
     # ambiguous across processes.
+    # Arbitrary library symbols, e.g. LayerKit's compositing entry points. These
+    # are shared-library addresses (>= 0x30000000), so unlike an executable's
+    # IMPs they are unambiguous across processes.
+    for spec in args.break_sym:
+        lib, _, sym = spec.partition(":")
+        src = None
+        for root in ("System/Library/Frameworks", "System/Library/PrivateFrameworks",
+                     "usr/lib"):
+            cand = list((Path(mnt_saved) / root).rglob(lib)) if mnt_saved else []
+            for c in cand:
+                if c.is_file() and not c.is_symlink():
+                    src = c
+                    break
+            if src:
+                break
+        if not src:
+            print(f"  !! {lib} not found for {spec}")
+            continue
+        libsyms = {n: v for v, n, d in msym.symbols(src.read_bytes()) if d}
+        if sym in libsyms:
+            bps[libsyms[sym] & ~1] = f"{lib}:{sym}"
+            print(f"  watching {lib}:{sym} at {libsyms[sym]:#x}")
+        else:
+            print(f"  !! {sym} not in {lib}")
+    if mnt_saved:
+        subprocess.run(["hdiutil", "detach", mnt_saved], capture_output=True)
+
     if args.watch_port:
         for n in ("_GSGetPurpleSystemEventPort", "_ResetEventPortSet",
                   "_GSRegisterApplicationPort", "_GSSendSystemEvent",
