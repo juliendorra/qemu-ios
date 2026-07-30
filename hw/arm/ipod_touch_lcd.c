@@ -1,4 +1,6 @@
 #include "hw/arm/ipod_touch_lcd.h"
+#include "target/arm/cpu.h"
+#include "hw/core/cpu.h"
 #include "ui/pixel_ops.h"
 #include "ui/console.h"
 #include "hw/display/framebuffer.h"
@@ -13,11 +15,27 @@ static int lcd_visible_sample_count(uint32_t base);
 
 static void it_lcd_trace_base(const char *win, uint32_t base)
 {
+    uint32_t pc = 0, lr = 0;
+
     if (!getenv("IT_LCD_TRACE")) {
         return;
     }
-    fprintf(stderr, "[LCD] %s base <- 0x%08x (visible %d/6 at that base)\n",
-            win, base, lcd_visible_sample_count(base));
+    /*
+     * WHO programmed the base. iPhone OS 1.1.4 re-points the window 182 times
+     * in a run and 1.0 only twice, which is why 1.0 never shows the home screen
+     * again after an app is dismissed (it repaints into a backing store and the
+     * display is never aimed at it). Naming the writer is the way to find what
+     * 1.0 is missing, and the guest pc is right here for the taking -- the same
+     * idiom the [BTN] trace uses.
+     */
+    if (current_cpu) {
+        CPUARMState *env = &ARM_CPU(current_cpu)->env;
+        pc = env->regs[15];
+        lr = env->regs[14];
+    }
+    fprintf(stderr, "[LCD] %s base <- 0x%08x (visible %d/6 at that base) "
+            "pc=0x%08x lr=0x%08x\n",
+            win, base, lcd_visible_sample_count(base), pc, lr);
 }
 
 /* IT_FB_TRACE=1: log every LCD MMIO access. The render investigation needs

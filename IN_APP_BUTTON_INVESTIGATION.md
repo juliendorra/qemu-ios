@@ -640,10 +640,41 @@ That is a single mechanism explaining every remaining symptom, it is consistent
 with everything measured, and it is exactly T1's "model MBX swap completion" --
 but for the **legacy CLCD** path, not the TVOut one.
 
-**Next:** find what 1.0 expects the MBX swap to do to the CLCD (which register
-write or base program), by tracing what 1.1.4's 182 base programs come from and
-what 1.0 does instead at the same point. `IT_LCD_TRACE=1` plus a breakpoint on
-the CLCD's base-programming path is the instrument.
+### Where the base programs come from: the SAME driver function on both
+
+`IT_LCD_TRACE=1` now prints the guest pc and lr of whoever programs the window
+base (the idiom the `[BTN]` trace already used). Over a full probe run:
+
+| build | writer | kext | calls |
+|---|---|---|---|
+| 1.1.4 | `pc=0xc0380eec` | **`AppleH1CLCD`+0x1eec** | **522** |
+| 1.0 | `pc=0xc0300edc` | **`AppleH1CLCD`+0x1edc** | **2** (both at boot) |
+| (both) | `pc=0x1800xxxx` | iBoot, once | 1 |
+
+**Same kext, same function** -- the offsets differ by 0x10 between builds, i.e.
+it is the same code. So 1.0 is not missing the ability to re-point the display;
+**nothing ever calls it** after boot. 1.1.4 calls it ~500 times a run.
+
+### The repaint exists -- it just is not on screen
+
+The same run makes that visible. With the CLCD swap-device window in place,
+1.0's `3_home_returns` now reports **94.62% changed while the lit fraction stays
+99.1% -> 99.1%**. The displayed screen did not change; some OTHER buffer gained
+94% new content. That is SpringBoard painting the home screen into a buffer the
+display is not aimed at -- exactly what "nothing re-points the base" predicts.
+
+**Harness flaw this exposes, and it now produces a FALSE PASS:** `changed()`
+takes the largest per-base difference across the three framebuffers (a
+deliberate fix, so a transition to a DIMMER screen could not be missed). It
+therefore passes when an off-screen buffer changes. Steps 3 and 4 report PASS on
+1.0 today while the screen is visibly unchanged, and step 5 then fails. The
+verdict needs the CURRENT SCANOUT buffer (the model's own `lcd_scanout_base()`
+rule), not the best of three.
+
+**Next:** find what drives that CLCD function ~500 times a run on 1.1.4 and
+never on 1.0. The leading candidate remains the MBX legacy swap: 1.0 registers
+`AppleH1CLCD` as the MBX's swap device, so the flip is plausibly meant to be
+performed by a swap our stub never performs.
 
 ### Is the change 1.0-specific? No -- all three builds ship the same MBX code
 
