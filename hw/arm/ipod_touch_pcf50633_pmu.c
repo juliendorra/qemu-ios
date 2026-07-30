@@ -459,11 +459,31 @@ static void pcf50633_prewarm_park(void *opaque)
      * no vCPU behind it, and touch that is delivered to the model and never
      * acted on.
      *
-     * Nothing here uses the suspend semantics: the wake path calls vm_start()
-     * directly rather than qemu_system_wakeup_request(), which is the API that
-     * would require SUSPENDED.
+     * BUT PAUSED BREAKS BEING WOKEN BY INJECTED INPUT, and that is not a
+     * detail of the harness -- it is QEMU's own rule. qmp_input_send_event()
+     * opens with
+     *
+     *     if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+     *         error_setg(errp, "VM not running");
+     *
+     * i.e. SUSPENDED is deliberately wakeable by injected input and PAUSED is
+     * not. Parked with PAUSED, the wake keypress is refused by QMP and never
+     * reaches ipod_touch_key_event() at all: measured on 1.1.4 AND the iPod as
+     * "[WAKE] Pre-warmed wake parked; awaiting Power/Home" followed by no
+     * further [BTN] line, and 5_home_wakes at 0.00%. A UI keypress still works
+     * (ui/cocoa.m calls qemu_input_event_send_key() with no runstate check), so
+     * this cost us every AUTOMATED sleep/wake test rather than the feature --
+     * which is worse, not better: it is the tests that would have caught it.
+     *
+     * So park SUSPENDED, which is also what is actually true here (the guest
+     * performed a system suspend and is waiting on a wake source), and keep the
+     * sticky flag honest by clearing it on the wake path -- ipod_touch.c already
+     * calls vm_set_suspended(false) before every vm_start() there, which is the
+     * half of a4619ce78e that fixes the migration bug. A snapshot taken while
+     * genuinely parked SHOULD restore suspended; one taken after a wake is now
+     * clean because the flag was cleared.
      */
-    vm_stop(RUN_STATE_PAUSED);
+    vm_stop(RUN_STATE_SUSPENDED);
     fprintf(stderr, "[WAKE] Pre-warmed wake parked; awaiting Power/Home\n");
 }
 

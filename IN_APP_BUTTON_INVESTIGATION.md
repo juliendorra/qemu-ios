@@ -990,3 +990,77 @@ CLCD, on a build whose MBX is registered as the *legacy* swap device. That is
 the one hop nobody has instrumented yet, and it is instrumentable the same way
 the 1.1.4 chain was: `spin-locate.py --break-kaddr <IOMobileGraphicsFamily addr>
 --kernelcache`, using 1.0's own kext offsets.
+
+
+## Two boot/wake regressions from 2026-07-30, both fixed
+
+Neither is the in-app button bug; both were introduced today and both broke
+SHIPPED bundles, so they are recorded here with their mechanisms.
+
+### 1. The TVOut window was never placed (1.1.4 and the iPod would not boot)
+
+`a4619ce78e` made the window wait for the kernel's announcement instead of being
+mapped blind at init -- correct, and it is what stops the window faulting 1.0.
+But `tvout_workaround_move()` still opened with
+
+```c
+if (!tvout_wa_region || pa == tvout_wa_addr) return;
+```
+
+and **the board default is exactly what 1.1.4 and the iPod announce**. So the
+derived address equalled `tvout_wa_addr`, the function returned before mapping
+anything, and with nothing mapped at init the window was never placed at all.
+The log says it outright -- `derived 0x089c8560 ... matches the board default`
+and then no placement line -- and the guest never reaches a stable home screen.
+
+Fixed by gating that early return on `tvout_wa_mapped`: the board constant is
+now only a prediction to check against, and must not double as "already there".
+
+### 2. Parking with PAUSED made the machine unwakeable by injected input
+
+The same commit changed the pre-warm park from `vm_stop(RUN_STATE_SUSPENDED)` to
+`RUN_STATE_PAUSED`, reasoning that "nothing here uses the suspend semantics".
+Something does -- **QEMU's own input gate**:
+
+```c
+/* qmp_input_send_event() */
+if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+    error_setg(errp, "VM not running");
+```
+
+SUSPENDED is deliberately wakeable by injected input; PAUSED is not. Parked with
+PAUSED the wake keypress was refused by QMP and never reached
+`ipod_touch_key_event()` at all -- measured on 1.1.4 AND the iPod as
+`[WAKE] Pre-warmed wake parked; awaiting Power/Home` followed by **no further
+`[BTN]` line**, and `5_home_wakes` at 0.00%.
+
+Note the shape: a UI keypress still worked (`ui/cocoa.m` calls
+`qemu_input_event_send_key()` with no runstate check), so this did not break the
+feature for a person sitting in front of the app -- it broke **every automated
+sleep/wake test**, which is worse, because the tests are what would have caught
+it.
+
+Fixed by parking SUSPENDED again -- which is also what is actually true (the
+guest performed a system suspend and awaits a wake source) -- while KEEPING the
+half of `a4619ce78e` that fixes the migration bug: `ipod_touch.c` calls
+`vm_set_suspended(false)` before every `vm_start()` on the wake path, so the
+sticky flag no longer leaks into snapshots taken after a wake.
+
+### All three bundles, after both fixes
+
+| board | 1_open | 2_touch | 3_home_returns | 4_power | 5_wake |
+|---|---|---|---|---|---|
+| iPod (N45AP) | PASS | PASS | **PASS 98.58%** | PASS | **PASS 56.46%** |
+| iPhone OS 1.1.4 | PASS | PASS | **PASS 96.99%** | PASS | **PASS 74.63%** |
+| iPhone OS 1.0 | PASS | PASS | FAIL 0.00% | FAIL | -- |
+
+1.0 is unchanged by either fix, as expected: it announces no TVOut device, so it
+places no window, and it never reaches the in-app transition that would sleep.
+
+### Correction to an earlier entry in this document
+
+"1.1.4 stops booting on today's tree" (committed in `d84422b6fe`) named the
+snapshot/migration work as the suspect. That was wrong on the cause: the boot
+failure was regression 1 above, and the `hw_error("Unable to read file!")` abort
+that first pointed at the NAND was a SEPARATE fault under a full disk. The NAND
+robustness fix in that commit stands on its own merits; the attribution does not.
