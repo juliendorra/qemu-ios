@@ -963,6 +963,68 @@ row-table range is `14 × 3600/7 + 2×75 = 7350` — within 0.6% of this model's
 neither matches. Whatever 1.0 feeds the table, it is not explained by a clean
 off-by-one either.
 
+#### Tracing 1.0's count words: the call chain, and what it rules out
+
+`_mt_FillMTContactDirectFromBinary` divides by fields the tables build; the
+tables are indexed by `[fp]` / `[fp+4]`; those are written by
+**`_mt_DefineSurfaceGrid`**, and the chain above it is:
+
+```
+_mt_InitProcessing
+  -> _mt_DefineSurfaceGrid(surface, rows, cols, ..., basicInfo)   ; writes [fp], [fp+4]
+  -> _alg_InitWatershedAndTracking
+       -> _alg_CompleteSurfaceGridInit
+            -> _alg_InitZephyrPlatformSpecifics    ; family id -> 5000/7500
+            -> _alg_InitGridPitchAndEdgeOptions    ; pitch 36/7, 56/11, margins 75
+                 -> _alg_InitRowColXYConvert       ; builds the tables, writes the ranges
+```
+
+The decisive line is at the end of `_mt_DefineSurfaceGrid`:
+
+```
+ldr  r2, [r4, #0x14]        ; a pointer stored 7 bytes into the basic-info blob
+ldrb r3, [r2, #2]           ; -> [surface+0]  = the COLUMN count
+ldrb r3, [r2, #5]           ; -> [surface+4]  = the ROW count
+```
+
+**So 1.0 does not use different values — it reads the same two bytes 1.1.4
+reads, at the same offsets 2 and 5, out of the same cached SENSOR_INFO (0xD3)
+reply.** 1.1.4 simply reads them at the point of use instead of copying them
+into the surface first. That kills the "1.0 feeds the tables a different count"
+hypothesis outright, and it means the earlier framing of this section was
+wrong: **the two builds' inputs and constants are now known identical on every
+axis examined — family id, pitches, divisors, margins, and the row/column
+bytes.**
+
+**Confirmed live** (`IT_MT_TRACE=2`, 1.0 cold boot): the driver enumerates and
+fetches exactly five reports, in order —
+
+```
+0x8f/0x82 report 0xD1 (family id)   0xD3 (sensor info)  0xD0 (region descriptor)
+          0xA1 (region params)      0xD9 (surface dimensions)
+```
+
+— which is precisely the set the kext's five `_cache*` functions request, and
+the model answers every one. Nothing is refused, nothing is retried.
+
+Both kexts also enumerate and cache the same reports through the same code:
+`_cacheDeviceBasicInfo` (0xD3), `_cacheSensorRegionDescriptor` (0xD0),
+`_cacheSensorRegionParams` (0xA1), `_cacheSensorSurfaceDimensions` (0xD9) — the
+1.0 and 1.1.4 functions are instruction-for-instruction the same apart from
+vtable slot numbers. **The model answers 0xD0 and 0xA1 with a single zero byte
+in both cases**, so if that stub were the cause it would have to affect both
+builds equally, and it demonstrably does not.
+
+**What that leaves.** With inputs, constants and formula all identical, the
+remaining explanations for a 5.6% divergence are (a) something further along
+the 1.0 path that has not been read yet — `_alg_DeriveImageFilteringParams` and
+the `[fp+0x3c]` table base are the unexamined terms — or (b) a difference not in
+this framework at all but in what each build's **UIKit** does with the same
+normalised point. **(b) is now the more likely of the two**, because it is the
+only layer this investigation has never opened, and because the 1.1.4 map's
+larger hit-box slop (11 px vs 9 px) is already direct evidence that the two
+UIKits hit-test differently.
+
 #### Whose bug is 1.0's vertical scale — ours or Apple's? Open, with the fork stated
 
 The wire coordinate is physical (hundredths of a mm of sensor), so on a real
@@ -970,17 +1032,31 @@ device there is one truth: the silicon reports a finger at 60 mm as 6000
 whatever firmware is installed. Each firmware then divides by a range it
 computes itself. Two hypotheses fit everything measured so far:
 
-* **Ours.** On real hardware both builds derived the *same* range — plausible
-  now that their pitch/margin constants are known identical — and 1.0 shifts
-  only in this emulator because it derives its count/base from something the
-  model answers wrongly. The one-byte zero stub for the region descriptor
-  (0xD0/0xA1) is the named suspect. If so, real 1.0 users never saw the shift,
-  and the fix is to implement that report with real-shaped data.
-* **Apple's.** 1.0 genuinely fed the tables a different count/base and computed
-  a ~5% short range on real hardware too; the 1.1.4 rewrite (folding the pitch
-  setter into the platform function and re-sourcing the counts) was the fix.
-  If so, the shift is authentic history, our emulation of it is *faithful*,
-  and "correcting" it is exactly as much a UX choice as the finger projection.
+* **Ours.** Some report the model stubs feeds one build's path and not the
+  other's. **Substantially weakened by the trace above**: the two builds read
+  the same reports through the same code and compute the range from the same
+  bytes with the same constants, so a stub that misleads 1.0 should mislead
+  1.1.4 identically. For this to survive, the divergence would have to sit in
+  the one 1.0-only term not yet read (`_alg_DeriveImageFilteringParams`, the
+  `[fp+0x3c]` table base).
+* **Apple's — now the leading hypothesis.** The two builds compute the same
+  sensor range and differ *above* MultitouchSupport, in UIKit's own handling of
+  the normalised point. The 1.1.4 map already shows the two UIKits hit-testing
+  differently (slop 11 px vs 9 px), and iPhone OS 1.0 was the first release of
+  a brand-new input stack. If so the shift is **authentic history**, this
+  emulation is **faithful**, and "correcting" it is exactly as much a UX choice
+  as cancelling the finger projection.
+
+**The standing rule this implies — the device model must never be
+firmware-aware.** The machine cannot know which build will boot from it, and a
+model whose constants are tuned per firmware is emulation running backwards:
+real silicon served every firmware with one behaviour, and the firmwares
+differed in how they *read* it. Whatever resolution this fork gets, it must be
+one hardware truth that both builds interpret — per-build behaviour belongs in
+the layers that know the build (the launchers, the browser page, the docs),
+never in the device. `IT_MT_SENSOR_SCALE` and `IT_MT_SENSOR_GRID` are
+measurement knobs, not per-firmware settings, and none of them may become a
+default on the strength of fixing one build.
 
 **Why it is not "just fixed" today:** the only lever available without more
 information is the model's constants, and that experiment has been run —
