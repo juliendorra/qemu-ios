@@ -897,24 +897,64 @@ advertised `MT_REPORT_SENSOR_DIMENSIONS` never touches the position path.
 
 #### And this is where 1.0 and 1.1.4 diverge
 
-The same two functions exist in 1.0's `MultitouchSupport` and are structurally
-identical (all offsets shifted by +8). **But 1.0's
-`_alg_InitZephyrPlatformSpecifics` Zephyr branch sets only the 5000 / 7500 pair
-and a table pointer — no pitch, no divisor, no margins at all**, and it reads the
-row/column counts from different fields (`[fp]` and `[fp+4]` words, versus
-1.1.4's bytes at `[[fp+8]+2]` / `[[fp+8]+5]`). 1.1.4 gained the whole per-family
-pitch/margin block that 1.0 lacks.
+*(Corrected 2026-07-30, same day: the first version of this section claimed 1.0
+"has no pitch, no divisor, no margins at all". That was wrong — the constants
+were looked for only in `_alg_InitZephyrPlatformSpecifics`, and in 1.0 they live
+one function over.)*
 
-Different constants feeding the same formula is a complete and sufficient
-explanation for the measured divergence — 1.1.4 flat, 1.0 carrying a −5.6%
-vertical scale — without either build being "wrong".
+1.0 sets its pitch constants in **`_alg_InitGridPitchAndEdgeOptions`** — a
+symbol 1.1.4 no longer has, because 1.1.4 folded the same stores into
+`_alg_InitZephyrPlatformSpecifics`. And in 1.0's Zephyr branch they are
+**identical to 1.1.4's**: column 36/7, row 56/11, margins 75 (0.75 mm).
 
-**Not closed, and stated as such:** the exact numeric range was not reproduced
-arithmetically for either build. Doing that needs the table base term
-(`~[fp+0x3c]`), the actual row/column values the driver passes, and 1.0's pitch
-defaults (set somewhere other than the function that sets 1.1.4's). What is
-verified is the formula, the field locations, the table construction, 1.1.4's
-constants, and 1.0's *absence* of them.
+That sharpens the question considerably. Same pitches, same margins, same table
+formula — **if both builds fed the same count into it they would compute the
+same range**, and the measured divergence (1.1.4 flat, 1.0 −5.6% vertically)
+could not exist. So the difference is in the **count/base values** each build
+feeds the tables: 1.1.4 indexes with the SENSOR_INFO report's row/column bytes
+(`[[fp+8]+2]` / `[[fp+8]+5]`); 1.0 indexes with two words at `[fp]` / `[fp+4]`
+whose provenance is **not yet traced**. The grid-perturbation experiment proves
+SENSOR_INFO feeds them *somehow* (14×10 moved 1.0's touches), but possibly
+through an off-by-one, a rows-vs-intervals reading, or combined with the
+**sensor region descriptor (0xD0/0xA1) — which this model answers with a
+one-byte zero stub**. That stub is now the prime emulator-side suspect.
+
+**The arithmetic still does not close, stated as such.** With count 15 the
+row-table range is `14 × 3600/7 + 2×75 = 7350` — within 0.6% of this model's
+7306, i.e. 1.1.4's measured behaviour. 1.0 behaves as if the range were
+6922 ± 18: count 14 predicts 6836, count 15 without margins predicts 7200, and
+neither matches. Whatever 1.0 feeds the table, it is not explained by a clean
+off-by-one either.
+
+#### Whose bug is 1.0's vertical scale — ours or Apple's? Open, with the fork stated
+
+The wire coordinate is physical (hundredths of a mm of sensor), so on a real
+device there is one truth: the silicon reports a finger at 60 mm as 6000
+whatever firmware is installed. Each firmware then divides by a range it
+computes itself. Two hypotheses fit everything measured so far:
+
+* **Ours.** On real hardware both builds derived the *same* range — plausible
+  now that their pitch/margin constants are known identical — and 1.0 shifts
+  only in this emulator because it derives its count/base from something the
+  model answers wrongly. The one-byte zero stub for the region descriptor
+  (0xD0/0xA1) is the named suspect. If so, real 1.0 users never saw the shift,
+  and the fix is to implement that report with real-shaped data.
+* **Apple's.** 1.0 genuinely fed the tables a different count/base and computed
+  a ~5% short range on real hardware too; the 1.1.4 rewrite (folding the pitch
+  setter into the platform function and re-sourcing the counts) was the fix.
+  If so, the shift is authentic history, our emulation of it is *faithful*,
+  and "correcting" it is exactly as much a UX choice as the finger projection.
+
+**Why it is not "just fixed" today:** the only lever available without more
+information is the model's constants, and that experiment has been run —
+`IT_MT_SENSOR_SCALE=aspect` repairs 1.0 and measurably breaks 1.1.4, so tuning
+is not a fix. The honest fix under the "ours" hypothesis means knowing what a
+real Zephyr answers for the region reports, which would have to be guessed —
+and a plausible guess adopted without measurement is precisely the
+advertised-scale mistake this file already documents once. **Deciding the fork
+needs one of:** tracing where 1.0 loads `[fp]`/`[fp+4]` from (disassembly, no
+hardware needed), or a region-report dump / touch measurement from a real
+device running 1.0.
 
 #### Confirming it: perturb the reported grid
 
