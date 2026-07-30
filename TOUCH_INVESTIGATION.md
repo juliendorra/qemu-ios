@@ -669,6 +669,54 @@ the model's sensor surface height disagrees with what 1.0's driver derives. What
 is left on 1.0 after correcting it — a flat +7.6 px up-shift with symmetric
 ±10.5 slop — is the same shape 1.1.4 shows untouched, i.e. design compensation.
 
+**Arm 2 — 1.1.4 with `aspect`: it breaks, and by the predicted amount.** 310 taps:
+
+```
+digit  centre(drawn)    dL    dR    dT    dB  shift x  shift y  slop x  slop y
+    7   41.0, 223.5   -     7.0 -17.0  10.0      -       -3.5     -      13.5
+    9  200.0, 223.5 -10.0  12.0 -17.0  10.0      1.0     -3.5    11.0    13.5
+    1   41.0, 366.0   -     7.0  -8.0  19.0      -        5.5     -      13.5
+    3  200.0, 366.0 -10.0  12.0  -8.0  19.0      1.0      5.5    11.0    13.5
+    5  120.0, 294.0 -12.0  10.0 -11.0  15.0     -1.0      2.0    11.0    13.0
+```
+
+| arm | predicted slope | measured slope | predicted shift @ y 223.5 | measured |
+| --- | --- | --- | --- | --- |
+| 1.0 `aspect` | ~0 | **−0.0000** | +6.4 | +7.5 |
+| 1.1.4 `aspect` | +0.058 | **+0.0631** | −3.5 | **−3.5** |
+
+1.1.4 goes from flat (slope +0.007) to a **9 px swing across the keypad**, in the
+opposite direction to 1.0's original error — which is what "the guest was already
+using the number you just changed" looks like. Both predictions were written down
+before the runs and both came in; horizontal edges are unchanged in both arms.
+
+#### Verdict, and what is deliberately NOT being changed
+
+1. **The vertical part of the reported shift is real and is ours — on 1.0 only.**
+   A scale of 1.0556, worth 21 px at the top of the keypad, caused by the model's
+   sensor height. `IT_MT_SENSOR_SCALE=aspect` removes it exactly.
+2. **The horizontal part is not a coordinate error at all.** Both builds sit
+   within ±3.5 px, and 1.1.4 within ±1. What reads as "and to the left" is the
+   guest's ±9–11 px of hit-box slop, and a single corner measurement cannot tell
+   the two apart — which is how the original `kx ≤ 0.927` estimate came about.
+3. **The rest is design compensation and must stay.** After correcting 1.0, both
+   builds show a constant up-shift (1.0: +7.6, 1.1.4: +11.5) with a symmetric
+   slop. Constant across the panel is the signature of guest hit-testing, not of
+   this tree.
+4. **The default is NOT changed, and should not be on this evidence.** The flag
+   fixes one firmware and breaks the other by a comparable amount. Shipping it
+   would trade a 1.0 defect for a 1.1.4 one — the same shape of mistake as the
+   advertised-scale "fix", caught this time before it landed rather than after.
+
+**The real defect underneath is that the model describes its sensor two ways.**
+It advertises a 10 × 15 grid (ratio 1.5) and places fingers on a 4602 × 7306
+surface (ratio 1.588), and the two firmwares read different ones. A fix has to
+make those agree *and* keep 1.1.4's numbers where they are — which means finding
+what 1.1.4's driver actually divides by, not tuning a constant until one build
+looks right. `AppleMultitouchSPI.kext` in 1A543a still has full C++ symbols
+(that is how the `0x46` question was settled), so the 1.0 side is readable
+directly; 1.1.4's is the one to disassemble next.
+
 #### Method notes worth keeping
 
 * **The profile has to be taken where the buttons are light.** The digit buttons

@@ -64,10 +64,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
  * disagrees.
  *
  * 6922 is, within the fit's uncertainty (+-18), the height that gives the
- * internal surface the PANEL's aspect ratio: 4602 * 480/320 = 6903.
- * IT_MT_SENSOR_SCALE=aspect selects that, so the prediction "the vertical
- * slope collapses to zero and nothing else moves" can be tested with the same
- * instrument that found it. Nothing is changed by default until it is.
+ * internal surface the PANEL's aspect ratio: 4602 * 480/320 = 6903. That is
+ * also the ratio of the sensor GRID this model advertises (MT_SENSOR_ROWS 15 /
+ * MT_SENSOR_COLUMNS 10 = 1.5), while 4602 x 7306 is 1.588 -- so the model
+ * describes its sensor two ways and the two disagree.
+ *
+ * IT_MT_SENSOR_SCALE=aspect selects the grid-consistent height, and it was
+ * measured on BOTH firmwares. It is NOT a fix, and must not become the default:
+ *
+ *   1.0   slope -0.0527 -> -0.0000   fixed  (residual flat +7.6 px)
+ *   1.1.4 slope +0.0070 -> +0.0631   BROKEN (9 px swing across the keypad)
+ *
+ * 1.1.4's driver already agrees with 7306, so changing the height trades a 1.0
+ * defect for a 1.1.4 one. The two drivers derive the mapping differently and no
+ * single pair of constants satisfies both; the fix is to find what 1.1.4
+ * actually divides by and make the advertised grid and the surface agree, not
+ * to tune a constant until one build looks right.
  */
 #define MT_ADVERTISED_SENSOR_SURFACE_WIDTH  MT_SENSOR_SURFACE_WIDTH
 #define MT_ADVERTISED_SENSOR_SURFACE_HEIGHT MT_SENSOR_SURFACE_HEIGHT

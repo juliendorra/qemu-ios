@@ -1003,9 +1003,9 @@ static int mt_sensor_scale_mode(void)
                     MT_ADVERTISED_SENSOR_SURFACE_HEIGHT);
         } else if (e && strcmp(e, "aspect") == 0) {
             cached = MT_SCALE_ASPECT;
-            fprintf(stderr, "[MT] sensor scale: ASPECT (%u x %u) -- candidate "
-                    "for the measured vertical scale error; see "
-                    "scripts/calc-touch-map.py\n",
+            fprintf(stderr, "[MT] sensor scale: ASPECT (%u x %u) -- fixes iPhone "
+                    "OS 1.0's vertical scale error and BREAKS 1.1.4's by a "
+                    "comparable amount; measurement only, never a default\n",
                     MT_DEFAULT_SENSOR_SURFACE_WIDTH,
                     MT_ASPECT_SENSOR_SURFACE_HEIGHT);
         }
