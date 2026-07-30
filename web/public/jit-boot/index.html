@@ -26,8 +26,20 @@
            border-radius: 4px; padding: .4rem .9rem; cursor: pointer; }
   button:active { background: #3a4150; }
   #fbstat { color: #7f8896; }
-  #tipfix { color: #7f8896; display: flex; align-items: center; gap: .35rem;
-            cursor: pointer; user-select: none; }
+  #tipfix, .viz { color: #7f8896; display: flex; align-items: center;
+            gap: .35rem; cursor: pointer; user-select: none; }
+  /* Overlays sit on the canvas but must never eat its pointer events. */
+  #panelwrap { position: relative; overflow: hidden; border-radius: 6px;
+               line-height: 0; }
+  #finger { position: absolute; left: 0; top: 0; pointer-events: none;
+            opacity: .8; will-change: transform; }
+  .tapdot, .clickmark { position: absolute; pointer-events: none;
+            transform: translate(-50%, -50%); border-radius: 50%;
+            transition: opacity 1.1s ease-out .3s; }
+  .tapdot { width: 12px; height: 12px; background: #007aff;
+            border: 2px solid #fff; box-shadow: 0 0 6px #007affcc; }
+  .clickmark { width: 10px; height: 10px; border: 2px solid #ffffffb0;
+            background: transparent; }
   #state { padding: .5rem .75rem; border-radius: 4px; background: #22262e;
            margin-bottom: .5rem; }
   #marks { padding: .5rem .75rem; border-radius: 4px; background: #1b1f26;
@@ -40,7 +52,29 @@
 </style>
 <h1>iPhone OS 1.0 — full boot, WebAssembly JIT</h1>
 <div id="device">
-  <canvas id="screen" width="320" height="480"></canvas>
+  <div id="panelwrap">
+    <canvas id="screen" width="320" height="480"></canvas>
+    <!-- A finger at true scale. The panel is 6.4 px/mm (320 px / 50 mm), so a
+         ~14 mm adult fingertip is ~90 px wide -- it really did cover more than
+         a quarter of the screen's width, and showing that occlusion is the
+         point: it is WHY iPhone OS shifts every contact upward. -->
+    <svg id="finger" width="96" height="360" viewBox="0 0 96 360"
+         style="display:none">
+      <defs>
+        <linearGradient id="fgrad" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0"   stop-color="#d9a184"/>
+          <stop offset=".45" stop-color="#eebd9e"/>
+          <stop offset="1"   stop-color="#cf9276"/>
+        </linearGradient>
+      </defs>
+      <path d="M 8 52 C 8 18 28 4 48 4 C 68 4 88 18 88 52
+               L 92 200 C 94 280 90 360 90 360 L 10 360
+               C 10 360 4 280 6 200 Z"
+            fill="url(#fgrad)" stroke="#b07a5e" stroke-width="1.5"/>
+      <path d="M 26 30 C 30 16 42 10 48 10 C 54 10 66 16 70 30"
+            fill="none" stroke="#c48b6d" stroke-width="2" opacity=".5"/>
+    </svg>
+  </div>
   <div id="buttons">
     <button id="home">Home (H)</button>
     <button id="power">Power (P)</button>
@@ -50,6 +84,16 @@ compensate for a fingertip occluding its target -- SBFingerProjection, 3.5
 typographic points = 1.2347 mm. A mouse is exact and occludes nothing, so that
 compensation lands your click above the pointer. Tick this to add it back.">
     <input type="checkbox" id="tipfixbox"> <span id="tipfixlabel">correct finger offset</span>
+  </label>
+  <label class="viz" title="Replace the cursor with a finger at the panel's real
+scale (6.4 px/mm): a fingertip covered more than a quarter of the screen's
+width, which is why iPhone OS compensates upward at all.">
+    <input type="checkbox" id="fingerbox"> finger cursor
+  </label>
+  <label class="viz" title="On every click, mark in blue where iPhone OS
+actually computes the tap -- above your click by the measured shift. With
+'correct finger offset' ticked the blue dot lands on the click itself.">
+    <input type="checkbox" id="tapdotbox"> show OS tap point
   </label>
   <div id="fbstat">panel: no frames yet</div>
 </div>
@@ -517,12 +561,66 @@ compensation lands your click above the pointer. Tick this to add it back.">
 
   function pressWallMs() { return MIN_PRESS_MS; }
 
+  // ------------------------------------------- occlusion & tap-point viz ---
+  //
+  // Purely visual: nothing below changes what is injected into the guest.
+  // The finger is positioned so the pointer sits just inside the fingertip;
+  // the pad then covers the UI below and beside it, the way a real finger hid
+  // what it touched. The blue dot marks where iPhone OS computes the tap:
+  // ABOVE the click by the measured shift (its own finger compensation, plus
+  // on 1.0 the open scale question), so computed = injected - shift(injected).
+  // With the correction checkbox on, injected = click + shift, and the dot
+  // lands back on the click -- which is the whole demonstration.
+  const fingerEl = document.getElementById('finger');
+  const fingerBox = document.getElementById('fingerbox');
+  const tapdotBox = document.getElementById('tapdotbox');
+  const panelwrap = document.getElementById('panelwrap');
+  function shiftAt(y) {           // measured shift, in panel px, at panel y
+    const t = BUILDS[BUILD].tip;
+    return t.a + t.b * y;
+  }
+  function canvasPos(ev) {
+    const r = canvas.getBoundingClientRect();
+    return { x: (ev.clientX - r.left) / r.width * canvas.width,
+             y: (ev.clientY - r.top) / r.height * canvas.height };
+  }
+  fingerBox.addEventListener('change', () => {
+    canvas.style.cursor = fingerBox.checked ? 'none' : 'pointer';
+    if (!fingerBox.checked) fingerEl.style.display = 'none';
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!fingerBox.checked) return;
+    const p = canvasPos(e);
+    fingerEl.style.display = 'block';
+    // Fingertip leading edge ~6 px above the pointer, pad centred on it.
+    fingerEl.style.transform =
+      `translate(${(p.x - 48).toFixed(1)}px, ${(p.y - 6).toFixed(1)}px)`;
+  });
+  canvas.addEventListener('pointerleave', () => {
+    fingerEl.style.display = 'none';
+  });
+  function showTapPoint(x, y) {
+    if (!tapdotBox.checked) return;
+    const injectedY = y + tipOffset(y);
+    const osY = injectedY - shiftAt(injectedY);
+    for (const [cls, px, py] of [['clickmark', x, y], ['tapdot', x, osY]]) {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.style.left = `${px}px`;
+      d.style.top = `${py}px`;
+      panelwrap.appendChild(d);
+      requestAnimationFrame(() => { d.style.opacity = '0'; });
+      setTimeout(() => d.remove(), 1600);
+    }
+  }
+
   let touching = false;
   let pressStart = 0;
   canvas.addEventListener('pointerdown', (e) => {
     // Throws for a pointer id with no active pointer (synthetic events), and
     // an exception here would abort the handler before the touch is ever sent.
     try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    { const p = canvasPos(e); showTapPoint(p.x, p.y); }
     touching = true;
     pressStart = performance.now();
     sendTouch(e, true);

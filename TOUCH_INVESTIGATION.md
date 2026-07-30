@@ -821,6 +821,25 @@ the numbers exist. Two gaps worth stating before anyone trusts the box:
   is exactly where it is least safe. Probing an app with controls near both
   extremes would close that.
 
+**Two more optional overlays make the difference itself visible** (2026-07-30),
+both pure DOM over the canvas — nothing in the injection path changes, and the
+`?tap=`/`?sweep=` measurement paths are untouched:
+
+* **`finger cursor`** replaces the pointer with an SVG finger at the panel's
+  true scale — 6.4 px/mm, so a ~14 mm fingertip is ~90 px wide and covers more
+  than a quarter of the screen's width, at 80% opacity. Seeing that occlusion
+  is the point: it is *why* iPhone OS compensates upward at all.
+* **`show OS tap point`** marks every click twice: a white ring at the click
+  itself, and a **blue dot where iPhone OS computes the tap** —
+  `computed = injected − shift(injected)` from the same per-build table. With
+  the correction checkbox off the dot sits 8–33 px above the click (1.0);
+  ticked, the injection adds the shift back and the dot lands on the click,
+  which is the whole demonstration.
+
+Verified in the page: click at y=100 on 1.0 → blue dot at y=72.4, exactly
+`shift(100) = 27.6`. The dots fade after ~1.6 s; they are appended after the
+finger so they stay visible over the fingertip.
+
 **Verified as far as the browser currently allows**: the page loads with no
 console error, the control renders, and the label computes `8–33 px` for 1.0
 from the table. **It is not verified end-to-end against a live guest** — the
