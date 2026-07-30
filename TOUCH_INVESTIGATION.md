@@ -780,6 +780,58 @@ question is settled. Anyone wanting the authentic behaviour — including the fa
 that a real finger *needed* that 1.2 mm — should leave it off; the difference
 showing is itself the historical detail.
 
+#### The browser page: a checkbox, and the numbers it needs
+
+The web port injects **panel pixels** straight into the model
+(`_wasm_input_touch(x, y, down)` in `web/public/jit-boot/index.html`), so the
+pre-correction there is a JS-side offset on `y` and needs **no wasm rebuild**
+and no env var. `#tipfixbox` does exactly that, **off by default**.
+
+The measured correction is per build and is affine, `shift(y) = a + b·y` in panel
+pixels — it is added back to the injected `y`, so a click lands where the pointer
+is:
+
+| build | a | b | at panel top → bottom |
+| --- | --- | --- | --- |
+| 1A543a (1.0) | 32.91 | −0.0527 | +33 px → +8 px |
+| 4A102 (1.1.4) | 9.64 | +0.0070 | +10 px → +13 px |
+
+**The two rows are not the same kind of number, and the UI should not pretend
+they are.** 4A102's is a constant and is entirely the guest's own behaviour —
+`SBFingerProjection` (7.90 px) plus that build's hit-box asymmetry; nothing is
+broken. 1A543a's is a **scale**, and only ~7.6 px of it is the finger
+projection; the rest is this emulator's own vertical geometry defect, so ticking
+the box there *hides* a bug rather than compensating for a design choice. That is
+recorded in the `BUILDS` table next to the coefficients.
+
+Deliberately **not** applied to the `?tap=` / `?sweep=` paths: those exist to
+measure the raw path, and correcting them would measure the correction.
+Horizontal is not corrected at all — measured within ±3.5 px on 1.0 and ±1 px on
+1.1.4, and only two columns were probed, so there is nothing there to justify it.
+
+**What we have, and what we do not.** Both builds the page serves are mapped, so
+the numbers exist. Two gaps worth stating before anyone trusts the box:
+
+* **The iPod (N45AP, Zephyr 2) has never been mapped.** The page does not serve
+  it, but any UI that grows an iPod row needs its own map first — its driver is
+  a different one and none of these numbers transfer.
+* **The fit is only measured over y ≈ 199…390**, the Calculator keypad. The
+  table extrapolates it to the full 0…480 panel, which is untested at the
+  status bar and the dock — and for 1.0, where `b` is real, the extrapolation
+  is exactly where it is least safe. Probing an app with controls near both
+  extremes would close that.
+
+**Verified as far as the browser currently allows**: the page loads with no
+console error, the control renders, and the label computes `8–33 px` for 1.0
+from the table. **It is not verified end-to-end against a live guest** — the
+snapshot resume currently stalls before the panel comes up (runstate never
+reaches `running`, 0 frames). That stall is **pre-existing and unrelated**:
+checking `index.html` out at HEAD, with no checkbox present, reproduces it
+exactly. It is the browser thread another session is working on.
+
+*(Noticed while testing, not fixed, not mine: the page has no
+`<meta charset="utf-8">`, so the em dash in the `<h1>` renders as mojibake.)*
+
 **Verified with the same instrument**, 1.0 on the shipped snapshot,
 `IT_MT_TIP_CORRECTION=11.5`, 325 taps:
 

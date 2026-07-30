@@ -26,6 +26,8 @@
            border-radius: 4px; padding: .4rem .9rem; cursor: pointer; }
   button:active { background: #3a4150; }
   #fbstat { color: #7f8896; }
+  #tipfix { color: #7f8896; display: flex; align-items: center; gap: .35rem;
+            cursor: pointer; user-select: none; }
   #state { padding: .5rem .75rem; border-radius: 4px; background: #22262e;
            margin-bottom: .5rem; }
   #marks { padding: .5rem .75rem; border-radius: 4px; background: #1b1f26;
@@ -43,6 +45,12 @@
     <button id="home">Home (H)</button>
     <button id="power">Power (P)</button>
   </div>
+  <label id="tipfix" title="iPhone OS deliberately shifts every touch upward to
+compensate for a fingertip occluding its target -- SBFingerProjection, 3.5
+typographic points = 1.2347 mm. A mouse is exact and occludes nothing, so that
+compensation lands your click above the pointer. Tick this to add it back.">
+    <input type="checkbox" id="tipfixbox"> <span id="tipfixlabel">correct finger offset</span>
+  </label>
   <div id="fbstat">panel: no frames yet</div>
 </div>
 <div>
@@ -439,13 +447,30 @@
   // timer on the emulator thread drains it and does the actual dispatch.
   // Calling QEMU's input API straight from here would touch a queue owned by
   // another thread, without the BQL.
+  // Off by default: the shift is what the hardware did, and seeing it is part
+  // of what this page shows. Deliberately NOT applied to ?tap= / ?sweep=, which
+  // exist to measure the raw path -- correcting those would measure the
+  // correction.
+  // BUILDS is declared further down, so this reads it LAZILY -- at pointer
+  // time, never at module-evaluation time, which would hit the temporal dead
+  // zone and abort the whole script before touch is ever wired up.
+  const tipBox = document.getElementById('tipfixbox');
+  function tipOffset(y) {
+    if (!tipBox || !tipBox.checked) return 0;
+    const t = BUILDS[BUILD].tip;
+    return Math.round(t.a + t.b * y);
+  }
+
   function sendTouch(ev, down) {
     if (!moduleRef || !runtimeReady) return;
     const r = canvas.getBoundingClientRect();
     const x = Math.round((ev.clientX - r.left) / r.width * canvas.width);
     const y = Math.round((ev.clientY - r.top) / r.height * canvas.height);
     if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return;
-    moduleRef._wasm_input_touch(x, y, down ? 1 : 0);
+    // Clamped, not wrapped: near the bottom edge the corrected point would
+    // otherwise fall off the panel and the guest would see nothing at all.
+    const cy = Math.min(canvas.height - 1, Math.max(0, y + tipOffset(y)));
+    moduleRef._wasm_input_touch(x, cy, down ? 1 : 0);
   }
 
   // A press has to stay down long enough for the GUEST to observe it, and
@@ -749,9 +774,27 @@
   // EPOCH is firmware-keyed, not board-keyed: booting one build's NAND against
   // another's epoch wedges iBoot with an EMPTY serial log, which looks exactly
   // like a hang. So they travel together, in one table, and ?build= picks a row.
+  //
+  // `tip` is the measured vertical error, as shift(y) = a + b*y in PANEL
+  // PIXELS -- how far BELOW the drawn control its hit box actually sits, i.e.
+  // how far ABOVE your cursor the guest receives the point. Adding it back to
+  // the injected y makes a click land where the pointer is. Both rows come
+  // from scripts/calc-touch-map.py; see TOUCH_INVESTIGATION.md.
+  //
+  // The two builds are NOT the same kind of number:
+  //   4A102  b ~ 0        a pure constant, and it is entirely iPhone OS's own
+  //                       finger projection (SBFingerProjection = 3.5 points
+  //                       = 1.2347 mm = 7.90 px) plus that build's hit-box
+  //                       asymmetry. Nothing here is broken.
+  //   1A543a b = -0.0527  a SCALE, largest at the top of the panel. Only ~7.6
+  //                       of it is the finger projection; the rest is a real
+  //                       defect in this emulator's sensor geometry, which the
+  //                       checkbox therefore HIDES rather than fixes.
   const BUILDS = {
-    '1A543a': { epoch: 0, label: 'iPhone OS 1.0' },
-    '4A102':  { epoch: 3, label: 'iPhone OS 1.1.4' },
+    '1A543a': { epoch: 0, label: 'iPhone OS 1.0',
+                tip: { a: 32.91, b: -0.0527 } },
+    '4A102':  { epoch: 3, label: 'iPhone OS 1.1.4',
+                tip: { a: 9.64,  b: 0.0070 } },
   };
   const BUILD = new URLSearchParams(location.search).get('build') || '1A543a';
   if (!BUILDS[BUILD]) {
@@ -760,6 +803,12 @@
   const EPOCH = BUILDS[BUILD].epoch;
   document.querySelector('h1').textContent =
     `${BUILDS[BUILD].label} (${BUILD}) — WebAssembly JIT`;
+  {
+    const t = BUILDS[BUILD].tip;
+    const top = Math.round(t.a), bot = Math.round(t.a + t.b * 480);
+    document.getElementById('tipfixlabel').textContent =
+      `correct finger offset (${top === bot ? `${top}` : `${bot}\u2013${top}`} px)`;
+  }
 
   const RESUME = new URLSearchParams(location.search).get('resume') === '1';
 
