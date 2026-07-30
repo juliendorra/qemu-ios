@@ -802,6 +802,42 @@ A uniform **−11.5 px at every row**, with the horizontal edges byte-identical
 and the surviving slope is the separate 1.0 scale error — which this correction
 deliberately does not touch, because a constant cannot cancel a scale.
 
+#### Dead ends and traps from the disassembly, in the order they were hit
+
+* **The kext is the wrong binary, and it looks like the right one.** The name
+  says multitouch, the symbols say `handleFrame`, `_cacheSensorSurfaceDimensions`
+  — and it interprets no coordinates whatsoever. `handleFrame()` forwards to
+  `sendFrameToRegisteredUserClients()`. Everything of interest is in
+  `PlugIns/MultitouchHID.plugin` and `MultitouchSupport.framework`. Start there.
+* **`_MTSurface_getBounds_mm`'s `/100` is a red herring.** It is the first
+  concrete scale constant you find, it is exactly the "hundredths of a mm" the
+  surface dimensions are in, and it is *not* on the contact-position path — it
+  converts the sensor GRID descriptor's int16 bounds, which our model answers
+  with an empty region descriptor anyway.
+* **The plugin's own default parameters say the finger correction does not
+  exist.** `gHMTipOffsetParams` is statically initialised with
+  `majorAxisGain = 0` and `upwardsAxisOffset_mm = 0`. Reading the initialised
+  data and stopping there gives exactly the wrong answer: the real values are
+  pushed in at runtime, and the only other binary in the filesystem mentioning
+  `FingerTipVerticalOffset` is SpringBoard. **Grep the whole root filesystem for
+  the property name before trusting a default.**
+* **A wrong intermediate conclusion, kept because it was productive.** Having
+  found that `gScreenBounds_mm` = advertised dimensions / 100, the obvious
+  reading is "the guest divides positions by the advertised 5000 × 7500", which
+  would compress every touch by 8%. The **map says otherwise** (1.1.4 within
+  ±1 px), and it was that contradiction — not more reading — that forced finding
+  the actual position path, where the coordinate arrives already normalised and
+  the surface dimensions only scale the tip offset. Measurement refuted a
+  plausible disassembly reading, again.
+* **`otool -tV` and Apple's `objdump` print nothing at all** for these `arm_v6`
+  Mach-Os on a current host — not an error, just an empty disassembly, which
+  reads like a corrupt file. Hence `scripts/macho-disasm.py`.
+* **A C string can have more than one `__cfstring` wrapper.** Locating
+  `SBFingerProjection` by finding the C string and then the `__cfstring` entry
+  pointing at it found a *different* reference site than the real one; the code
+  that matters used a second copy. Resolve the literal pool from the code side
+  and read back what the `__cfstring` points to, rather than the reverse.
+
 **The real defect underneath is that the model describes its sensor two ways.**
 It advertises a 10 × 15 grid (ratio 1.5) and places fingers on a 4602 × 7306
 surface (ratio 1.588), and the two firmwares read different ones. A fix has to
@@ -863,6 +899,24 @@ this, and records the actual image paths plus an `overridden` list in the
 snapshot metadata, so an override-built snapshot can never be mistaken for one
 built from the product tree. Regenerating 4A102's product NAND (W7a) is still
 the right thing to do; it is not a blocker for measuring touch.
+
+**The 1.1.4 snapshot was attempted first, and failed — worth knowing before
+trying again.** `build-snapshot.py --build 4A102 --nand <clone>` boots fine and
+renders (`[LCD] Retained kernel enabled scanout at 0x0f400000`), then
+**`[LCD] Merlot panel entered sleep`** before the 300 s boot-wait is up, and the
+producer's wake loop reports `panel at 0.0%, waking ...` twice and refuses to
+ship a dark snapshot. **Home does not bring it back**: the `[BTN]` lines show
+the keypresses reaching the guest, but a slept Merlot panel comes up on the LOCK
+screen, which then wants a slide (`scripts/lock-unlock-probe.py` has the
+recipe — drag y=430 from x=45 to x=280). The serial log also fills with repeated
+`AppleMultitouchSPI: downloaded 44480 bytes of firmware data` after the sleep.
+
+Rather than teach the snapshot producer to unlock, the maps **cold-boot and
+poll**: `calc-touch-map.py` grew `wait_live()`, which proceeds the moment the
+panel is live (two consecutive samples ≥40%) instead of after a fixed wait, so
+the run starts before the auto-lock rather than racing it. The map then taps
+continuously and nothing sleeps. A 1.1.4 cold boot to a live panel took ~420 s
+of allowance and came up at 69.8%.
 
 **One caveat on the clone:** pointing QEMU at it means guest writes land in it,
 so successive runs do not start from identical state (the bundle's own launcher
@@ -1048,6 +1102,31 @@ front by "the bundle clones a pristine NAND every launch", which makes
 non-persisting first-run state the expected outcome -- and the alert is a real
 difference between 1.1.4 and 1.0 that should stay visible anyway. See below.
 
+**Believing a corner measurement about an offset.** One click at (157.5, 345)
+still registering as `5` gave `offset ≥ (−11.5, −24)`, which is arithmetically
+right and attributes the whole excess to a shift. A corner conflates the shift
+with the hit box's own **slop**, and decomposed the horizontal 11.5 px is ~9 px
+of slop plus ~2 px of shift *in the other direction*. Measure two opposite edges
+before calling anything an offset. (The rest of that measurement held up
+exactly: 5's bottom edge really is at 345.)
+
+**Two harness failures that each killed a 12–15 minute map after it had
+started.** Both are the same lesson — a test whose oracle is a whole-image
+comparison needs a tolerance, and a run that discards partial results pays for
+it in wall clock:
+
+* the `c`-clears-the-display check compared the display region **byte for
+  byte**, and a single pixel at the display's bottom bevel flipped mid-run, so
+  every later clear read as "the display will not clear";
+* the fingerprint distinguishability check used a **mean** absolute difference,
+  and on a big pale-blue gradient carrying one dark glyph, `7` and `9` differ in
+  ~5% of *pixels* but almost nothing on average — it declared two perfectly
+  distinguishable fingerprints identical and refused to start.
+
+Both are fixed (count changed bytes; treat "cleared" as a tolerance), and the
+map now writes `map.json` after **every edge** and tolerates up to three clear
+failures instead of exiting.
+
 **Probing a bundle by pointing QEMU at its shipped NAND.** That skips the
 launcher's per-launch clone, so guest writes accumulate in the shipped image
 and change what every later launch starts from. 560 stray pages across the two
@@ -1055,8 +1134,35 @@ iPhone bundles before it was caught. See below.
 
 ## Reproduction
 
-`scripts/` has no harness for this yet; the probes used here live in the
-session scratchpad. The essentials:
+**There is a harness now** (this said there was not, until 2026-07-30):
+
+```bash
+# the hit-box map -- 1.0, from the shipped snapshot, ~15 min
+scripts/calc-touch-map.py --build 1A543a \
+    --snapshot web/public/jit-boot/snapshots/1A543a/state --logs /tmp/map10
+
+# 1.1.4 -- cold boot; --pre-tap dismisses the Edit Home Screen alert, and the
+# Calculator icon sits at (122,237) here, not 1.0's (122,247)
+scripts/calc-touch-map.py --build 4A102 --nand <clone>/nand \
+    --nor <clone>/nor_m68ap.bin --iboot <clone>/iboot_204_m68ap.bin \
+    --boot-wait 420 --pre-tap 180,325 --calc-icon 122,237 --logs /tmp/map114
+
+# constant-vs-scale verdict, one or many maps
+scripts/calc-touch-map-fit.py /tmp/map10/map.json /tmp/map114/map.json
+
+# the A/B knobs, neither of them a default
+IT_MT_SENSOR_SCALE=aspect     # fixes 1.0's vertical scale, BREAKS 1.1.4's
+IT_MT_TIP_CORRECTION=11.5     # cancels the guest's own finger projection
+
+# read Apple's own binaries (mount root.img read-only first)
+scripts/macho-disasm.py <binary> --find Sensor
+```
+
+Useful extras: `--home-only` stops after the home-screen shot for
+reconnaissance, `--geometry-only` after the keypad profile, and `--env K=V`
+passes anything else through to QEMU.
+
+For the older, yes/no style probes, the essentials:
 
 * launch a bundle with `-display none -qmp unix:…,server,nowait`;
 * wait for `[LCD] Touch input ready` in the log (the model refuses touch until
