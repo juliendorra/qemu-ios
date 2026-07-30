@@ -64,6 +64,9 @@
   // page itself is the measurement, readable without a debugger attached.
   // "first pixels" is not a serial landmark: SpringBoard never announces
   // itself, so the framebuffer is the only honest evidence it is up.
+  // On a ?resume=1 run these never fire -- the guest is already past them and
+  // its serial output is whatever the restored kernel replays. The framebuffer
+  // landmarks ("first pixels", "home screen") are the ones that matter there.
   const LANDMARKS = [
     ['iBoot banner',   t => t.includes('BUILD_TAG')],
     ['kernel',         t => t.includes('Darwin Kernel Version')],
@@ -704,6 +707,20 @@
   const BUILD = '1A543a';
   const EPOCH = 0;
 
+  // ?resume=1 restores a post-boot snapshot instead of booting, so the page
+  // reaches an interactive home screen in seconds rather than ~250 s.
+  //
+  // The stream is produced NATIVELY (scripts/wasm/snapshot-probe.py --keep-state)
+  // and restored here: same QEMU version, same machine, same device set, so the
+  // vmstate format matches. Whether a native-host stream loads in a
+  // WebAssembly host is exactly what this proves or disproves.
+  //
+  // It must be a stream captured from a RUNNING guest. QEMU records the source's
+  // runstate in the global-state section and only auto-starts the destination
+  // when that says "running"; a snapshot of a stopped guest comes up PAUSED and
+  // needs a monitor `cont`, which this page has no way to send.
+  const RESUME = new URLSearchParams(location.search).get('resume') === '1';
+
   const { default: Module } = await import('./qemu-system-arm.js');
 
   // Only the small artifacts are still fetched whole; the NAND arrives as
@@ -737,6 +754,7 @@
       // it especially misleading. Write to a MEMFS file and poll it instead.
       '-serial', 'file:/fw/serial.log',
       '-icount', 'shift=1',
+      ...(RESUME ? ['-incoming', 'file:/fw/state'] : []),
     ],
     onRuntimeInitialized: () => {
       runtimeReady = true;
@@ -748,6 +766,27 @@
       // parent is precisely the thread blocked in Atomics.wait waiting for the
       // chunk -- so the fetch never completes. Measured: 10 s timeout when
       // nested, 5 ms when the page owns it.
+      if (RESUME) {
+        // -incoming leaves the machine PAUSED and the page has no QMP monitor,
+        // so ask the emulator thread to start it. ui/wasm.c services the request
+        // from its drain timer, under the BQL, and waits for RUN_STATE_PAUSED --
+        // which is precisely the "the incoming stream has finished loading"
+        // signal, since the runstate is INMIGRATE until then.
+        moduleRef._wasm_request_resume();
+        line('resume requested; waiting for the snapshot to load');
+        const poll = setInterval(() => {
+          let st = 0;
+          try { st = moduleRef._wasm_run_state(); } catch (e) { return; }
+          if (st === 1) {
+            clearInterval(poll);
+            mark('snapshot resumed');
+            state('resumed from snapshot', 'ok');
+          } else if (st === 3) {
+            state('loading the snapshot…');
+          }
+        }, 500);
+      }
+
       startChunkFetcher(moduleRef, {
         script: manifest.fetcher || '/chunk-fetch-worker.js',
         onError: (m) => {
@@ -796,6 +835,20 @@
       // main thread, so the per-read stat() becomes a cross-thread round trip
       // and the boot stalls outright.
       mod.FS.writeFile('/fw/nand/nand-tune', 'overlay=ram\n');
+
+      if (RESUME) {
+        // The whole stream has to be resident before the machine starts: the
+        // incoming migration is read synchronously from MEMFS at startup, so
+        // there is no opportunity to fault it in.
+        state('downloading the snapshot…');
+        const r = await fetch('state');
+        if (!r.ok) throw new Error(`no snapshot at ./state (${r.status}) — `
+                                   + 'generate one with snapshot-probe.py '
+                                   + '--keep-state and stage it here');
+        const st = new Uint8Array(await r.arrayBuffer());
+        mod.FS.writeFile('/fw/state', st);
+        line(`staged snapshot (${(st.length / 1048576).toFixed(1)} MiB)`);
+      }
 
       // Prefetch the recorded boot order, and AWAIT it: a demand-faulted chunk
       // costs the guest a full network round trip while it blocks.

@@ -44,6 +44,7 @@
 #include "ui/surface.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "system/runstate.h"
 #include <emscripten.h>
 
 /*
@@ -286,10 +287,75 @@ static void wasm_input_dispatch(const WasmInputEvent *ev)
     }
 }
 
+/*
+ * Resuming a restored snapshot.
+ *
+ * `-incoming file:` leaves the machine PAUSED: QEMU records the source's
+ * runstate in the migration stream, and process_incoming_migration_co() only
+ * calls vm_start() when that says "running". A snapshot of a STOPPED guest
+ * therefore always comes up paused -- and stopping the guest first is not
+ * optional here, because a LIVE migration of this machine aborts on
+ *
+ *     assertion (block == qemu_get_ram_block(end - 1)) in
+ *     tlb_reset_dirty_range_all
+ *
+ * The machine maps main RAM twice (RAM_MEM_BASE and its uncached alias at
+ * RAM_MEM_BASE | UNCACHED_MEM_BIT), so a dirty range spans what that assertion
+ * insists is a single block. Only stop-and-copy produces a usable stream.
+ *
+ * Natively the answer is one `cont` over QMP. The page has no monitor at all, so
+ * it asks through the same ring the input events use, and the request is
+ * serviced HERE -- on the emulator thread, under the BQL, which is what
+ * vm_start() requires.
+ *
+ * The wait on RUN_STATE_PAUSED is the interesting part: while the incoming
+ * stream is still loading the runstate is RUN_STATE_INMIGRATE, and it only
+ * becomes PAUSED once the load has finished. So that transition is exactly the
+ * "the snapshot is in, you may start now" signal, and polling for it avoids
+ * having to guess when the load completed.
+ */
+static bool wasm_resume_requested;
+
+EMSCRIPTEN_KEEPALIVE void wasm_request_resume(void)
+{
+    qatomic_set(&wasm_resume_requested, true);
+}
+
+/* Reports the run state to the page: 0 unknown, 1 running, 2 paused,
+ * 3 still loading an incoming migration. Lets the page say what is happening
+ * instead of showing a blank canvas. */
+EMSCRIPTEN_KEEPALIVE int wasm_run_state(void)
+{
+    if (runstate_is_running()) {
+        return 1;
+    }
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        return 3;
+    }
+    if (runstate_check(RUN_STATE_PAUSED)) {
+        return 2;
+    }
+    return 0;
+}
+
+static void wasm_maybe_resume(void)
+{
+    if (!qatomic_read(&wasm_resume_requested)) {
+        return;
+    }
+    if (!runstate_check(RUN_STATE_PAUSED)) {
+        return;                        /* still loading, or already running */
+    }
+    qatomic_set(&wasm_resume_requested, false);
+    vm_start();
+}
+
 static void wasm_input_drain(void *opaque)
 {
     uint32_t tail = qatomic_read(&wasm_input_tail);
     uint32_t head = qatomic_load_acquire(&wasm_input_head);
+
+    wasm_maybe_resume();
 
     while (tail != head) {
         wasm_input_dispatch(&wasm_input_ring[tail & WASM_INPUT_RING_MASK]);

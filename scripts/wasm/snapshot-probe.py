@@ -123,6 +123,16 @@ def launch(qemu: Path, machine: str, nor: Path, serial: Path, sock: str,
            # The standing constraint: without it the guest takes timeout paths
            # and panics, natively as well as in the browser.
            "-icount", "shift=1",
+           # No user networking. The native build links slirp and registers a
+           # "slirp" savevm section; the WebAssembly build has no slirp at all,
+           # so a stream captured with networking on fails to load there with
+           #
+           #   Unknown section or instance 'slirp' 0
+           #
+           # A migration stream is only portable between hosts whose DEVICE SETS
+           # match, and slirp is the first place the two builds differ. The page
+           # passes no -net either, so this makes both sides consistent.
+           "-net", "none",
            "-qmp", f"unix:{sock},server,nowait"]
     if incoming:
         cmd += ["-incoming", incoming]
@@ -158,6 +168,13 @@ def main() -> int:
                     help="do not press Home before sampling; the guest "
                          "auto-locks, so a long --boot-wait then measures a "
                          "sleeping panel")
+    ap.add_argument("--downtime-ms", type=int, default=600000,
+                    help="migration downtime limit; must exceed the transfer "
+                         "so it converges in one stop-and-copy pass")
+    ap.add_argument("--stop-first", action="store_true",
+                    help="stop the guest before migrating. The resulting state "
+                         "restores PAUSED and needs a monitor `cont`, so it is "
+                         "unusable in the browser; off by default")
     ap.add_argument("--tap-after", default=None,
                     help="after restoring, tap this panel pixel ('x,y') and "
                          "report whether the screen changed -- the only check "
@@ -211,7 +228,32 @@ def main() -> int:
         report["before"] = sample(qmp, args.logs / "frames", "before")
         print("before:", json.dumps(report["before"]), flush=True)
 
-        qmp.execute("stop")
+        # Deliberately NOT stopping the guest first.
+        #
+        # QEMU records the SOURCE's runstate in the migration stream's global
+        # state section, and on the destination
+        # process_incoming_migration_co() only calls vm_start() when that says
+        # "running". Snapshot a stopped guest and every restore comes up PAUSED
+        # and needs a `cont` over the monitor -- which is fine here but
+        # impossible in the browser, where the page has no QMP socket at all.
+        #
+        # Migrating a live guest converges and stops the source itself, so the
+        # state is just as consistent and the destination auto-starts.
+        if args.stop_first:
+            qmp.execute("stop")
+        else:
+            # Converge in ONE pass. A live migration of this guest does not
+            # converge on its own: under -icount it keeps dirtying pages while
+            # the transfer proceeds, and a first attempt timed out mid-stream and
+            # left a TRUNCATED file -- which fails on restore with
+            # "check_section_footer: Read section footer failed", not with
+            # anything that points at the cause.
+            #
+            # A downtime limit larger than the transfer makes QEMU decide it may
+            # stop and copy immediately, so the stream is complete AND the source
+            # is recorded as running.
+            qmp.execute("migrate-set-parameters",
+                        downtime_limit=args.downtime_ms)
         print(f"migrating to {state} ...", flush=True)
         r = qmp.execute("migrate", uri=f"file:{state}")
         if "error" in r:

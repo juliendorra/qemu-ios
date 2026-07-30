@@ -17,6 +17,9 @@ node_modules/
 /public/*/nand.pack
 /public/*/qemu-system-arm.js
 /public/*/qemu-system-arm.wasm
+# A post-boot migration stream, produced by scripts/wasm/snapshot-probe.py
+# --keep-state. ~24 MiB, reproducible, never committed.
+/public/*/state
 
 # Session B's bench harness (web/bench-b/index.html) is SOURCE; the firmware
 # and emulator symlinked beside it are not, same rule as public/*.

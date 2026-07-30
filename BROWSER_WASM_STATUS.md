@@ -126,6 +126,93 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### A snapshot LOADS AND PAINTS in the browser in 5.4 s — but does not keep running
+
+**Proven, seen on screen:** `?resume=1` fetches a natively-produced 56.9 MiB
+migration stream, stages it into MEMFS, boots with `-incoming file:/fw/state`,
+and the page shows the **iPhone OS 1.0 home screen at 5.4 s** — first pixels and
+the >40%-non-black landmark both at 5.4 s, 45.5% non-black — against ~250 s for
+a cold chunked boot. The resume itself completed at **2.4 s**.
+
+**Not yet usable:** the restored machine does not keep executing. Measured from
+the page, without blocking the main thread:
+
+```
+run_state = 0        (not running, not paused, not INMIGRATE)
+guest_ms delta = 0   over 55 s of wall clock
+```
+
+And it is **racy**: the first attempt painted the home screen, later reloads of
+the same stream painted nothing at all. So what works today is "the stream loads
+and the restored frame is presented", not "the machine resumes".
+
+#### Three things this needed, all of which are findings in their own right
+
+**1. `-incoming` leaves the machine PAUSED, and the page has no monitor.** QEMU
+records the source's runstate in the stream and only auto-starts when it says
+"running". `ui/wasm.c` therefore exports `wasm_request_resume()`, serviced from
+the drain timer on the emulator thread under the BQL. It waits for
+`RUN_STATE_PAUSED`, which is exactly the "the incoming stream has finished
+loading" edge, since the runstate is `INMIGRATE` until then.
+
+**2. Live migration is IMPOSSIBLE on this machine.** The obvious way to get a
+stream recorded as "running" is to migrate a live guest. It aborts:
+
+```
+Assertion failed: (block == qemu_get_ram_block(end - 1)),
+  tlb_reset_dirty_range_all, physmem.c:872
+```
+
+The machine maps main RAM **twice** — `RAM_MEM_BASE` and an uncached alias at
+`RAM_MEM_BASE | UNCACHED_MEM_BIT` — so a dirty range spans what that assertion
+insists is one block. Two truncated state files were produced before the
+assertion was read; the failure surfaces on restore as
+`check_section_footer: Read section footer failed`, which points nowhere near the
+cause. **Only stop-and-copy works**, hence `--stop-first`.
+
+*A wrong diagnosis worth recording:* the first truncation was attributed to a
+session interrupt killing the probe mid-transfer. That was wrong — the assertion
+was doing it, and a rerun with no interruption failed identically.
+
+**3. A migration stream is only portable between hosts whose DEVICE SETS match.**
+The first browser attempt failed with
+
+```
+load of migration failed: Unknown section or instance 'slirp' 0
+```
+
+The native build links slirp and registers a `slirp` savevm section; the wasm
+build has no slirp at all. Fixed by generating with `-net none` so both sides
+agree. **Expect more of these** as either build's device set drifts; the error
+names the section, so each one is cheap to fix once looked at.
+
+#### What must be snapshotted, and why it matters more than it sounds
+
+A snapshot of a guest parked in "awaiting Power/Home" restores to a **black
+panel** even though it restores correctly: the guest is in WFI with almost no
+timers armed, so under `-icount` virtual time has nothing to advance towards.
+Natively that recovers, because native runs ~50x faster and gets 30 s of guest
+time in the probe's settle window; the browser gets under one second of guest
+time in the same wall clock and simply sits there.
+
+Snapshot a **live home screen** instead (`--boot-wait 300`, before the ~260 s
+auto-lock, and check the `before` sample really is ~45%). That is also what you
+would ship: resuming to a locked device is not an instant boot.
+
+#### Next steps, in order
+
+1. **Make `wasm_run_state()` return the raw runstate index.** "0" currently means
+   "none of the three I check for", which is not diagnosable. This is the one
+   thing blocking progress.
+2. **Find out whether the resume request races the load.** `wasm_request_resume()`
+   is called from `onRuntimeInitialized`, which fires during module init — before
+   the incoming stream has loaded. The wait on `RUN_STATE_PAUSED` is supposed to
+   handle that, but the run-to-run inconsistency suggests it does not always.
+3. **Check which timers are armed after a restore.** Only the LCD's refresh timer
+   and pl192 migrate; every other device's timer is whatever `realize()` armed.
+   If nothing periodic is armed, a halted vCPU plus `-icount` is a permanent
+   stall, which is exactly the signature observed.
+
 ### A3 started: the LCD now migrates, and a snapshot RESTORES a live panel
 
 First increment of the snapshot work, and the measurement that motivated it is
