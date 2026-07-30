@@ -1226,3 +1226,69 @@ selector together with the fb handle it stores -- then compare against the handl
 `LayerKit+0x39400` passes to `SwapBegin`. That identifies whether the swap is
 being issued on a display that was never opened, or on one whose open result was
 dropped.
+
+
+## RETRACTION: the NULL framebuffer handle was an artifact (2026-07-30, late)
+
+Static disassembly of 1.0's LayerKit (all stubs resolved through the indirect
+symbol table -- `scratchpad stubs.py`, now reproducible with capstone) proves the
+pinned mechanism impossible, and a re-measurement with memory dereferencing
+confirms it:
+
+* `LayerKit+0x39400` -- the measured SwapBegin caller -- is the return address of
+  the call at `_LKDisplayFinishUpdate+0x7c` (0x30b003fc). But FinishUpdate
+  **guards `d->fb != 0` at its entry** (0x30b0039c: `ldr r3,[r0,#8]; cmp r3,#0;
+  beq epilogue`) and reloads the SAME field into r0 for the call, with no store
+  in between. That call site cannot pass a NULL fb.
+* Re-measured with the new `--deref` option (gsevent-type-probe now reads guest
+  memory at breakpoint hits): every SwapBegin from that lr carries
+  **fb=0x12aaa0, valid**, with a live IOKit connect port at [fb+0xc]=0x2517.
+  SwapBegin at +0x7c simply runs every frame because the swap token
+  `[buffer+0x10]` is cleared at the end of each FinishUpdate.
+* A NULL-fb display DOES exist by design: `_LKDisplayByName` creates the main
+  display (`{AppleMX31IPU, AppleH1CLCD}`, flag=0, fb kept for life) and a
+  SECOND display (`{AppleH1TVOut}`, flag=1) whose fb is deliberately
+  CFRelease'd inside `_new_display` (bit-0 path, 0x30aff558). The original
+  NULL reading was almost certainly that display or a mid-step register read.
+  1.1.4's LayerKit has the identical two-display structure and works.
+
+Structure recovered on the way (1.0 LKDisplay object): [0]=service, [4]=name,
+[8]=fb, [0xc]=ID, [0x24]=buffers, [0x30]=current buffer index, [0x38]=buffer
+count, [0x84]=pending update, [0xa0]=flags (bit0=release-fb-at-create,
+bit1=disabled, bit5=secondary). `_LKDisplaySetEnabled(d,1)` reopens the fb if
+NULL and calls `IOMobileFramebufferRequestPowerChange(fb,1)`;
+`SetEnabled(d,0)` swaps a NULL layer x3 + RequestPowerChange(fb,0).
+Userland selectors: SwapBegin=4 (scalar), SwapEnd=5 (0x80-byte struct in),
+SwapWait=6.
+
+
+## THE ACTUAL SHAPE: the press kills the render loop, and something CRASHES (2026-07-30, late)
+
+Same run (`/tmp/gsev-m68ap-10-swap`, 2 presses, gsevent-type-probe --deref):
+
+* **Baseline, app frontmost: SpringBoard's swap path is fully healthy.** Every
+  ~6 s (status bar): `SetEnabled(d=0xaff40,1)` -> `FinishUpdate` (fb valid) ->
+  `SwapBegin` -> `SwapEnd`, buffer index cycling 2->0->1->2. The display CAN be
+  repointed at any time; nothing is broken until the press.
+* Press 2 delivered completely: menu DOWN+UP to SpringBoard, and **Preferences
+  received its type2002 deactivation** at t=21.33.
+* After the press: **zero** FinishUpdate / SetEnabled / SwapBegin / SwapEnd hits
+  in ANY process for the remaining 66 s. Even the periodic status-bar render
+  stops. The failure is not "swap not submitted" -- the render loop's
+  display-flush section never runs again.
+* The gate is in `_render_for_time` (0x30b07cac): if the render context's
+  attached-layer count `[ctx+0x24]` is 0, the whole flush section --
+  SetEnabled at +0x88, FinishUpdate at +0x49c -- is skipped. After the
+  dismissal SpringBoard's context has NO attached layers, forever.
+* **`crashdump` ran at t=31.99** -- 10.6 s after the deactivation, the classic
+  1.x watchdog shape: the app did not exit within 10 s of its 2002 and was
+  killed. SpringBoard then received GSEvent **type2001 sub=31** (app-exited,
+  sub = pid) at t=32.06 -- and still never re-attached its layers.
+
+So the standing question is no longer LayerKit bookkeeping. It is:
+**why does the 1.0 app hang instead of exiting after its type2002**, and
+secondarily why SpringBoard's home-screen layer re-attach (which should follow
+the app-exit notification) never happens. The crash report the watchdog kill
+produces names the exact thread and PC where the app sat -- capture run in
+progress with `S5L8900_STAGE_NAND=0` and a preserved NAND, to be read back with
+`extract-hfs-from-nand.py --partition data`.

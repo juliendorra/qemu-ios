@@ -228,6 +228,13 @@ def main() -> int:
                     help="break on LIB:SYMBOL, e.g. LayerKit:_LKBackingStoreSwap. "
                          "Repeatable. Library addresses are unambiguous across "
                          "processes, unlike an executable's IMPs.")
+    ap.add_argument("--deref", action="append", default=[],
+                    help="on hits at a --break-sym breakpoint, also read guest "
+                         "memory: 'SYMSUFFIX=r0+8,r0+0xa0'. The suffix is "
+                         "matched against the breakpoint name, each rN+OFF is "
+                         "a 4-byte read at that register plus offset. This is "
+                         "what turns 'SwapBegin was entered' into 'SwapBegin "
+                         "was entered on the display whose fb field is X'.")
     ap.add_argument("--watch-port", action="store_true",
                     help="also break on the GraphicsServices event-PORT calls "
                          "(_GSGetPurpleSystemEventPort, _ResetEventPortSet, "
@@ -332,6 +339,17 @@ def main() -> int:
             print(f"  !! {sym} not in {lib}")
     if mnt_saved:
         groot.detach(Path(mnt_saved), mnt_mine)
+
+    # --deref parsing: breakpoint-name suffix -> [(reg#, offset, label)]
+    derefs = []
+    for spec in args.deref:
+        suffix, _, exprs = spec.partition("=")
+        lst = []
+        for e in exprs.split(","):
+            e = e.strip()
+            reg, _, off = e.partition("+")
+            lst.append((int(reg.lstrip("r")), int(off, 0) if off else 0, e))
+        derefs.append((suffix, lst))
 
     if args.watch_port:
         for n in ("_GSGetPurpleSystemEventPort", "_ResetEventPortSet",
@@ -466,6 +484,17 @@ def main() -> int:
             else:
                 rec["lr"] = w[14]
                 rec["lr_in"] = brk.whose(w[14], libs)
+                for suffix, lst in derefs:
+                    if not which.endswith(suffix):
+                        continue
+                    mem = {}
+                    for regn, off, label in lst:
+                        blk = g.mem((w[regn] + off) & 0xffffffff, 4)
+                        mem[label] = (struct.unpack("<I", blk)[0]
+                                      if blk and len(blk) == 4 else None)
+                    rec["mem"] = mem
+                    rec["r0"] = w[0]
+                    rec["r1"] = w[1]
                 # Is the code at this address actually SpringBoard's?
                 code = g.mem(pc, 16)
                 rec["real"] = bool(code and code == sb_code.get(pc))
@@ -668,6 +697,22 @@ def main() -> int:
             print(f"    {'REAL ' if h.get('real') else 'bogus'} t={h['t']:<7} "
                   f"[{h['phase']}] in {h.get('proc')}  {h['at']}  "
                   f"lr={h.get('lr', 0):#x} {h.get('lr_in', '')}{gate}")
+        libhits = [r for r in records if ":" in r["at"]]
+        if libhits:
+            print(f"\n  library breakpoint hits: {len(libhits)} "
+                  f"(full list in events.json)")
+            c = Counter((r["phase"], r["at"], r.get("proc")) for r in libhits)
+            for (ph, at, p), n in sorted(c.items()):
+                print(f"    {n:5d}  [{ph}] {at} in {p}")
+            withmem = [r for r in libhits if "mem" in r]
+            for r in withmem[:120]:
+                ms = " ".join(f"{k}={v:#x}" if v is not None else f"{k}=?"
+                              for k, v in r["mem"].items())
+                print(f"      t={r['t']:<8} [{r['phase']}] {r['at']} "
+                      f"in {r.get('proc')} r0={r.get('r0', 0):#x} "
+                      f"r1={r.get('r1', 0):#x} lr={r.get('lr', 0):#x} {ms}")
+            if len(withmem) > 120:
+                print(f"      ... {len(withmem) - 120} more in events.json")
         new = {(r.get("proc"), r.get("type")) for r in records
                if r["phase"] != "before" and r["at"] == "event"} - \
               {(r.get("proc"), r.get("type")) for r in records
