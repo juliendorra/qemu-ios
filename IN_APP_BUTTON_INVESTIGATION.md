@@ -811,3 +811,53 @@ Next steps, in order of cost:
 4. Re-check, once MBX responds, whether POWER-in-app (step 4) and the "touch is
    blocked too" symptom clear at the same time. They should: they are all
    downstream of the same starvation.
+
+
+## Session close, 2026-07-30: state of 1.0, and three things not to repeat
+
+**iPhone OS 1.0 is in working order except the one defect this doc is about.**
+Verified at HEAD with the current engine: boots to the home screen (45.4% lit),
+touch works, an icon tap opens an app (`1_open_app` PASS 97.10%), in-app touch
+works (`2_touch_in_app` PASS 35.93%). Outstanding: `3_home_returns` and
+`4_power_sleeps` at 0.00% -- the in-app display transition, i.e. T1.
+
+### Step 0 from MBX_T1_BRIEF.md: ATTEMPTED, REGRESSES 1.1.4, REVERTED
+
+"Map nothing until a TVOut device is announced" was implemented and **reverted
+uncommitted**. Two findings, both worth keeping:
+
+* A bug of mine inside it: `tvout_workaround_move()` early-returns when the
+  derived address equals the board default -- the NORMAL case on 1.1.4 -- so with
+  nothing mapped at init the window was never placed at all and the guest never
+  reached a stable home screen. Fixed by gating that early return on
+  `tvout_wa_mapped`.
+* With that fixed, 1.1.4 passed steps 1-4 but **`5_home_wakes` failed 2 of 2**
+  (0.00%, panel stays at 0.6-22.6% lit) where it had passed at 56% before. So
+  the window is needed BEFORE the TVOut announcement on the WAKE path. Step 0 as
+  written is not free; do not retry it in that form.
+
+### OPEN, and not mine: 1.1.4 aborts at HEAD in the NAND model
+
+Three consecutive 1.1.4 runs died early with a HOST-side abort, not a guest
+panic and not the slowness that first looked like the cause:
+
+```
+qemu: hardware error: Unable to read file!      (hw/arm/ipod_touch_nand.c:374)
+Abort trap: 6
+```
+
+Ruled out: the bundle NAND is intact (`nand.pack` 314,886,212 bytes, dated
+Jul 28, untouched by engine installs -- the installer replaces only the binary,
+frameworks and signature); not Step 0 (reverted, tree clean); 1.0 boots fine on
+the same engine. **HEAD moved during the session** (now `11090d07be`, newer than
+the brief), so today's shared-tree changes are the leading suspect. The cheap A/B
+is the pre-session engine, kept at `/tmp/qemu-{1.0,114,n45}-engine.bak`.
+
+### The display-client trap recurred, and produced a false ALL-FAIL
+
+One 1.0 run reported every step failing, including `1_open_app` at 0.26%. The
+cause is in this document already (trap 2/7): the probe printed
+**`display client attached: False`**, and with no display client QEMU never calls
+`gfx_update`, so every touch is refused. The very next run, with the client
+attached, was normal. **Read that line before believing a touch verdict** -- and
+note host load (18-62 during these runs) makes the client attach flakier.
