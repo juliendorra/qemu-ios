@@ -195,7 +195,7 @@
     // [BTN] and ONKEY too: without them a headless run cannot tell "the button
     // never reached the guest" from "it reached the guest and nothing happened",
     // which is exactly the distinction the in-app HOME bug turns on.
-    if (/\[BTN\]|ONKEY/.test(text)) {
+    if (/\[BTN\]|ONKEY|\[WASM\]/.test(text)) {
       console.log(`[guest] ${text.trim()}`);
     }
     if (/\[TOUCH\]|\[LCD\] (Touch input|Retained touch)/.test(text)) {
@@ -720,6 +720,7 @@
   // when that says "running"; a snapshot of a stopped guest comes up PAUSED and
   // needs a monitor `cont`, which this page has no way to send.
   const RESUME = new URLSearchParams(location.search).get('resume') === '1';
+  let lastRunState = null;
 
   const { default: Module } = await import('./qemu-system-arm.js');
 
@@ -777,12 +778,27 @@
         const poll = setInterval(() => {
           let st = 0;
           try { st = moduleRef._wasm_run_state(); } catch (e) { return; }
-          if (st === 1) {
+          // RunState indices are not stable across QEMU versions, so ask the
+          // emulator for the NAME rather than keeping a copy of the enum here.
+          let name = String(st);
+          try {
+            const h = moduleRef.HEAPU8;
+            let a = Number(moduleRef._wasm_run_state_name());
+            let end = a;
+            while (h[end]) end++;
+            name = new TextDecoder().decode(h.subarray(a, end));
+          } catch (e) { /* keep the number */ }
+          if (name !== lastRunState) {
+            lastRunState = name;
+            line(`runstate: ${name}`);
+            console.log(`[bench] runstate: ${name}`);
+          }
+          if (name === 'running') {
             clearInterval(poll);
             mark('snapshot resumed');
             state('resumed from snapshot', 'ok');
-          } else if (st === 3) {
-            state('loading the snapshot…');
+          } else {
+            state(`snapshot: ${name}…`);
           }
         }, 500);
       }

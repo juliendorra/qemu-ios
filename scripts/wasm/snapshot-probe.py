@@ -168,6 +168,15 @@ def main() -> int:
                     help="do not press Home before sampling; the guest "
                          "auto-locks, so a long --boot-wait then measures a "
                          "sleeping panel")
+    ap.add_argument("--require-live", action="store_true",
+                    help="wait for a LIVE panel before snapshotting, waking the "
+                         "device if needed, and refuse to write a snapshot of a "
+                         "dark screen. Strongly recommended: a snapshot of a "
+                         "sleeping panel restores black and cannot be woken in "
+                         "the browser within any reasonable wall-clock time")
+    ap.add_argument("--live-pct", type=float, default=40.0,
+                    help="non-black percentage that counts as a live panel")
+    ap.add_argument("--live-timeout", type=float, default=420.0)
     ap.add_argument("--downtime-ms", type=int, default=600000,
                     help="migration downtime limit; must exceed the transfer "
                          "so it converges in one stop-and-copy pass")
@@ -225,6 +234,37 @@ def main() -> int:
         qmp = QMP(sock_a)
         if not args.no_wake:
             wake(qmp)
+
+        # Snapshot on a CONDITION, not a timer.
+        #
+        # A fixed --boot-wait is a lottery: boot times vary about twofold run to
+        # run, and the guest auto-locks roughly 260 s after reaching the home
+        # screen. So the same 300 s caught a live home screen one run and an
+        # already-sleeping panel the next -- and a snapshot of a sleeping panel
+        # restores to a black screen that cannot be woken in the browser, where
+        # guest time runs ~50x slower than the wall clock.
+        #
+        # Poll for a live panel instead, and press Home if it has gone dark.
+        if args.require_live:
+            deadline = time.time() + args.live_timeout
+            while time.time() < deadline:
+                shot = args.logs / "frames" / "probe.ppm"
+                shot.parent.mkdir(parents=True, exist_ok=True)
+                qmp.execute("screendump", filename=str(shot))
+                pct = measure(shot)[0]
+                if pct >= args.live_pct:
+                    print(f"panel live at {pct:.1f}% -- snapshotting", flush=True)
+                    break
+                print(f"panel at {pct:.1f}%, waking ...", flush=True)
+                wake(qmp, settle=10.0)
+            else:
+                print(f"panel never reached {args.live_pct}% -- refusing to "
+                      "write a snapshot of a dark screen", flush=True)
+                report["error"] = "panel never live"
+                (args.logs / "report.json").write_text(json.dumps(report,
+                                                                 indent=2))
+                return 1
+
         report["before"] = sample(qmp, args.logs / "frames", "before")
         print("before:", json.dumps(report["before"]), flush=True)
 

@@ -321,32 +321,58 @@ EMSCRIPTEN_KEEPALIVE void wasm_request_resume(void)
     qatomic_set(&wasm_resume_requested, true);
 }
 
-/* Reports the run state to the page: 0 unknown, 1 running, 2 paused,
- * 3 still loading an incoming migration. Lets the page say what is happening
- * instead of showing a blank canvas. */
+/*
+ * The RAW RunState index, not a hand-rolled summary.
+ *
+ * The first version returned 1/2/3 for running/paused/inmigrate and 0 for
+ * "anything else" -- and the browser resume then sat at 0, which said only that
+ * it was in none of the three states guessed at. A value that cannot name the
+ * state it found is not a diagnostic. The page prints RunState_str() of this,
+ * so a new state explains itself.
+ */
 EMSCRIPTEN_KEEPALIVE int wasm_run_state(void)
 {
-    if (runstate_is_running()) {
-        return 1;
-    }
-    if (runstate_check(RUN_STATE_INMIGRATE)) {
-        return 3;
-    }
-    if (runstate_check(RUN_STATE_PAUSED)) {
-        return 2;
-    }
-    return 0;
+    return (int)runstate_get();
+}
+
+/* The name, so the page does not carry a copy of the enum that can drift. */
+EMSCRIPTEN_KEEPALIVE const char *wasm_run_state_name(void)
+{
+    return RunState_str(runstate_get());
 }
 
 static void wasm_maybe_resume(void)
 {
+    static RunState last_reported = RUN_STATE__MAX;
+    RunState now;
+
     if (!qatomic_read(&wasm_resume_requested)) {
         return;
     }
-    if (!runstate_check(RUN_STATE_PAUSED)) {
-        return;                        /* still loading, or already running */
+
+    now = runstate_get();
+    if (now != last_reported) {
+        /*
+         * Every transition while a resume is pending, once each. Without this
+         * a stuck resume is a silent black canvas: the page can poll the state
+         * but cannot see the SEQUENCE, and the sequence is what says whether
+         * the incoming stream ever finished loading.
+         */
+        last_reported = now;
+        fprintf(stderr, "[WASM] resume pending; runstate=%s\n",
+                RunState_str(now));
+    }
+
+    if (now == RUN_STATE_RUNNING) {
+        qatomic_set(&wasm_resume_requested, false);
+        fprintf(stderr, "[WASM] already running; nothing to resume\n");
+        return;
+    }
+    if (now != RUN_STATE_PAUSED) {
+        return;                        /* still loading incoming state */
     }
     qatomic_set(&wasm_resume_requested, false);
+    fprintf(stderr, "[WASM] snapshot loaded; starting the vcpu\n");
     vm_start();
 }
 

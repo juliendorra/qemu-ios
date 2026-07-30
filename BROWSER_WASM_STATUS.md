@@ -126,6 +126,55 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### Why the resumed machine stopped: the PMU was suspending the whole VM
+
+Chasing this needed one change and then answered itself. `wasm_run_state()`
+originally returned a hand-rolled 1/2/3 for running/paused/inmigrate and **0 for
+"anything else"** — and the browser resume sat at 0, which says only "none of the
+three states I guessed at". *A value that cannot name the state it found is not a
+diagnostic.* It now returns the raw `RunState` index, and `ui/wasm.c` logs every
+transition while a resume is pending:
+
+```
+[WASM] resume pending; runstate=inmigrate
+[WASM] resume pending; runstate=paused
+[WASM] snapshot loaded; starting the vcpu
+runstate: 12
+```
+
+So the stream loads, `vm_start()` runs — and the machine then goes to **12 =
+`RUN_STATE_SUSPENDED`**. There is exactly one caller of
+`vm_stop(RUN_STATE_SUSPENDED)` in the tree:
+`hw/arm/ipod_touch_pcf50633_pmu.c`, the PMU's pre-warmed-wake park.
+
+**The PMU had no `VMStateDescription`**, so it came back at RESET while the guest
+resumed mid-flight, and its sleep/wake state machine restarted from the wrong
+place and parked a machine that should have been running. Note the shape of it:
+not a lost register value but **a lost position in a state machine that stops the
+whole VM** — which is why it presented as "the snapshot does not resume" rather
+than as anything PMU-shaped.
+
+`vmstate_pcf50633` now covers the interrupt/mask registers, the 256-byte register
+file, the OOCSHDWN and pre-warm flags, `last_button_press_ns`, and the pre-warm
+deadline timer — the last of these because it is what distinguishes "this
+firmware can be pre-warmed" from "park where we are", and restoring without it
+would leave `prewarm_active` set for ever.
+
+### Snapshot on a CONDITION, not a timer
+
+`--boot-wait` is a lottery. Boot times vary about twofold run to run and the
+guest auto-locks ~260 s after reaching the home screen, so the *same* 300 s
+caught a live home screen one run and an already-sleeping panel the next — and a
+snapshot of a sleeping panel restores black and cannot be woken in the browser
+within any sane wall-clock time (guest time runs ~50x slower).
+
+`snapshot-probe.py --require-live` polls for a live panel, presses Home if it has
+gone dark, and **refuses to write a snapshot of a dark screen** rather than
+producing a useless one. It has already earned that: one run hit the intermittent
+`panic: We are hanging here...`, never rendered, and was correctly refused
+instead of yielding a black-screen state file that would have looked like a
+browser bug.
+
 ### A snapshot LOADS AND PAINTS in the browser in 5.4 s — but does not keep running
 
 **Proven, seen on screen:** `?resume=1` fetches a natively-produced 56.9 MiB

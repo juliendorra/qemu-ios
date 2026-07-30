@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_pcf50633_pmu.h"
+#include "migration/vmstate.h"
 #include "hw/arm/ipod_touch_sysic.h"
 #include "hw/arm/ipod_touch_lcd.h"
 #include "hw/intc/pl192.h"
@@ -454,13 +455,70 @@ static void pcf50633_init(Object *obj)
                                        pcf50633_prewarm_deadline, s);
 }
 
+/*
+ * Migration. The PMU is the third device made migratable, and it was found by
+ * measurement rather than by working down a list: a snapshot restored in the
+ * browser loaded, painted the home screen, and then went to RunState 12 --
+ * RUN_STATE_SUSPENDED -- within a second. There is exactly one caller of
+ * vm_stop(RUN_STATE_SUSPENDED) in the tree, and it is this device's pre-warm
+ * park.
+ *
+ * With no VMStateDescription the PMU came back at RESET while the guest resumed
+ * mid-flight, so the sleep/wake state machine restarted from the wrong place and
+ * parked a machine that should have been running. Note the shape of the bug: not
+ * a lost register value, but a lost position in a STATE MACHINE that stops the
+ * whole VM.
+ *
+ * NOT migrated: the i2c parent (handled by its own vmstate), the vic0/vic1/lcd/
+ * sysic back-pointers (wired at machine init, before the incoming state loads),
+ * and prewarm_park_bh (a bottom half, recreated by instance_init).
+ *
+ * The pre-warm deadline timer IS migrated. It is what distinguishes "this
+ * firmware can be pre-warmed" from "park where we are"; restoring without it
+ * would re-arm nothing and leave prewarm_active set for ever.
+ */
+static const VMStateDescription vmstate_pcf50633 = {
+    .name = "pcf50633-pmu",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(i2c, Pcf50633State),
+        VMSTATE_UINT32(cmd, Pcf50633State),
+        VMSTATE_BOOL(has_reg_addr, Pcf50633State),
+        VMSTATE_UINT8(int1, Pcf50633State),
+        VMSTATE_UINT8(int2, Pcf50633State),
+        VMSTATE_UINT8(int3, Pcf50633State),
+        VMSTATE_UINT8(int4, Pcf50633State),
+        VMSTATE_UINT8(int5, Pcf50633State),
+        VMSTATE_UINT8(retained_int2_wake, Pcf50633State),
+        VMSTATE_BOOL(retained_int2_reexposed, Pcf50633State),
+        VMSTATE_UINT8(int1m, Pcf50633State),
+        VMSTATE_UINT8(int2m, Pcf50633State),
+        VMSTATE_UINT8(int3m, Pcf50633State),
+        VMSTATE_UINT8(int4m, Pcf50633State),
+        VMSTATE_UINT8(int5m, Pcf50633State),
+        VMSTATE_UINT8_ARRAY(regs, Pcf50633State, 256),
+        VMSTATE_BOOL(oocshdwn_fired, Pcf50633State),
+        VMSTATE_BOOL(wake_reset_pending, Pcf50633State),
+        VMSTATE_BOOL(prewarm_active, Pcf50633State),
+        VMSTATE_BOOL(prewarm_parked, Pcf50633State),
+        VMSTATE_BOOL(prewarm_wake_requested, Pcf50633State),
+        VMSTATE_BOOL(prewarm_no_park, Pcf50633State),
+        VMSTATE_TIMER_PTR(prewarm_deadline, Pcf50633State),
+        VMSTATE_INT64(last_button_press_ns, Pcf50633State),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void pcf50633_class_init(ObjectClass *klass, const void *data)
 {
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->event = pcf50633_event;
     k->recv = pcf50633_recv;
     k->send = pcf50633_send;
+    dc->vmsd = &vmstate_pcf50633;
 }
 
 static const TypeInfo pcf50633_info = {
