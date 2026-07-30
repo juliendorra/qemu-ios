@@ -729,17 +729,8 @@ The chain, end to end:
 sensor-surface dimensions are used ONLY to scale the tip offset**, at
 `320/50 = 480/75 = 6.4 px/mm`. The position arrives already normalised.
 
-**What is still not identified is where that normalisation happens and by
-what.** It is upstream, in `MultitouchSupport.framework`, and it is *not* the
-advertised 5000 × 7500: were it that, our placement at 4602 × 7306 would land
-every touch 8% short, and the map says 1.1.4 is within ±1 px. Nor is it the flat
-`/100` (hundredths of a mm) that `_MTSurface_getBounds_mm` uses for grid bounds.
-Empirically — from the `aspect` A/B, where changing the placement height by 5.8%
-moved 1.1.4's touches by the full predicted amount — 1.1.4's divisor tracks the
-model's *internal* 4602 × 7306 almost exactly, and 1.0's is ~5.6% smaller
-vertically. **That remains the open question**; what is now settled is that it is
-not in the kext and not in the HID plugin, so `MultitouchSupport.framework`'s
-frame→path conversion is where to look next, on both builds.
+The normalisation itself happens upstream, in `MultitouchSupport.framework` —
+**see the next section, which found it.**
 
 **The upward projection, with its actual number.** `MultitouchHID`'s own
 defaults have `majorAxisGain = 0` and `upwardsAxisOffset_mm = 0`; the values are
@@ -801,6 +792,114 @@ A uniform **−11.5 px at every row**, with the horizontal edges byte-identical
 (−13/+6, +9, −11/+7) and the slop unchanged. The knob does exactly one thing,
 and the surviving slope is the separate 1.0 scale error — which this correction
 deliberately does not touch, because a constant cannot cancel a scale.
+
+### What MultitouchSupport normalises by: the sensor GRID, not the surface
+
+`_mt_FillMTContactDirectFromBinary` in `MultitouchSupport.framework` is the
+function that turns a wire contact into an `MTContact`. The position is at wire
+offsets **+4 (x) and +6 (y)** — `MTParse_BinaryPathOrImage` copies the contact
+field-for-field, byte-swapping only, so wire offsets survive intact — and it is
+used three times:
+
+```
+_alg_ClipPosToScreenEdge(x, xMin, xMax)          ; clipped to the surface range
+[contact+0x40] = x / 100.0                       ; millimetres
+[contact+0x1c] = (x - xMin) / (xMax - xMin)      ; NORMALISED  <- what the plugin reads
+```
+
+So, end to end:
+
+    normX = (rawX − xMin) / (xMax − xMin)
+    normY = (rawY − yMin) / (yMax − yMin)
+    px    = normX × screenWidth ,   screenH − normY × screenHeight
+
+**And `xMin/xMax/yMin/yMax` are not the advertised surface dimensions.** They are
+four `int16`s at `surface+0x148…0x14e` (1.1.4; `+0x150…0x156` on 1.0), in
+hundredths of a millimetre — the same fields `_MTSurface_getBounds_mm` divides
+by 100 — and they are built by **`_alg_InitRowColXYConvert`** from the sensor's
+**row and column counts**:
+
+* two 65/66-entry `int16` lookup tables are built, one per axis, each entry
+  `((i − 1) × pitch × 100) / divisor` via `__divsi3`;
+* the range is then `table[count] + margin` down to `table[1] − margin`;
+* **X comes from the ROW table and Y from the COLUMN table.**
+
+1.1.4's `_alg_InitZephyrPlatformSpecifics` supplies the per-family constants for
+the Zephyr branch (family id `0x41`, `0x42`, `0x50…0x52`):
+
+| field | value | meaning |
+| --- | --- | --- |
+| `+0x2c` / `+0x30` | 36 / 7 | column pitch → `3600/7` = **5.143 mm** per column |
+| `+0x34` / `+0x38` | 56 / 11 | row pitch → `5600/11` = **5.091 mm** per row |
+| `+0x24…+0x2a` | 75 each | four edge margins, **0.75 mm** |
+| `+0x1c` / `+0x20` | 5000 / 7500 | the advertised surface — stored, but not on this path |
+
+Those pitches are the right order for a 10 × 15 grid over a ~50 × 75 mm sensor,
+and `(15−1) × 5.143 + 2 × 0.75 ≈ 73.5 mm` against this model's 73.06 — i.e. the
+model's internal constants sit within ~0.6% of what the guest computes, which is
+exactly why 1.1.4 lands correctly.
+
+**So the answer to "what does it divide by" is: a range it computes itself, from
+the grid the device reports times constants compiled into the framework.** The
+advertised `MT_REPORT_SENSOR_DIMENSIONS` never touches the position path.
+
+#### And this is where 1.0 and 1.1.4 diverge
+
+The same two functions exist in 1.0's `MultitouchSupport` and are structurally
+identical (all offsets shifted by +8). **But 1.0's
+`_alg_InitZephyrPlatformSpecifics` Zephyr branch sets only the 5000 / 7500 pair
+and a table pointer — no pitch, no divisor, no margins at all**, and it reads the
+row/column counts from different fields (`[fp]` and `[fp+4]` words, versus
+1.1.4's bytes at `[[fp+8]+2]` / `[[fp+8]+5]`). 1.1.4 gained the whole per-family
+pitch/margin block that 1.0 lacks.
+
+Different constants feeding the same formula is a complete and sufficient
+explanation for the measured divergence — 1.1.4 flat, 1.0 carrying a −5.6%
+vertical scale — without either build being "wrong".
+
+**Not closed, and stated as such:** the exact numeric range was not reproduced
+arithmetically for either build. Doing that needs the table base term
+(`~[fp+0x3c]`), the actual row/column values the driver passes, and 1.0's pitch
+defaults (set somewhere other than the function that sets 1.1.4's). What is
+verified is the formula, the field locations, the table construction, 1.1.4's
+constants, and 1.0's *absence* of them.
+
+#### Confirming it: perturb the reported grid
+
+If the reading above is right, changing the grid the model reports **must** move
+where taps land. `IT_MT_SENSOR_GRID=<rows>x<cols>` overrides the SENSOR_INFO
+(0xD3) reply for exactly that test; the default is the real 15 × 10.
+
+**Result: it moves, and the mechanism is confirmed.** Cold-booted 1.0 with
+`IT_MT_SENSOR_GRID=14x10` (one row fewer), everything else identical:
+
+| | 15 × 10 (real) | 14 × 10 |
+| --- | --- | --- |
+| tap (122, 247) = Calculator's icon centre | launches, every run | **nothing launches** |
+| `[TOUCH] mouse DOWN` | 1 | 1 |
+| `[MT] frame consumed` (`IT_MT_TRACE=1`) | — | **18** |
+| panel after the tap | Calculator | home screen, 45.2% — unchanged |
+
+The driver is **alive and consuming frames**; the touch simply arrives somewhere
+other than the icon. That is the positive control the disassembly needed: the
+grid the model reports really does set the range the position is normalised by.
+
+**One detail does not fit yet and is left open.** A one-row change should move
+the mapping by ~7% if the range were simply proportional to `count − 1`, which
+would still land inside a 57 px icon — yet the tap misses entirely. So the
+displacement is larger than that proportionality predicts, meaning either the
+row/column count feeds the range somewhere else as well, or the table index and
+the count are not related the way the loop above suggests. Quantifying it needs
+a map run whose Calculator icon position is re-found for the perturbed grid.
+
+**A trap that would have produced a false negative:** the first attempt ran from
+the shipped snapshot, which is the fastest harness and the wrong one here. The
+driver queries the sensor grid **once, during its startup**, long before the
+snapshot was captured, so the restored guest already holds the original
+15 × 10 range and no override can reach it. **Any experiment that changes what
+the model reports during enumeration has to cold-boot.** Killed and re-run
+against a `cp -Rc` clone of the 1A543a NAND, which also keeps the artifact tree
+read-only.
 
 #### Dead ends and traps from the disassembly, in the order they were hit
 

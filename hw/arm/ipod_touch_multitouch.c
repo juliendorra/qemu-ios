@@ -68,6 +68,41 @@ static void mt_trace_cmd(const char *proto, uint8_t cmd)
     fprintf(stderr, "[MT] %s cmd 0x%02x (n=%u)\n", proto, cmd, repeat);
 }
 
+/*
+ * IT_MT_SENSOR_GRID=<rows>x<cols>: override the sensor grid reported by the
+ * SENSOR_INFO report (0xD3). Purely an EXPERIMENT knob, default = the real
+ * 15 x 10.
+ *
+ * It exists because MultitouchSupport.framework normalises the contact
+ * position by a range it derives from these two counts (see
+ * TOUCH_INVESTIGATION.md, "What MultitouchSupport normalises by"):
+ * `_alg_InitRowColXYConvert` builds a row table and a column table by
+ * integer-dividing a per-family pitch, then stores min/max in hundredths of a
+ * millimetre. If that reading is right, changing a count here MUST move where
+ * taps land -- and if it does not, the reading is wrong.
+ */
+static void mt_sensor_grid(uint8_t *rows, uint8_t *cols)
+{
+    static int cached = -1;
+    static unsigned r = MT_SENSOR_ROWS, c = MT_SENSOR_COLUMNS;
+
+    if (cached < 0) {
+        const char *e = getenv("IT_MT_SENSOR_GRID");
+        unsigned pr, pc;
+        cached = 1;
+        if (e && sscanf(e, "%ux%u", &pr, &pc) == 2 && pr && pc &&
+            pr <= 0xFF && pc <= 0xFF) {
+            r = pr;
+            c = pc;
+            fprintf(stderr, "[MT] sensor grid OVERRIDDEN: %u rows x %u cols "
+                    "(real hardware is %u x %u) -- experiment only\n",
+                    r, c, MT_SENSOR_ROWS, MT_SENSOR_COLUMNS);
+        }
+    }
+    *rows = r;
+    *cols = c;
+}
+
 static void prepare_interface_version_response(IPodTouchMultitouchState *s) {
     memset(s->out_buffer + 1, 0, 15);
 
@@ -160,8 +195,7 @@ static void prepare_short_control_response(IPodTouchMultitouchState *s, uint8_t 
     }
     else if(report_id == MT_REPORT_SENSOR_INFO) {
         s->out_buffer[3] = MT_ENDIANNESS;
-        s->out_buffer[4] = MT_SENSOR_ROWS;
-        s->out_buffer[5] = MT_SENSOR_COLUMNS;
+        mt_sensor_grid(&s->out_buffer[4], &s->out_buffer[5]);
         s->out_buffer[6] = (MT_BCD_VERSION & 0xFF);
         s->out_buffer[7] = (MT_BCD_VERSION >> 8) & 0xFF;
     }
@@ -242,8 +276,7 @@ static void z1_prepare_report_response(IPodTouchMultitouchState *s, uint8_t repo
             break;
         case MT_REPORT_SENSOR_INFO:
             data[0] = MT_ENDIANNESS;
-            data[1] = MT_SENSOR_ROWS;
-            data[2] = MT_SENSOR_COLUMNS;
+            mt_sensor_grid(&data[1], &data[2]);
             data[3] = (MT_BCD_VERSION >> 8) & 0xFF;
             data[4] = MT_BCD_VERSION & 0xFF;
             break;
