@@ -912,3 +912,42 @@ rendered? Candidates: its window/layers released when the app went fullscreen
 and not restored, or a render context still bound to the app's surface. Note
 `_LKImageQueueFlush` and `_LKRenderImageQueueShow` never fire on EITHER build,
 so the presentation path in use is `_LKBackingStoreSwap` -- start there.
+
+
+## Two bugs found on the way, 2026-07-30 (late)
+
+### FIXED: an unreadable NAND page killed the whole emulator
+
+`nand_read()` reached a branch where `stat()` had SUCCEEDED but `fopen()` then
+failed -- the file vanished between the two calls, or the descriptor table was
+exhausted, or the clone directory went away under a running guest -- and called
+`hw_error("Unable to read file!")`, which aborts QEMU.
+
+It killed three consecutive 1.1.4 boots, ~20 lines into the kernel, and the
+abort looks nothing like its cause: no guest panic, no message naming the page,
+just a register dump. Real silicon has no such failure mode, and an unreadable
+page is indistinguishable from an erased one. Now it complains ONCE with the
+path and `strerror(errno)` and hands back an erased page, so a transient I/O
+failure degrades into a guest-level problem instead of destroying the machine.
+
+### OPEN, and not in 1.0's path: today's tree stops 1.1.4 booting
+
+Clean A/B on the SAME bundle and NAND, only the engine binary swapped:
+
+| engine | result |
+| --- | --- |
+| pre-session (`/tmp/qemu-114-engine.bak`) | **5/5 PASS**, 449 log lines |
+| today's tree (`4f76a0baf5`) | **17 log lines**, stalls right after the kernelcache decrypt, no panic, no abort |
+
+So a change committed today breaks 1.1.4 at early kernel boot. **1.0 boots and
+behaves normally on the same engine**, so this does not block the in-app button
+work -- but it does mean 1.1.4 can only be used as a control with the OLD engine
+(which lacks the MBX bit-6 fix; it passed 5/5 before that fix anyway).
+
+Not bisected. Today's commits span both sessions; the browser-port session's
+snapshot/migration work (`6be281f387`, `11090d07be`) is the larger and newer
+part, and the MBX bit-6 change is ruled out because 1.1.4 passed 5/5 with it
+repeatedly earlier in the day.
+
+**Current bundle state:** 1.0 on today's engine (works, except the transition),
+1.1.4 on the pre-session engine (5/5), iPod on today's engine (untested since).

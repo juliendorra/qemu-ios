@@ -480,11 +480,42 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
             }
         }
         else {
+            /*
+             * stat() said the page is there, so this branch is only reached if
+             * the open FAILS anyway -- the file vanished between the two calls,
+             * the descriptor table is exhausted, or the clone directory went
+             * away underneath a running guest.
+             *
+             * That used to be hw_error("Unable to read file!"), which aborts
+             * QEMU outright. It killed three consecutive 1.1.4 boots on
+             * 2026-07-30, ~20 lines into the kernel, and the abort looks
+             * nothing like its cause: no guest panic, no message naming the
+             * page, just a register dump. A transient I/O failure on ONE page
+             * is not a reason to destroy the machine -- the silicon has no such
+             * failure mode, and an unreadable page is indistinguishable from an
+             * erased one. Report it once, loudly, and hand back an erased page.
+             */
             FILE *f = fopen(filename, "rb");
-            if (f == NULL) { hw_error("Unable to read file!"); }
-            fread(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
-            fread(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
-            fclose(f);
+
+            if (f == NULL) {
+                static bool complained;
+
+                if (!complained) {
+                    complained = true;
+                    fprintf(stderr, "[NAND] cannot open %s (%s) -- returning an "
+                            "ERASED page. stat() saw it, so the backing store "
+                            "moved underneath us; the guest may fail later, but "
+                            "it will fail as a guest, not as an abort.\n",
+                            filename, strerror(errno));
+                }
+                present = false;
+                memset(s->page_buffer, 0xFF, NAND_BYTES_PER_PAGE);
+                memset(s->page_spare_buffer, 0xFF, NAND_BYTES_PER_SPARE);
+            } else {
+                fread(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
+                fread(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
+                fclose(f);
+            }
         }
 
         s->buffered_page = page;
