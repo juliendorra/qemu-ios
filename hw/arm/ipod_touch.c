@@ -217,9 +217,26 @@ static void ipod_touch_button_idle_level(void)
  */
 static void ipod_touch_console_line(const char *line)
 {
-    const char *p = strstr(line, "Added swap device: AppleH1TVOut");
+    /*
+     * Match ANY swap device, not the TVOut literal.
+     *
+     * TV-out does not exist in iPhone OS 1.0: `AppleH1TVOut` appears 0 times in
+     * its kernelcache (4 times in 1.1.4), because TV-out arrived in the 1.1
+     * line. 1.0 announces
+     *
+     *   AppleMBX: Added swap device: AppleH1CLCD  id: c0813200
+     *   AppleMBX: Using AppleH1CLCD as legacy swap device
+     *
+     * so a match on "AppleH1TVOut" never fired on 1.0 (measured: zero
+     * [TVOUT-WA] lines in a full 1.0 boot) and the swap-device field was never
+     * neutralised there. AppleMBX's teardown polls the same field whichever
+     * device is registered, so derive from whatever the kernel names.
+     */
+    const char *p = strstr(line, "Added swap device: ");
 
     if (p) {
+        char devname[32] = "?";
+        sscanf(p + 19, "%31s", devname);
         p = strstr(p, "id:");
         if (p) {
             uint32_t va = (uint32_t)strtoul(p + 3, NULL, 16);
@@ -229,12 +246,13 @@ static void ipod_touch_console_line(const char *line)
                 tvout_wa_derived = true;
                 if (pa != tvout_wa_addr) {
                     fprintf(stderr, "[TVOUT-WA] board default 0x%08x is WRONG "
-                            "for this kernel (swap device at VA 0x%08x)\n",
-                            (uint32_t)tvout_wa_addr, va);
+                            "for this kernel (%s swap device at VA 0x%08x) - "
+                            "moving the window\n",
+                            (uint32_t)tvout_wa_addr, devname, va);
                 } else {
                     fprintf(stderr, "[TVOUT-WA] derived 0x%08x from the guest "
-                            "(swap device VA 0x%08x + 0x%x) - matches the "
-                            "board default\n", (uint32_t)pa, va,
+                            "(%s swap device VA 0x%08x + 0x%x) - matches the "
+                            "board default\n", (uint32_t)pa, devname, va,
                             TVOUT_WA_FIELD_OFFSET);
                 }
                 tvout_workaround_move(pa);

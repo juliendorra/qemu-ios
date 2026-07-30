@@ -472,6 +472,48 @@ an env var instead of a rebuild. Unbound, `mbx_update_irq()` is a no-op, so
 nothing can regress -- and since the dismissal path masks all MBX events, an
 interrupt is not expected to help *there*.
 
+### TV-out does not exist in 1.0 -- and our swap-device workaround was inert there
+
+The user's observation, confirmed by counting strings in each RELEASE kernelcache:
+
+| | `AppleH1TVOut` | `TVOut` | `Added swap device` |
+|---|---|---|---|
+| 1.0 (1A543a) | **0** | **0** | 1 |
+| 1.1.4 (4A102) | 4 | 4 | 1 |
+
+TV-out arrived in the 1.1 line. 1.0's own boot log says what it uses instead:
+
+```
+AppleMBX: Added swap device: AppleH1CLCD  id: c0813200
+AppleMBX: Using AppleH1CLCD as legacy swap device
+```
+
+against 1.1.4's `Added swap device: AppleH1TVOut  id: c09c8400`. **So "wire the
+TVOut SDO IRQ" could never have helped 1.0: the driver is not there.** That is a
+stronger reason than the polling argument above, and it settles the question --
+the IRQ hook is coverage for the 1.1 line, not a fix for this bug.
+
+It also exposed a real emulator bug. The swap-device workaround matched the
+literal `"Added swap device: AppleH1TVOut"`, so on 1.0 it **never fired** --
+measured: zero `[TVOUT-WA]` lines in a full 1.0 boot, i.e. the field was never
+neutralised and nobody noticed. Exactly the silent-inertness the code's own
+comment warns about. Now generalised to any swap device:
+
+```
+[TVOUT-WA] board default 0x089c8560 is WRONG for this kernel
+           (AppleH1CLCD swap device at VA 0xc0813200) - moving the window
+[TVOUT-WA] window moved 0x089c8560 -> 0x08813360
+```
+
+**It did not fix the transition** (`3_home_returns` still 0.00%), so the
+swap-device field was not the blocker on 1.0 -- but the fix stands on its own: a
+workaround that silently does nothing is worse than none.
+
+**Regression note before shipping this more widely:** the generalisation changes
+behaviour on any build whose swap device is not TVOut. Only the 1.0 bundle has
+this engine; re-run the probe for `m68ap-114` and `n45ap` (the iPod runs 1.1 /
+3A101a, so check which device IT announces) before installing it there.
+
 ### Still open: the transition itself
 
 `3_home_returns` remains 0.00% in every mode. The guest no longer spins, events
