@@ -663,6 +663,12 @@ The same run makes that visible. With the CLCD swap-device window in place,
 94% new content. That is SpringBoard painting the home screen into a buffer the
 display is not aimed at -- exactly what "nothing re-points the base" predicts.
 
+**CORRECTION (2026-07-30, same day): that off-screen repaint is INTERMITTENT.**
+A later run with the scanout-aware verdict recorded `diff_any_buffer = 0.00` for
+step 3 -- no buffer changed anywhere. So "SpringBoard paints the home screen into
+an invisible buffer" rests on ONE observation out of two and is NOT established.
+What is solid is the scanout verdict below and the caller chain.
+
 **Harness flaw this exposes, and it now produces a FALSE PASS:** `changed()`
 takes the largest per-base difference across the three framebuffers (a
 deliberate fix, so a transition to a DIMMER screen could not be missed). It
@@ -671,10 +677,53 @@ therefore passes when an off-screen buffer changes. Steps 3 and 4 report PASS on
 verdict needs the CURRENT SCANOUT buffer (the model's own `lcd_scanout_base()`
 rule), not the best of three.
 
-**Next:** find what drives that CLCD function ~500 times a run on 1.1.4 and
-never on 1.0. The leading candidate remains the MBX legacy swap: 1.0 registers
-`AppleH1CLCD` as the MBX's swap device, so the flip is plausibly meant to be
-performed by a swap our stub never performs.
+### The scanout verdict, fixed and validated
+
+`app-button-probe.py` now reads the LCD's current window base out of the model's
+own `IT_LCD_TRACE` output (`scanout_index()`, w1 falling back to w2, the model's
+own rule) and judges THAT buffer; the other two are still captured and reported
+as `diff_any_buffer`, with an `[off-screen buffers changed N%]` annotation when
+they diverge. Validated on both builds in one parallel run:
+
+| board | before the fix | after the fix |
+|---|---|---|
+| 1.0 | `3_home_returns` **PASS 94.62%** (false) | **FAIL 0.00%** -- honest |
+| 1.1.4 | PASS | **PASS 96.98%**, 5/5 unchanged |
+
+1.0's scanout is `FB_BASES[0]` = 0x0FE00000, matching its only w1 program.
+
+### WHO drives the flip: IOMobileGraphicsFamily, from USERLAND
+
+`spin-locate.py --break-kaddr 0xc0380eec --kernelcache ...` breaks at the writer
+and names the stack (kernel addresses are global, so a hit needs no process
+disambiguation). Three hits, identical each time:
+
+```
+AppleH1CLCD+0x1eec                       <- programs the window base
+  AppleH1CLCD+0x2c00
+  com.apple.iokit.IOMobileGraphicsFamily+0x23b4
+  com.apple.iokit.IOMobileGraphicsFamily+0x254c
+  kernel+0x138ca3                        (IOKit dispatch)
+  com.apple.iokit.IOMobileGraphicsFamily+0x3d34
+  kernel+0x14b013 / +0x14b7e7 / +0x149f79 / +0x4e8d7 / +0x13405
+                                         (IOUserClient + syscall path)
+```
+
+So the flip is an **explicit userland request through the IOMobileFramebuffer
+user client** -- not a side effect of an MBX swap. **That weakens the
+MBX-legacy-swap hypothesis considerably**: on the build that works, nothing in
+this chain involves the MBX.
+
+And the path exists on 1.0: `com.apple.iokit.IOMobileGraphicsFamily` is present
+in both kernelcaches (1.0 `0xc02fa000..0xc02ff000`, 1.1.4
+`0xc037a000..0xc037f000`), as is `AppleH1CLCD`. So 1.0 has the whole mechanism
+and simply never asks for it.
+
+**Next:** find the USERLAND caller on 1.1.4 -- the CoreSurface/LayerKit code that
+issues that IOMobileFramebuffer request ~500 times a run -- and check whether
+1.0's equivalent exists and is reached. Break on the user-client entry from the
+userland side (CoreSurface has 118 exported symbols, LayerKit 1843, so
+`--break-sym` can watch the candidates by name).
 
 ### Is the change 1.0-specific? No -- all three builds ship the same MBX code
 

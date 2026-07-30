@@ -89,6 +89,13 @@ def main() -> int:
                          "kernelcache's kmod_info list, and walk the kernel "
                          "stack at the spin to name the CALLER -- i.e. which "
                          "driver asked the MBX to do work")
+    ap.add_argument("--break-kaddr", type=lambda v: int(v, 0), default=None,
+                    help="instead of hunting a spin, break at this KERNEL "
+                         "address and report who called it (lr + r7 frames + a "
+                         "stack scan, all named through --kernelcache). Kernel "
+                         "addresses are global, so unlike an executable's IMPs "
+                         "a hit needs no process disambiguation.")
+    ap.add_argument("--hits", type=int, default=3)
     ap.add_argument("--no-app", action="store_true")
     args = ap.parse_args()
 
@@ -289,6 +296,62 @@ def main() -> int:
         print(f"attaching gdbstub on :{args.gdb_port} ...")
         g = brk.Gdb(args.gdb_port)
         g.wait_stop(2)                      # attaching stops the VM
+
+        if args.break_kaddr is not None:
+            a = args.break_kaddr
+            print(f"  breakpoint at {a:#x} ({kname(a) or '?'}): "
+                  f"{g.set_break(a)}")
+            callers = []
+            for h in range(args.hits):
+                g.cont()
+                if g.wait_stop(60) is None:
+                    print(f"  no hit {h + 1} within 60 s")
+                    break
+                w = g.regs()
+                if not w:
+                    break
+                regs, _c = w
+                sp, fp, lr, pc = regs[13], regs[7], regs[14], regs[15]
+                print(f"\n  === hit {h + 1}: pc={pc:#x} {kname(pc) or ''} ===")
+                print(f"    lr      {lr:#010x}  {kname(lr) or name_of(lr)}")
+                rec = {"pc": pc, "lr": lr, "lr_name": kname(lr), "frames": []}
+                cur = fp
+                for _ in range(10):
+                    blk = g.mem(cur, 8)
+                    if not blk or len(blk) < 8:
+                        break
+                    prev, ret = struct.unpack("<II", blk)
+                    if not ret or ret == 0xFFFFFFFF:
+                        break
+                    nm = kname(ret) or name_of(ret)
+                    print(f"    frame   {ret:#010x}  {nm}")
+                    rec["frames"].append([ret, nm])
+                    if not prev or prev <= cur:
+                        break
+                    cur = prev
+                blk = g.mem(sp, 0x200)
+                seen, scan = set(), []
+                if blk:
+                    for i in range(0, len(blk) - 4, 4):
+                        v, = struct.unpack_from("<I", blk, i)
+                        nm = kname(v)
+                        if nm and v not in seen and not nm.startswith("kernel+"):
+                            seen.add(v)
+                            scan.append([v, nm])
+                    print("    stack scan (kext addresses):")
+                    for v, nm in scan[:12]:
+                        print(f"      {v:#010x}  {nm}")
+                rec["stack_scan"] = scan
+                callers.append(rec)
+                # step off before continuing, or QEMU re-traps at the same pc
+                g.del_break(a)
+                g.step()
+                g.set_break(a)
+            out["callers"] = callers
+            (args.logs / "spin.json").write_text(json.dumps(out, indent=1))
+            print(f"\n  {len(callers)} hits recorded -> "
+                  f"{args.logs / 'spin.json'}")
+            return 0
 
         # ---- pass 1: sample ------------------------------------------------
         hist, procs, sampled = Counter(), Counter(), []

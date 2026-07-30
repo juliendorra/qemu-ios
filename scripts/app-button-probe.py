@@ -50,6 +50,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -174,9 +175,17 @@ def grab(q: QMP, tmp: Path) -> list:
     "0.00% changed" while the transition had plainly happened. 1.1.4 hits it
     the other way at step 1, its home screen being 69.5% lit.
 
-    Keeping all three and taking the LARGEST per-base change answers the
-    question the steps actually ask -- "did the screen change" -- without
-    needing to know which buffer is being scanned out at that instant.
+    Keeping all three and taking the largest per-base change fixed that -- but
+    it introduced the OPPOSITE error, and on 2026-07-30 it produced a FALSE
+    PASS: on iPhone OS 1.0 the dismissal repaints the home screen into a buffer
+    the display is NOT scanning out, so step 3 scored 94.62% "changed" while the
+    visible screen sat unmoved at 99.1% lit. Any buffer changing counted, even
+    an invisible one.
+
+    So the verdict now follows the SCANOUT: `scanout_index()` reads the LCD's
+    current window base out of the model's own IT_LCD_TRACE output and the steps
+    judge that buffer. The other two are still captured, for diagnosis and as a
+    fallback when the base has never been programmed.
     """
     out = []
     for base in FB_BASES:
@@ -186,9 +195,40 @@ def grab(q: QMP, tmp: Path) -> list:
     return out
 
 
-def changed(a, b) -> float:
-    """Largest change across the framebuffers (see grab)."""
+LCD_BASE_RE = re.compile(r"\[LCD\] (w[12]) base <- (0x[0-9a-f]+)")
+
+
+def scanout_index(logp: Path):
+    """Which of FB_BASES the LCD is scanning out, from the model's own trace.
+
+    The model's rule is w1, falling back to w2 (`lcd_scanout_base()`), so take
+    the most recent w1 program if there is one and the most recent w2 otherwise.
+    Returns None when the base has never been programmed -- callers then fall
+    back to "any buffer", and say so.
+    """
+    try:
+        txt = logp.read_bytes().decode("utf8", "replace")
+    except OSError:
+        return None
+    w1 = w2 = None
+    for win, base in LCD_BASE_RE.findall(txt):
+        try:
+            b = int(base, 16)
+        except ValueError:
+            continue
+        if b in FB_BASES:
+            if win == "w1":
+                w1 = FB_BASES.index(b)
+            else:
+                w2 = FB_BASES.index(b)
+    return w1 if w1 is not None else w2
+
+
+def changed(a, b, idx=None) -> float:
+    """Change in the SCANNED-OUT buffer, or the largest change if unknown."""
     if isinstance(a, list):
+        if idx is not None and idx < len(a) and idx < len(b):
+            return changed(a[idx], b[idx])
         return max((changed(x, y) for x, y in zip(a, b)), default=0.0)
     n = min(len(a), len(b)) // 4
     c = sum(1 for i in range(0, n * 4, 4)
@@ -197,8 +237,10 @@ def changed(a, b) -> float:
     return round(100.0 * c / n, 2) if n else 0.0
 
 
-def lit(d) -> float:
+def lit(d, idx=None) -> float:
     if isinstance(d, list):
+        if idx is not None and idx < len(d):
+            return lit(d[idx])
         return max((lit(x) for x in d), default=0.0)
     n = len(d) // 4
     c = sum(1 for i in range(0, n * 4, 4 * 97) if d[i] or d[i+1] or d[i+2])
@@ -278,7 +320,7 @@ def main() -> int:
     else:
         cmd += ["-vnc", f"127.0.0.1:{args.vnc_port - 5900}"]
 
-    env = dict(os.environ, S5L8900_HTTP_BRIDGE="0", S5L8900_HTTPS_BRIDGE="0")
+    env = dict(os.environ, IT_LCD_TRACE="1", S5L8900_HTTP_BRIDGE="0", S5L8900_HTTPS_BRIDGE="0")
     log = open(logp, "wb")
     # start_new_session + killpg below: the bundle's entry point is a SHELL that
     # runs QEMU as a CHILD, so terminating `proc` leaves qemu-system-arm alive
@@ -319,15 +361,28 @@ def main() -> int:
             time.sleep(wait)
             after = grab(q, tmp)
             seg = logp.read_bytes()[mark:].decode("utf8", "replace")
-            d = changed(before, after)
+            # Judge the buffer the LCD is actually scanning out. Anything else
+            # scores repaints the user cannot see -- which is exactly how this
+            # step reported PASS 94.62% on 1.0 while the screen sat unmoved.
+            idx = scanout_index(logp)
+            d = changed(before, after, idx)
             ok = verdict(d, before, after, seg)
             png(after, args.logs / f"{name}.png")
+            lb, la = lit(before, idx), lit(after, idx)
+            off = max(changed(before, after), 0.0)
             report["steps"].append({"step": name, "diff": d, "pass": bool(ok),
-                                    "lit_before": lit(before),
-                                    "lit_after": lit(after), "note": note})
+                                    "scanout_index": idx,
+                                    "diff_any_buffer": off,
+                                    "lit_before": lb,
+                                    "lit_after": la, "note": note})
+            extra = ""
+            if idx is None:
+                extra = "  [scanout UNKNOWN: judged on any buffer]"
+            elif off - d > 5:
+                extra = f"  [off-screen buffers changed {off:.2f}%]"
             print(f"{'PASS' if ok else 'FAIL'}  {name:24s} screen changed "
-                  f"{d:6.2f}%   lit {lit(before):5.1f}% -> {lit(after):5.1f}%"
-                  + (f"   ({note})" if note else ""))
+                  f"{d:6.2f}%   lit {lb:5.1f}% -> {la:5.1f}%"
+                  + (f"   ({note})" if note else "") + extra)
             if not ok:
                 rc = 1
             return after
@@ -362,7 +417,8 @@ def main() -> int:
         # once reported 1.1.4 unable to return to SpringBoard when a human could
         # do it by hand.
         step("1_open_app", lambda: tap(q, *icon, 0.12), WAIT_OPEN,
-             lambda d, b, a, seg: d > 20 and abs(lit(a) - lit(b)) > 8,
+             lambda d, b, a, seg: d > 20 and abs(lit(a, scanout_index(logp))
+                                                - lit(b, scanout_index(logp))) > 8,
              "tapping an icon must open something")
         step("2_touch_in_app", lambda: tap(q, 160, 423, 0.12), WAIT_TOUCH,
              lambda d, b, a, seg: d > 2,
