@@ -15,6 +15,82 @@ comes after.
 
 ---
 
+## Session — 2026-07-30 (late): iPhone OS 1.1.4 reaches the home screen IN THE VIEWER
+
+**`web/public/jit-boot/?build=4A102` now boots iPhone OS 1.1.4 to the SpringBoard
+home screen: 220.8 s, settling at 69.8% non-black.** The stall documented earlier
+("BSD root 114 s, then nothing, panel 2.2%") was **a stale `build-wasm`
+directory** — not the page, and not a regression in the engine sources. A plain
+rebuild fixed it and nothing else changed.
+
+### The measurements
+
+Headless Chrome (`--headless=new` plus the three throttle flags), chunked 4A102,
+verified by framebuffer percentage rather than by any serial string:
+
+| landmark | bench-b, 07-29 engine | bench-b, current sources | **viewer, rebuilt engine** |
+| --- | --- | --- | --- |
+| first pixels | 14 s | 14 s | **0.7 s** |
+| iBoot banner | 27 s | 28 s | **27 s** |
+| kernel | 98 s | 92 s | **96 s** |
+| BSD root | 113 s | 107 s | **111 s** |
+| launchd | 129 s | *never matched* | **127 s** |
+| **home screen** | **214 s @ 69.7%** | **238 s @ 69.1%** | **220.8 s @ 47.5%, settling 69.8%** |
+
+Native acceptance for the same tree is 74.32% at `kernel_0x0f496000`. All three
+agree.
+
+The engine arm was built with
+`WASM_BUILD_DIR=build-wasm-b IT_WASM_MEMORY64_FULL=1
+scripts/wasm/build-qemu.sh --configure` (correct configure confirmed by
+`libcurl found: NO`); the viewer arm with a plain
+`WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh`.
+
+### `guestRatio` under `-icount`, measured
+
+A high ratio means the CPU is IDLE, and this run puts numbers on it:
+
+* **0.014 – 0.06** while genuinely booting (the busy, JIT-compiling regime);
+* **0.27 – 0.40** once the home screen is up and the guest is idling.
+
+The stalled runs' ~0.5 was therefore the idle signature, correctly read. Note
+that the *low* end is the healthy-under-load one, which is the opposite of the
+intuition.
+
+### The stale-build trap, in one line
+
+`build-wasm/…/hw_arm_ipod_touch.c.o` was **07-30 19:41**, and `bc729339c1`
+(20:00, TVOut window placement — "the guest never reaches a stable home screen"
+without it) and `fee4450ea9` (20:35, park `SUSPENDED` again) both landed after
+it. A wasm build directory is not rebuilt by anything that rebuilds the native
+one, so a browser page can silently reproduce a guest-level bug that was fixed
+in the tree hours earlier. **Check the object timestamps against `git log` before
+believing any browser-only symptom.**
+
+### Reproducing
+
+```bash
+WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh
+scripts/wasm/serve.py --port 8023 --results /tmp/viewer.json &
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --user-data-dir=/tmp/prof --headless=new --enable-logging=stderr --v=0 \
+  --disable-background-timer-throttling \
+  --disable-backgrounding-occluded-windows \
+  --disable-renderer-backgrounding \
+  --disable-features=CalculateNativeWinOcclusion \
+  "http://localhost:8023/public/jit-boot/?build=4A102" 2> /tmp/chrome.log
+```
+
+Read the run from the console, not from `--results` (see the handoff): the
+viewer's 15 s heartbeat goes to stderr, and only **one** `POST /__bench-result`
+was observed in a 300 s run.
+
+```bash
+grep -oE '"\[(bench|guest)\][^"]*"' /tmp/chrome.log | tail -20
+```
+
+---
+
 ## Session — 2026-07-29 (Session A): making it visible and interactive
 
 Parallel session A (`BROWSER_WASM_SESSION_A.md`): paint the framebuffer, take

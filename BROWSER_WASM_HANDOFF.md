@@ -592,7 +592,15 @@ the wrong URLs and the guest starves — observed as a boot reaching the iBoot
 banner and stopping, with **6 chunk requests in 9 minutes**. With the absolute
 base the same boot serves 661 chunks and reaches BSD root.
 
-### Still open: 1.1.4 does not finish booting in THIS viewer
+### CLOSED (2026-07-30): 1.1.4 did not finish booting in THIS viewer — a stale `build-wasm`
+
+> **Resolved.** `web/public/jit-boot/?build=4A102` now reaches the SpringBoard
+> home screen at **220.8 s, settling at 69.8% non-black**, after a plain
+> `WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh` and no other change.
+> The cause was a **stale engine binary**, not this page and not a regression in
+> the engine sources. The investigation below is kept because its exclusions
+> stand and because the two variables it named were both wrong in an instructive
+> way. Read "ANSWERED" at the end of this section first.
 
 With the verified NAND and a correct chunk base, `?build=4A102` reaches first
 pixels 0.8 s, iBoot 27 s, kernel 96 s, **BSD root 114 s** — then stalls before
@@ -637,6 +645,156 @@ Repointing bench-b's engine symlink would have answered it in one run, but
 `web/bench-b/` belongs to Session B and the change was refused — correctly.
 Rebuilding their build directory is the equivalent move that stays inside the
 normal workflow.
+
+### ANSWERED (2026-07-30): the engine is fine, and the viewer's ENGINE BINARY was stale
+
+`build-wasm-b` was reconfigured and rebuilt from current sources
+(`WASM_BUILD_DIR=build-wasm-b IT_WASM_MEMORY64_FULL=1
+scripts/wasm/build-qemu.sh --configure`, correct configure confirmed by
+`libcurl found: NO`, artifacts 22:29). bench-b on chunked 4A102, headless with
+the three throttle flags:
+
+| landmark | reference (2026-07-29 engine) | current sources |
+| --- | --- | --- |
+| first pixels | 14 s | 14 s |
+| iBoot banner | 27 s | 28 s |
+| kernel | 98 s | 92 s |
+| BSD root | 113 s | 107 s |
+| launchd | 129 s | *never matched* |
+| **home screen** | **214 s @ 69.7%** | **238 s @ 69.1%** |
+
+**It still reaches the home screen.** So today's engine did NOT regress the
+browser 1.1.4 path, and by the branch above the fault is on the viewer side.
+
+**But the cause is not the viewer's page plumbing — it is the wasm binary the
+viewer loads.** `build-wasm/…/hw_arm_ipod_touch.c.o` was **07-30 19:41**, and
+two commits land after it, both about exactly this symptom:
+
+* `bc729339c1` (20:00) — the TVOut placement fix. Without it, on 1.1.4 the
+  derived address *equals* the board default, `tvout_workaround_move()`
+  early-returns, and with nothing mapped at init the window is **never placed at
+  all**. That commit's own words: "the guest never reaches a stable home
+  screen". A panel stuck at 2.2% non-black is what an unplaced window looks like.
+* `fee4450ea9` (20:35) — park `SUSPENDED` again; the 19:41 binary still has
+  `a4619ce78e`'s `RUN_STATE_PAUSED`, which "made the machine unwakeable by
+  injected input".
+
+So the viewer was never running "today's engine". It was running a **19-minute
+window** of it that contains the lazy TVOut mapping *without* its fix. Note the
+timestamps are suggestive, not conclusive on their own — a build takes the
+WORKING TREE, so a 19:41 object could in principle contain a fix committed at
+20:00. The decisive check is the re-run, and it confirms it:
+
+**Viewer, rebuilt engine, chunked 4A102, headless** — first pixels **0.7 s**,
+iBoot **27 s**, kernel **96 s**, BSD root **111 s**, launchd **127 s** (never
+reached before), **home screen 220.8 s at 47.5%, settling 69.8% non-black**.
+Against the stalled run's identical page and identical assets, the only
+difference is the wasm binary. Landmark-for-landmark the boot is the same one
+that stalled: it is not faster, it simply no longer stops.
+
+**Generalise this.** A wasm build directory is rebuilt by nothing that rebuilds
+the native one, so `build-wasm*` silently drifts behind the tree and a browser
+page reproduces guest-level bugs that were fixed hours earlier. Before spending a
+run on "the browser behaves differently from native", diff the object timestamps
+against `git log`:
+
+```bash
+find build-wasm -name 'hw_arm_ipod_touch.c.o' -exec ls -la {} \;
+git log --format='%h %ad %s' --date=format:'%m-%d %H:%M' -8 -- hw/ ui/
+```
+
+`guestRatio` also got calibrated on the way: **0.014–0.06 while genuinely
+booting**, **0.27–0.40 once the home screen is idle**. The stalled runs' ~0.5 was
+correctly read as idle — but note the *low* end is the healthy-under-load one.
+
+**Method note: `build-wasm` is rebuilt by a plain
+`WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh`** — no `--configure`
+needed. `configs/meson/emscripten.txt` last changed **07-29 18:02** and is clean
+in the tree, so a directory configured on the 30th already has the
+`HEAPU8`/`HEAPU32` exports. `--configure` *was* required for `build-wasm-b`,
+which was configured 07-29 14:37, before that change.
+
+### Two recorded conclusions that need correcting
+
+**`?paint=0` does not skip the blit.** It skips only `ctx.putImageData`;
+`blit()` — the full per-pixel walk of the surface out of shared memory, on the
+main thread — and the `Atomics.store` seq ack both still run every frame. The
+recorded "painting excluded" result therefore excludes the canvas **upload**
+only, not the per-frame main-thread work that the starvation theory was actually
+about. A real test of that theory has to skip the whole `paint()` body.
+
+Separately, the engine **never blocks on that ack**: `wasm_gfx_update()` in
+`ui/wasm.c` only unions unconsumed damage into the damage rect. So the display
+seam cannot stall the guest directly; only main-thread CPU contention could, and
+a 320x480 blit at the LCD's 10 Hz is far too cheap to be a plausible cause.
+
+**"Stalls before launchd" is not evidence of a stall.** The `launchd` landmark
+is a serial-log grep and it is unreliable: the current-sources bench-b run above
+reached the home screen at 238 s having **never matched `launchd` at all**, and
+sat at "BSD root, nothing since" for ~130 s on the way. Only the framebuffer
+percentage decides. This is the same trap as "never grep for SpringBoard", one
+landmark further along.
+
+### Dead end: `/fw/jit-tune`
+
+The viewer never writes `/fw/jit-tune` and bench-b always does — a real
+difference, and harmless. `tcg/wasm64.c`'s compiled-in defaults are exactly the
+values bench-b writes: `instantiate=100`, `max_instances=48000`, `adaptive=1`
+("Absent file, absent variable: the defaults below, i.e. the measured
+settings"). Confirmed in the run's own counters: `[JIT] tuning: instantiate=100
+max_instances=48000 adaptive=1`.
+
+### Also verified identical between the two pages, so not causes
+
+The full argv (`-M iPhone-2G,…epoch=`, `-m 1G`, `-pflash`, `-display wasm`,
+`-serial file:/fw/serial.log`, `-icount shift=1`), the epoch table
+(`4A102` → 3 in both), the chunk base (`/chunked/4A102/` in both), and the
+`overlay=ram` `nand-tune` write. On a first visit the viewer's overlay
+`preRun` read is inert as well: IndexedDB is empty, so no `/fw/nand/overlay.bin`
+is written.
+
+### Trap: `serve.py --results` OVERWRITES, and an unlabelled server takes anyone's POST
+
+`RESULT_PATH.write_bytes(body)` replaces the whole file on every POST, and
+without `--results-label` the endpoint accepts any page's report. Port 8010
+already had another session's server on it, `serve.py` exits with `Address
+already in use` **but the port still answers 200 from the older server** — so a
+run looks fine while its reports land in, and clobber, the other session's
+results file. That happened here. Always start your own server on a free port,
+and check the `serve.py` log rather than trusting a 200.
+
+`--results-label` is the guard, but note the **viewer's report body carries no
+`label` field** (bench-b's does). A labelled server therefore silently 204s away
+every viewer report and writes nothing. For viewer runs, use a dedicated port
+with no label filter.
+
+### Harness gap: the viewer's heartbeat goes to the CONSOLE, not to `--results`
+
+bench-b runs `setInterval(() => report(true), 15000)`; the viewer has a 15 s
+console heartbeat (`[bench] t=… frames=… nonBlack=… guestRatio=…`) but calls
+`report()` **only** from `mark()` and the sweep paths. So its `--results` file is
+frozen between landmarks while the console is fully informative. Read a headless
+viewer run from `--enable-logging=stderr` output:
+
+```bash
+grep -oE '"\[(bench|guest)\][^"]*"' chrome.log | tail -20
+```
+
+Judging that run only by `--results` is what made it look dead here. Two other
+liveness cross-checks: the `serve.py` access log counts
+`/chunked/…/chunks/` requests, and a plateau there is NOT a stall (the reference
+run fetched 576 chunks against 16,040 resident hits — fetches level off by
+design once the working set is in).
+
+**Undiagnosed, documented so the next session does not trust the file:** in a
+300 s viewer run the server logged exactly **one** `POST /__bench-result`, though
+five landmarks fired and each calls `report(true)`. No page-side error was
+printed and the endpoint returned 204 every time, so `reportEndpoint` was not
+tripped. Left alone as out of scope; the console has everything.
+
+**Ambient load is a real hazard for these numbers.** One run here overlapped
+macOS `CacheDelete` at 82% and `AMPLibraryAgent` at 68%; check `ps` before
+trusting a wall-clock landmark.
 
 ## W7a (original) — Regenerate 4A102's product NAND
 
