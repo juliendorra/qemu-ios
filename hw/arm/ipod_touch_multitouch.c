@@ -81,6 +81,40 @@ static void mt_trace_cmd(const char *proto, uint8_t cmd)
  * millimetre. If that reading is right, changing a count here MUST move where
  * taps land -- and if it does not, the reading is wrong.
  */
+/*
+ * IT_MT_FAMILY_ID=<n>: override the multitouch family id (report 0xD1).
+ *
+ * This is NOT cosmetic. MultitouchSupport.framework dispatches its sensor
+ * PITCH constants on this id, and the two firmwares accept different sets:
+ *
+ *   1.1.4  _alg_InitZephyrPlatformSpecifics: 0x41, 0x42, and the RANGE 0x50-0x52
+ *   1.0    same function:                    0x41, 0x50, 0x42 -- exact, no range
+ *
+ * The model reports 81 = 0x51, which 1.1.4 accepts and 1.0 does NOT. 1.0 then
+ * falls through to a generic branch whose pitches are 94/19 and 381/76 instead
+ * of the Zephyr 36/7 and 56/11, computes a different sensor range, and
+ * normalises every contact by it -- which is exactly the vertical scale error
+ * the Calculator map measures on 1.0 and not on 1.1.4.
+ *
+ * See TOUCH_INVESTIGATION.md. Real Zephyr silicon must have reported an id
+ * that 1.0 knew, since 1.0 shipped on the device; 0x51 is a later-generation
+ * value only the newer framework recognises.
+ */
+static uint8_t mt_family_id(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("IT_MT_FAMILY_ID");
+        cached = e ? (int)(strtol(e, NULL, 0) & 0xFF) : MT_FAMILY_ID;
+        if (cached != MT_FAMILY_ID) {
+            fprintf(stderr, "[MT] family id OVERRIDDEN: %#x (built-in %#x)\n",
+                    cached, MT_FAMILY_ID);
+        }
+    }
+    return (uint8_t)cached;
+}
+
 static void mt_sensor_grid(uint8_t *rows, uint8_t *cols)
 {
     static int cached = -1;
@@ -191,7 +225,7 @@ static void prepare_short_control_response(IPodTouchMultitouchState *s, uint8_t 
     memset(s->out_buffer + 1, 0, 15);
 
     if(report_id == MT_REPORT_FAMILY_ID) {
-        s->out_buffer[3] = MT_FAMILY_ID;
+        s->out_buffer[3] = mt_family_id();
     }
     else if(report_id == MT_REPORT_SENSOR_INFO) {
         s->out_buffer[3] = MT_ENDIANNESS;
@@ -272,7 +306,7 @@ static void z1_prepare_report_response(IPodTouchMultitouchState *s, uint8_t repo
     uint8_t *data = &s->out_buffer[4];
     switch(report_id) {
         case MT_REPORT_FAMILY_ID:
-            data[0] = MT_FAMILY_ID;
+            data[0] = mt_family_id();
             break;
         case MT_REPORT_SENSOR_INFO:
             data[0] = MT_ENDIANNESS;

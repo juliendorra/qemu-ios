@@ -1025,7 +1025,80 @@ only layer this investigation has never opened, and because the 1.1.4 map's
 larger hit-box slop (11 px vs 9 px) is already direct evidence that the two
 UIKits hit-test differently.
 
-#### Whose bug is 1.0's vertical scale — ours or Apple's? Open, with the fork stated
+### FOUND (2026-07-31): the family id. It is OURS, and one value fixes both builds
+
+**`MT_FAMILY_ID` is 81 = `0x51`, and iPhone OS 1.0 does not recognise it.**
+
+`_alg_InitZephyrPlatformSpecifics` dispatches the sensor PITCH constants on the
+multitouch family id (report `0xD1`), and the two builds accept different sets —
+the diff is four instructions:
+
+```
+1.1.4                                  1.0
+  ldr  r2, [r0, #0x14]                   ldr  r3, [r0, #0x1c]
+  sub  r3, r2, #0x50                     cmp  r3, #0x41
+  cmp  r2, #0x41                         cmpne r3, #0x50
+  cmpne r3, #2          <-- a RANGE      beq  ...              <-- exact equality
+  bls  ...                               cmp  r3, #0x42
+  cmp  r2, #0x42                         bne  ...
+  bne  ...
+```
+
+| build | accepts |
+| --- | --- |
+| 1.1.4 | `0x41`, `0x42`, **and the range `0x50`–`0x52`** |
+| 1.0 | `0x41`, `0x50`, `0x42` — **exact, no range** |
+
+`0x51` is inside 1.1.4's range and outside 1.0's list. So 1.1.4 takes the Zephyr
+branch and 1.0 **falls through to a generic branch**, which sets entirely
+different pitches — `94/19` and `381/76` (4.947 mm, 5.013 mm) instead of the
+Zephyr `36/7` and `56/11` (5.143 mm, 5.091 mm) — plus a different flag that
+sends `_alg_InitGridPitchAndEdgeOptions` down its own else-path. Different
+pitches build different tables, which produce a different sensor range, which
+normalises every contact differently. **That is a scale, on 1.0 only, from a
+value this model chose.**
+
+**Which resolves the fork: it is ours, not Apple's.** And the argument is
+simple — 1.0 shipped *on the iPhone 1*. Real Zephyr silicon in that device must
+have reported an id 1.0 recognised, or touch would not have worked at all on
+the phone's own launch firmware. `0x51` is a later-generation value that only
+the newer framework learned; we picked a number the hardware of this era never
+sent.
+
+**And the fix obeys the standing rule exactly.** `0x50` is accepted by *both*
+builds — it is in 1.0's list and inside 1.1.4's range — so one hardware truth
+serves both firmwares, with no per-build behaviour anywhere. That is the shape
+a fix had to have, and it is why tuning `MT_SENSOR_SURFACE_*` never could be one.
+
+`IT_MT_FAMILY_ID` exists to test it; the prediction, written before the run:
+**1.0's slope collapses from −0.0527 to ~0**, leaving only the finger
+projection (~+7.6 constant), and **1.1.4 is unchanged**, because `0x50` and
+`0x51` are both inside its accepted range and select the identical branch.
+
+**Measured, 1.0 cold boot with `IT_MT_FAMILY_ID=0x50`** — every edge moves onto
+1.1.4's value, which is the outcome the hypothesis requires:
+
+| edge | 1.0 default (`0x51`) | 1.0 with `0x50` | 1.1.4 default |
+| --- | --- | --- | --- |
+| digit 7 R | 75 | **73** | 73 |
+| digit 7 T | 211 | **200** | 199 |
+| digit 7 B | 278 | **270** | 270 |
+| digit 9 L | 162 | **165** | 165 |
+| digit 9 R | 231 | **237** | 237 |
+| digit 7 shift_y / slop_y | 21.0 / 9.0 | **11.5 / 10.5** | 11.0 / 11.0 |
+
+Every single value lands on 1.1.4's, within the ±0.5 px the 1 px binary search
+can resolve. The two firmwares now behave **identically** on the same hardware
+— which is what "one hardware truth, two firmwares" is supposed to look like,
+and what no amount of tuning `MT_SENSOR_SURFACE_*` ever produced.
+
+*(That run died at digit 9's bottom edge with `OSError: No space left on
+device` — the host disk hit 100%, screendumps started failing and the search
+reported an unbracketed edge. A disk-full artifact, not a measurement; this
+file already records a full disk breaking two 1.1.4 boots. The numbers above
+are from before the failure and are unaffected.)*
+
+#### Whose bug is 1.0's vertical scale — the fork as it stood before the family id
 
 The wire coordinate is physical (hundredths of a mm of sensor), so on a real
 device there is one truth: the silicon reports a finger at 60 mm as 6000
