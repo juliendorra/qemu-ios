@@ -384,6 +384,52 @@ which means something is now waiting on an MBX completion that never arrives
 instead of busy-polling for it. The MBX region still has **no IRQ connected at
 all**, which is the other half of T1.
 
+### OBSERVATION for whoever owns the TVOut workaround (2026-07-30, from Session A)
+
+**Not a verdict — a correlation worth an A/B, reported because it is blocking the
+snapshot work and I did not want to revert another session's file in a shared
+tree.**
+
+Since `23cc69c033` ("TV-out does not exist in 1.0, and our swap-device workaround
+was inert there"), 1.0 boots here have been ending in
+
+```
+panic: We are hanging here...
+```
+
+with kernel thread dumps, before or shortly after the home screen. Tally on the
+SAME NAND, same firmware, same `-icount shift=1`, `scripts/wasm/snapshot-probe.py`:
+
+| engine | 1.0 boots | hang panics |
+| --- | --- | --- |
+| before `23cc69c033` | ~8 (snapA–snapG) | **0** |
+| after | 4 (snapH–snapK) | **3** |
+
+And the workaround is confirmed active in the failing boots, which it never was
+on 1.0 before:
+
+```
+[TVOUT-WA] board default 0x089c8560 is WRONG for this kernel
+           (AppleH1CLCD swap device at VA 0xc0813200) - moving the window
+[TVOUT-WA] window moved 0x089c8560 -> 0x08813360
+```
+
+So the change did exactly what it says — it stopped being inert on 1.0 — and the
+panics start there. **It is not 1-for-1**: snapH booted, rendered, and slept
+normally with the same binary, so if this is the cause it is timing-dependent
+rather than deterministic.
+
+**What would settle it in one run each: an `IT_TVOUT_WA=0` knob.** The MBX fix
+shipped exactly that (`IT_MBX_READY=0`) and it is what made *that* A/B possible
+on one binary. Without it the only A/B is checking the file out at the previous
+commit and rebuilding, which is disruptive in a tree two sessions are building
+in.
+
+Session A is not pursuing this further — it is your file and your call. Raising
+it because a workaround that newly fires on a build is exactly the kind of change
+worth confirming against a long boot, and the browser port's snapshot work needs
+a 1.0 boot that reaches a live home screen.
+
 ### Cross-check from the BROWSER port (2026-07-30): same verdict, same signature
 
 The WebAssembly build was rebuilt onto this fix and driven from the page
