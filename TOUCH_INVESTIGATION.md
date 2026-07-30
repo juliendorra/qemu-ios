@@ -400,6 +400,24 @@ the Z1 firmware upload completed in this boot (`IT_MT_TRACE=1` logs the
 transitions). Only once a native tap is consumed at ALL does the row-1 versus
 near-the-extremes question become answerable natively.
 
+### The row-1 dead zone may be the 1.0 scale error — untested, but it now has numbers
+
+*(Added 2026-07-30, after the Calculator map.)* The measured 1.0 vertical scale
+predicts row 1 as the most fragile target on the screen. Extrapolating the
+Calculator hit-box measurements (`dT ≈ +12, dB ≈ +30` at y ≈ 223, slope −0.0527)
+up to icon row 1 (drawn y 39..95) puts its ACTUAL hit zone at roughly
+**y 59..133**: an aim at the row's centre (67) clears the top of the hit zone by
+only ~8 px, and any aim in the icon's upper half — or a probe aiming at the
+icons' drawn extent rather than their displaced hit boxes — misses into the
+status-bar region entirely. Rows 2–3 and the dock keep 20–35 px of margin, which
+matches the original table (row 1: 0/10; rows 2–3 and dock: fine).
+
+This is an extrapolated prediction, not a measurement — the map only reaches
+y 199. The test it implies is cheap: re-run the row-1 probe aiming at
+**y ≈ 95–110** (the displaced hit zone) instead of 67; if it launches there,
+the dead zone and the scale error are one finding, and whatever settles the
+scale settles row 1 with it.
+
 ### touch-probe.py was testing a STOPPED machine (fixed 2026-07-30)
 
 Every `touch-probe.py` result in this file's earlier sections that reports
