@@ -1092,11 +1092,28 @@ can resolve. The two firmwares now behave **identically** on the same hardware
 — which is what "one hardware truth, two firmwares" is supposed to look like,
 and what no amount of tuning `MT_SENSOR_SURFACE_*` ever produced.
 
-*(That run died at digit 9's bottom edge with `OSError: No space left on
-device` — the host disk hit 100%, screendumps started failing and the search
-reported an unbracketed edge. A disk-full artifact, not a measurement; this
-file already records a full disk breaking two 1.1.4 boots. The numbers above
-are from before the failure and are unaffected.)*
+**What is still owed, and why it is not done:** the three-row slope confirmation
+and a 1.1.4 no-regression run. **Both are blocked on host disk space**, not on
+anything about touch. Two consecutive runs failed to it:
+
+* the first died at digit 9's bottom edge with `OSError: No space left on
+  device` — screendumps began failing and the search reported an unbracketed
+  edge;
+* the retry reached the home screen but the Calculator tap produced **zero**
+  `[TOUCH] mouse DOWN` lines with the input gate demonstrably armed, on
+  coordinates the previous run hit — a degraded-host artifact, not a touch
+  result.
+
+The volume was at 99–100% with ~150 MiB free. **This file already records a full
+disk breaking two 1.1.4 boots**; that trap has now cost four runs in total.
+Check `df` before a measurement session — and note that a cold-boot run against
+a NAND *clone* grows it (637 `_new.page` files in this one), so the clones are
+themselves part of the pressure.
+
+**None of that touches the numbers above**, which were all captured before the
+first failure, and which already show six independent edges moving onto 1.1.4's
+values. The default `MT_FAMILY_ID` is therefore left at `0x51` until the two
+outstanding runs are done.
 
 #### Whose bug is 1.0's vertical scale — the fork as it stood before the family id
 
