@@ -509,6 +509,29 @@ comment warns about. Now generalised to any swap device:
 swap-device field was not the blocker on 1.0 -- but the fix stands on its own: a
 workaround that silently does nothing is worse than none.
 
+**Which build announces what** (from each guest's own console, with the
+generalised match in place):
+
+| build | swap devices announced | window ends up on |
+|---|---|---|
+| 1.0 (1A543a) | `AppleH1CLCD` @ VA 0xc0813200 only ("legacy swap device") | CLCD -- a window it **never had before** |
+| 1.1.4 (4A102) | `AppleH1CLCD` @ 0xc09c8800 **and** `AppleH1TVOut` @ 0xc09c8400 | TVOut = its board default, i.e. UNCHANGED |
+| iPod 1.1 (3A101a) | `AppleH1CLCD` @ 0xc0a25c00 **and** `AppleH1TVOut` @ 0xc0a25800 | TVOut = its board default, i.e. UNCHANGED |
+
+A plain last-one-wins would have silently moved 1.1.4 and the iPod OFF the TVOut
+object the workaround was written for (measured: window at 0x089c8960 instead of
+0x089c8560 on 1.1.4). They still passed 5/5 that way, which is exactly how a
+silent misplacement hides. So the match now **prefers TVOut** when a build
+announces both, and falls back to whatever is announced otherwise.
+
+**Regression-verified with the final engine, all three bundles:**
+
+| board | 1_open | 2_touch | 3_home_returns | 4_power | 5_wake |
+|---|---|---|---|---|---|
+| iPod (N45AP) | PASS | PASS | **PASS 98.58%** | PASS | PASS |
+| iPhone OS 1.1.4 | PASS | PASS | **PASS 96.99%** | PASS | PASS |
+| iPhone OS 1.0 | PASS | PASS | **FAIL 0.00%** | FAIL | -- |
+
 **Regression note before shipping this more widely:** the generalisation changes
 behaviour on any build whose swap device is not TVOut. Only the 1.0 bundle has
 this engine; re-run the probe for `m68ap-114` and `n45ap` (the iPod runs 1.1 /
@@ -520,15 +543,28 @@ this engine; re-run the probe for `m68ap-114` and `n45ap` (the iPod runs 1.1 /
 flow, the app is told to deactivate, SpringBoard runs its dismissal to
 completion -- and no new frame appears. The next candidates, in order:
 
-1. **The MBX registers we answer with zero.** `rd 0x00ff8`, `rd 0x00ffc`,
-   `rd 0x00f10` all return 0 from the stub. If any is a fifo level, completion
-   count or capability word the driver acts on, it stalls silently -- exactly the
-   failure shape we are left with.
-2. **Does anything ask the LCD to flip afterwards?** `IT_LCD_TRACE=1` across the
-   press: window-base writes mean SpringBoard submitted a frame and the problem
-   is downstream; no writes mean the compositor is still blocked upstream.
-3. Only then T1's swap-device/TVOut work, which the caller chain says is a
-   different consumer from this one.
+1. ~~**The MBX registers we answer with zero**~~ **DEAD.** `0xff8`, `0xffc`,
+   `0xf00` and `0xf10` are each read **exactly once**, at log lines 974-977 --
+   probe/init time, ~650 lines before the press at line 1625 -- and the driver
+   went on to attach, start and register its swap device. Nothing re-reads them
+   during the dismissal. They are capability/ID registers, not a stall.
+2. ~~**Does anything ask the LCD to flip afterwards?**~~ **INCONCLUSIVE, and it
+   corrects an old reading.** `IT_LCD_TRACE=1` over a full run shows only **two**
+   window-base programs, the last long before the press -- but step 1 (open an
+   app) PASSES with none of them. So this path updates the screen by drawing
+   into the CURRENT base, not by flipping windows, and "no base flip after the
+   press" is not evidence of anything. It also means the old observation that
+   "the LCD base flips stopped after the press" was a symptom of the STARVATION
+   (now fixed), not of the transition.
+3. **What is actually true after the press:** MBX traffic continues and
+   completes (7x `WR 0x134`, 3x `rd 0x12c`, 3x `WR 0x130` after the keypress),
+   the guest idles, and SpringBoard simply never repaints -- the screen stays at
+   99% lit. So the compositor decides not to draw, rather than being blocked in
+   the MBX or starved of events.
+4. The next instrument therefore has to look at the CoreSurface/LayerKit
+   decision itself -- what SpringBoard asks CoreSurface for after the dismissal,
+   and why it produces no pixels -- rather than at the MBX registers, which are
+   now answering.
 
 ### Is the change 1.0-specific? No -- all three builds ship the same MBX code
 

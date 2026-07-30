@@ -125,6 +125,7 @@ static MemoryRegion *tvout_wa_region;
 static hwaddr tvout_wa_addr;
 static uint64_t tvout_wa_reads;
 static bool tvout_wa_derived;
+static bool tvout_wa_is_tvout;      /* the current window came from a TVOut device */
 
 static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -236,7 +237,22 @@ static void ipod_touch_console_line(const char *line)
 
     if (p) {
         char devname[32] = "?";
+        bool is_tvout;
+
         sscanf(p + 19, "%31s", devname);
+        is_tvout = strstr(devname, "TVOut") != NULL;
+        /*
+         * PREFER TVOut when the kernel announces more than one. 1.1.4 announces
+         * BOTH -- AppleH1TVOut at VA 0xc09c8400 and AppleH1CLCD at 0xc09c8800 --
+         * and a plain last-one-wins would silently move the window off the
+         * object the original workaround targeted, on a build that works today.
+         * 1.0 announces only AppleH1CLCD ("legacy swap device"), so it still
+         * gets a window; the iPod (1.1 / 3A101a) announces only AppleH1CLCD too.
+         */
+        if (tvout_wa_is_tvout && !is_tvout) {
+            return;
+        }
+        tvout_wa_is_tvout = is_tvout;
         p = strstr(p, "id:");
         if (p) {
             uint32_t va = (uint32_t)strtoul(p + 3, NULL, 16);
