@@ -121,6 +121,28 @@ void ipod_touch_prepare_retained_wake(void)
 #define TVOUT_WA_FIELD_OFFSET 0x160     /* field within the swap-device object */
 #define KERNEL_VA_BASE        0xC0000000
 
+/*
+ * IT_TVOUT_WA=0 removes the workaround entirely -- no window is mapped and the
+ * kernel's swap-device announcement is ignored.
+ *
+ * It exists so the workaround can be A/B'd on ONE binary, the way IT_MBX_READY
+ * lets the MBX fix be. Before this, comparing "with" and "without" meant
+ * checking the file out at an older commit and rebuilding, which in a tree that
+ * two sessions build in is disruptive enough that the comparison does not get
+ * made -- and this workaround became NON-INERT on 1.0 only recently
+ * (23cc69c033), which is exactly when a knob is worth having.
+ */
+static bool tvout_wa_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("IT_TVOUT_WA");
+        cached = !(e && e[0] == '0');
+    }
+    return cached;
+}
+
 static MemoryRegion *tvout_wa_region;
 static hwaddr tvout_wa_addr;
 static uint64_t tvout_wa_reads;
@@ -235,7 +257,9 @@ static void ipod_touch_console_line(const char *line)
      */
     const char *p = strstr(line, "Added swap device: ");
 
-    if (p) {
+    /* Only the swap-device handling is gated: the Darwin-banner hook below
+     * applies the button idle levels and is unrelated to this workaround. */
+    if (p && tvout_wa_enabled()) {
         char devname[32] = "?";
         bool is_tvout;
 
@@ -253,6 +277,37 @@ static void ipod_touch_console_line(const char *line)
             return;
         }
         tvout_wa_is_tvout = is_tvout;
+        /*
+         * ONLY place the window on a TVOut swap device.
+         *
+         * Generalising this to any swap device (23cc69c033) was measured to
+         * BREAK iPhone OS 1.0, deterministically -- 2 of 2 boots with it,
+         * 2 of 2 without, on one binary via IT_TVOUT_WA:
+         *
+         *   enabled   scanout 0.0%     1738 serial lines, then
+         *             panic(cpu 0 caller 0xC00628CC): kernel abort type 4:
+         *             fault_type=0x1, fault_addr=0x0
+         *   disabled  scanout 45.4%    3230 lines, home screen
+         *
+         * The mechanism is the fault address. This window is a 4-byte MMIO
+         * region whose reads return ZERO, punched over a field of the swap
+         * device object. On a TVOut object that field is the one the hung
+         * teardown polls, so reading zero is the point. On 1.0 the same offset
+         * lands in AppleH1CLCD -- a LIVE object the kernel dereferences -- and
+         * it faults on the zero it reads.
+         *
+         * And it bought nothing: the commit that generalised it reported
+         * 3_home_returns still 0.00%, so 1.0 was never fixed by it, only
+         * broken. The naming/reporting improvements from that commit are kept;
+         * only the targeting is restored.
+         */
+        if (!is_tvout) {
+            fprintf(stderr, "[TVOUT-WA] %s is not a TVOut swap device - "
+                    "leaving the window alone (placing it here faults 1.0; "
+                    "set IT_TVOUT_WA=0 to remove the window entirely)\n",
+                    devname);
+            return;
+        }
         p = strstr(p, "id:");
         if (p) {
             uint32_t va = (uint32_t)strtoul(p + 3, NULL, 16);
@@ -1668,13 +1723,17 @@ static void ipod_touch_machine_init(MachineState *machine)
     // placement, used until the kernel announces the real object address; the
     // console tap then moves the window and reports any mismatch (see the
     // block comment above tvout_workaround_read).
-    iomem = g_new(MemoryRegion, 1);
-    memory_region_init_io(iomem, OBJECT(nms), &tvout_workaround_ops, NULL, "tvoutworkaround", 0x4);
-    tvout_wa_region = iomem;
-    tvout_wa_addr = (nms->board_id == BOARD_ID_M68AP) ?
-                    TVOUT_WORKAROUND_M68AP_MEM_BASE :
-                    TVOUT_WORKAROUND_MEM_BASE;
-    memory_region_add_subregion_overlap(sysmem, tvout_wa_addr, iomem, 1);
+    if (tvout_wa_enabled()) {
+        iomem = g_new(MemoryRegion, 1);
+        memory_region_init_io(iomem, OBJECT(nms), &tvout_workaround_ops, NULL, "tvoutworkaround", 0x4);
+        tvout_wa_region = iomem;
+        tvout_wa_addr = (nms->board_id == BOARD_ID_M68AP) ?
+                        TVOUT_WORKAROUND_M68AP_MEM_BASE :
+                        TVOUT_WORKAROUND_MEM_BASE;
+        memory_region_add_subregion_overlap(sysmem, tvout_wa_addr, iomem, 1);
+    } else {
+        fprintf(stderr, "[TVOUT-WA] disabled by IT_TVOUT_WA=0\n");
+    }
     ipod_touch_console_tap_install(ipod_touch_console_line);
 
     qemu_register_reset(ipod_touch_cpu_reset, nms);
