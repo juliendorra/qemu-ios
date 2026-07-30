@@ -446,6 +446,57 @@ So before re-running the comparison: establish which pack that chunk set came
 from, or regenerate the product NAND (W7a). Session B reports 1.1.4 reaching the
 home screen in `web/bench-b/`, so their asset path may differ from this one.
 
+### OPEN: the click-to-tap shift, and why part of it is EXPECTED
+
+**Reported symptom (user, observed manually, native):** a click lands up and to
+the left of the pointer. On **1.1.4 it is not uniform across the screen**, so a
+single constant offset cannot describe it.
+
+**One concrete measurement.** In Calculator on 1.0, the lowest-and-rightmost
+click that still registered as `5` was at panel **(157.5, 345)**, while 5's
+drawn button is about **x 94..146, y 269..321**. For that to still hit 5 the
+guest must have received a point at or inside (146, 321):
+
+    offset >= (-11.5, -24) panel px      i.e. kx <= 0.927, ky <= 0.930
+
+#### Part of the vertical offset is BY DESIGN — do not "fix" it blind
+
+iPhone OS makes tap targets **larger than the drawn control and biased upward**,
+to compensate for the finger occluding the target and the contact centroid
+sitting below where the user believes they are pointing. Driven by a MOUSE,
+which is exact, that compensation appears as a systematic upward error. **So a
+vertical up-shift is expected**, and treating all of it as a bug would mean
+"fixing" the emulator until it stops matching the hardware.
+
+**Where that compensation lives: in the GUEST, not here.** The Zephyr controller
+reports a raw contact centroid; the expansion and upward bias are UIKit /
+SpringBoard hit-testing. So its magnitude is not a constant in this tree — it
+would be recovered by disassembling UIKit, or inferred from a hit-box map. Our
+model's only job is to deliver an accurate contact point.
+
+**The horizontal component is NOT explained by any of that** — finger geometry
+is symmetric left/right. That part is ours.
+
+#### The discriminator, and the instrument
+
+A design compensation is roughly CONSTANT across the screen. A scale error GROWS
+with distance from the origin. **1.1.4 varying across the screen therefore points
+at a scale error, not at compensation** — so mapping the offset at several
+positions separates them.
+
+`scripts/calc-touch-map.py` is the instrument, and Calculator is why: every other
+touch test here answers a yes/no ("did an app launch") through a settle window
+already shown to be unreliable, whereas **pressing a digit puts that digit in the
+display** — a precise, per-tap oracle. That turns hit-box edges into a binary
+search instead of a guess. Clear with `c` between taps.
+
+**State: stage 1 only.** It restores the snapshot, taps the Calculator icon at
+(122, 247) — the measured centre of row 3 / column 2 — and then reports
+`not in Calculator (top strip brightness 102)`. The tap path itself is known
+good (the same harness launches Settings from (274, 249)), so this is either a
+settle that is too short or a display-strip probe aimed at the wrong rows. The
+calibration and boundary-search stages are designed but NOT written.
+
 ### Measured home-screen geometry (1.0), and a method for hit-box work
 
 Taken from a column/row brightness profile of the real scanout, so it is not an
