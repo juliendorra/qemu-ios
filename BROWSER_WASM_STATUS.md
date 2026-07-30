@@ -158,10 +158,30 @@ artifact, so 98 s of compression is free at runtime.
 
 Serve `state.br` with `Content-Encoding: br` and the browser decompresses on the
 way in, carrying no decoder — the same trick `chunk-pack.py`'s output already
-relies on. **The dev server does not do this yet**: `serve.py`'s Brotli header
-is scoped to chunk paths, so local runs fetch the raw `state`. Generalising that
-rule to any `.br` file is a one-line change in Session B's file and is the only
-thing between here and an 11 MiB instant boot.
+relies on. **Done**: `serve.py` now serves any `*.br` with that header, and the
+page reports
+
+```
+staged snapshot (11.5 MiB on the wire, 57.4 MiB decoded)
+```
+
+Three things about that change worth keeping:
+
+- **It is a SEPARATE branch from `send_chunk_head()`, on purpose.** That function
+  also drives the counter behind `/__chunk-stats`, which is the independent
+  measurement of "cold boot 18.57 MiB, warm boot nothing" — independent because
+  the *server* measures it, not the page under test. Widening `CHUNK_PATH` to
+  cover a 12 MiB snapshot would have quietly turned that into ~30 MiB and
+  invalidated the NAND result.
+- **It honours `Accept-Encoding`.** The first version declared `br`
+  unconditionally, which `curl --compressed` caught immediately: a client
+  without Brotli got an undecodable body and *no error*, which for the snapshot
+  means QEMU rejecting a migration stream with nothing pointing at the cause. It
+  now returns 406 with an explanation.
+- **The page verifies rather than trusts.** It compares the decoded length
+  against `bytes` in the provenance file and falls back to the raw stream on a
+  mismatch, so a host that serves `.br` without the header degrades to a slower
+  boot instead of a corrupt one.
 
 #### Provenance, because a stale snapshot fails without naming the cause
 

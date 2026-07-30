@@ -134,10 +134,73 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    def send_precompressed_head(self):
+        """Serve any stored-Brotli file (`*.br`) with Content-Encoding: br.
+
+        Same trick as the NAND chunks, generalised: the artifact is compressed
+        at BUILD time, the browser decompresses it on the way in, and nothing we
+        ship carries a Brotli decoder. A real host does this for free -- nginx
+        `brotli_static`, or any CDN serving a precompressed object -- so this
+        only exists to stop the dev server being the one place the scheme does
+        not work.
+
+        The page cannot do it itself: DecompressionStream supports gzip,
+        deflate and deflate-raw, and NOT brotli, which browsers decode only as a
+        transfer encoding. The alternative is bundling a JS decoder and spending
+        most of the saving decompressing 57 MiB single-threaded.
+
+        DELIBERATELY NOT routed through send_chunk_head(). That function also
+        drives the counter behind /__chunk-stats, which is the independent
+        measurement of "a cold boot pulls 18.57 MiB, a warm boot pulls nothing"
+        -- independent precisely because the SERVER measures it rather than the
+        page under test. Widening CHUNK_PATH to cover the 12 MiB snapshot would
+        have quietly turned that number into ~30 MiB and invalidated the NAND
+        delivery result. A separate branch keeps the two measurements apart.
+
+        Range requests are not honoured for these: a byte range of an encoded
+        body means the range of the ENCODED bytes, which no caller here wants.
+        """
+        path = self.translate_path(self.path.split("?", 1)[0])
+        if not path.endswith(".br") or not os.path.isfile(path):
+            return None
+
+        # Only claim an encoding the client actually accepts. Declaring `br`
+        # unconditionally is not merely impolite: a client without Brotli gets
+        # a body it cannot decode and no error, which for the snapshot means
+        # QEMU rejecting a migration stream with nothing pointing at the cause.
+        # Caught by `curl --compressed`, which advertises only gzip/deflate on
+        # a build without Brotli and silently produced zero bytes.
+        accept = self.headers.get("Accept-Encoding", "")
+        if "br" not in [t.split(";")[0].strip() for t in accept.split(",")]:
+            self.send_error(
+                406, "Client does not accept Brotli",
+                f"{self.path} is stored pre-compressed and this server has no "
+                "Brotli encoder to undo it. Use a client that sends "
+                "'Accept-Encoding: br' (every current browser does), or fetch "
+                "the uncompressed artifact beside it.")
+            return None
+
+        size = os.path.getsize(path)
+        handle = open(path, "rb")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Encoding", "br")
+        self.send_header("Content-Length", str(size))
+        # What actually crossed the wire, since Content-Length is invisible to
+        # the page once the body has been decoded.
+        self.send_header("X-Encoded-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        return handle
+
     def send_head(self):
         chunk = self.send_chunk_head()
         if chunk is not None:
             return chunk
+
+        precompressed = self.send_precompressed_head()
+        if precompressed is not None:
+            return precompressed
 
         header = self.headers.get("Range")
         if not header:

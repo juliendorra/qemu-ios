@@ -857,15 +857,52 @@
         // incoming migration is read synchronously from MEMFS at startup, so
         // there is no opportunity to fault it in.
         state('downloading the snapshot…');
-        const r = await fetch(`snapshots/${BUILD}/state`);
-        if (!r.ok) {
-          throw new Error(`no snapshot at snapshots/${BUILD}/state `
-            + `(${r.status}) — build one with `
-            + `scripts/wasm/build-snapshot.py --build ${BUILD}`);
+        const base = `snapshots/${BUILD}/`;
+
+        // Prefer the Brotli'd stream: 11.5 MiB on the wire against 57.2 MiB
+        // raw, decompressed by the BROWSER via Content-Encoding: br so nothing
+        // here carries a decoder.
+        //
+        // But verify rather than assume. A host that serves .br WITHOUT the
+        // header hands back compressed bytes that look like a perfectly good
+        // response, and QEMU would then reject the migration stream as garbage
+        // with nothing pointing at the cause. The provenance file records the
+        // raw byte count, so a length mismatch is caught here and falls back to
+        // the uncompressed stream.
+        let meta = null;
+        try {
+          const m = await fetch(base + 'state-provenance.json');
+          if (m.ok) meta = await m.json();
+        } catch (e) { /* optional */ }
+
+        let st = null;
+        if (meta && meta.brotli_bytes) {
+          const rb = await fetch(base + 'state.br');
+          if (rb.ok) {
+            const buf = new Uint8Array(await rb.arrayBuffer());
+            if (buf.length === meta.bytes) {
+              st = buf;
+              line(`staged snapshot (${(meta.brotli_bytes / 1048576).toFixed(1)}`
+                   + ` MiB on the wire, ${(buf.length / 1048576).toFixed(1)}`
+                   + ` MiB decoded)`);
+            } else {
+              line(`state.br came back ${buf.length} B, expected `
+                   + `${meta.bytes} B decoded — the server is not sending `
+                   + 'Content-Encoding: br; using the raw stream', 'err');
+            }
+          }
         }
-        const st = new Uint8Array(await r.arrayBuffer());
+
+        if (!st) {
+          const r = await fetch(base + 'state');
+          if (!r.ok) {
+            throw new Error(`no snapshot at ${base}state (${r.status}) — `
+              + `build one with scripts/wasm/build-snapshot.py --build ${BUILD}`);
+          }
+          st = new Uint8Array(await r.arrayBuffer());
+          line(`staged snapshot (${(st.length / 1048576).toFixed(1)} MiB, raw)`);
+        }
         mod.FS.writeFile('/fw/state', st);
-        line(`staged snapshot (${(st.length / 1048576).toFixed(1)} MiB)`);
       }
 
       // Prefetch the recorded boot order, and AWAIT it: a demand-faulted chunk
