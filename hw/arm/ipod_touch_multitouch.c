@@ -1030,8 +1030,65 @@ uint32_t mt_sensor_surface_height(void)
     }
 }
 
+/*
+ * IT_MT_TIP_CORRECTION=<panel pixels>: cancel iPhone OS's OWN finger-tip
+ * projection, so a mouse click lands where the pointer is.
+ *
+ * This is a deliberate UX choice, not a bug fix, and the default is 0 --
+ * historically faithful. iPhone OS shifts every contact UPWARD on purpose,
+ * because a fingertip occludes what it is pointing at and the contact centroid
+ * sits below where the user believes they are aiming. Driven by a mouse, which
+ * is exact and occludes nothing, that compensation is a pure error.
+ *
+ * The magnitude is not guesswork; it is read out of the guest (see
+ * TOUCH_INVESTIGATION.md, "Where the up-shift comes from"). SpringBoard reads
+ * the `SBFingerProjection` preference, default **3.5 typographic points**,
+ * converts it with 25.4/72 to 1.2347 mm, and hands it to the MultitouchHID
+ * plugin as `FingerTipVerticalOffset`; the plugin converts mm to pixels at
+ * screen/sensor-surface = 320/50 = 480/75 = 6.4 px/mm. That is **7.90 px**, and
+ * both 1A543a and 4A102 carry identical code and the same default.
+ *
+ * Measured hit-box centre shifts, for anyone choosing a value:
+ *
+ *   1.0    +7.6 px  (once the separate vertical SCALE error is corrected)
+ *   1.1.4  +11.5 px (no scale error; ~3.6 px more than the projection alone,
+ *                    which is the guest's own hit-box asymmetry, not this)
+ *
+ * Horizontal needs no correction: measured within +-3.5 px on 1.0 and +-1 px
+ * on 1.1.4, so this knob is deliberately vertical-only.
+ */
+#define MT_PANEL_HEIGHT_PX 480.0f
+
+static float mt_tip_correction_px(void)
+{
+    static int cached = -1;
+    static float px;
+
+    if (cached < 0) {
+        const char *e = getenv("IT_MT_TIP_CORRECTION");
+        px = e ? strtof(e, NULL) : 0.0f;
+        cached = 1;
+        if (px != 0.0f) {
+            fprintf(stderr, "[MT] tip correction: reporting contacts %.2f panel "
+                    "px LOWER, to cancel iPhone OS's own finger projection "
+                    "(faithful default is 0)\n", px);
+        }
+    }
+    return px;
+}
+
 static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, float y, uint16_t radius1, uint16_t radius2, uint16_t radius3, uint16_t contactDensity) {
     MTFrame *frame = calloc(1, sizeof(*frame));
+
+    /* y here is the LCD handler's fy = 1 - screen_y/2^15, so the sensor origin
+     * is at the BOTTOM of the panel: moving a contact DOWN the screen means
+     * DECREASING y. Applied here rather than at the call sites so the velocity
+     * computation below sees the corrected value too. */
+    float correction = mt_tip_correction_px();
+    if (correction != 0.0f) {
+        y -= correction / MT_PANEL_HEIGHT_PX;
+        y = MIN(MAX(y, 0.0f), 1.0f);
+    }
 
     uint16_t data_len = sizeof(MTFrameHeader) + sizeof(FingerData) + 2;
 

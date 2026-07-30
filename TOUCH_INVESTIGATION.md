@@ -708,6 +708,100 @@ before the runs and both came in; horizontal edges are unchanged in both arms.
    would trade a 1.0 defect for a 1.1.4 one — the same shape of mistake as the
    advertised-scale "fix", caught this time before it landed rather than after.
 
+### Where the up-shift comes from: `SBFingerProjection`, 3.5 points (2026-07-30)
+
+Disassembled rather than inferred, with `scripts/macho-disasm.py` against the
+1.1.4 root filesystem. **The whole sensor→screen path is in userland, not in the
+kext**, which is why looking at `AppleMultitouchSPI.kext` alone was never going
+to answer it: `handleFrame()` forwards the raw frame to registered user clients
+and interprets no coordinates at all.
+
+The chain, end to end:
+
+| stage | binary | what it does |
+| --- | --- | --- |
+| cache | `AppleMultitouchSPI.kext` `_cacheSensorSurfaceDimensions` | reads report **0xD9**, publishes the two words as IORegistry `Sensor Surface Width` / `Height` |
+| bounds | `MultitouchHID.plugin` `MultitouchHIDClass::ResetHMLite` | `MTDeviceGetSensorSurfaceDimensions()`, divides each by **100** (units are hundredths of a mm), and passes them to `MTHMLiteInit` as `gScreenBounds_mm`. If the query fails it keeps a hardcoded default of **{0, 0, 50.0, 75.0} mm** — numerically identical to the 5000 × 7500 this model advertises |
+| position | `MultitouchHID.plugin` `_mthm_FilterContactForScreenUI` | `px_x = normX * gScreenSize.width`, `px_y = screenH - normY * screenH` |
+| tip offset | same, via `_mthm_ComputeFingerEllipseTipOffset_mm` + `_mthm_mmToPixels` | converts an offset in **mm** to pixels with `screenPx / gScreenBounds_mm` |
+
+**So in the plugin the contact POSITION is `normalised × screen size`, and the
+sensor-surface dimensions are used ONLY to scale the tip offset**, at
+`320/50 = 480/75 = 6.4 px/mm`. The position arrives already normalised.
+
+**What is still not identified is where that normalisation happens and by
+what.** It is upstream, in `MultitouchSupport.framework`, and it is *not* the
+advertised 5000 × 7500: were it that, our placement at 4602 × 7306 would land
+every touch 8% short, and the map says 1.1.4 is within ±1 px. Nor is it the flat
+`/100` (hundredths of a mm) that `_MTSurface_getBounds_mm` uses for grid bounds.
+Empirically — from the `aspect` A/B, where changing the placement height by 5.8%
+moved 1.1.4's touches by the full predicted amount — 1.1.4's divisor tracks the
+model's *internal* 4602 × 7306 almost exactly, and 1.0's is ~5.6% smaller
+vertically. **That remains the open question**; what is now settled is that it is
+not in the kext and not in the HID plugin, so `MultitouchSupport.framework`'s
+frame→path conversion is where to look next, on both builds.
+
+**The upward projection, with its actual number.** `MultitouchHID`'s own
+defaults have `majorAxisGain = 0` and `upwardsAxisOffset_mm = 0`; the values are
+pushed in at runtime by **SpringBoard**, which is the only other binary in the
+filesystem mentioning `FingerTipVerticalOffset`:
+
+```
+SBFingerProjection  (com.apple.springboard)   default 3.5     -> FingerTipVerticalOffset
+SBFingerGain        (com.apple.springboard)   default 0.0     -> EllipseTipGain
+                    multiplied by 25.4/72 -- the value is in TYPOGRAPHIC POINTS
+```
+
+    3.5 pt x 25.4/72 = 1.2347 mm ; 1.2347 mm x 6.4 px/mm = 7.90 px
+
+**7.90 px of deliberate upward shift**, and `1A543a` and `4A102` carry
+byte-identical code with the same 3.5 default — so it is the same on both.
+
+**Does it match the measurement? On 1.0, almost exactly.** Once the separate
+vertical scale error is corrected, 1.0's residual constant is **+7.5…+8.0 px**
+against a predicted **7.90**. 1.1.4 measures **+11.0…+12.5**, about 3.6 px more;
+since the projection is identical, that surplus is the guest's own hit-box
+asymmetry (1.1.4's slop is 11 px against 1.0's 9), not the multitouch path.
+
+**And no, the iPod work did not remove it.** Nothing in this tree writes
+`SBFingerProjection`, `SBFingerGain`, `FingerTipVerticalOffset` or
+`EllipseTipGain`, and no NAND recipe patches them. The projection is intact and
+authentic on all three bundles.
+
+#### Optionally cancelling it: `IT_MT_TIP_CORRECTION`
+
+Because a mouse is exact and occludes nothing, the projection is a pure error
+for a desktop user — so the model can pre-correct it, and now can:
+
+```bash
+IT_MT_TIP_CORRECTION=11.5 ...      # panel pixels; contacts are reported LOWER
+```
+
+`get_frame()` subtracts it from the normalised y (the sensor origin is at the
+BOTTOM, so "lower on screen" is a *decrease*), before the velocity computation
+so that stays consistent. **The default is 0 — historically faithful.** It is
+deliberately vertical-only: horizontal measured within ±3.5 px on 1.0 and ±1 px
+on 1.1.4, so there is nothing there to correct.
+
+Suggested values, from the map: **11.5** for 1.1.4, and for 1.0 either **7.6**
+(the projection, leaving the scale error visible) or nothing until the scale
+question is settled. Anyone wanting the authentic behaviour — including the fact
+that a real finger *needed* that 1.2 mm — should leave it off; the difference
+showing is itself the historical detail.
+
+**Verified with the same instrument**, 1.0 on the shipped snapshot,
+`IT_MT_TIP_CORRECTION=11.5`, 325 taps:
+
+| | shift_y by row (223.5 / 294 / 366) | shift_x | slop |
+| --- | --- | --- | --- |
+| off | 21.0 / 18.0 / 13.5 | −3.5, −2.0 | 9.0–9.5 |
+| 11.5 | **9.5 / 6.0 / 2.0** | −3.5, −2.0 | 8.5–9.5 |
+
+A uniform **−11.5 px at every row**, with the horizontal edges byte-identical
+(−13/+6, +9, −11/+7) and the slop unchanged. The knob does exactly one thing,
+and the surviving slope is the separate 1.0 scale error — which this correction
+deliberately does not touch, because a constant cannot cancel a scale.
+
 **The real defect underneath is that the model describes its sensor two ways.**
 It advertises a 10 × 15 grid (ratio 1.5) and places fingers on a 4602 × 7306
 surface (ratio 1.588), and the two firmwares read different ones. A fix has to
