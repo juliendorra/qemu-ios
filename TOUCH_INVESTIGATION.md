@@ -16,6 +16,69 @@ that means "the guest actually took this touch". Byte-level evidence came from
 
 ---
 
+## Reference: how iPhone OS 1.x actually turns a contact into a tap
+
+Read this before touching anything in `ipod_touch_multitouch.c`. It was
+reconstructed from Apple's own binaries with `scripts/macho-disasm.py`
+(`AppleMultitouchSPI.kext`, `MultitouchHID.plugin`,
+`MultitouchSupport.framework`, `SpringBoard`, `UIKit`), verified against
+measurement, and it explains why almost every intuition about this pipeline is
+wrong.
+
+### The pipeline, in order
+
+| # | where | what happens |
+| --- | --- | --- |
+| 1 | **controller → kext** | the frame carries the contact position as `int16` at wire offsets **+4 (x)** and **+6 (y)**, in **hundredths of a millimetre of physical sensor space** |
+| 2 | `AppleMultitouchSPI.kext` | **interprets no coordinates at all** — `handleFrame()` forwards the raw frame to user clients. It only *caches* five reports as IORegistry properties: `0xD1` family id, `0xD3` sensor info, `0xD0`/`0xA1` region, `0xD9` surface dimensions |
+| 3 | `MultitouchSupport.framework` | `_mt_FillMTContactDirectFromBinary` clips the position, stores it as mm (`/100`), and **normalises** it: `norm = (raw − min) / (max − min)` |
+| 4 | `MultitouchHID.plugin` | `px = norm × screenSize`, and `py = screenH − norm_y × screenH` (the sensor origin is at the **bottom**) |
+| 5 | `MultitouchHID.plugin` | adds the **finger tip offset**, converted from mm at `screenPx / sensorSurface_mm` = `320/50` = `480/75` = **6.4 px/mm** |
+| 6 | `UIKit` | ordinary `hitTest:forEvent:` against view frames. **Identical between 1.0 and 1.1.4**, instruction for instruction |
+
+### The four facts that matter most
+
+**1. The advertised surface dimensions (`0xD9`, 5000 × 7500) never position
+anything.** They are used only to scale the *tip offset* in step 5. Every
+attempt to fix a positional error by adjusting `MT_SENSOR_SURFACE_*` is
+therefore aimed at the wrong constant — which is exactly why two such "obvious"
+fixes have now been measured wrong (see the two dead-end sections below).
+
+**2. The normalisation range is COMPUTED, not reported.**
+`_alg_InitRowColXYConvert` builds two lookup tables — one per axis — whose
+entries are `((i−1) × pitch × 100) / divisor` via `__divsi3`, then takes
+`range = table[count] + margin` down to `table[1] − margin`. **X comes from the
+ROW table, Y from the COLUMN table.** So the divisor the guest uses is a
+function of the sensor **grid** (`0xD3`) and of pitch constants compiled into
+the framework — never of anything the device says its surface measures.
+
+**3. Those pitch constants are selected by the FAMILY ID**, and the accepted
+sets differ between firmwares — 1.1.4 takes a *range* `0x50–0x52`, 1.0 an exact
+list `0x41 / 0x50 / 0x42`. That single dispatch is the whole of the 1.0-versus-
+1.1.4 divergence this file spent a day chasing. **A family id is not cosmetic
+metadata; it selects the coordinate system.**
+
+**4. The upward shift is deliberate and lives in SpringBoard.** It reads
+`SBFingerProjection` from `com.apple.springboard` — default **3.5 typographic
+points**, converted with `25.4/72` to **1.2347 mm** — and pushes it to the
+plugin as `FingerTipVerticalOffset`; `SBFingerGain` defaults to 0. At 6.4 px/mm
+that is **7.90 px** of intentional up-shift, identical in both builds, because
+a fingertip occludes its target and the contact centroid sits low. Driven by a
+mouse this is a pure error, but it is **not a bug** and must never be "fixed"
+in the device model.
+
+### What this means for the model
+
+* the model's job is to report **one honest hardware description** and place
+  contacts in physical sensor units; every firmware then derives its own
+  mapping from that;
+* **the device model must never be firmware-aware** — see the standing rule
+  under the family-id section;
+* a positional error is almost always in what the model *declares*
+  (family id, grid), not in how it *places* the contact.
+
+---
+
 ## iPod Touch (N45AP, Zephyr 2) — a regression from the T7 SPI framing fix
 
 The Z2 driver reads one frame in **two SPI transactions**:
@@ -1115,6 +1178,28 @@ first failure, and which already show six independent edges moving onto 1.1.4's
 values. The default `MT_FAMILY_ID` is therefore left at `0x51` until the two
 outstanding runs are done.
 
+#### What was and was NOT fixed in the emulator this session
+
+Worth stating plainly, because the diagnosis is strong enough to be mistaken for
+a fix: **no emulator bug was fixed.** Every device-model change added here is a
+measurement knob or an opt-in, and every default is unchanged:
+
+| added | kind | default |
+| --- | --- | --- |
+| `IT_MT_SENSOR_SCALE=aspect` | measurement knob | off — *proven wrong to ship* |
+| `IT_MT_SENSOR_GRID` | measurement knob | off |
+| `IT_MT_FAMILY_ID` | measurement knob | off (`0x51` unchanged) |
+| `IT_MT_TIP_CORRECTION` | UX alternative | `0` = faithful |
+
+One bug was **diagnosed** (the family id) and is one confirmation run from being
+fixed. Real fixes landed only in tooling — the map's clear check, its
+fingerprint check, its row profiler, and `wait_live()`.
+
+**The most valuable outcome was negative:** a bug was *prevented*. `aspect`
+looked like an obvious fix, repaired 1.0 exactly, and would have broken 1.1.4 —
+the second time this file records a plausible sensor-scale fix killed by
+measurement before it shipped.
+
 #### Whose bug is 1.0's vertical scale — the fork as it stood before the family id
 
 The wire coordinate is physical (hundredths of a mm of sensor), so on a real
@@ -1442,6 +1527,88 @@ equivalent instruments, and `IT_MT_TRACE=1` should be on for both.
 ## Dead ends and mistakes
 
 Recorded so nobody spends the time twice.
+
+### The 2026-07-30/31 hunt: six wrong assumptions, in the order they were held
+
+The family-id answer took a day, and almost none of that was spent near it.
+Each of these was believed, acted on, and killed — five of the six by
+**measurement contradicting a reading of Apple's code**, which is the pattern
+worth internalising.
+
+1. **"The shift is horizontal and vertical."** It is vertical. Horizontally
+   both builds are within ±3.5 px, and 1.1.4 within ±1 — in the *opposite*
+   direction to the report. The apparent leftward error was hit-box **slop**
+   (±9–11 px), which a single corner measurement cannot separate from an
+   offset. That is how the original `kx ≤ 0.927` estimate arose.
+
+2. **"1.1.4 is the non-uniform one."** Measured, **1.1.4 is uniform and 1.0
+   varies** — the exact reverse of the reported symptom. Believing the report
+   would have sent the whole investigation at the wrong firmware.
+
+3. **"The internal surface height is wrong; give it the panel's aspect
+   ratio."** `6922 ≈ 4602 × 480/320` is numerically compelling, and
+   `IT_MT_SENSOR_SCALE=aspect` does repair 1.0 **exactly** (slope −0.0527 →
+   −0.0000). It also **breaks 1.1.4** by a comparable amount, which is how we
+   learned no pair of surface constants can satisfy both — because the surface
+   constants are not what either firmware divides by. **The second sensor-scale
+   fix in this file to look obvious and measure wrong.**
+
+4. **"The kext is where the coordinate maths is."** Its name says multitouch,
+   its symbols say `handleFrame` and `_cacheSensorSurfaceDimensions`, and it
+   interprets **no coordinates whatsoever**. Cost: a full pass through the
+   wrong binary.
+
+5. **"1.0 lacks the pitch constants 1.1.4 has."** Written into this file as
+   fact, and wrong — the search had stopped at
+   `_alg_InitZephyrPlatformSpecifics`, and in 1.0 the same stores live one
+   function over in `_alg_InitGridPitchAndEdgeOptions`, with **identical**
+   values. Corrected the same day. *A symbol not being in the function you
+   expected is not evidence it does not exist.*
+
+6. **"Then it must be UIKit."** With the MT stack proven identical, UIKit was
+   the last suspect standing and the natural next target. It is not there
+   either: `-[UIView(Geometry) hitTest:forEvent:]` is instruction-for-
+   instruction identical between builds — and structurally a hit test compares
+   points to frames, so it **can produce a constant but never a scale**. That
+   reasoning should have come *first* and would have skipped the step.
+
+**What actually cracked it** was neither disassembly nor a new run: taking the
+affine measured in Calculator and testing it against the *already-recorded*
+SpringBoard home-screen results. It predicted all four — including row 1
+missing by 1.4 px — which proved the transform was pipeline-level, not app
+layout, and forced the search back into the one dispatch nobody had compared.
+**Cross-check an old dataset before paying for a new one.**
+
+### Two experiments that were invalid before they ran
+
+* **Perturbing the sensor grid from a snapshot.** The driver queries the grid
+  **once, at startup**, long before the snapshot was captured, so the restored
+  guest already held the original range and no override could reach it. Any
+  experiment that changes what the model reports *during enumeration* has to
+  cold-boot. Caught before the result was believed, but only just.
+* **Reading the plugin's own default parameters.** `gHMTipOffsetParams` is
+  statically initialised with `gain = 0` and `upwardsAxisOffset_mm = 0`, so the
+  binary alone says the finger correction does not exist. The real values are
+  pushed in at runtime by SpringBoard. **Grep the whole root filesystem for a
+  property name before trusting a compiled-in default.**
+
+### Traps in the instrument itself
+
+* **A byte-exact image oracle.** One pixel at the Calculator display's bottom
+  bevel flipped mid-run, and every later `c` press read as "the display will
+  not clear" — killing a 12-minute map with two buttons measured.
+* **A mean-based image comparison.** On a big pale gradient carrying one glyph,
+  `7` and `9` differ in ~5% of *pixels* but almost nothing on average; the check
+  declared two perfectly distinguishable fingerprints identical and refused to
+  start. Count changed bytes.
+* **Profiling geometry where the buttons are dark.** A column profile across a
+  digit row profiles the *glyph* (~30 px), not the button (~51 px), and a global
+  threshold clips the dark rows by 10–15 px — injecting exactly the systematic
+  error the tool exists to measure.
+* **A full host disk.** Cost **four** runs across the session: one died mid-
+  search with `No space left on device`, one delivered zero `[TOUCH] mouse
+  DOWN` lines with the gate armed, and this file already recorded two 1.1.4
+  boots lost the same way. `df` before a session.
 
 **"`0x46` is an unimplemented command."** That was the first conclusion here,
 and it was wrong. It is a retry counter that `deviceGetResultLength()` memsets
