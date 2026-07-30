@@ -261,11 +261,14 @@ def main() -> int:
     msym = _load("machosym", REPO / "scripts" / "macho-symbols.py")
     app, icon = btn.BOARDS[args.board]
 
-    mnt = Path(f"/tmp/gsev-root-{os.getpid()}")
-    mnt.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse",
-                    "-mountpoint", str(mnt), str(brk.ROOTS[args.board])],
-                   capture_output=True)
+    groot = _load("guestroot", REPO / "scripts" / "guest_root.py")
+    try:
+        mnt, mnt_mine = groot.attach(brk.ROOTS[args.board], "gsev-root")
+    except RuntimeError as e:
+        print(f"FAIL: {e}")
+        return 2
+    if not mnt_mine:
+        print(f"  reusing existing mount at {mnt}")
     try:
         sb_bin = args.logs / "SpringBoard"
         sb_bin.write_bytes((mnt / SB).read_bytes())
@@ -277,12 +280,9 @@ def main() -> int:
         fps = exec_fingerprints(mnt)
         print(f"  {len(fps)} executables fingerprinted at {EXEC_BASE:#x}")
         mnt_saved = str(mnt) if args.break_sym else None
-        if args.break_sym:
-            # resolve before detaching
-            pass
     finally:
         if not args.break_sym:
-            subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
+            groot.detach(mnt, mnt_mine)
 
     syms = {n: v for v, n, d in msym.symbols(gs_bin.read_bytes()) if d}
     cb = syms.get("_PurpleEventCallback")
@@ -331,7 +331,7 @@ def main() -> int:
         else:
             print(f"  !! {sym} not in {lib}")
     if mnt_saved:
-        subprocess.run(["hdiutil", "detach", mnt_saved], capture_output=True)
+        groot.detach(Path(mnt_saved), mnt_mine)
 
     if args.watch_port:
         for n in ("_GSGetPurpleSystemEventPort", "_ResetEventPortSet",

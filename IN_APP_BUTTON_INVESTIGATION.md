@@ -1064,3 +1064,50 @@ snapshot/migration work as the suspect. That was wrong on the cause: the boot
 failure was regression 1 above, and the `hw_error("Unable to read file!")` abort
 that first pointed at the NAND was a SEPARATE fault under a full disk. The NAND
 robustness fix in that commit stands on its own merits; the attribution does not.
+
+
+## The break, narrowed to one value: LayerKit's framebuffer handle is NULL (2026-07-30)
+
+Walking down from userland with `--break-sym` and the IOKit user-client funnel.
+
+**1. The swap DOES reach the kernel on 1.0** -- 74 `IOConnectCall*` hits after the
+press. But look at WHICH IOMobileFramebuffer functions make them:
+
+| build | user-client calls after the press |
+| --- | --- |
+| 1.1.4 | `SwapBegin`+0x48, `SwapEnd`+0x38, `SwapWait`+0x58 -- 41 each |
+| **1.0** | `SwapWait`+0x58, `EnableVSyncNotifications`+0x68, `DisableVSyncNotifications`+0x50, `GetVSyncRunLoopSource`+0x3c |
+
+**`SwapBegin` and `SwapEnd` never reach the kernel on 1.0**, although both
+functions are entered (measured earlier: 3 calls each after the press).
+
+**2. Why: the framebuffer handle is NULL.** `_IOMobileFramebufferSwapBegin` on
+1.0 (`0x31bf9378`) skips its `IOConnectCallScalarMethod` on exactly one path:
+
+```
+31bf937c  subs r4, r0, #0          ; the fb handle
+31bf9390  beq  0x31bf940c          ; NULL -> load an error code and return
+...
+31bf93bc  bl   _IOConnectCallScalarMethod    ; the only kernel call
+```
+
+Measured at the entry: **`r0(fb) = 0x00000000`**, called from `LayerKit+0x39400`.
+So LayerKit asks for a swap with no framebuffer, the function returns before
+touching the kernel, and nothing re-points the display. That is the whole
+mechanism, and it explains every downstream symptom: an app can open (it draws
+in place, no swap needed) while the dismissal repaint can never be presented.
+
+### What is NOT yet established
+
+* **Whether the NULL handle is the MAIN display or a secondary context.** 1.0 has
+  no TVOut, so a TVOut display context would legitimately carry a NULL fb. What
+  argues against that being harmless: no `SwapBegin` from ANY context reaches the
+  kernel.
+* **Why it is NULL.** `_IOMobileFramebufferOpen` (`0x31bf9cfc`) recorded 0 hits,
+  but the probe attaches gdb after the home screen is up and the open would
+  happen at SpringBoard startup -- so this does not distinguish "never called"
+  from "called before the window and failed". Arming that breakpoint from boot
+  is the next measurement.
+* **Why `SwapWait` reaches the kernel while `SwapBegin` does not**, if both take
+  the same handle. Either `SwapWait` has no NULL guard, or it is called on a
+  different context. Worth reading before concluding.

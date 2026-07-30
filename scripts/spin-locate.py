@@ -112,11 +112,15 @@ def main() -> int:
     dis = _load("objcdis", REPO / "scripts" / "objc-method-disasm.py")
     app, icon = btn.BOARDS[args.board]
 
-    mnt = Path(f"/tmp/spin-root-{os.getpid()}")
-    mnt.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse",
-                    "-mountpoint", str(mnt), str(brk.ROOTS[args.board])],
-                   capture_output=True)
+    groot = _load("guestroot", REPO / "scripts" / "guest_root.py")
+    try:
+        mnt, mounted_here = groot.attach(brk.ROOTS[args.board], "spin-root")
+    except RuntimeError as e:
+        print(f"FAIL: {e}")
+        return 2
+    if not mounted_here:
+        print(f"  reusing existing mount at {mnt}")
+
     symmap = []
     try:
         sb_bin = args.logs / "SpringBoard"
@@ -145,7 +149,7 @@ def main() -> int:
                 except Exception:
                     pass
     finally:
-        subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
+        groot.detach(mnt, mounted_here)
 
     symmap.sort()
     addrs = [a for a, _ in symmap]
