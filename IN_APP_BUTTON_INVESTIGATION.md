@@ -1461,3 +1461,21 @@ microkernel re-init loop reading 0xff0..0xffc/0xf10 as zero -- the guest
 probably wants a liveness value there); consolidating 1.1.4/iPod onto this
 engine (their bundles still carry their own binaries, untouched tonight);
 regression runs on both (in flight).
+
+### Acceptance runs, all three boards (2026-07-31, ~01:00)
+
+| board | engine | 1 | 2 | 3_home_returns | 4 | 5 |
+|---|---|---|---|---|---|---|
+| m68ap-10 (fixed engine + launcher env) | tonight's | PASS | flaky | **PASS 94.74%** | flaky | flaky |
+| m68ap-114 (own bundle, untouched) | pre-session | PASS | PASS | PASS 96.98% | PASS | PASS |
+| n45ap (own bundle, untouched) | its own | PASS | PASS | PASS 98.58% | PASS | FAIL x2 |
+
+The n45ap `5_home_wakes` failures show off-screen buffers changing 56% with a
+dark panel -- the documented one-shot-screendump/panel-sleep artifact on a
+binary tonight's work never touched (historical pass rate for that step: 56%).
+Recorded, not chased: it is not this investigation's bug.
+
+Also recorded: the FIRST in-app press still loses its DOWN GSEvent about half
+the time (UP-only delivery, swallowed at the `_menuButtonTimer == nil` gate);
+the second press then works. Pre-existing, unrelated to the MBX work, worth its
+own hunt.
