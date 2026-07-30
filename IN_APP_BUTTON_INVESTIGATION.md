@@ -1420,3 +1420,44 @@ So the dismissal now COMPLETES but takes >10 s -- consistent with the app
 still being watchdog-killed (or another timeout) before SpringBoard recovers,
 where before the fix SpringBoard never recovered at all. Latency measurement in
 flight. Env used: IT_MBX_EVENTS=1 IT_MBX_IRQ=12 (DT: mbx interrupts = 0x0C).
+
+
+## THE FIX LANDS: 3_home_returns passes on 1.0 (2026-07-31)
+
+Three MBX model changes, each derived from a measured register conversation
+(never guessed), engine installed into the 1.0 bundle:
+
+1. **`WR 0x12C` = host soft event** -> OR into event status. (The conversation
+   previously died here.)
+2. **Kick bit 8 at 0x1020** (`0x00010100`, after a microkernel code upload via
+   the 0x1024/0x1028 index/data pairs) -> completion, same as bit 0. The old
+   `(val & 1)` test missed it.
+3. **The command-stream fire at 0xA00000** (descriptor block 0xa00000..0xa0003c
+   rewritten with `0xf0000000` word 0, the last write before the guest polls
+   0x12C) -> completion.
+
+With all three, plus `IT_MBX_EVENTS=1 IT_MBX_IRQ=12` (the DT's own interrupt
+number for the mbx node), on the 1.0 bundle:
+
+| wait | 1_open | 2_touch | 3_home_returns | 4_power | 5_wake |
+|---|---|---|---|---|---|
+| 8s  | PASS | PASS | FAIL (arrives late) | PASS 98.73% | PASS |
+| 14s | PASS | flaky | **PASS 94.74%** | flaky | -- |
+| 20s | PASS | flaky | **PASS 97.05%** | PASS | FAIL |
+
+`3_home_returns` non-zero -- the acceptance criterion -- is now met
+repeatedly (68.32%, 97.05%, 94.74%). The dismissal takes ~8-14 s (the app is
+likely still watchdog-killed and SpringBoard now RECOVERS, where before it
+wedged forever; the crash log is still written). Step 2/4/5 vary run to run
+with timing; the wedge itself is gone -- the render loop keeps ticking after
+every press in every instrumented run.
+
+The env pair is now exported by the launcher's `iphone-2g` profile
+(`scripts/ipod-app-launcher.sh`, installed into the 1.0 bundle), so a plain
+double-click gets the fix; `IT_MBX_EVENTS=0` reverts to the old stub for A/Bs.
+
+**NOT yet done:** the ~10 s dismissal latency (next lever: the repeated
+microkernel re-init loop reading 0xff0..0xffc/0xf10 as zero -- the guest
+probably wants a liveness value there); consolidating 1.1.4/iPod onto this
+engine (their bundles still carry their own binaries, untouched tonight);
+regression runs on both (in flight).

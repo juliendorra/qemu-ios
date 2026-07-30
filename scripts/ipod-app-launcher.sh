@@ -48,6 +48,14 @@ case "$PROFILE" in
         # starts a clear 100 above it, not the +10 that would land inside.
         DEFAULT_HTTPS_PORT=18543
         DEFAULT_HTTPS_CONTROL_PORT=18542
+        # MBX completion events + the interrupt line the kernel's own device
+        # tree names for the mbx node (SoC IRQ 12 = 0x0C). Without these, the
+        # iPhone OS 1.0 in-app HOME press wedges SpringBoard's LayerKit server
+        # thread inside the MBX2D app-snapshot render, the app is watchdog-
+        # killed, and the home screen never returns
+        # (IN_APP_BUTTON_INVESTIGATION.md, 2026-07-31). Overridable for A/Bs.
+        export IT_MBX_EVENTS="${IT_MBX_EVENTS:-1}"
+        export IT_MBX_IRQ="${IT_MBX_IRQ:-12}"
         ;;
     *)
         echo "Unsupported S5L8900 profile: $PROFILE" >&2

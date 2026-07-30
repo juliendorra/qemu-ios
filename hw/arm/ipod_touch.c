@@ -891,9 +891,25 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
          * i.e. a command descriptor at 0x824..0x83c followed by a kick at 0x6d8.
          */
         case 0x6d8:
-        case 0x1020:        /* 0x1020 bit 0 also starts work on other paths */
-            if (addr == 0x6d8 || (val & 1)) {
+        case 0x1020:        /* kick: bit 0, and bit 8 after a microkernel code
+                             * upload via the 0x1024/0x1028 index/data pairs --
+                             * measured 0x00010100 during the 1.0 app-snapshot
+                             * render, which the (val & 1) test missed. */
+            if (addr == 0x6d8 || (val & 0x101)) {
                 /* Nothing is actually rendered, so completion is immediate. */
+                mbx_event_status |= MBX_EVENT_DONE;
+                mbx_update_irq();
+            }
+            break;
+        /*
+         * The command-stream window at 0xA00000. The 2D blit is written as a
+         * descriptor block (0xa00000..0xa0003c) and then FIRED by rewriting
+         * word 0 with 0xf0000000 -- the last MBX write before the guest polls
+         * 0x12C for completion (measured, 1.0 app snapshot). Complete it
+         * immediately, like the other kicks.
+         */
+        case 0xa00000:
+            if ((val & 0xf0000000) == 0xf0000000) {
                 mbx_event_status |= MBX_EVENT_DONE;
                 mbx_update_irq();
             }
