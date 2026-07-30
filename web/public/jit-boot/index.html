@@ -857,10 +857,12 @@
         // incoming migration is read synchronously from MEMFS at startup, so
         // there is no opportunity to fault it in.
         state('downloading the snapshot…');
-        const r = await fetch('state');
-        if (!r.ok) throw new Error(`no snapshot at ./state (${r.status}) — `
-                                   + 'generate one with snapshot-probe.py '
-                                   + '--keep-state and stage it here');
+        const r = await fetch(`snapshots/${BUILD}/state`);
+        if (!r.ok) {
+          throw new Error(`no snapshot at snapshots/${BUILD}/state `
+            + `(${r.status}) — build one with `
+            + `scripts/wasm/build-snapshot.py --build ${BUILD}`);
+        }
         const st = new Uint8Array(await r.arrayBuffer());
         mod.FS.writeFile('/fw/state', st);
         line(`staged snapshot (${(st.length / 1048576).toFixed(1)} MiB)`);

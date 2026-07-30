@@ -126,6 +126,54 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### Snapshot generation is a build step, and it is COMPRESSED, not chunked
+
+`scripts/wasm/build-snapshot.py --build 1A543a --brotli` boots the firmware,
+waits for a genuinely live panel, stops, migrates, and writes
+`web/public/jit-boot/snapshots/<BUILD>/{state,state.br,state-provenance.json}`.
+The page fetches `snapshots/${BUILD}/state`, so a version picker cannot serve
+one build's machine against another's NAND. Verified end to end: home screen at
+**5.2 s** from the build step's own output.
+
+#### Chunking would buy nothing; compression buys a great deal
+
+Asked and measured rather than assumed. **Chunking is the wrong tool here.** The
+NAND is chunked because a cold boot touches only ~17% of it, so laziness pays.
+The migration stream has no such access pattern: `-incoming` reads **all of it,
+synchronously, at startup**. Chunking it would add per-chunk requests and
+service-worker round trips for zero avoided bytes.
+
+Compression is a different story, because ~30% of the stream is zero bytes:
+
+| | size | of raw | time |
+| --- | --- | --- | --- |
+| raw | 57.23 MiB | — | — |
+| gzip -6 | 18.57 MiB | 32.4% | 1.5 s |
+| brotli q5 | 14.55 MiB | 25.4% | 0.7 s |
+| **brotli q11** | **11.46 MiB** | **20.0%** | 98 s |
+
+**At q11 the snapshot is SMALLER than the chunked cold-boot working set**
+(18.57 MiB) and reaches an interactive home screen ~14x sooner. It is a build
+artifact, so 98 s of compression is free at runtime.
+
+Serve `state.br` with `Content-Encoding: br` and the browser decompresses on the
+way in, carrying no decoder — the same trick `chunk-pack.py`'s output already
+relies on. **The dev server does not do this yet**: `serve.py`'s Brotli header
+is scoped to chunk paths, so local runs fetch the raw `state`. Generalising that
+rule to any `.br` file is a one-line change in Session B's file and is the only
+thing between here and an 11 MiB instant boot.
+
+#### Provenance, because a stale snapshot fails without naming the cause
+
+`state-provenance.json` records the firmware build, the byte count, a SHA-256,
+the QEMU version, and **the engine commit** — the last being the compatibility
+key. A migration stream only loads into an emulator whose device set and vmstate
+layout match, and this has already broken twice: once because the wasm build has
+no slirp (`Unknown section or instance 'slirp'`), and once every time a device
+gained a `VMStateDescription` during this session. The build step also warns when
+the engine tree is dirty, since the recorded commit is then not quite what
+produced the stream.
+
 ### INSTANT BOOT WORKS: a restored snapshot is interactive in the browser
 
 `?resume=1` fetches a natively-produced 57 MiB migration stream, restores it, and
