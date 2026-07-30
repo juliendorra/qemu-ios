@@ -1339,3 +1339,49 @@ call on the legacy swap device object at `[fb+0x58]`, vtable+0xec
 legacy swap device" -- on 1.0 that is AppleH1CLCD, there being no TVOut).
 Verification in flight: SwapWait entry vs its return-from-kernel instruction
 (0x31bf9818) breakpoint pairing in SpringBoard across the press.
+
+
+## WEDGE PINNED TO THE INSTRUCTION: `_mbx2DFinish` inside the app-snapshot RPC (2026-07-31)
+
+Three probe runs with the new thread-identity (`sp`) recording:
+
+1. SpringBoard has THREE relevant threads: main (sp 0x2ffffxxx -- menu handlers,
+   `_LKRenderServerKick` from lr 0x30b06598), the LayerKit server thread
+   (sp 0x5bbxxx -- `_LKRenderServerDispatchMessage`), and the render thread
+   (sp 0x53bxxx -- `render_for_time` + `FinishUpdate`).
+2. Healthy cadence: main kicks (bursts of 5) -> server dispatches msg 40001 ->
+   render thread ticks. After the dismissal press: main KEEPS KICKING (bursts
+   every ~15 s, forever) and the server never dispatches again. The wedge is in
+   the server thread, and it happened while handling exactly one message.
+3. That message is the app's snapshot RPC, and the server thread's last five
+   acts are (run 7, `/tmp/gsev-m68ap-10-lkx`):
+
+   ```
+   t=23.35  __LKXRenderClient                 entry (server side of the RPC)
+   t=23.35  _CoreSurfaceBufferLookup          ok
+   t=23.36  _LKDisplayCreateBuffer            ok
+   t=23.36  _idle_hardware                    ok (its MBX arm is skipped)
+   t=23.38  MBX2D _mbx2DFinish  lr=0x30b0db2c inside _LKRenderMBX2DRenderBuffer
+            -- LAST HIT EVER; never returns; guest idle
+   ```
+
+**So: `__LKXRenderClient` renders the client's window into its CoreSurface via
+`_LKRenderMBX2DRenderBuffer` -- the MBX 2D path -- even though
+`LK_ENABLE_MBX2D=0`.** The env var gates SpringBoard's own compositing
+(`[r8]/[sl]` globals in `_idle_hardware`), but `__LKXRenderClient+0x1cc` checks
+a DIFFERENT global (0 -> lazily `_LKRenderMBX2DNew` at +0x410, then
+RenderBuffer). `_mbx2DFinish` then waits for 2D-transfer completion from our
+do-nothing MBX stub, idle (a kernel sleep, not a spin -- this is the "waits on
+an MBX completion that never arrives" from the 2026-07-29 entry, now with the
+exact call chain).
+
+Downstream, in order: no RPC reply -> app watchdog-killed at +10 s
+(`0x8badf00d`) -> crashdump + type2001 to SpringBoard -> SpringBoard main
+thread kicks the dead server forever -> layers never re-attach -> display never
+re-pointed. One sleeping thread, every symptom.
+
+The kernel's own DT names the MBX interrupt: node `mbx`, `interrupts = 0x0C`
+(SoC IRQ 12; LCD is 0xD). The emulator already has completion-event modelling
+(`IT_MBX_EVENTS=1`: kick at 0x6d8/0x1020 sets event bit 6, host-clear at 0x134,
+enable at 0x130) and an unbound IRQ line (`IT_MBX_IRQ=<n>`). A/B in flight:
+`IT_MBX_EVENTS=1 IT_MBX_IRQ=12 app-button-probe --board m68ap-10`.
