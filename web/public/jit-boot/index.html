@@ -107,6 +107,7 @@
   // "home screen" can only be established from the framebuffer, and only a
   // page that paints can see it.
   let lastReport = 0;
+  let reportEndpoint = true;   // cleared on a static host
   function report(force) {
     const now = performance.now();
     if (!force && now - lastReport < 5000) return;
@@ -132,8 +133,22 @@
     // channel: `--enable-logging=stderr` is the ONLY way to see what a page is
     // doing, and a silent .catch() here left a run looking dead for ten minutes
     // with the server showing no POSTs and no way to tell why.
+    // On a STATIC host there is no /__bench-result, so this 404s every 15 s.
+    // Give up after the first failure rather than filling a real deployment's
+    // console with errors -- but say so once, because a silent .catch() here is
+    // what once left a run looking dead with no way to ask why.
+    if (!reportEndpoint) return;
     fetch('/__bench-result', { method: 'POST', body, keepalive: true })
-      .catch((e) => console.error('[bench] report POST failed:', e));
+      .then((r) => {
+        if (!r.ok && r.status === 404) {
+          reportEndpoint = false;
+          console.log('[bench] no /__bench-result endpoint; stopping reports');
+        }
+      })
+      .catch((e) => {
+        reportEndpoint = false;
+        console.error('[bench] report POST failed, stopping reports:', e);
+      });
   }
   // A heartbeat, so a headless run says something every 15 s even before the
   // first landmark. Silence then means the page is genuinely wedged, which is

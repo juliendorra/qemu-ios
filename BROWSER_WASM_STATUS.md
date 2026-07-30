@@ -126,6 +126,49 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### It deploys as a STATIC tree — no application server
+
+`scripts/wasm/stage-static.py --build 1A543a --out DIR` assembles exactly what a
+visitor fetches and writes the host config beside it, so a deploy is one
+`rsync`. Verified by serving the staged directory as a plain static tree:
+home screen at **5.1 s**, `?resume=1`, nothing dynamic involved.
+
+```
+staged 12 entries
+  on disk         133.0 MiB
+  cold boot        18.5 MiB downloaded
+  instant boot     11.5 MiB downloaded  (?resume=1)
+```
+
+Nothing needs server-side logic — it is files plus **three response headers**:
+
+| | why |
+| --- | --- |
+| **COOP + COEP** | pthreads → `SharedArrayBuffer` → the page must be cross-origin isolated. Missing these, the emulator does not start and it looks like a broken build |
+| **HTTPS** | `SharedArrayBuffer` and service workers both need a secure context; `localhost` is exempt, a real domain is not |
+| **`Content-Encoding: br`** for `*.br` | chunks and the snapshot are stored pre-compressed. Optional in the sense that the page detects a non-decoding host and falls back — at 57.4 MiB instead of 11.5 |
+
+The generated `.htaccess` and `nginx.conf.snippet` set all three. The nginx one
+repeats the isolation headers inside each `location`, because `add_header` does
+**not** inherit into a block that declares its own — a classic way to lose COOP
+on exactly the files that need it.
+
+Four things the staging step handles that a plain copy would get wrong:
+
+- **Symlinks are resolved.** The dev tree symlinks the engine and firmware into
+  `build-wasm/` and `m68ap-artifacts/`; an `rsync` without `-L` ships dangling
+  links.
+- **`nand.pack` is excluded** — 216 MiB the viewer no longer reads (only
+  `web/bench-b/` still does).
+- **`sw.js` lands at the document root.** It registers with `scope: '/'`, and a
+  service worker cannot control paths above its own location.
+- **The raw `state` is dropped when `state.br` exists**, halving the upload.
+
+The page also stops POSTing to `/__bench-result` after the first 404, so a real
+deployment does not fill the console with dev-harness errors every 15 s — while
+still saying once that it has stopped, because a silent `.catch()` here is what
+previously left a run looking dead with no way to ask why.
+
 ### Snapshot generation is a build step, and it is COMPRESSED, not chunked
 
 `scripts/wasm/build-snapshot.py --build 1A543a --brotli` boots the firmware,
