@@ -1155,9 +1155,29 @@ can resolve. The two firmwares now behave **identically** on the same hardware
 — which is what "one hardware truth, two firmwares" is supposed to look like,
 and what no amount of tuning `MT_SENSOR_SURFACE_*` ever produced.
 
-**What is still owed, and why it is not done:** the three-row slope confirmation
-and a 1.1.4 no-regression run. **Both are blocked on host disk space**, not on
-anything about touch. Two consecutive runs failed to it:
+#### The 1.1.4 no-regression run: PASSED, byte for byte
+
+Full map, 326 taps, `IT_MT_FAMILY_ID=0x50`, same bundle NAND as the baseline so
+only one variable changes:
+
+```
+digit  centre(drawn)    dL    dR    dT    dB  shift x  shift y  slop x  slop y
+    7   41.0, 223.5   -     7.0   0.0  22.0      -       11.0     -      11.0
+    9  200.0, 223.5 -10.0  12.0   0.0  22.0      1.0     11.0    11.0    11.0
+    1   41.0, 366.0   -     7.0   1.0  23.0      -       12.0     -      11.0
+    3  200.0, 366.0 -10.0  12.0   1.0  23.0      1.0     12.0    11.0    11.0
+    5  120.0, 294.0 -12.0  10.0   1.0  24.0     -1.0     12.5    11.0    11.5
+```
+
+**Every one of the twenty edges is identical to the 1.1.4 baseline**, and so is
+the fit (slope +0.0070, intercept +9.64, verdict CONSTANT on both axes). That
+is precisely what the disassembly predicts: `0x50` and `0x51` are both inside
+1.1.4's accepted range `0x50`–`0x52` and select the same branch, so the build
+that already worked cannot notice the change.
+
+**What is still owed, and why it is not done:** the 1.0 three-row slope
+confirmation. It was **blocked on host disk space**, not on anything about
+touch. Two consecutive runs failed to it:
 
 * the first died at digit 9's bottom edge with `OSError: No space left on
   device` — screendumps began failing and the search reported an unbracketed
