@@ -358,8 +358,13 @@ def main() -> int:
         lst = []
         for e in exprs.split(","):
             e = e.strip()
-            reg, _, off = e.partition("+")
-            lst.append((int(reg.lstrip("r")), int(off, 0) if off else 0, e))
+            # rN+OFF reads [rN+OFF]; each further >OFF chases the pointer:
+            # 'r0+0x58>0>0xec' = [[[r0+0x58]+0]+0xec] -- e.g. an object's
+            # vtable slot, in one hit.
+            hops = e.split(">")
+            reg, _, off = hops[0].partition("+")
+            offs = [int(off, 0) if off else 0] + [int(h, 0) for h in hops[1:]]
+            lst.append((int(reg.lstrip("r")), offs, e))
         derefs.append((suffix, lst))
 
     if args.watch_port:
@@ -495,14 +500,24 @@ def main() -> int:
             else:
                 rec["lr"] = w[14]
                 rec["lr_in"] = brk.whose(w[14], libs)
+                # WHICH THREAD: the stack pointer. Two hits with sp in the same
+                # ~64k region are the same thread; the probe cannot otherwise
+                # tell SpringBoard's main thread from its render-server thread,
+                # and the two carry entirely different meanings here.
+                rec["sp"] = w[13]
                 for suffix, lst in derefs:
                     if not which.endswith(suffix):
                         continue
                     mem = {}
-                    for regn, off, label in lst:
-                        blk = g.mem((w[regn] + off) & 0xffffffff, 4)
-                        mem[label] = (struct.unpack("<I", blk)[0]
-                                      if blk and len(blk) == 4 else None)
+                    for regn, offs, label in lst:
+                        v = w[regn]
+                        for off in offs:
+                            blk = g.mem((v + off) & 0xffffffff, 4)
+                            v = (struct.unpack("<I", blk)[0]
+                                 if blk and len(blk) == 4 else None)
+                            if v is None:
+                                break
+                        mem[label] = v
                     rec["mem"] = mem
                     rec["r0"] = w[0]
                     rec["r1"] = w[1]
@@ -721,7 +736,8 @@ def main() -> int:
                               for k, v in r["mem"].items())
                 print(f"      t={r['t']:<8} [{r['phase']}] {r['at']} "
                       f"in {r.get('proc')} r0={r.get('r0', 0):#x} "
-                      f"r1={r.get('r1', 0):#x} lr={r.get('lr', 0):#x} {ms}")
+                      f"r1={r.get('r1', 0):#x} lr={r.get('lr', 0):#x} "
+                      f"sp={r.get('sp', 0):#x} {ms}")
             if len(withmem) > 120:
                 print(f"      ... {len(withmem) - 120} more in events.json")
         new = {(r.get("proc"), r.get("type")) for r in records
