@@ -109,4 +109,8 @@ bool it_nand_chunks_init(const char *nand_path);
 void nand_set_buffered_page(ITNandState *s, uint32_t page);
 void nand_begin_multi_write(ITNandState *s, uint32_t num_pages);
 
+/* W6: serialize the copy-on-write overlay so the page can persist it.
+ * Caller frees. Must run on the emulator thread -- the table is live. */
+uint8_t *it_nand_overlay_save(uint32_t *out_len);
+
 #endif

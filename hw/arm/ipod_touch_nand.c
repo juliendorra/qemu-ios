@@ -108,6 +108,115 @@ static void nand_note_read(uint32_t bank, uint32_t page)
  */
 static GHashTable *nand_overlay;      /* (bank<<24)|page -> 2112 bytes */
 
+/*
+ * W6, the persistence half: get the overlay OUT of the tab and back in.
+ *
+ * Restore is a file read at init -- the page writes <nand>/overlay.bin in
+ * preRun, before the machine starts, so nothing has to cross a thread boundary.
+ * Saving cannot work that way, because the guest is running when the page wants
+ * a copy, so it goes through a request the EMULATOR thread services
+ * (ui/wasm.c's drain timer) and publishes for the page to read.
+ *
+ * Format, deliberately trivial and self-describing:
+ *
+ *   magic "ITNOVL1"  u8[8]      (NUL-padded)
+ *   record count     u32 LE
+ *   page size        u32 LE     so a stride change is caught, not mis-read
+ *   records          count x { u32 LE key, page_size bytes }
+ *
+ * The key is the model's own (bank << 24) | page. This is NOT a migration
+ * stream: it is keyed to the PACK, not to the engine's vmstate layout, so it
+ * survives an emulator rebuild -- which is the whole reason persistence lives
+ * here rather than in a VM snapshot. (A snapshot does not capture NAND writes
+ * at all: the overlay has no VMStateDescription.)
+ */
+#define NAND_OVERLAY_MAGIC "ITNOVL1"
+#define NAND_OVERLAY_HEADER 16
+
+static uint32_t nand_overlay_page_size(void)
+{
+    return NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE;
+}
+
+static void nand_overlay_restore(ITNandState *s)
+{
+    char filename[PATH_MAX];
+    g_autofree char *blob = NULL;
+    gsize len = 0;
+    uint32_t count, page_size, i;
+    const uint8_t *p;
+
+    g_snprintf(filename, sizeof(filename), "%s/overlay.bin", s->nand_path);
+    if (!g_file_get_contents(filename, &blob, &len, NULL)) {
+        return;                                  /* first visit */
+    }
+    if (len < NAND_OVERLAY_HEADER ||
+        memcmp(blob, NAND_OVERLAY_MAGIC, strlen(NAND_OVERLAY_MAGIC)) != 0) {
+        fprintf(stderr, "[NAND] overlay.bin is not an overlay - ignoring\n");
+        return;
+    }
+    memcpy(&count, blob + 8, 4);
+    memcpy(&page_size, blob + 12, 4);
+    if (page_size != nand_overlay_page_size()) {
+        fprintf(stderr, "[NAND] overlay.bin has page size %u, this NAND uses "
+                "%u - ignoring rather than corrupting it\n",
+                page_size, nand_overlay_page_size());
+        return;
+    }
+    if (len != (gsize)NAND_OVERLAY_HEADER + (gsize)count * (4 + page_size)) {
+        fprintf(stderr, "[NAND] overlay.bin is truncated (%zu bytes for %u "
+                "records) - ignoring\n", (size_t)len, count);
+        return;
+    }
+
+    p = (const uint8_t *)blob + NAND_OVERLAY_HEADER;
+    for (i = 0; i < count; i++) {
+        uint32_t key;
+        uint8_t *record = g_malloc(page_size);
+
+        memcpy(&key, p, 4);
+        memcpy(record, p + 4, page_size);
+        g_hash_table_insert(nand_overlay, GUINT_TO_POINTER(key), record);
+        p += 4 + page_size;
+    }
+    fprintf(stderr, "[NAND] restored %u overlay pages from a previous visit\n",
+            count);
+}
+
+/* Serialize for the page. Caller frees. Runs on the emulator thread. */
+uint8_t *it_nand_overlay_save(uint32_t *out_len)
+{
+    uint32_t page_size = nand_overlay_page_size();
+    GHashTableIter iter;
+    gpointer key, value;
+    uint32_t count, i = 0;
+    uint8_t *blob, *p;
+
+    *out_len = 0;
+    if (nand_overlay == NULL) {
+        return NULL;
+    }
+    count = g_hash_table_size(nand_overlay);
+    *out_len = NAND_OVERLAY_HEADER + count * (4 + page_size);
+    blob = g_malloc0(*out_len);
+    memcpy(blob, NAND_OVERLAY_MAGIC, strlen(NAND_OVERLAY_MAGIC));
+    memcpy(blob + 8, &count, 4);
+    memcpy(blob + 12, &page_size, 4);
+
+    p = blob + NAND_OVERLAY_HEADER;
+    g_hash_table_iter_init(&iter, nand_overlay);
+    while (g_hash_table_iter_next(&iter, &key, &value) && i < count) {
+        uint32_t k = GPOINTER_TO_UINT(key);
+        memcpy(p, &k, 4);
+        memcpy(p + 4, value, page_size);
+        p += 4 + page_size;
+        i++;
+    }
+    return blob;
+}
+
+static void nand_overlay_restore(ITNandState *s);
+
 static bool nand_overlay_enabled(ITNandState *s)
 {
     static int cached = -1;
@@ -132,6 +241,7 @@ static bool nand_overlay_enabled(ITNandState *s)
         nand_overlay = g_hash_table_new_full(NULL, NULL, NULL, g_free);
         fprintf(stderr, "[NAND] copy-on-write overlay in RAM: guest writes "
                 "shadow the pack for this session\n");
+        nand_overlay_restore(s);
     }
     return cached;
 }

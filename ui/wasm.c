@@ -45,6 +45,7 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "system/runstate.h"
+#include "hw/arm/ipod_touch_nand.h"
 #include <emscripten.h>
 
 /*
@@ -341,6 +342,72 @@ EMSCRIPTEN_KEEPALIVE const char *wasm_run_state_name(void)
     return RunState_str(runstate_get());
 }
 
+/*
+ * W6: hand the NAND copy-on-write overlay to the page so it can persist it.
+ *
+ * The overlay is a live GHashTable owned by the emulator thread, so the page
+ * cannot walk it. It asks here instead; the drain timer serializes it on the
+ * emulator thread and publishes a pointer the page reads straight out of
+ * HEAPU8, the same copy-free arrangement the framebuffer uses.
+ *
+ * Persistence is keyed to the NAND PACK, not to the engine's vmstate layout,
+ * which is the reason it lives here and not in a VM snapshot: a snapshot is
+ * invalidated by any device gaining a VMStateDescription, and would take a
+ * user's saved state with it. It also would not work -- the overlay has no
+ * vmstate, so a snapshot does not capture guest NAND writes at all.
+ */
+static bool wasm_overlay_requested;
+static uint8_t *wasm_overlay_blob;
+static uint32_t wasm_overlay_len;
+
+EMSCRIPTEN_KEEPALIVE void wasm_request_overlay_save(void)
+{
+    qatomic_set(&wasm_overlay_requested, true);
+}
+
+/* 0 while the request is outstanding; the byte count once it is ready. */
+EMSCRIPTEN_KEEPALIVE uint32_t wasm_overlay_size(void)
+{
+    return qatomic_read(&wasm_overlay_len);
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t wasm_overlay_addr(void)
+{
+    return (uint32_t)(uintptr_t)qatomic_read(&wasm_overlay_blob);
+}
+
+/* The page calls this once it has copied the bytes out. */
+EMSCRIPTEN_KEEPALIVE void wasm_overlay_release(void)
+{
+    uint8_t *blob = qatomic_xchg(&wasm_overlay_blob, NULL);
+
+    qatomic_set(&wasm_overlay_len, 0);
+    g_free(blob);
+}
+
+static void wasm_maybe_save_overlay(void)
+{
+    uint8_t *blob;
+    uint32_t len = 0;
+
+    if (!qatomic_read(&wasm_overlay_requested)) {
+        return;
+    }
+    if (qatomic_read(&wasm_overlay_blob) != NULL) {
+        return;                        /* the page has not collected the last */
+    }
+    qatomic_set(&wasm_overlay_requested, false);
+
+    blob = it_nand_overlay_save(&len);
+    if (blob == NULL) {
+        return;                        /* no overlay: nothing to persist */
+    }
+    /* Publish the pointer LAST: the page polls the size, so a non-zero size
+     * must imply a valid pointer. */
+    qatomic_set(&wasm_overlay_blob, blob);
+    qatomic_set(&wasm_overlay_len, len);
+}
+
 static void wasm_maybe_resume(void)
 {
     static RunState last_reported = RUN_STATE__MAX;
@@ -382,6 +449,7 @@ static void wasm_input_drain(void *opaque)
     uint32_t head = qatomic_load_acquire(&wasm_input_head);
 
     wasm_maybe_resume();
+    wasm_maybe_save_overlay();
 
     while (tail != head) {
         wasm_input_dispatch(&wasm_input_ring[tail & WASM_INPUT_RING_MASK]);

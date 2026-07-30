@@ -709,11 +709,6 @@
   let sweepResult = null;
   const SWEEP_MODE = new URLSearchParams(location.search).get('sweep');
 
-  // ---------------------------------------------------------------- boot ---
-  import { registerChunkWorker, loadManifest, stageChunkedNand,
-           prefetchBootSet, startChunkFetcher, chunkStats }
-    from '../../src/emulator/chunk-loader.js';
-
   // 1A543a only, for now. The chunk set for 4A102 exists, but this page's
   // bootrom/iBoot/NOR are 1.0's and the security epoch is firmware-keyed --
   // booting 1.1.4's NAND against 1.0's epoch wedges iBoot with an EMPTY serial
@@ -735,6 +730,100 @@
   // when that says "running"; a snapshot of a stopped guest comes up PAUSED and
   // needs a monitor `cont`, which this page has no way to send.
   const RESUME = new URLSearchParams(location.search).get('resume') === '1';
+
+  // ------------------------------------------------------- persistence ---
+  //
+  // W6. Guest NAND writes live in a copy-on-write overlay in the emulator's
+  // heap and evaporate with the tab, so the device forgets everything between
+  // visits. This carries the overlay to IndexedDB and back.
+  //
+  // Keyed to the NAND PACK, not to the engine build. That is the whole reason
+  // persistence is not done with a VM snapshot: a snapshot is invalidated by
+  // any device gaining a VMStateDescription, so every emulator update would
+  // discard the user's state -- and it would not work anyway, because the
+  // overlay has no vmstate and a snapshot does not capture NAND writes at all.
+  const OVERLAY_DB = 'iphone-os-overlay';
+  const OVERLAY_KEY = `${BUILD}/overlay`;
+
+  function idb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(OVERLAY_DB, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('overlay');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function overlayLoad() {
+    try {
+      const db = await idb();
+      return await new Promise((resolve, reject) => {
+        const r = db.transaction('overlay').objectStore('overlay').get(OVERLAY_KEY);
+        r.onsuccess = () => resolve(r.result || null);
+        r.onerror = () => reject(r.error);
+      });
+    } catch (e) {
+      line(`overlay: could not read saved state (${e})`, 'err');
+      return null;
+    }
+  }
+
+  async function overlayStore(bytes) {
+    const db = await idb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('overlay', 'readwrite');
+      tx.objectStore('overlay').put(bytes, OVERLAY_KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  // Ask the emulator thread for the overlay and wait for it to publish. The
+  // serialization happens on ITS thread -- the table is live and the page must
+  // not walk it.
+  let saveInFlight = false;
+  async function saveOverlay(reason) {
+    if (saveInFlight || !moduleRef || !runtimeReady) return;
+    if (!moduleRef._wasm_request_overlay_save) return;
+    saveInFlight = true;
+    try {
+      moduleRef._wasm_request_overlay_save();
+      let size = 0;
+      for (let i = 0; i < 60 && !size; i++) {
+        await sleep(100);
+        size = moduleRef._wasm_overlay_size();
+      }
+      if (!size) { line('overlay: nothing to save yet'); return; }
+      const addr = Number(moduleRef._wasm_overlay_addr());
+      // Copy out of shared memory before releasing it, and copy rather than
+      // view: structuredClone into IndexedDB refuses a SharedArrayBuffer view.
+      const bytes = new Uint8Array(moduleRef.HEAPU8.slice(addr, addr + size));
+      moduleRef._wasm_overlay_release();
+      await overlayStore(bytes);
+      const pages = (size - 16) / (4 + 2112);
+      line(`overlay saved: ${pages} pages, `
+           + `${(size / 1048576).toFixed(1)} MiB (${reason})`);
+      console.log(`[bench] overlay saved: ${pages} pages (${reason})`);
+    } catch (e) {
+      line(`overlay save failed: ${e}`, 'err');
+    } finally {
+      saveInFlight = false;
+    }
+  }
+
+  // Save when the tab goes away. pagehide/visibilitychange are the only events
+  // that reliably fire on mobile; unload does not.
+  addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') saveOverlay('hidden');
+  });
+  addEventListener('pagehide', () => saveOverlay('pagehide'));
+  globalThis.__saveOverlay = () => saveOverlay('manual');
+
+  // ---------------------------------------------------------------- boot ---
+  import { registerChunkWorker, loadManifest, stageChunkedNand,
+           prefetchBootSet, startChunkFetcher, chunkStats }
+    from '../../src/emulator/chunk-loader.js';
+
   let lastRunState = null;
 
   const { default: Module } = await import('./qemu-system-arm.js');
@@ -866,6 +955,16 @@
       // main thread, so the per-read stat() becomes a cross-thread round trip
       // and the boot stalls outright.
       mod.FS.writeFile('/fw/nand/nand-tune', 'overlay=ram\n');
+
+      // Restore is just a file: the model reads <nand>/overlay.bin when it
+      // enables the overlay, before the machine starts, so nothing has to cross
+      // a thread boundary on the way in.
+      const saved = await overlayLoad();
+      if (saved) {
+        mod.FS.writeFile('/fw/nand/overlay.bin', saved);
+        line(`restoring ${((saved.length - 16) / (4 + 2112)) | 0} saved `
+             + `NAND pages from a previous visit`);
+      }
 
       if (RESUME) {
         // The whole stream has to be resident before the machine starts: the

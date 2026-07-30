@@ -126,6 +126,54 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### W6: the device remembers — NAND writes persist across visits
+
+Guest NAND writes lived in a copy-on-write overlay in the emulator's heap and
+evaporated with the tab, so every visit started from a pristine device. They now
+go to IndexedDB and come back. **Verified end to end: 243 pages saved,
+`restoring 243 saved NAND pages from a previous visit` on the next load.**
+
+- **Restore is just a file.** The page writes `<nand>/overlay.bin` in `preRun`
+  and `hw/arm/ipod_touch_nand.c` reads it when it enables the overlay — before
+  the machine starts, so nothing crosses a thread boundary on the way in.
+- **Saving cannot work that way**, because the guest is running when the page
+  wants a copy. It goes through a request the EMULATOR thread services (the same
+  drain timer as input) which serializes the live `GHashTable` and publishes a
+  pointer the page reads out of `HEAPU8`.
+- Triggered on `visibilitychange`/`pagehide` — the only events that fire
+  reliably on mobile; `unload` does not.
+
+**Keyed to the PACK, not to the engine build.** That is why persistence is not
+done with a VM snapshot, and the reasoning matters: a snapshot is invalidated by
+any device gaining a `VMStateDescription`, so every emulator update would
+discard the user's state. **And it would not work anyway — the overlay has no
+vmstate, so a VM snapshot does not capture guest NAND writes at all.**
+
+The format is trivial and self-describing (`ITNOVL1`, count, page size, then
+`{key, 2112 bytes}` records) and it *checks*: a page-size change or a truncated
+blob is reported and ignored rather than half-applied.
+
+#### An unresolved consequence: the shipped snapshot and the overlay are not paired
+
+That last point has a corollary this work exposed and has **not** fixed. The
+instant-boot snapshot captures RAM and devices; the NAND overlay it was taken
+with is *not* in it. So a resumed machine has a page cache that believes in
+NAND writes the NAND no longer has. It demonstrably works today — the home
+screen resumes and apps launch — presumably because the relevant state is still
+cached in RAM, but it is an inconsistency that could bite on a longer session.
+
+**`build-snapshot.py` should capture the overlay alongside the state file, and
+the page should stage both.** That needs a way to dump the overlay from the
+NATIVE build, which currently has no equivalent of the wasm export — an env var
+naming a dump path would do it.
+
+#### A self-inflicted bug worth one line
+
+The persistence block keys IndexedDB on `BUILD`, and was inserted *above* the
+`const BUILD` declaration: `Cannot access 'BUILD' before initialization`, which
+killed the whole module at 0.0 s. `node --check` does not catch a TDZ violation
+— only running it does. The page's own error banner is what named it.
+
 ### It deploys as a STATIC tree — no application server
 
 `scripts/wasm/stage-static.py --build 1A543a --out DIR` assembles exactly what a
