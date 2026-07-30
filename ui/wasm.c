@@ -45,7 +45,9 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "system/runstate.h"
+#include "exec/cpu-common.h"
 #include "hw/arm/ipod_touch_nand.h"
+#include "hw/arm/ipod_touch_lcd.h"
 #include <emscripten.h>
 
 /*
@@ -126,68 +128,101 @@ static void wasm_display_seq_end(void)
     qatomic_store_release(&wasm_display_info.seq, wasm_display_info.seq + 1);
 }
 
-static void wasm_gfx_switch(DisplayChangeListener *dcl,
-                            DisplaySurface *surface)
+/*
+ * ZERO-COPY scanout: publish the GUEST framebuffer itself, not a console
+ * surface.
+ *
+ * The first revision registered a DisplayChangeListener and let the console
+ * machinery drive the LCD model's gfx_update. That path costs three things,
+ * and the page needs none of them:
+ *
+ *   - framebuffer_update_memory_section() enables DIRTY_MEMORY_VGA logging on
+ *     the framebuffer pages, which forces every guest STORE to them off the
+ *     TCG fast path -- the single most expensive consequence, invisible in
+ *     any display-side profile because it is paid inside generated code;
+ *   - framebuffer_update_display() syncs and walks the dirty bitmap every
+ *     refresh tick;
+ *   - draw_line32_32() converts BGRX to a surface the page never reads (its
+ *     bytes are identical to the source anyway) -- the page does its own
+ *     swizzle straight out of HEAPU32.
+ *
+ * So: no DCL, no console surface, no dirty tracking. The LCD model exports
+ * the scanout base (it_lcd_scanout_pa); the drain timer below maps it once
+ * per base change and republishes at WASM_SCANOUT_HZ. The page reads the
+ * pixels from shared memory exactly as before -- same struct, same seqlock,
+ * same swizzle -- it cannot tell the difference except by speed.
+ *
+ * Tearing: the page can catch a frame mid-composite. The real panel's DMA
+ * races the CPU identically; nothing downstream cares.
+ *
+ * Behaviour change, deliberate: while the panel is OFF the old path blanked
+ * the surface; this one stops publishing, so the page keeps the last frame.
+ * The auto-lock blank therefore no longer reaches the canvas. If that matters
+ * to the page it can watch guest_ms stalls or a future panel flag; blanking
+ * from here would mean writing 600 KiB into guest-visible memory, which
+ * zero-copy exists to avoid.
+ */
+#define WASM_SCANOUT_HZ 10             /* the real panel's own rescan rate */
+
+static uint32_t wasm_scanout_pa;       /* currently mapped guest PA, 0 = none */
+static void *wasm_scanout_ptr;
+static hwaddr wasm_scanout_len;
+
+static void wasm_publish_scanout(void)
 {
+    static int64_t next_pub_ms;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    uint32_t pa = it_lcd_scanout_pa();
     uint64_t pixels;
 
-    if (surface == NULL) {
+    if (pa == 0) {
+        return;                        /* panel off or not yet programmed */
+    }
+
+    if (pa != wasm_scanout_pa) {
+        if (wasm_scanout_ptr != NULL) {
+            cpu_physical_memory_unmap(wasm_scanout_ptr, wasm_scanout_len,
+                                      false, 0);
+            wasm_scanout_ptr = NULL;
+        }
+        wasm_scanout_len = FB_SIZE;
+        wasm_scanout_ptr = cpu_physical_memory_map(pa, &wasm_scanout_len,
+                                                   false);
+        if (wasm_scanout_ptr == NULL || wasm_scanout_len < FB_SIZE) {
+            /* Not plain RAM, or a partial mapping: refuse loudly once. */
+            if (wasm_scanout_ptr != NULL) {
+                cpu_physical_memory_unmap(wasm_scanout_ptr, wasm_scanout_len,
+                                          false, 0);
+                wasm_scanout_ptr = NULL;
+            }
+            fprintf(stderr, "[WASM] scanout base 0x%08x is not mappable RAM; "
+                    "display frozen until the next base flip\n", pa);
+            wasm_scanout_pa = 0;
+            return;
+        }
+        wasm_scanout_pa = pa;
+        next_pub_ms = 0;               /* a base flip publishes immediately */
+    }
+
+    if (now < next_pub_ms) {
         return;
     }
+    next_pub_ms = now + 1000 / WASM_SCANOUT_HZ;
 
-    pixels = (uint64_t)(uintptr_t)surface_data(surface);
+    pixels = (uint64_t)(uintptr_t)wasm_scanout_ptr;
 
     wasm_display_seq_begin();
-    wasm_display_info.width = surface_width(surface);
-    wasm_display_info.height = surface_height(surface);
-    wasm_display_info.stride = surface_stride(surface);
+    wasm_display_info.width = FB_WIDTH;
+    wasm_display_info.height = FB_HEIGHT;
+    wasm_display_info.stride = FB_WIDTH * FB_BPP;
     wasm_display_info.pixels_lo = (uint32_t)pixels;
     wasm_display_info.pixels_hi = (uint32_t)(pixels >> 32);
-    /* A new surface invalidates everything the page has drawn so far. */
+    /* No dirty tracking by design: every publish is a full frame. */
     wasm_display_info.damage_x = 0;
     wasm_display_info.damage_y = 0;
-    wasm_display_info.damage_w = wasm_display_info.width;
-    wasm_display_info.damage_h = wasm_display_info.height;
+    wasm_display_info.damage_w = FB_WIDTH;
+    wasm_display_info.damage_h = FB_HEIGHT;
     wasm_display_seq_end();
-}
-
-static void wasm_gfx_update(DisplayChangeListener *dcl,
-                            int x, int y, int w, int h)
-{
-    uint32_t x0, y0, x1, y1;
-
-    /* Anything the page has not painted yet has to be unioned in. */
-    if (qatomic_read(&wasm_display_info.ack) != wasm_display_info.seq) {
-        /* Union with damage the page has not consumed yet. */
-        x0 = MIN(wasm_display_info.damage_x, (uint32_t)x);
-        y0 = MIN(wasm_display_info.damage_y, (uint32_t)y);
-        x1 = MAX(wasm_display_info.damage_x + wasm_display_info.damage_w,
-                 (uint32_t)(x + w));
-        y1 = MAX(wasm_display_info.damage_y + wasm_display_info.damage_h,
-                 (uint32_t)(y + h));
-    } else {
-        x0 = x;
-        y0 = y;
-        x1 = x + w;
-        y1 = y + h;
-    }
-
-    wasm_display_seq_begin();
-    wasm_display_info.damage_x = x0;
-    wasm_display_info.damage_y = y0;
-    wasm_display_info.damage_w = x1 - x0;
-    wasm_display_info.damage_h = y1 - y0;
-    wasm_display_seq_end();
-}
-
-static void wasm_refresh(DisplayChangeListener *dcl)
-{
-    /*
-     * Drives the device's own refresh path. The S5L8900 LCD re-scans at 10 Hz
-     * and calls dpy_gfx_update() for the lines it touched, so damage arrives
-     * without this backend polling pixels itself.
-     */
-    graphic_hw_update(dcl->con);
 }
 
 /* ---------------------------------------------------------------- input --- */
@@ -450,6 +485,7 @@ static void wasm_input_drain(void *opaque)
 
     wasm_maybe_resume();
     wasm_maybe_save_overlay();
+    wasm_publish_scanout();
 
     while (tail != head) {
         wasm_input_dispatch(&wasm_input_ring[tail & WASM_INPUT_RING_MASK]);
@@ -472,27 +508,20 @@ static void wasm_input_drain(void *opaque)
 
 /* --------------------------------------------------------------- wiring --- */
 
-static const DisplayChangeListenerOps wasm_dcl_ops = {
-    .dpy_name       = "wasm",
-    .dpy_gfx_switch = wasm_gfx_switch,
-    .dpy_gfx_update = wasm_gfx_update,
-    .dpy_refresh    = wasm_refresh,
-};
-
-static DisplayChangeListener wasm_dcl = {
-    .ops = &wasm_dcl_ops,
-};
-
 static void wasm_display_init(DisplayState *ds, DisplayOptions *opts)
 {
-    QemuConsole *con = qemu_console_lookup_by_index(0);
-
-    if (con == NULL) {
+    /*
+     * Deliberately NO DisplayChangeListener. Registering one starts the
+     * console's GUI refresh timer, whose graphic_hw_update() drives the LCD
+     * model's surface path and enables DIRTY_MEMORY_VGA logging on the
+     * framebuffer -- the costs itemised above wasm_publish_scanout(). The
+     * scanout is published from the drain timer instead, and input never
+     * needed the console in the first place.
+     */
+    if (qemu_console_lookup_by_index(0) == NULL) {
         error_report("wasm display: the machine has no graphic console");
         exit(1);
     }
-    wasm_dcl.con = con;
-    register_displaychangelistener(&wasm_dcl);
 
     wasm_input_timer = timer_new_ms(QEMU_CLOCK_REALTIME, wasm_input_drain,
                                     NULL);

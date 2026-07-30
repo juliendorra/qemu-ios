@@ -328,6 +328,31 @@ static uint32_t lcd_scanout_base(IPodTouchLCDState *lcd)
                                     : lcd->w2_framebuffer_base;
 }
 
+/*
+ * Zero-copy scanout for the WebAssembly display (ui/wasm.c).
+ *
+ * The wasm page reads guest RAM straight out of the shared heap and does its
+ * own colour conversion, so going through the QEMU console surface would cost
+ * three things for nothing: the per-refresh dirty-bitmap sync, a 320x480
+ * conversion into a surface nobody reads, and -- the expensive one --
+ * DIRTY_MEMORY_VGA logging on the framebuffer pages, which pushes every guest
+ * STORE to them through the slow path. This accessor is the whole interface
+ * instead: the current scanout base, or 0 while the panel is off.
+ *
+ * Compiled unconditionally (it is trivially small); only ui/wasm.c calls it.
+ */
+static IPodTouchLCDState *it_lcd_instance;
+
+uint32_t it_lcd_scanout_pa(void)
+{
+    IPodTouchLCDState *s = it_lcd_instance;
+
+    if (s == NULL || s->panel_off) {
+        return 0;
+    }
+    return lcd_scanout_base(s);
+}
+
 static void lcd_refresh(void *opaque)
 {
     //fprintf(stderr, "%s: refreshing LCD screen\n", __func__);
@@ -594,6 +619,7 @@ static void s5l8900_lcd_realize(DeviceState *dev, Error **errp)
     IPodTouchLCDState *s = IPOD_TOUCH_LCD(dev);
     s->con = graphic_console_init(dev, 0, &s5l8900_gfx_ops, s);
     qemu_console_resize(s->con, FB_WIDTH, FB_HEIGHT);
+    it_lcd_instance = s;
 
     s->input_ready = false;
     s->input_ready_frames = 0;

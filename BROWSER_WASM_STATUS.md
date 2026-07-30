@@ -15,6 +15,87 @@ comes after.
 
 ---
 
+## Session — 2026-07-31: the speed campaign — measurements first, then the display
+
+**The goal moved from "boots" to "real-time".** Target restated as a number:
+at `-icount shift=1` one virtual second = 5×10⁸ guest instructions, so
+real-time means `guestRatio` ≈ 1.0 under load. Native already delivers it;
+the whole gap is in the wasm execution stack.
+
+### Fixed on the way in: the second-visit black screen (a preRun race)
+
+`?resume=1` worked on a COLD load and failed on every WARM one, with
+`-incoming file:/fw/state: Could not open '/fw/state'` and exit status 1.
+Cause: **Emscripten does not await an async `preRun`** — `run()` proceeds at
+the first `await`, so all staging raced `main()`, and the race was decided by
+wasm compile time. Cold compile = slow start = staging wins; warm cache =
+0.7 s start = staging loses. Every deployment would have shown a black panel
+on the second visit.
+
+Fix in `web/public/jit-boot/index.html`: `addRunDependency('stage-assets')`
+before the first `await`, released after staging; the failure path reports and
+keeps the gate closed rather than releasing over a half-staged FS. Verified:
+two consecutive warm reloads, home screen at 0.7 s and 1.7 s.
+
+### Measured: the steady-state split (before any optimization)
+
+Post-resume, interactive load (tapping Settings on 1A543a, visible pane):
+
+- **busy `guestRatio` = 0.053–0.063** — ~6% of real time, the same regime as
+  boot. The snapshot fixes time-to-usable, NOT speed-when-used.
+- **The JIT cold tail never ends**: one app launch compiled ~2,000 new TBs
+  (6.3k→8.4k), every batch a synchronous `WebAssembly.Module` + instantiate
+  charged to the guest's wall clock. Launching an app IS new code; a "warm
+  steady state" does not exist.
+- Arithmetic: real-time needs ~16×. Display-off was the known ~2× (kernel
+  118 s vs 276 s); the remaining ~8× is the execution engine.
+
+### Upstream check: nothing to pull
+
+`ktock/qemu-wasm` `wasm64-tcg-b` tip is still the 2026-01 emsdk bump; the
+graft is AHEAD of upstream (tuning, counters, adaptive threshold). Engine
+speedups will not arrive from upstream.
+
+### The display path went zero-copy (ui/wasm.c + it_lcd_scanout_pa)
+
+The DCL/console-surface path cost three things the page never needed:
+`DIRTY_MEMORY_VGA` logging on the framebuffer (every guest STORE to those
+pages leaves the TCG fast path — paid inside generated code, invisible to a
+display profile), the per-refresh dirty-bitmap walk, and a BGRX→surface
+conversion whose output bytes equal its input (`draw_line32_32` is a memcpy in
+disguise) feeding a surface the page ignores — it swizzles straight out of
+`HEAPU32`.
+
+Now: **no DisplayChangeListener at all.** The LCD model exports the scanout
+base (`it_lcd_scanout_pa()`, 0 while the panel is off); the 15 ms drain timer
+maps it once per base flip (`cpu_physical_memory_map`) and republishes the
+same `WasmDisplayInfo` struct at 10 Hz — the panel's real rescan rate. The
+page is unchanged and cannot tell the difference except by speed.
+
+Deliberate behaviour change: panel-off no longer blanks the canvas (the old
+path memset the surface); the page keeps the last frame. Also gone with the
+DCL: `IT_FB_TRACE`'s "present" line (the vsync line remains — it is on the
+LCD's own timer).
+
+Verified so far: resume + interactive launch work on the new engine; the old
+1A543a snapshot still loads (no vmstate was touched). Cold boot, zero-copy
+`-display wasm`: **first pixels 3.1 s, kernel 138 s, BSD 152 s, home screen
+232.6 s** — kernel is now AT the old display-none floor (118–138 s window),
+where the old display-wasm figure was 276 s. The same-engine `?display=none`
+control arm (page A/B switch added for exactly this) is the pending number.
+
+Interactive busy-ratio did NOT move (0.053–0.055 after, 0.057–0.063 before):
+an app launch is compile-dominated, not paint-dominated — consistent with the
+JIT being the remaining ~8×.
+
+**New tools:** `?display=none` page switch (measurement only — resume and
+touch need the drain timer, which `-display none` never starts);
+`scripts/wasm/profile-run.mjs` — dependency-free CDP profiler that attaches
+to every worker, samples a chosen stretch, and buckets self-time (generated
+TB wasm / engine wasm / JS / GC), one `.cpuprofile` per worker for DevTools.
+
+---
+
 ## Session — 2026-07-30 (late): iPhone OS 1.1.4 reaches the home screen IN THE VIEWER
 
 **`web/public/jit-boot/?build=4A102` now boots iPhone OS 1.1.4 to the SpringBoard

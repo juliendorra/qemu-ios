@@ -1033,7 +1033,13 @@ actually computes the tap -- above your click by the measured shift. With
             `nand=/fw/nand,epoch=${EPOCH}`,
       '-m', '1G',
       '-pflash', '/fw/nor.bin',
-      '-display', 'wasm',
+      // ?display=none is the A/B control for the display path: serial
+      // landmarks (iBoot/kernel/BSD/launchd) still work, the panel ones do
+      // not. NOTE -display none also never starts the wasm input/drain timer,
+      // so ?resume=1 and touch DO NOT work with it -- measurement only.
+      '-display',
+      new URLSearchParams(location.search).get('display') === 'none'
+        ? 'none' : 'wasm',
       // NOT -serial stdio. In a browser the guest's stdout never reaches
       // Module.print (it does under Node), so a run looks silent even while it
       // is booting normally -- device-model stderr still arrives, which makes
@@ -1107,6 +1113,15 @@ actually computes the tap -- above your click by the measured shift. With
       if (tapSpec) runSingleTap(tapSpec);
     },
     preRun: [async (mod) => {
+      // An ASYNC preRun is NOT awaited by Emscripten: `run()` proceeds at the
+      // first await, so every fetch below races `main()`. That race is won or
+      // lost by how long wasm compilation takes -- a COLD load compiles slowly
+      // and staging wins; a warm one starts in ~0.7 s and staging loses, and
+      // `-incoming file:/fw/state` then dies with "No such file or directory"
+      // and status 1, leaving a permanently black panel on the SECOND visit.
+      // A run dependency is the documented way to hold `main()` back.
+      mod.addRunDependency('stage-assets');
+      try {
       // preRun runs on the MAIN thread, so this is the Module whose exports
       // and HEAP views address the shared memory from here.
       moduleRef = mod;
@@ -1209,6 +1224,14 @@ actually computes the tap -- above your click by the measured shift. With
       });
       state(`booting — ${(staged / 1048576).toFixed(1)} MiB of images + `
             + `${manifest.prefetch.length} chunks prefetched`);
+      } catch (e) {
+        // Report it rather than releasing the gate on a half-staged FS, which
+        // would reproduce exactly the black panel this dependency prevents.
+        line(`staging failed: ${e.message}`, 'err');
+        state('staging failed', 'err');
+        throw e;
+      }
+      mod.removeRunDependency('stage-assets');
     }],
     print: (t) => { note(t); line(t); },
     printErr: (t) => {

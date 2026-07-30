@@ -70,4 +70,8 @@ typedef struct IPodTouchLCDState
 
 bool ipod_touch_lcd_framebuffer_is_dark(IPodTouchLCDState *lcd);
 
+/* Zero-copy scanout for ui/wasm.c: the guest PA being scanned out, or 0 while
+ * the panel is off (or no LCD exists). See the comment at the definition. */
+uint32_t it_lcd_scanout_pa(void);
+
 #endif
