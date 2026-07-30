@@ -1232,6 +1232,19 @@ which board it is, and two different chips legitimately report two different
 family ids. It is **not** firmware-awareness, which stays forbidden: neither
 value depends on which OS boots.
 
+**Verified on the shipped default**, no environment variable set (`family id
+OVERRIDDEN` appears zero times in the log), 1.0 cold boot, 109 taps:
+
+```
+digit  centre(drawn)    dL    dR    dT    dB  shift x  shift y  slop x  slop y
+    7   41.0, 223.5   -     7.0   1.0  22.0      -       11.5     -      10.5
+    1   41.0, 366.0   -     7.0   2.0  23.0      -       12.5     -      10.5
+```
+
+Identical to the `IT_MT_FAMILY_ID=0x50` run on every edge, which confirms the
+plumbing as well as the constant — the Z1 report path really does carry
+`MT_FAMILY_ID_Z1`, and the Z2 path is untouched.
+
 #### What was and was NOT fixed in the emulator this session
 
 Worth stating plainly, because the diagnosis is strong enough to be mistaken for
