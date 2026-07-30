@@ -7,6 +7,7 @@
  */
 
 #include "hw/arm/ipod_touch_spi.h"
+#include "migration/vmstate.h"
 #include "hw/core/hw-error.h"
 
 static int apple_spi_word_size(S5L8900SPIState *s)
@@ -359,11 +360,34 @@ static void s5l8900_spi_realize(DeviceState *dev, struct Error **errp)
     }
 }
 
+/*
+ * Migration. The SPI controller is how the guest reads the touch controller, so
+ * its register file and FIFOs have to come back: a restored machine whose SPI
+ * block is at reset makes the driver re-enumerate the device it was already
+ * talking to -- observed as a burst of Z1 get-report/report-info after a
+ * restore, with touch frames queued by the model and never collected.
+ */
+static const VMStateDescription vmstate_s5l8900_spi = {
+    .name = "s5l8900-spi",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(last_irq, S5L8900SPIState),
+        VMSTATE_FIFO8(rx_fifo, S5L8900SPIState),
+        VMSTATE_FIFO8(tx_fifo, S5L8900SPIState),
+        VMSTATE_UINT32_ARRAY(regs, S5L8900SPIState, MMIO_SIZE >> 2),
+        VMSTATE_UINT32(mmio_size, S5L8900SPIState),
+        VMSTATE_UINT8(base, S5L8900SPIState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void s5l8900_spi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = s5l8900_spi_realize;
     device_class_set_legacy_reset(dc, s5l8900_spi_reset);
+    DEVICE_CLASS(klass)->vmsd = &vmstate_s5l8900_spi;
 }
 
 static const TypeInfo s5l8900_spi_info = {

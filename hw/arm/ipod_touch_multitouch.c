@@ -1,4 +1,6 @@
 #include "hw/arm/ipod_touch_multitouch.h"
+#include "migration/vmstate.h"
+#include "hw/ssi/ssi.h"
 #include "hw/core/hw-error.h"
 #include "qemu/log.h"
 
@@ -1244,6 +1246,80 @@ static void ipod_touch_multitouch_reset(DeviceState *dev)
     }
 }
 
+/*
+ * Migration.
+ *
+ * Found by measurement, like the others. A snapshot taken with the panel ASLEEP
+ * restored touch-responsive; one taken with a LIVE home screen restored with
+ * dead touch. The difference is not the panel -- it is that waking a sleeping
+ * device re-uploads the controller firmware ("Retained touch input ready after
+ * Z2 reload"), which rebuilt this device's state by accident. A live snapshot
+ * never does that, so the controller came back at RESET: firmware_loaded false,
+ * and the driver's frame reads answered by a device that believes it has no
+ * firmware.
+ *
+ * So the FIRMWARE and PROTOCOL state migrates, and the transient state does not:
+ *
+ *   out_buffer / in_buffer      malloc'd SPI transaction scratch
+ *   next_frame / deferred_frame malloc'd queued touch frames
+ *
+ * Those are pointers, and a snapshot caught mid-transaction would restore
+ * dangling ones. post_load resets them to a clean IDLE state instead. The cost
+ * is at most one touch frame in flight at the instant of the snapshot; the
+ * alternative is a device whose buffer pointers do not match its indices.
+ *
+ * The touch coordinates are floats and are not migrated either: they only mean
+ * anything while a finger is down, and post_load lifts the finger.
+ */
+static int ipod_touch_multitouch_post_load(void *opaque, int version_id)
+{
+    IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
+
+    /* A clean idle protocol state: no half-finished SPI transaction, no queued
+     * frame, and no finger down. */
+    g_free(s->out_buffer);
+    g_free(s->in_buffer);
+    s->out_buffer = NULL;
+    s->in_buffer = NULL;
+    s->cur_cmd = 0;
+    s->buf_size = 0;
+    s->buf_ind = 0;
+    s->in_buffer_ind = 0;
+    s->frame_data_pending = false;
+    g_free(s->next_frame);
+    g_free(s->deferred_frame);
+    s->next_frame = NULL;
+    s->deferred_frame = NULL;
+    s->touch_down = false;
+    return 0;
+}
+
+static const VMStateDescription vmstate_ipod_touch_multitouch = {
+    .name = "ipod-touch-multitouch",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = ipod_touch_multitouch_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_SSI_PERIPHERAL(ssidev, IPodTouchMultitouchState),
+        VMSTATE_BOOL(firmware_transfer_seen, IPodTouchMultitouchState),
+        VMSTATE_BOOL(firmware_loaded, IPodTouchMultitouchState),
+        VMSTATE_UINT8_ARRAY(hbpp_atn_ack_response, IPodTouchMultitouchState, 2),
+        VMSTATE_UINT32(frame_counter, IPodTouchMultitouchState),
+        VMSTATE_UINT64(last_frame_timestamp, IPodTouchMultitouchState),
+        VMSTATE_BOOL(suppress_power_release, IPodTouchMultitouchState),
+        VMSTATE_BOOL(suppress_home_release, IPodTouchMultitouchState),
+        /* Zephyr1 upload/verify progress. zephyr1 itself is set from the board
+         * at machine init and must NOT come from the stream. */
+        VMSTATE_UINT32(z1_upload_cksum, IPodTouchMultitouchState),
+        VMSTATE_BOOL(z1_raw_upload, IPodTouchMultitouchState),
+        VMSTATE_BOOL(z1_frame_len_sent, IPodTouchMultitouchState),
+        VMSTATE_UINT32(z1_raw_sum, IPodTouchMultitouchState),
+        VMSTATE_UINT8(z1_verify_matched, IPodTouchMultitouchState),
+        VMSTATE_UINT8_ARRAY(z1_verify_resp, IPodTouchMultitouchState, 4),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void ipod_touch_multitouch_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1251,6 +1327,7 @@ static void ipod_touch_multitouch_class_init(ObjectClass *klass, const void *dat
     device_class_set_legacy_reset(dc, ipod_touch_multitouch_reset);
     k->realize = ipod_touch_multitouch_realize;
     k->transfer = ipod_touch_multitouch_transfer;
+    dc->vmsd = &vmstate_ipod_touch_multitouch;
 }
 
 static const TypeInfo ipod_touch_multitouch_type_info = {

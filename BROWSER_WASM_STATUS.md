@@ -126,6 +126,48 @@ Re-measure with `scripts/wasm/bench-run.py` (Session B's, commit `67782c9d12`),
 which launches Chrome with the three throttles disabled. Do not quote 1206 s as
 a browser boot time.
 
+### Snapshot state: five devices migrated, panel and machine restore, touch does not
+
+Where the device-by-device loop stands. Each was found by measuring, not by
+working down a list:
+
+| device | why it had to migrate | how it was found |
+| --- | --- | --- |
+| LCD | scanout base zero → black panel | 45.4% → 0.003% across a restore |
+| pl192 (VIC) | a reset VIC has `intenable == 0` | defensive; not A/B'd alone |
+| PMU | its pre-warm park calls `vm_stop(RUN_STATE_SUSPENDED)` | restored machine went to RunState 12 |
+| multitouch | `firmware_loaded` false → controller looks unprogrammed | sleeping snapshots restored interactive, live ones did not |
+| sysic + SPI | the ATN path and the bus the controller is read over | restore triggered a burst of Z1 `get-report`/`report-info` |
+
+**Restoring now gives a live panel and a running machine**: `before` 45.4% →
+`after` 45.4%, guest executing. And sysic+SPI demonstrably fixed the
+re-enumeration — Z1 init commands after a tap went from many to **0**.
+
+**What still fails: the guest never collects the touch frame.**
+
+```
+ATN edges after tap:      1      the model queued a frame and raised the edge
+frames consumed:          0      the guest never read it
+Z1 re-enumeration cmds:   0      fixed by sysic + SPI
+```
+
+#### This is probably NOT a snapshot bug
+
+The same signature — **1 ATN edge, 0 frames consumed** — appears in
+`scripts/touch-probe.py` runs on a NORMAL boot with no migration anywhere near
+them (see the OPEN section in
+[`TOUCH_INVESTIGATION.md`](TOUCH_INVESTIGATION.md)). Both drive input through
+QMP `input-send-event`; the paths that DO work — the browser page, and
+`fb-snapshot`-style runs — go through `qemu_input_queue_abs` + `queue_btn` +
+sync from inside the emulator.
+
+So the next move is not another device. It is to find out why a QMP-injected
+touch is queued and announced but never collected, on a plain boot, before
+attributing anything to the snapshot. If that is a harness artifact, the
+restored machine may already be interactive under the browser's own input path —
+which is the one that actually matters here, and which has never been tried
+against a restored snapshot.
+
 ### Why the resumed machine stopped: the PMU was suspending the whole VM
 
 Chasing this needed one change and then answered itself. `wasm_run_state()`

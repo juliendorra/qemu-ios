@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_sysic.h"
+#include "migration/vmstate.h"
 #include "hw/arm/ipod_touch_pcf50633_pmu.h"
 
 static void gpio_irq_auto_lower(void *opaque)
@@ -162,9 +163,44 @@ static void ipod_touch_sysic_init(Object *obj)
     }
 }
 
+/*
+ * Migration. SYSIC owns the GPIO interrupt block, which is the path the
+ * multitouch ATN edge takes to reach the guest: the controller sets a bit in
+ * gpio_int_status and pulses gpio_irqs[group].
+ *
+ * Restored at RESET, the enable/type masks are gone, so a frame the model
+ * queues raises an edge the guest has no reason to look at -- the tap is
+ * delivered, logged, and then simply never collected.
+ *
+ * The auto-lower timers are NOT migrated: they exist to drop an edge-triggered
+ * pulse shortly after it is raised, so the worst a fresh one does is leave a
+ * line high that the next pulse re-lowers. Their INFO struct is migrated,
+ * because it says which group a pending lower belongs to.
+ */
+static const VMStateDescription vmstate_ipod_touch_sysic = {
+    .name = "ipod-touch-sysic",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(power_state, IPodTouchSYSICState),
+        VMSTATE_UINT32(power_epoch, IPodTouchSYSICState),
+        VMSTATE_UINT32_ARRAY(gpio_int_level, IPodTouchSYSICState,
+                             GPIO_NUMINTGROUPS),
+        VMSTATE_UINT32_ARRAY(gpio_int_status, IPodTouchSYSICState,
+                             GPIO_NUMINTGROUPS),
+        VMSTATE_UINT32_ARRAY(gpio_int_enabled, IPodTouchSYSICState,
+                             GPIO_NUMINTGROUPS),
+        VMSTATE_UINT32_ARRAY(gpio_int_type, IPodTouchSYSICState,
+                             GPIO_NUMINTGROUPS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void ipod_touch_sysic_class_init(ObjectClass *klass, const void *data)
 {
-    
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->vmsd = &vmstate_ipod_touch_sysic;
 }
 
 static const TypeInfo ipod_touch_sysic_type_info = {
