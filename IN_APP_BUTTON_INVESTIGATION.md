@@ -1292,3 +1292,50 @@ the app-exit notification) never happens. The crash report the watchdog kill
 produces names the exact thread and PC where the app sat -- capture run in
 progress with `S5L8900_STAGE_NAND=0` and a preserved NAND, to be read back with
 `extract-hfs-from-nand.py --partition data`.
+
+
+## THE APP'S DEATH, FROM ITS OWN CRASH LOG (2026-07-30, late)
+
+Run with `S5L8900_STAGE_NAND=0` and a preserved NAND clone; the guest's own
+crash report recovered from the raw guest-written pages (`bank*/26528_new.page`
+-- `extract-hfs-from-nand.py --partition data` cannot follow the FTL remap of a
+dirtied NAND, but the report is plain text in the pages). Preferences [31],
+parent SpringBoard [15]:
+
+```
+Exception Codes: 0x8badf00d            <- the 1.x watchdog ("ate bad food")
+Thread 0:
+0  libSystem   0x300053f4              mach_msg_trap
+1  libSystem   0x30005373              mach_msg
+2  LayerKit    0x30afd2bc  __LKSRenderClient+0xb4
+3  LayerKit    0x30b0de50  _LKPurpleServerRenderContext+0x7c
+4+ UIKit 0x323c1644, 0x323c172c, ...   the suspend path
+```
+
+**The app dies waiting on a synchronous Mach RPC to SpringBoard's purple render
+server.** During its HOME-press suspend path, UIKit asks LayerKit for the
+purple server render context; the MIG call never gets a reply; 10 s later the
+watchdog kills the app. The app never touches the framebuffer, MBX, or any
+IOKit service on this path -- every hardware-facing theory about the APP side is
+dead. The app's death is DOWNSTREAM of SpringBoard.
+
+So one wedged SpringBoard thread explains the entire symptom set:
+
+* it stops calling `_LKDisplayFinishUpdate` (the render loop and the purple
+  server run there),
+* it never re-attaches the home-screen layers (so `[ctx+0x24]` stays 0),
+* it never replies to the app's render-context RPC (so the app is
+  watchdog-killed, crashdump runs, SpringBoard receives type2001 sub=pid),
+* and GSEvent delivery in SpringBoard's MAIN thread keeps working (menu
+  DOWN/UP for press 2, the type2001 -- all measured arriving).
+
+The candidate wedge, and it is exactly T1's shape: at dismissal the render
+thread enters kernel `SwapWait` (selector 6; `SwapWait+0x58`'s IOConnect DID
+reach the kernel in the press window per the earlier histogram, and never
+appears at baseline) and sleeps forever on a swap completion our MBX/CLCD model
+never signals. Kernel side, all of SwapBegin/End/Wait funnel into ONE virtual
+call on the legacy swap device object at `[fb+0x58]`, vtable+0xec
+(`IOMobileGraphicsFamily` 0xc02fd90c / 0xc02fd990 / ...; "AppleMBX: Using %s as
+legacy swap device" -- on 1.0 that is AppleH1CLCD, there being no TVOut).
+Verification in flight: SwapWait entry vs its return-from-kernel instruction
+(0x31bf9818) breakpoint pairing in SpringBoard across the press.

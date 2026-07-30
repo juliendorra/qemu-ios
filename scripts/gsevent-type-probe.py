@@ -228,6 +228,12 @@ def main() -> int:
                     help="break on LIB:SYMBOL, e.g. LayerKit:_LKBackingStoreSwap. "
                          "Repeatable. Library addresses are unambiguous across "
                          "processes, unlike an executable's IMPs.")
+    ap.add_argument("--break-addr", action="append", default=[],
+                    help="break on a raw address, as NAME=0xADDR. For return "
+                         "sites and mid-function points that have no symbol -- "
+                         "e.g. SwapWait's return-from-kernel instruction, so an "
+                         "entry with no matching return names a thread wedged "
+                         "in the kernel.")
     ap.add_argument("--deref", action="append", default=[],
                     help="on hits at a --break-sym breakpoint, also read guest "
                          "memory: 'SYMSUFFIX=r0+8,r0+0xa0'. The suffix is "
@@ -339,6 +345,11 @@ def main() -> int:
             print(f"  !! {sym} not in {lib}")
     if mnt_saved:
         groot.detach(Path(mnt_saved), mnt_mine)
+
+    for spec in args.break_addr:
+        name, _, addr = spec.partition("=")
+        bps[int(addr, 0) & ~1] = name
+        print(f"  watching {name} at {addr}")
 
     # --deref parsing: breakpoint-name suffix -> [(reg#, offset, label)]
     derefs = []
