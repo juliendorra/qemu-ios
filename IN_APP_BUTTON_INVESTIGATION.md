@@ -1857,3 +1857,19 @@ raise the event. The engine addresses (`0x608 = 0x8000`, `0x60c = 0x1b000`) are
 MBX-space, so that translation is the missing piece -- and the register-sparing
 store now under test is what would capture the driver's own page table
 (`0x61c = 0x00020007`) to supply it.
+
+### The register-sparing store is NEUTRAL -- and it confirms the 0x85C diagnosis
+
+Result of the test promised above: with the backing store covering only
+`>= MBX_REG_LIMIT` (0x2000) so the register page keeps answering as registers,
+`IT_MBX_RAM=1` no longer wedges. Press at t=41.74, dismissal at t=75.47 --
+**+33.73 s, the baseline to within 0.03 s**, and the run continues normally
+afterwards (app reopens, second press behaves).
+
+So the whole-window wedge was the register page, as suspected, and almost
+certainly `0x85C`'s read-modify-write; the memory window was never the
+problem. That makes the store safe to switch on as an INSTRUMENT: it now
+captures what the driver writes into MBX-space, including the page table at
+`0x61c = 0x00020007`, which is the translation the memory-side fix needs.
+Still off by default -- it changes nothing on its own (neutral is exactly
+what "the guest never reads this memory" predicts).
