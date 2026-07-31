@@ -95,6 +95,16 @@ actually computes the tap -- above your click by the measured shift. With
 'correct finger offset' ticked the blue dot lands on the click itself.">
     <input type="checkbox" id="tapdotbox"> show OS tap point
   </label>
+  <label class="viz" title="The emulator offers every frame (~66 Hz) and the
+page accepts on requestAnimationFrame -- the browser's vsync, usually 60 Hz,
+which is also the real panel's rate. Each accepted frame costs a full
+153k-pixel blit (there is no damage tracking), sub-ms on a desktop; tick this
+to cap acceptance at 30 Hz on a constrained host. The fps readout below is
+MEASURED accepted frames, so a silent regression of this path shows up in
+plain view. An occluded tab reads ~0 fps by design: rAF is suspended, the
+guest keeps running.">
+    <input type="checkbox" id="hz30box"> cap refresh at 30 Hz (save CPU)
+  </label>
   <div id="fbstat">panel: no frames yet</div>
 </div>
 <div>
@@ -432,9 +442,24 @@ actually computes the tap -- above your click by the measured shift. With
     }
   }
 
+  // Accept rate. The emulator OFFERS every frame (~66 Hz, one seq bump per
+  // 15 ms drain tick); the page accepts on rAF -- the browser's vsync,
+  // usually 60 Hz, which is the real panel's rate too. The 30 Hz cap is the
+  // OPT-IN for constrained hosts, not the default: capping saved only a
+  // sub-ms blit per frame, and the panel shipped at 10 Hz once precisely
+  // because a low rate was invisible while the guest was slow. The measured
+  // fps sits in the stats line so this path can never silently regress.
+  const hz30box = document.getElementById('hz30box');
+  let lastAcceptMs = 0;
+  let fpsCount = 0, fpsWindowStart = 0, fpsShown = 0;
+
   function paint() {
     if (!displayBroken) requestAnimationFrame(paint);
     if (!moduleRef || !runtimeReady || displayBroken) return;
+
+    // -8: don't let a 33.4 ms rAF beat miss a 33.3 ms cap forever.
+    if (hz30box.checked &&
+        performance.now() - lastAcceptMs < 1000 / 30 - 8) return;
 
     if (infoBase < 0) {
       const fn = moduleProp('_wasm_display_info_addr');
@@ -476,10 +501,24 @@ actually computes the tap -- above your click by the measured shift. With
 
     frames++;
     if (frames === 1) mark('first pixels');
+
+    // Measured ACCEPTED frames over a rolling ~1 s window. This is the
+    // number the refresh cap promises; showing it is what keeps the promise.
+    const nowMs = performance.now();
+    lastAcceptMs = nowMs;
+    fpsCount++;
+    if (nowMs - fpsWindowStart >= 1000) {
+      fpsShown = fpsCount * 1000 / (nowMs - fpsWindowStart);
+      fpsCount = 0;
+      fpsWindowStart = nowMs;
+    }
+
     const pct = (100 * nonBlack / (info.width * info.height)).toFixed(1);
     nonBlackPct = Number(pct);
     fbstatEl.textContent =
-      `panel: ${info.width}x${info.height} · ${frames} frames · ${pct}% non-black`;
+      `panel: ${info.width}x${info.height} · ${frames} frames · ${pct}% `
+      + `non-black · ${fpsShown.toFixed(1)} fps `
+      + `(${hz30box.checked ? 'cap 30 Hz' : 'vsync'})`;
     // The native oracle renders 59.0% non-black at 1.0's home screen.
     if (nonBlackPct > 40) mark('home screen (>40% non-black)');
   }

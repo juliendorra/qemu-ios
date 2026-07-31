@@ -163,17 +163,17 @@ static void wasm_display_seq_end(void)
  * zero-copy exists to avoid.
  */
 /*
- * How often a new frame is OFFERED to the page (a seq bump; no pixels move).
- * The guest's panel vsyncs at 60 Hz of ITS time; what reaches the canvas is
- * capped by this in WALL time. 10 Hz was the first, conservative value and
- * was invisible only because a busy guest at ~6% of real time produces ~4
- * frames a second anyway -- as the engine speeds up it would have become the
- * animation ceiling. Publishing is nearly free by design; the page pays one
- * 153k-pixel swizzle per accepted frame (sub-ms), so 30 Hz is comfortable.
- * Every publish forces a full page-side blit (there is no damage tracking
- * any more), which is the only reason this is not simply 60.
+ * A new frame is OFFERED to the page (a seq bump; no pixels move) on EVERY
+ * drain tick, ~66 Hz. The real panel is 60 Hz and the page accepts on
+ * requestAnimationFrame -- the browser's own vsync -- so the canvas sees at
+ * most the display's rate whatever is offered here. Do NOT rate-limit here
+ * "to 60": the 15 ms tick grid aliases a 16.7 ms limit down to ~33 Hz.
+ *
+ * History: 10 Hz first (invisible only because a busy guest at ~6% of real
+ * time makes ~4 frames a wall second), then 30. Publishing is free by
+ * design; the page pays one sub-ms 153k-pixel swizzle per ACCEPTED frame,
+ * and that is the entire cost of offering at full rate.
  */
-#define WASM_SCANOUT_HZ 30
 
 static uint32_t wasm_scanout_pa;       /* currently mapped guest PA, 0 = none */
 static void *wasm_scanout_ptr;
@@ -181,8 +181,6 @@ static hwaddr wasm_scanout_len;
 
 static void wasm_publish_scanout(void)
 {
-    static int64_t next_pub_ms;
-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     uint32_t pa = it_lcd_scanout_pa();
     uint64_t pixels;
 
@@ -212,13 +210,7 @@ static void wasm_publish_scanout(void)
             return;
         }
         wasm_scanout_pa = pa;
-        next_pub_ms = 0;               /* a base flip publishes immediately */
     }
-
-    if (now < next_pub_ms) {
-        return;
-    }
-    next_pub_ms = now + 1000 / WASM_SCANOUT_HZ;
 
     pixels = (uint64_t)(uintptr_t)wasm_scanout_ptr;
 
