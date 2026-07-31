@@ -88,14 +88,24 @@ static void it_tvout_trace(IPodTouchTVOutState *s, const char *dir,
  * the line is LOWERED and nothing is raised that tick -- an ISR that never
  * acks sees at most ~30 Hz of self-clearing pulses, never a held level.
  */
-static bool it_tvout_sdo_enabled(void)
+bool ipod_touch_tvout_sdo_modelled(void)
 {
     static int cached = -1;
     if (cached < 0) {
+        /* Default ON since 2026-07-31: verified on 4A102 (boot to home,
+         * lock/unlock battery), N45AP (3/3 cycles) and 1A543a (inert -- no
+         * TVOut driver in the 1.0 line). IT_TVOUT_SDO=0 restores the old
+         * stub AND re-enables the derived zero-window (ipod_touch.c gates
+         * the window on this), which is the A/B for this model. */
         const char *e = getenv("IT_TVOUT_SDO");
-        cached = e && e[0] && e[0] != '0';
+        cached = !(e && e[0] == '0');
     }
     return cached;
+}
+
+static bool it_tvout_sdo_enabled(void)
+{
+    return ipod_touch_tvout_sdo_modelled();
 }
 
 #define TVOUT_SDO_FIELD_INTERVAL_NS (16680000)  /* ~59.94 Hz fields */

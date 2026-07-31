@@ -9,6 +9,11 @@
 
 #define SDO_IRQ 0x280
 
+/* Is the SDO field-interrupt model active? (IT_TVOUT_SDO, default on.)
+ * The swap-device zero-window in ipod_touch.c is only placed when this is
+ * OFF -- they are alternative answers to the same missing completion. */
+bool ipod_touch_tvout_sdo_modelled(void);
+
 #define TYPE_IPOD_TOUCH_TVOUT                "ipodtouch.tvout"
 OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchTVOutState, IPOD_TOUCH_TVOUT)
 

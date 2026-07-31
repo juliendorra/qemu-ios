@@ -19,8 +19,27 @@
 > SoC SDO line is now wired to instance 3 (it was inertly on instance 2).
 > The first (v1) run had the latch on the wrong instance so acks never
 > landed — the storm guard self-throttled it and the boot STILL completed
-> the swap and reached home; v2 implements the decoded contract. Verification
-> matrix (both boards, four builds, touch/lock probes) in progress below.
+> the swap and reached home; v2 implements the decoded contract.
+>
+> **Verification matrix (IT_TVOUT_WA=0 + IT_TVOUT_SDO=1 unless noted):**
+>
+> | config | result |
+> |---|---|
+> | 4A102 boot → home (v1 model) | **PASS**, `[swapdev+0x160]` 0xc2afbd00 → 0 in guest RAM |
+> | 4A102 boot → home (v2 contract) | **PASS**, quiescent: ~5 field ticks total, guest disables SDO after its swap; serial shows `detach(AppleH1TVOut)` → `attach(AppleH1CLCD)` |
+> | N45AP lock-unlock-probe, 3 cycles | **PASS 3/3** (booted home 29.7% nb, touch delivered every cycle, sleep/wake clean) — the board the window was invented for |
+> | 1A543a (1.0) inertness: no TVOut driver, knob on | **PASS** — home 45.8% nb, zero SDO lines |
+> | 4A102 lock-unlock battery under SDO (staged NAND, `--icount 1`) | **PASS 3/3** (touch delivered, sleep/wake clean) |
+> | 4A102 DEFAULT config (no env) after the flip | **PASS** — home, window never mapped, "[TVOUT-WA] swap-device window NOT armed" |
+> | 3A109a / 1C28 home render | **BLOCKED — NAND artifacts not on disk** (only nor.bin+ipsw); regenerate per BUILD.md before verifying these two |
+>
+> **DEFAULTS FLIPPED (2026-07-31, end of session): `IT_TVOUT_SDO` defaults
+> ON, and the zero-window is only armed when the model is off.** One knob
+> A/Bs the whole thing: `IT_TVOUT_SDO=0` restores the stub + derived window
+> exactly as before. The window code stays for that A/B and for the two
+> unverified builds. `lock-unlock-probe` grew `--icount` (the 4A102 boot
+> trap), and note it does NOT stage the NAND — clone before pointing it at
+> a build artifact.
 
 > **§4 GATE MEASURED (2026-07-31, late evening): software compositing is a
 > SINGLE-DIGIT share of guest CPU — MBX modelling is FIDELITY-ONLY work.**

@@ -139,6 +139,21 @@ static bool tvout_wa_enabled(void)
     if (cached < 0) {
         const char *e = getenv("IT_TVOUT_WA");
         cached = !(e && e[0] == '0');
+        /*
+         * The window and the SDO field-interrupt model are alternative
+         * answers to the same missing swap completion, and the window is
+         * actively harmful once the completion is real: it swallows the
+         * driver's own in-flight-request write ([swapdev+0x160]) and
+         * forces its reads to zero. So with the model on (the default
+         * since 2026-07-31), no window is placed; IT_TVOUT_SDO=0 brings
+         * the window back exactly as it was.
+         */
+        if (cached && ipod_touch_tvout_sdo_modelled()) {
+            fprintf(stderr, "[TVOUT-WA] swap-device window NOT armed: the "
+                    "SDO field-interrupt model is on (IT_TVOUT_SDO=0 to "
+                    "restore the window)\n");
+            cached = 0;
+        }
     }
     return cached;
 }
@@ -386,8 +401,10 @@ static void ipod_touch_console_line(const char *line)
         ipod_touch_button_idle_level();
     }
     /* SpringBoard is the consumer that hangs when the window is misplaced, so
-     * its start is the moment to check that the window is real. */
-    if (!tvout_wa_reads && strstr(line, "SpringBoard[")) {
+     * its start is the moment to check that the window is real. Only
+     * meaningful when a window is actually armed (i.e. the SDO model is
+     * off) -- with the model on there is deliberately nothing to read. */
+    if (tvout_wa_enabled() && !tvout_wa_reads && strstr(line, "SpringBoard[")) {
         static bool warned;
         if (!warned) {
             warned = true;
@@ -2049,7 +2066,9 @@ static void ipod_touch_machine_init(MachineState *machine)
         fprintf(stderr, "[TVOUT-WA] armed but NOT mapped; expecting 0x%08x, "
                 "waiting for the guest to announce a TVOut swap device\n",
                 (uint32_t)tvout_wa_addr);
-    } else {
+    } else if (!ipod_touch_tvout_sdo_modelled()) {
+        /* the SDO-modelled case already announced itself in
+         * tvout_wa_enabled(); this branch is a genuine IT_TVOUT_WA=0 */
         fprintf(stderr, "[TVOUT-WA] disabled by IT_TVOUT_WA=0\n");
     }
     ipod_touch_console_tap_install(ipod_touch_console_line);

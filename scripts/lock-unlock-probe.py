@@ -261,6 +261,11 @@ def main() -> int:
                          "logic never executes -- results do not reflect the "
                          "packaged app. Kept only for A/B against old runs.")
     ap.add_argument("--vnc-port", type=int, default=5999)
+    ap.add_argument("--icount", type=int, default=None,
+                    help="pass -icount N. 1.1.4 boots without icount are "
+                         "timing-sensitive and can panic in "
+                         "IOIpodUSBDevice::start (the fb-snapshot trap, "
+                         "BROWSER_WASM_STATUS.md); use --icount 1 for m68ap")
     # A human slide is slower and produces far more motion frames than the
     # original 12-step/0.7 s default; this bug is timing-sensitive, so the
     # gesture must be sweepable.
@@ -304,6 +309,8 @@ def main() -> int:
                "-m", "1G", "-pflash", str(nor), "-L", str(PC_BIOS),
                "-serial", f"file:{serial}",
                "-qmp", f"unix:{qmp_path},server,nowait"]
+        if args.icount is not None:
+            cmd += ["-icount", str(args.icount)]
     if args.no_display_client:
         if not args.app:
             cmd += ["-display", "none"]
