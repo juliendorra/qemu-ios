@@ -223,11 +223,26 @@ c_args + c_link_args, fresh `build-wasm-lj`, viewer at
 final link when this session closed. To finish: wait for the link, boot
 `/public/jit-boot-lj/` for landmarks vs 84/93/152, `--js-flags=--prof` it,
 and check whether `emscripten_longjmp` left the vCPU profile. The
-experiment flags are NOT committed — re-add `-sSUPPORT_LONGJMP=wasm` to
-emscripten.txt's c_args/cpp_args/c_link_args/cpp_link_args and reconfigure
-fresh to reproduce. If the link failed instead: that is the known
-asyncify-vs-wasm-EH collision, and the lever falls back to reducing
-`cpu_loop_exit` FREQUENCY rather than unit cost.
+experiment flags are NOT committed.
+
+**VERDICT (2026-07-31, late): DEAD — asyncify hangs on wasm-EH.** With the
+flag verifiably in every compile and the link (2,139 hits in build.ninja),
+all 1998 objects compile, and then `wasm-opt --asyncify ...
+--enable-exception-handling` wedges after ~1.3 s of CPU, unkillable
+(kill -9 immune, uninterruptible), stuck at a ~28 MB partial in-place
+rewrite. Reproduced twice; the first stall was misread as disk-full. Since
+`-sASYNCIFY=1` is mandatory (coroutines + the TCG backend's `ffi_call_js`),
+`-sSUPPORT_LONGJMP=wasm` is unusable here. The longjmp lever must reduce
+`cpu_loop_exit` FREQUENCY (why does the vCPU exit so often — icount window
+sizing, interrupt cadence) rather than the unit cost of the longjmp.
+Two zombie wasm-opt processes (PIDs 71876, 92267) may linger until reboot.
+
+Two operational traps from the attempt, both now burned into comments:
+plain `ninja` after touching `configs/meson/emscripten.txt` triggers a
+meson regen OUTSIDE the build script's hermetic env (homebrew pkg-config,
+zlib.h failures, all objects dirtied) — always rebuild via
+`scripts/wasm/build-qemu.sh`; and `pkill -f "a\|b"` does not alternate —
+kill toolchain stragglers by PID.
 
 ---
 
