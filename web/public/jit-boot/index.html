@@ -282,7 +282,12 @@ guest keeps running.">
     }
     if (/\[TOUCH\]|\[LCD\] (Touch input|Retained touch)/.test(text)) {
       console.log(`[guest] ${text.trim()}`);
-      if (/Touch input ready|Retained touch input ready/.test(text)) {
+      // Three variants, one gate: "Touch input ready" (cold boot),
+      // "Retained touch input ready" (wake after Z2 reload), and "Touch
+      // input restored after wake" — the one a RESUME prints, whose absence
+      // from this regex hung ?sweep=calc at the gate for two whole runs.
+      if (/Touch input (ready|restored)|Retained touch input ready/
+          .test(text)) {
         touchReady = true;
       }
     }
@@ -843,6 +848,62 @@ guest keeps running.">
                 + `${asleep ? ' PANEL ASLEEP - INVALID' : ''}`);
   }
 
+  // ?sweep=calc — the APP-LAUNCH benchmark: tap the Calculator icon and time
+  // tap → "digit display visible". This is the number a user feels; boot
+  // landmarks cannot see it (the 16-bit jmp-cache experiment moved a boot
+  // 10% without anyone knowing what it did to launches). Icon coordinate
+  // (122,247) and the readiness oracle are MEASURED values lifted from
+  // scripts/calc-touch-map.py: mean red of the display strip rows 60–100,
+  // cols 40–280 reads ~102 on the home screen and ~149 in Calculator;
+  // threshold 125. Reports wall seconds AND guest seconds — under -icount
+  // those are different quantities and both matter (wall = felt latency,
+  // guest = how much work 1.0 actually does to launch).
+  async function runCalcBench() {
+    await awaitTouchGate();
+    // 1.0 swallows the first press after the gate arms (documented in
+    // IN_APP_BUTTON_INVESTIGATION.md). Prime with a throwaway tap on empty
+    // wallpaper, then the real one. First run without this: tap swallowed,
+    // nothing launched, guest idle-warped to auto-lock, poll froze on a
+    // dark panel for 400 s.
+    tapWall(160, 180, MIN_PRESS_MS);
+    await sleep(3000);
+    const t0 = performance.now();
+    const g0 = Atomics.load(u32, infoBase + 11);
+    console.log('[calcbench] tapping Calculator icon (122,247)');
+    tapWall(122, 247, MIN_PRESS_MS);
+    let ready = false, dt = 0;
+    for (;;) {
+      await sleep(250);
+      dt = (performance.now() - t0) / 1000;
+      let sum = 0, n = 0;
+      for (let y = 60; y < 100; y += 4) {
+        for (let x = 40; x < 280; x += 4) {
+          sum += imageData.data[(y * 320 + x) * 4];
+          n++;
+        }
+      }
+      if (sum / n > 125) { ready = true; break; }
+      // Panel off (auto-lock) freezes frames and the strip forever: abort
+      // with a reason instead of polling a dead image to the timeout.
+      if (nonBlackPct < 5) {
+        console.log('[calcbench] ABORT: panel went dark (auto-lock?) at '
+                    + dt.toFixed(1) + ' s');
+        break;
+      }
+      if (dt > 600) break;
+    }
+    const gs = (Atomics.load(u32, infoBase + 11) - g0) / 1000;
+    const msg = `[calcbench] tap->ready: `
+      + `${ready ? dt.toFixed(1) + ' s wall' : 'TIMEOUT'} `
+      + `(${gs.toFixed(1)} s guest)`;
+    console.log(msg);
+    line(msg);
+    sweepResult = { mode: 'calcbench', build: BUILD,
+                    wall_s: ready ? +dt.toFixed(1) : null,
+                    guest_s: +gs.toFixed(1), ready };
+    report(true);
+  }
+
   // ?tap=x,y taps ONE panel coordinate after the guest's input gate arms, and
   // reports whether the screen changed. Exists because the sweep deliberately
   // excludes icon row 1, which is the coordinate under investigation.
@@ -1183,6 +1244,7 @@ guest keeps running.">
       if (SWEEP_MODE === '1') runSweep();
       else if (SWEEP_MODE === 'real') runVerify();
       else if (SWEEP_MODE === 'home') runHomeCheck();
+      else if (SWEEP_MODE === 'calc') runCalcBench();
       const tapSpec = new URLSearchParams(location.search).get('tap');
       if (tapSpec) runSingleTap(tapSpec);
     },
