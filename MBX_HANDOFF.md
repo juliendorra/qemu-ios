@@ -174,6 +174,55 @@
 >   boot names the teardown poller and any writer of the field. Not yet run —
 >   the compositing measurement owns the machine first.
 
+> **T2 UNBLOCKED (2026-08-01): the MBX has an MMU, and its page directory is
+> in registers `0x1000`–`0x101c`.** The blocker recorded at the end of
+> `IN_APP_BUTTON_INVESTIGATION.md` — *"learn the guest-physical location of
+> the `[1a4]`/`[1a8]` structures; that translation is the missing piece"* —
+> is answered, and derived from the guest rather than declared.
+>
+> Evidence, from a boot trace that was already on disk (`IT_MBX_TRACE=all`)
+> plus the 4A102 kext disassembly:
+>
+> ```
+> WR 0x01000 = 0x08b1b000   WR 0x01004 = 0x08b1c000    <- guest PHYSICAL
+> WR 0x01008 = 0x08b5d000   WR 0x0100c = 0x08b5e000       page addresses,
+> WR 0x01010 = 0x08ba0000   WR 0x01014 = 0x08ba1000       all in DRAM
+> WR 0x01018 = 0x08b82000   WR 0x0101c = 0x08be3000       (RAM_MEM_BASE+)
+> WR 0x01020 = 0x00010001                               <- MMU enable
+> ```
+>
+> The writer is a loop at `0xc03b7334`: it walks eight memory descriptors,
+> calls a VA→PA helper on each (`blx r10`), and stores the result at
+> register offset `r5` starting at `#4096` (0x1000), stepping 4, ending at
+> the literal `0x1020` — exactly eight entries. So `0x1000..0x101c` is an
+> **8-entry page directory** and `0x1020` is its control/enable.
+>
+> Three consequences, in order of importance:
+>
+> 1. **The model can translate MBX addresses to guest physical memory**, by
+>    reading the directory it is already handed and walking it in DRAM. The
+>    engine-owned words (`[[1a4]+0x60]` et al.) can therefore be written
+>    honestly — which is the precondition the six failed register tricks all
+>    violated. No per-build constant, no kernel-heap guess.
+> 2. **`0x8000` / `0x1b000` / `0x1d000` / `0x21000` / `0xa00000` are MBX
+>    VIRTUAL addresses, not offsets into our MMIO window.** 8 directory
+>    entries x 4 MiB = 32 MiB of MBX address space covers every one of them.
+>    This retro-explains two measured mysteries: why the truthful trace saw
+>    **zero** aperture reads (the structures live in DRAM, the CPU reaches
+>    them by its own mapping), and why backing the aperture with private
+>    storage was neutral-to-harmful (it was the wrong memory).
+> 3. **A correction to the shipped model:** `s5l8900_mbx_write` treats
+>    `0x1020` bit 0 as a render KICK that completes an operation. It is the
+>    MMU enable. The completion it currently signals there is spurious;
+>    revisit when the 2D path is modelled.
+>
+> **First experiment for T2** (cheap, no device code): walk the directory
+> from a live guest (`pmemsave` the eight pages, decode PTEs), translate
+> `0xa00000`, and read that DRAM page — if it already holds the 2D command
+> block the guest wrote through the aperture, the CPU has its own mapping
+> and the model only needs to READ; if it is empty, aperture writes are the
+> only path and the model must forward them through the page table.
+
 **Date:** 2026-07-28 · **Branch:** `ipod_touch_1g` · **State:** nothing started —
 this is the short path *into* the problem, not a report of work done.
 
