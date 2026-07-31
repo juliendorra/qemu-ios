@@ -1029,6 +1029,19 @@ static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
             r = (1 << 0x18) | 0x10000;
             break;
         case 0x1020:
+            /*
+             * MMU CONTROL, not a render kick (2026-08-01). Registers
+             * 0x1000..0x101c are an 8-entry page DIRECTORY: the driver's
+             * loop at kernel 0xc03b7334 runs a VA->PA helper over eight
+             * memory descriptors and stores each result there, stopping at
+             * the literal 0x1020, then writes 0x00010001 here. So bit 0 is
+             * the MMU enable and the constant below is the "MMU present"
+             * bit the guest reads back. The write path still treats bit 0
+             * as a completion kick (see s5l8900_mbx_write) -- that is
+             * wrong, but it only executes under IT_MBX_EVENTS=1, so it is
+             * left for the T2 work that will replace it with a real
+             * translation. See MBX_HANDOFF.md.
+             */
             r = 0x10000;
             break;
         default: {
