@@ -68,6 +68,14 @@ def main() -> int:
                     default=REPO / "build-ipod11" / "qemu-system-arm")
     ap.add_argument("--deadline", type=float, default=600,
                     help="give up if no home screen after this many seconds")
+    ap.add_argument("--mode", choices=("window", "sdo"), default="window",
+                    help="window: today's shipped config, instrumented. "
+                         "sdo: THE T1 ACCEPTANCE RUN -- swap-device window "
+                         "REMOVED (IT_TVOUT_WA=0) and the modelled SDO frame "
+                         "interrupt ON (IT_TVOUT_SDO=1); also watches the "
+                         "real [swapdev+0x160] field in guest RAM (sparse "
+                         "polls, never around input -- see dismiss-latency's "
+                         "polling trap)")
     ap.add_argument("--settle", type=float, default=60,
                     help="seconds to keep running after the home screen, so "
                          "post-boot teardown traffic is captured too")
@@ -108,9 +116,13 @@ def main() -> int:
     env.setdefault("IT_M68AP_NO_BASEBAND", "1")
     env["IT_FB_TRACE"] = "1"
     env["IT_MBX_TRACE"] = "all"
+    if args.mode == "sdo":
+        env["IT_TVOUT_WA"] = "0"
+        env["IT_TVOUT_SDO"] = "1"
     proc = subprocess.Popen(cmd, env=env, stdout=stderr.open("wb"),
                             stderr=subprocess.STDOUT)
     kind = {"kind": "blank"}
+    field_log = []
     try:
         client = lockprobe.DisplayClient(vnc_port)
         client.start()
@@ -118,8 +130,36 @@ def main() -> int:
               f"(IT_FB_TRACE, IT_MBX_TRACE=all) ...", flush=True)
         time.sleep(60)
         q = lockprobe.QMP(qmp_path)
+
+        field_pa = None
+
+        def watch_field():
+            """One sparse look at the real [swapdev+0x160] word (sdo mode)."""
+            nonlocal field_pa
+            if args.mode != "sdo":
+                return
+            if field_pa is None:
+                m = re.search(rb"Added swap device: AppleH1TVOut\s+id: "
+                              rb"([0-9a-f]{8})", serial.read_bytes())
+                if not m:
+                    return
+                va = int(m.group(1), 16)
+                field_pa = (va - 0xC0000000) + 0x08000000 + 0x160
+                print(f"swap device announced at VA 0x{va:08x}; watching "
+                      f"field PA 0x{field_pa:08x}")
+            raw = args.logs / "_field.raw"
+            q.cmd("pmemsave", {"val": field_pa, "size": 4,
+                               "filename": str(raw)})
+            v = int.from_bytes(raw.read_bytes(), "little")
+            raw.unlink(missing_ok=True)
+            field_log.append({"t": round(time.time() - t0, 1),
+                              "value": f"{v:08x}"})
+            print(f"  [swapdev+0x160] = 0x{v:08x}")
+
+        t0 = time.time()
         deadline = time.time() + args.deadline
         while time.time() < deadline:
+            watch_field()
             d, kind = lockprobe.grab(q, args.logs, classify)
             if kind["kind"] == "home":
                 break
@@ -130,6 +170,7 @@ def main() -> int:
                 if kind["kind"] == "home":
                     break
             time.sleep(10)
+        watch_field()
         print(f"screen: {kind}")
         lockprobe.png(d, args.logs / "screen.png")
         if kind["kind"] == "home":
@@ -156,7 +197,8 @@ def main() -> int:
         if m:
             wr_sites[(f"{m.group(3)}/{m.group(4)}", m.group(2))] += 1
 
-    report = {"build": args.build, "screen": kind,
+    report = {"build": args.build, "mode": args.mode, "screen": kind,
+              "swap_field_watch": field_log,
               "read_sites": [[f"pc={pc} lr={lr}", n]
                              for (pc, lr), n in rd_sites.most_common()],
               "write_sites": [[f"pclr={pclr} val={v}", n]

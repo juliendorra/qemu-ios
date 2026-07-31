@@ -19,7 +19,18 @@ typedef struct IPodTouchTVOutState {
     qemu_irq irq;
     uint32_t index;
 
-    //uint32_t sdo_irq_reg;
+    /* IT_TVOUT_SDO=1: a modelled SDO field interrupt (T1). The real SDO
+     * block raises an interrupt per video FIELD; the AppleH1TVOut swap path
+     * completes queued swaps from exactly that ISR (MBX_HANDOFF.md,
+     * 2026-07-31). The engine lives on instance 3 (the DT's tv-out node,
+     * 0x39300000) and toggles the field-parity bit on instance 2 via
+     * `peer`. Off by default until verified on both boards. */
+    QEMUTimer *frame_timer;
+    bool frame_timer_running;
+    bool irq_high;
+    uint32_t field_parity;
+    struct IPodTouchTVOutState *peer;   /* instance 3 -> instance 2 */
+
     uint32_t data[4096];
 } IPodTouchTVOutState;
 

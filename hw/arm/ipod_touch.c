@@ -2011,14 +2011,27 @@ static void ipod_touch_machine_init(MachineState *machine)
     tvout_state->index = 2;
     nms->tvout2_state = tvout_state;
     memory_region_add_subregion(sysmem, TVOUT2_MEM_BASE, &tvout_state->iomem);
-    busdev = SYS_BUS_DEVICE(dev);
-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_TVOUT_SDO_IRQ));
 
+    /*
+     * The SDO interrupt belongs to instance 3: the DT's tv-out node is
+     * tv-out@1300000 = 0x39300000 with interrupts <0x1e 0x26>, and the
+     * guest ISR acks ITS reg 0x280 (measured pc 0xc0383c8c writing
+     * [TVOUT3+0x280] = 1). It was previously connected to instance 2,
+     * which was inert while nothing ever raised a TVOut interrupt; the
+     * modelled SDO field interrupt (IT_TVOUT_SDO, ipod_touch_tvout.c)
+     * needs the line where the guest expects the status.
+     */
     dev = qdev_new("ipodtouch.tvout");
     tvout_state = IPOD_TOUCH_TVOUT(dev);
     tvout_state->index = 3;
     nms->tvout3_state = tvout_state;
     memory_region_add_subregion(sysmem, TVOUT3_MEM_BASE, &tvout_state->iomem);
+    busdev = SYS_BUS_DEVICE(dev);
+    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_TVOUT_SDO_IRQ));
+    /* instance 2 forwards its enable to the SDO engine; instance 3 toggles
+     * the field-parity bit in instance 2's register file */
+    nms->tvout2_state->peer = tvout_state;
+    tvout_state->peer = nms->tvout2_state;
 
     /*
      * The TVOut swap-device window. The region is CREATED here but deliberately

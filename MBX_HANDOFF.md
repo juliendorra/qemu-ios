@@ -1,5 +1,27 @@
 # MBX (PowerVR) — session handoff: the stub, and the two hacks that stand on it
 
+> **T1 BREAKTHROUGH (2026-07-31, night): 4A102 reaches the HOME SCREEN with
+> the swap-device zero-window REMOVED (`IT_TVOUT_WA=0`), completing the TVOut
+> swap through its own driver.** The missing hardware signal was the **SDO
+> field interrupt**, now modelled (`IT_TVOUT_SDO=1`, `hw/arm/ipod_touch_tvout.c`).
+> Watched live in guest RAM: `[swapdev+0x160]` went `0xc2afbd00 → 0` — the
+> in-flight swap request, issued and then completed by the guest itself.
+> No MBX register was involved at all: the TVOut swap completes display-side
+> (the T1 task text's "model MBX swap completion" was a misattribution;
+> "and/or connect the SDO IRQ" was the half that's true).
+>
+> The register contract, decoded from the guest ISR (0xc0383c64, AppleH1CLCD
+> kext) and confirmed by pc/lr-attributed traces:
+> `[TVOUT3+0x280]` bit 0 = field-interrupt status, W1C (the ISR's ack pc is
+> 0xc0383c8c); `[TVOUT2+0x004]` bit 1 = field parity; `[TVOUT3+0x040]` bit 1
+> = which parity completes a frame (reads 0 → even fields). TVOUT3
+> (0x39300000) is the DT's `tv-out@1300000`, `interrupts <0x1e 0x26>` — the
+> SoC SDO line is now wired to instance 3 (it was inertly on instance 2).
+> The first (v1) run had the latch on the wrong instance so acks never
+> landed — the storm guard self-throttled it and the boot STILL completed
+> the swap and reached home; v2 implements the decoded contract. Verification
+> matrix (both boards, four builds, touch/lock probes) in progress below.
+
 > **§4 GATE MEASURED (2026-07-31, late evening): software compositing is a
 > SINGLE-DIGIT share of guest CPU — MBX modelling is FIDELITY-ONLY work.**
 > (Measurement window closed; the machine is free.)
