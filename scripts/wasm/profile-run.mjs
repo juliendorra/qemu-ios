@@ -67,6 +67,10 @@ function wsConnect(url) {
 function makeWs(socket) {
   const handlers = new Set();
   let buf = Buffer.alloc(0);
+  /* A large response (a multi-MB .cpuprofile) arrives FRAGMENTED: one op=1
+   * frame with fin=0, then op=0 continuations. Dropping those was a hang
+   * that looked like Profiler.stop never answering. */
+  let frags = [];
   socket.on('data', (d) => {
     buf = Buffer.concat([buf, d]);
     for (;;) {
@@ -78,9 +82,13 @@ function makeWs(socket) {
       if (buf.length < off + len) return;
       const payload = buf.subarray(off, off + len);
       buf = buf.subarray(off + len);
-      if (op === 1 && fin) {
-        const text = payload.toString('utf8');
-        handlers.forEach((h) => h(text));
+      if (op === 1 || op === 0) {
+        frags.push(Buffer.from(payload));
+        if (fin) {
+          const text = Buffer.concat(frags).toString('utf8');
+          frags = [];
+          handlers.forEach((h) => h(text));
+        }
       } else if (op === 9) {           /* ping -> pong */
         send(0x0a, payload);
       }
@@ -128,6 +136,13 @@ function makeCdp(ws) {
       if (sessionId) msg.sessionId = sessionId;
       pending.set(msg.id, { resolve, reject });
       ws.sendText(JSON.stringify(msg));
+      /* A dead worker never answers; a hang here once cost a whole night. */
+      setTimeout(() => {
+        if (pending.has(msg.id)) {
+          pending.delete(msg.id);
+          reject(new Error(`${method} timed out after 30s`));
+        }
+      }, 30000);
     }),
     on: (method, h) => eventHandlers.set(method, h),
     close: ws.close,
@@ -179,11 +194,16 @@ cdp.on('Target.attachedToTarget', async ({ sessionId, targetInfo }) => {
   try {
     await cdp.call('Runtime.runIfWaitingForDebugger', {}, sessionId);
     await cdp.call('Target.setAutoAttach',
-      { autoAttach: true, waitForDebugger: true, flatten: true }, sessionId);
-  } catch { /* target may be gone already */ }
+      { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId);
+  } catch { /* target may be gone, or not support Target.* -- fine */ }
 });
-await cdp.call('Target.setAutoAttach',
-  { autoAttach: true, waitForDebugger: true, flatten: true });
+try {
+  await cdp.call('Target.setAutoAttach',
+    { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+} catch (e) {
+  console.log(`[profile] browser-level setAutoAttach: ${e.message} `
+    + '(continuing; page-level auto-attach still applies)');
+}
 /* Also attach to the already-created page target. */
 const { targetInfos } = await cdp.call('Target.getTargets');
 for (const t of targetInfos.filter((t) => t.type === 'page')) {
@@ -192,7 +212,7 @@ for (const t of targetInfos.filter((t) => t.type === 'page')) {
       { targetId: t.targetId, flatten: true });
     sessions.set(sessionId, { url: t.url, type: t.type });
     await cdp.call('Target.setAutoAttach',
-      { autoAttach: true, waitForDebugger: true, flatten: true }, sessionId);
+      { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId);
   } catch { /* fine */ }
 }
 

@@ -77,12 +77,19 @@ path memset the surface); the page keeps the last frame. Also gone with the
 DCL: `IT_FB_TRACE`'s "present" line (the vsync line remains — it is on the
 LCD's own timer).
 
-Verified so far: resume + interactive launch work on the new engine; the old
-1A543a snapshot still loads (no vmstate was touched). Cold boot, zero-copy
-`-display wasm`: **first pixels 3.1 s, kernel 138 s, BSD 152 s, home screen
-232.6 s** — kernel is now AT the old display-none floor (118–138 s window),
-where the old display-wasm figure was 276 s. The same-engine `?display=none`
-control arm (page A/B switch added for exactly this) is the pending number.
+**Verified, A/B on the same engine, each run solo:** zero-copy
+`-display wasm` boots **first pixels 3.1 s, kernel 138 s, BSD 152 s, home
+screen 232.6 s**; the `?display=none` control reads **kernel 153 s, BSD
+167 s, launchd 190 s**. Display-attached is now within run-to-run variance
+of — in this pair, slightly under — the display-none floor. The former 2×
+display cost (kernel 276 s vs 118 s) is GONE. Resume + interactive launch
+also verified on the new engine; the old 1A543a snapshot still loads (no
+vmstate was touched).
+
+One trap for the record: the first control run was started seconds after
+killing the first arm's Chrome and hung at "runtime initialized" with zero
+guest output — environmental, not reproducible solo or interactively. Do not
+chain headless Chrome runs back-to-back without a pause.
 
 Interactive busy-ratio did NOT move (0.053–0.055 after, 0.057–0.063 before):
 an app launch is compile-dominated, not paint-dominated — consistent with the
@@ -93,6 +100,38 @@ touch need the drain timer, which `-display none` never starts);
 `scripts/wasm/profile-run.mjs` — dependency-free CDP profiler that attaches
 to every worker, samples a chosen stretch, and buckets self-time (generated
 TB wasm / engine wasm / JS / GC), one `.cpuprofile` per worker for DevTools.
+
+### First worker profile (boot stretch 45–90 s, cold, chunked 1A543a)
+
+Ten targets attach (8 emulator pthreads + 2 chunk workers). The busy pthreads
+report **~100% self-time inside ONE engine-module function,
+`wasm-function[31678]`**, with only milliseconds in TB-instance code and JS
+glue. Read with care:
+
+- the engine ships **no name section and no symbol map**, so 31678 cannot be
+  named yet — rebuild with `--emit-symbol-map` first (likely candidates: the
+  TB dispatcher loop or `Atomics.wait` idlers, since blocked pthreads profile
+  as 100%-self in the function holding the futex);
+- near-zero samples in the separate TB modules either means the stretch is
+  compiler/dispatcher-dominated (consistent with ~2,000 modules compiled per
+  app launch) or that V8's sampler attributes poorly across
+  dynamically-instantiated modules. Distinguish by symbol-mapping the engine
+  and re-profiling a stretch with compilation quiesced.
+
+Three profiler traps burned into the script now: `Target.setAutoAttach`'s
+param is `waitForDebuggerOnStart` (not `waitForDebugger`); multi-MB
+`.cpuprofile` responses arrive as FRAGMENTED websocket frames (dropping
+continuations hangs `Profiler.stop` forever — this cost a whole night); every
+CDP call needs a timeout because a dead worker never answers.
+
+### Speed campaign scoreboard (2026-07-31)
+
+| lever | status | effect |
+| --- | --- | --- |
+| display path | **DONE** (zero-copy) | kernel 276 s → 138 s, at the display-none floor |
+| upstream JIT | checked | nothing to pull; graft is ahead |
+| engine (~8× remaining) | NEXT | profile harness ready; needs symbol map, then: inline hot memory helpers vs libffi, async instantiate, TB-exit linking |
+| busy `guestRatio` | 0.05–0.07 | unchanged by display work, as predicted — the engine owns it |
 
 ---
 
