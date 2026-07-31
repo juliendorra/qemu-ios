@@ -226,9 +226,11 @@ exceed 64 KiB. The day's speedups only found it sooner.
 
 Fix: `-sSTACK_SIZE=8MB` + `-sDEFAULT_PTHREAD_STACK_SIZE=4MB` in
 `configs/meson/emscripten.txt` (~48 MiB of the 2 GiB heap across all
-threads). Verification protocol: resume, tap Calculator, worker must
-survive the compile burst (the tap's UI outcome belongs to the parallel
-button/touch sessions, not this fix).
+threads). **VERIFIED same evening:** resume, tap Calculator, and the
+worker rode out the whole compile burst — 6,480 blocks and climbing at
+t=120 s where the crash had landed at 5,328 — no RangeError, machine
+alive throughout. (The tap's UI outcome belongs to the parallel
+button/touch sessions, not this fix.)
 
 The `-sSUPPORT_LONGJMP=wasm` attempt exposed a build-system trap that had
 been eating flags since the port began: **configure's
