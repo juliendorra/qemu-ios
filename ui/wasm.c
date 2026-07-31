@@ -162,7 +162,18 @@ static void wasm_display_seq_end(void)
  * from here would mean writing 600 KiB into guest-visible memory, which
  * zero-copy exists to avoid.
  */
-#define WASM_SCANOUT_HZ 10             /* the real panel's own rescan rate */
+/*
+ * How often a new frame is OFFERED to the page (a seq bump; no pixels move).
+ * The guest's panel vsyncs at 60 Hz of ITS time; what reaches the canvas is
+ * capped by this in WALL time. 10 Hz was the first, conservative value and
+ * was invisible only because a busy guest at ~6% of real time produces ~4
+ * frames a second anyway -- as the engine speeds up it would have become the
+ * animation ceiling. Publishing is nearly free by design; the page pays one
+ * 153k-pixel swizzle per accepted frame (sub-ms), so 30 Hz is comfortable.
+ * Every publish forces a full page-side blit (there is no damage tracking
+ * any more), which is the only reason this is not simply 60.
+ */
+#define WASM_SCANOUT_HZ 30
 
 static uint32_t wasm_scanout_pa;       /* currently mapped guest PA, 0 = none */
 static void *wasm_scanout_ptr;
