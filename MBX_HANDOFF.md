@@ -242,6 +242,22 @@
 > `0xf0000000`), not reverse-engineering an undocumented GPU. `pack2D…`
 > computes its block size from context flags (20 or 28 bytes, +12, +24),
 > which matches the variable-length blocks in the trace.
+>
+> **The encoding is tagged words.** Inside `_pack2DCtxBlitCopy` each word is
+> built by OR-ing an opcode into the top bits before the store —
+> `0x80000000`, `0xA0000000`, `0x94000000`, `0x30000000` are all visible as
+> immediates — and the traced stream ends blocks with `0x70000000` and fires
+> with `0xf0000000`. So the block is a sequence of `opcode | payload` words,
+> which is the easiest possible format to decode incrementally: implement
+> the opcodes one at a time and log the unknown ones.
+>
+> **And the caller chain is symbol-documented too.** LayerKit itself carries
+> `_LKRenderMBX2DNew`, `_LKRenderMBX2DCollect`, `_mbx2d_emit_layer`,
+> `_mbx2d_fill_opaque`, `_mbx2d_bind_texture`, `_mbx2d_prepare_texture` and
+> — note the name — **`_mbx2d_shmem_volatile`**, confirming the shared-memory
+> half that the register-trick moratorium is about. The full path
+> LayerKit → MBX2D → MBXConnect → user client is readable end to end on the
+> 1.0 root filesystem.
 
 **Date:** 2026-07-28 · **Branch:** `ipod_touch_1g` · **State:** nothing started —
 this is the short path *into* the problem, not a report of work done.
