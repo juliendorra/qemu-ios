@@ -1479,3 +1479,33 @@ Also recorded: the FIRST in-app press still loses its DOWN GSEvent about half
 the time (UP-only delivery, swallowed at the `_menuButtonTimer == nil` gate);
 the second press then works. Pre-existing, unrelated to the MBX work, worth its
 own hunt.
+
+
+## ENGINE CONSOLIDATION: all three bundles on tonight's engine (2026-07-31, ~02:00)
+
+All three app bundles now carry the SAME engine (tonight's build, with the
+three MBX completions) and the same launcher (MBX env exported only by the
+iphone-2g profile; the iPod profile sets nothing, so its MBX model is
+byte-identical to before). Backups: `/private/tmp/engine-backup-*.bak`,
+`/private/tmp/launcher-backup-*.bak`, and the 1.0 pre-fix engine at
+`/private/tmp/qemu-1.0-engine.pre-mbx12c.bak`. The 1.1.4 and iPod bundles had
+been sharing one older engine (md5 32c092a1...); tonight's is 6609a097...
+
+Before/after on the REAL bundles, same probe, same 8 s windows:
+
+| board | before (own old engine) | after (consolidated engine) |
+|---|---|---|
+| m68ap-114 | 5/5 | **5/5** (3_home_returns 96.99%, within noise of before's 96.98%) |
+| n45ap | 4/5 (5_home_wakes dark-panel artifact, off-screen buffers 56%) | **4/5, identical failure signature** -- pre-existing, unchanged |
+| m68ap-10 | 2/5 (3_home_returns 0.00% forever) | **5/5 at IT_PROBE_WAIT=10** -- the first full sweep on 1.0 |
+
+**Speed back to SpringBoard (m68ap-10):** fails at 8 s, passes at 10 s -- the
+dismissal takes 8-10 s, consistent with the app's 10 s suspend watchdog still
+firing inside the loop (SpringBoard then recovers and repaints, where before
+the fix it never did). 1.1.4's dismissal remains sub-8 s on the same engine, so
+the latency is 1.0's snapshot handshake, not the consolidated engine. The
+watchdog also fits the crash log still being written on 1.0 dismissals.
+A @12 s run in the same batch desynced on the FIRST-press DOWN swallow (step 2
+already 0.30%) and says nothing about the dismissal; the swallow remains the
+next quirk worth its own hunt, along with shaving the 8-10 s to animation
+speed (lever: the microkernel re-init loop reading 0xff0..0xffc/0xf10 as 0).
