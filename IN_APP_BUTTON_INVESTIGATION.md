@@ -1621,3 +1621,70 @@ inside the window on a loaded host, which is the latency mechanism above, not
 a delivery regression (POWER and HOME-wake still work immediately after). The
 40 s-window 4/4 run on the same engine is the acceptance evidence for press
 delivery.
+
+
+## THE LATENCY, FULLY NAMED: ~33 x 1.02 s MBX FinishSurface timeouts (2026-07-31, the sampler hunt)
+
+The "microkernel re-init loop reading 0xff0..0xffc/0xf10 as zero" lever in the
+memory notes was STALE (item 1 above already marked it DEAD). The real chain,
+measured link by link:
+
+**The shape.** With virtual-timestamped `[LCD]` flips (added this session), a
+single no-gdb in-app HOME press on 1.0 shows: instant reaction (the snapshot
+render repaints a buffer at +0.5..1.2 s, invisible), then ZERO framebuffer
+activity, then the dismissal animation runs at full ~55 Hz and completes --
+starting at a FIXED **press + 33.76 s of virtual time** (33.75/33.76/33.76/
+33.76/33.73/33.75 across six independent runs and two engines). 1.1.4 on the
+SAME engine dismisses in 1.34 s. Mid-freeze the guest is IDLE (spin-locate: 0.19
+host cores, 38/40 PC samples in the kernel idle path; SpringBoard never
+scheduled).
+
+**Where it sits.** The gsevent probe with reply-path breakpoints
+(`demux_ret/port_chk/send_ret` in `_LKRenderServerThread`) shows the app's 2002
+delivered 0.03 s after the press, `__LKXRenderClient` entered ~0.03 s later --
+and the RPC REPLY sent ~37 s after that, correct port and msgh_id 0x9d74,
+failing with MACH_SEND_INVALID_DEST because the 10 s suspend watchdog killed
+the app (0x8badf00d, crash log recovered from a preserved NAND EVEN ON CLEAN,
+"successful" dismissals -- every 1.0 dismissal is the app's corpse being cleaned
+up). The ~33.8 s is spent INSIDE `__LKXRenderClient`'s render.
+
+**The mechanism.** IT_MBX_TRACE with guest pc/lr (added this session) plus
+disassembly of the 1.0 RELEASE kernelcache and userland:
+
+* The zoom animation renders through `_LKRenderMBX2DRenderBuffer` as ~33
+  streamed 2D command blocks in the 0xA00000 window (advancing offsets, one
+  0x70000000-terminated block per row band).
+* After each block, userland `MBX2D _mbx2DFinish -> MBXConnect
+  _mbxFinishSurface` calls AppleMBX user-client method 10 (FinishSurface),
+  whose kernel sleep wrapper (0xc032e0xx) acks `0x134=0xfff`, arms
+  `0x130=0xffff`, and sleeps ~1 s.
+* The wake is the kext's real ISR (0xc032ee48): cause = `0x12C status & 0x130
+  enable`, dispatching bits 0x20/0x400/0x10/0x8/0x4; only **bit 4 (0x10,
+  render complete)** wakes FinishSurface. Nothing in the model ever raises
+  bit 4, so every block sleeps out its full ~1.02 s timeout: 33 x 1.02 =
+  the 33.8 s constant.
+
+**Why it cannot be faked from the register file (two wedges).** Latching 0x10
+on the 0x130 arm write, and raising it from a 500 us virtual timer after each
+kick, both WEDGE the guest at the first dismissal (0/2 presses, no flips at
+all, button IRQs no longer acked): the 0x10 ISR path and the woken
+FinishSurface consult op-state structures in GUEST RAM that only the real MBX
+microkernel writes (their physical pointers are handed to registers
+0x614/0x618 at init -- e.g. 0x1e3ce508). With the interrupt faked and the shmem
+never updated, the driver's bookkeeping goes inconsistent and it sleeps
+forever. Both fakes are reverted; the model is back to DONE-bit (bit 6)
+completions only, which the POLLED paths use correctly.
+
+**The honest fix (next lever, precise now):** model the completion in the
+shared memory the microkernel owns -- find the op-state layout FinishSurface's
+sleep loop checks (`[obj+0x1a4]/[obj+0x1a8]` structures; the ISR's bit-0x10
+path clears `+0x4c`, sets `+0xc`/`+0x2c`) relative to the 0x614/0x618 shmem
+base, write "complete" there on each kick, THEN raise bit 4. That is T1's
+remaining half, now with the exact addresses to start from.
+
+Also killed this session: the dl-10 dismiss-latency runs at 0.3-1 s pmemsave
+polling measured the AUTO-LOCK DIM (lit 18.5%, vs-home 35%), not the press --
+periodic pmemsave polling around a press SUPPRESSES delivery outright (0/8 at
+0.3 s, 0/1 at 1 s polling vs 4/4, 3/3, 2/2 with no in-window polling). Latency
+must be measured from the model's own timestamped traces, never by polling
+guest RAM. `dismiss-latency.py` grew a `--poll` flag and a warning.

@@ -33,9 +33,14 @@ static void it_lcd_trace_base(const char *win, uint32_t base)
         pc = env->regs[15];
         lr = env->regs[14];
     }
+    /* Virtual timestamp goes LAST: app-button-probe's LCD_BASE_RE matches
+     * the head of this line literally. Cadence of the flips is the dismissal
+     * latency question -- a line without time cannot answer it. */
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
     fprintf(stderr, "[LCD] %s base <- 0x%08x (visible %d/6 at that base) "
-            "pc=0x%08x lr=0x%08x\n",
-            win, base, lcd_visible_sample_count(base), pc, lr);
+            "pc=0x%08x lr=0x%08x t=%lld.%06lld\n",
+            win, base, lcd_visible_sample_count(base), pc, lr,
+            now / 1000000LL, now % 1000000LL);
 }
 
 /* IT_FB_TRACE=1: log every LCD MMIO access. The render investigation needs

@@ -36,7 +36,7 @@ static void sysic_trace(const char *what, uint8_t group, uint32_t value)
         return;
     }
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
-    fprintf(stderr, "[SYSIC %3lld.%06lld] %s group %u = 0x%08x (n=%u)\n",
+    fprintf(stderr, "[SYSIC] t=%lld.%06lld %s group %u = 0x%08x (n=%u)\n",
             now / 1000000LL, now % 1000000LL, what, group, value, n);
 }
 

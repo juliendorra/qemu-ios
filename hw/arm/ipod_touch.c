@@ -743,7 +743,33 @@ MBX
  */
 #define MBX_EVENT_READY   0x100     /* bit 8: what the stub always reported */
 #define MBX_EVENT_DONE    0x040     /* bit 6: the bit AppleMBX spins on */
-
+/*
+ * Bit 4: RENDER COMPLETE, the bit AppleMBX's sleeping wait needs. The
+ * kext's real ISR (kernel 0xc032ee48 on 1.0, entered via IRQ 12) decodes
+ * its cause as `status(0x12C) & enable(0x130)` and dispatches bits 0x20 /
+ * 0x400 / 0x10 / 0x8 / 0x4; only the 0x10 path wakes the FinishSurface
+ * sleeper that userland MBX2D's _mbxFinishSurface (user-client method 10)
+ * blocks in. The sleep wrapper (0xc032e0xx) acks 0x134=0xfff and THEN arms
+ * 0x130=0xffff before sleeping ~1 s -- so a completion latched at kick
+ * time is wiped before the sleep starts and can never wake it. Without
+ * this bit every streamed 2D block of a compositing pass times out its
+ * full ~1 s, which is what makes a 1.0 HOME dismissal cost a fixed ~33.8 s
+ * (~33 blocks) and leaves the app watchdog-killed (0x8badf00d) in the
+ * snapshot RPC this render serves.
+ *
+ * DO NOT fake bit 4 without modelling the SHARED-MEMORY protocol first.
+ * Both obvious fakes were tried on 2026-07-31 and both WEDGE the guest at
+ * the first dismissal (worse than the latency they fix): latching 0x10 on
+ * the 0x130 arm write, and raising it from a 500 us virtual timer after
+ * each kick. The 0x10 ISR path and the woken FinishSurface re-check the
+ * op's state in guest-RAM structures that only the real MBX microkernel
+ * updates (the init sequence hands their physical pointers to registers
+ * 0x614/0x618, e.g. 0x1e3ce508); with the interrupt faked and the shmem
+ * never written, the driver's bookkeeping goes inconsistent and it sleeps
+ * forever. The honest fix is to write the completion into that shmem --
+ * see IN_APP_BUTTON_INVESTIGATION.md (2026-07-31, the latency hunt) for
+ * the full measured chain.
+ */
 static uint32_t mbx_event_status = MBX_EVENT_READY;
 static uint32_t mbx_event_enable;
 static qemu_irq mbx_irq;
@@ -833,9 +859,19 @@ static void mbx_trace(const char *dir, hwaddr addr, uint64_t val)
         return;
     }
     /* Host-clock timestamp: the dismissal latency hunt needs to know WHERE
-     * the seconds go, and a conversation without time cannot say. */
-    fprintf(stderr, "[MBX] %9.3f %s 0x%05x = 0x%08x (n=%u)\n",
-            g_get_monotonic_time() / 1e6, dir, (uint32_t)addr, (uint32_t)val, n);
+     * the seconds go, and a conversation without time cannot say. The guest
+     * pc/lr name the DRIVER CODE doing it (symbolize with
+     * scripts/kernel-addr-symbolize.py), which is how a polled register's
+     * wanted VALUE can be read out of the kernel instead of guessed. */
+    uint32_t pc = 0, lr = 0;
+    if (current_cpu) {
+        CPUARMState *env = &ARM_CPU(current_cpu)->env;
+        pc = env->regs[15];
+        lr = env->regs[14];
+    }
+    fprintf(stderr, "[MBX] %9.3f %s 0x%05x = 0x%08x pc=0x%08x lr=0x%08x (n=%u)\n",
+            g_get_monotonic_time() / 1e6, dir, (uint32_t)addr, (uint32_t)val,
+            pc, lr, n);
 }
 
 static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
@@ -921,7 +957,12 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
          * descriptor block (0xa00000..0xa0003c) and then FIRED by rewriting
          * word 0 with 0xf0000000 -- the last MBX write before the guest polls
          * 0x12C for completion (measured, 1.0 app snapshot). Complete it
-         * immediately, like the other kicks.
+         * immediately, like the other kicks. (A STREAMED sequence also
+         * exists -- blocks appended at advancing offsets ending in
+         * 0x70000000, one per animation step of the 1.0 dismissal -- but
+         * completing those on the terminator write is a no-op for the guest:
+         * its waiter sleeps on the ISR bit-4 path, not on bit 6. See the
+         * MBX_EVENT comment block above.)
          */
         case 0xa00000:
             if ((val & 0xf0000000) == 0xf0000000) {
@@ -1198,8 +1239,10 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
 
     if (getenv("IT_KEY_TRACE")) {
+        /* The "[KEYTRACE]" token is matched literally by six probes --
+         * the timestamp must come AFTER it, not inside the brackets. */
         int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
-        fprintf(stderr, "[KEYTRACE %3lld.%06lld] ",
+        fprintf(stderr, "[KEYTRACE] t=%lld.%06lld ",
                 now / 1000000LL, now % 1000000LL);
         fprintf(stderr, "keycode=%d pmu=%p active=%d parked=%d "
                 "no_park=%d sup_pwr=%d sup_home=%d oocshdwn=%d\n",
@@ -1426,7 +1469,7 @@ static void ipod_touch_key_event(void *opaque, int keycode)
         CPUARMState *env = &arm_cpu->env;
         uint32_t cpsr = cpsr_read(env);
         int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
-        fprintf(stderr, "[BTN %3lld.%06lld] keycode=%d  PC=0x%08x  I=%d F=%d  power=%d\n",
+        fprintf(stderr, "[BTN] t=%lld.%06lld keycode=%d  PC=0x%08x  I=%d F=%d  power=%d\n",
                 now / 1000000LL, now % 1000000LL,
                 keycode, env->regs[15], (cpsr >> 7) & 1, (cpsr >> 6) & 1, is_power);
     }

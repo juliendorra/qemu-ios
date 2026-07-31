@@ -53,11 +53,11 @@ def _load(name: str, path: Path):
 
 ab = _load("appbtn", REPO / "scripts" / "app-button-probe.py")
 
-# [BTN   12.345678] keycode=35 ...
-BTN_RE = re.compile(r"\[BTN\s+(\d+)\.(\d+)\] keycode=(\d+)")
-# [SYSIC   12.345678] ACK INTSTAT group 1 = 0x00000100 (n=3)
+# [BTN] t=12.345678 keycode=35 ...
+BTN_RE = re.compile(r"\[BTN\] t=(\d+)\.(\d+) keycode=(\d+)")
+# [SYSIC] t=12.345678 ACK INTSTAT group 1 = 0x00000100 (n=3)
 SYSIC_RE = re.compile(
-    r"\[SYSIC\s+(\d+)\.(\d+)\] (\S+ \S+) group (\d+) = 0x([0-9a-f]+)")
+    r"\[SYSIC\] t=(\d+)\.(\d+) (\S+ \S+) group (\d+) = 0x([0-9a-f]+)")
 
 
 def parse_traces(seg: str):

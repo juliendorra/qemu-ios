@@ -54,6 +54,12 @@ def main() -> int:
                     help="key hold in WALL seconds; under -icount the guest "
                          "sees far less, and a too-short hold may sit below "
                          "the button debounce")
+    ap.add_argument("--poll", type=float, default=0.3,
+                    help="seconds between framebuffer polls. 0.3 catches "
+                         "animation frames but the pmemsave BQL traffic "
+                         "perturbs delivery; 1.0 is the gentle setting for "
+                         "latency numbers (the 2026-07-31 dl-10 runs at 0.3 "
+                         "measured the AUTO-LOCK DIM, not the press)")
     ap.add_argument("--logs", type=Path, default=Path("/tmp/dismiss-latency"))
     args = ap.parse_args()
     args.logs.mkdir(parents=True, exist_ok=True)
@@ -135,7 +141,7 @@ def main() -> int:
         prev = inapp
         rows = []
         while time.time() - t0 < args.watch:
-            time.sleep(0.3)
+            time.sleep(args.poll)
             idx = btn.scanout_index(logp)
             cur = btn.grab(q, tmp)
             t = time.time() - t0
