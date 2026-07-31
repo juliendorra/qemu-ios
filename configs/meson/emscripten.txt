@@ -13,5 +13,14 @@ objc_args = ['-pthread']
 #
 # --profiling-funcs keeps the wasm name section (+0.9 MB): without it every
 # CPU profile of the engine is one anonymous wasm-function[NNNN].
-c_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32','-lnodefs.js','-lworkerfs.js','--profiling-funcs']
-cpp_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32','-lnodefs.js','-lworkerfs.js','--profiling-funcs']
+#
+# The STACK sizes are not tuning, they are a crash fix: Emscripten pthreads
+# default to a ~64 KiB stack, and the vCPU thread compiles TBs on ITS stack
+# (rr_cpu_thread_fn -> ... -> tb_gen_code -> tcg_gen_code -> tcg_optimize).
+# A large-enough guest block -- first met launching Calculator on 1A543a,
+# 2026-07-31 -- overflows it as `RangeError: Maximum call stack size
+# exceeded` in tcg_optimize and kills the machine. Native QEMU threads get
+# MiB-scale stacks; 4 MiB per pthread ~= a dozen threads = ~48 MiB of the
+# 2 GiB heap.
+c_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32','-lnodefs.js','-lworkerfs.js','--profiling-funcs','-sSTACK_SIZE=8MB','-sDEFAULT_PTHREAD_STACK_SIZE=4MB']
+cpp_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32','-lnodefs.js','-lworkerfs.js','--profiling-funcs','-sSTACK_SIZE=8MB','-sDEFAULT_PTHREAD_STACK_SIZE=4MB']

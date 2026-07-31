@@ -209,23 +209,26 @@ name section): opening Calculator at ~43 s in, the vCPU worker threw
 permanently dead (touch ignored, `[MLOOP] ready=0` forever — nothing
 notifies the main loop once the vCPU thread is gone).
 
-The stack is the signature to chase: REPEATED groups of
-`wrapper → invoke_ijjj/invoke_ijj (the setjmp JS shims) → engine fns
-(1178/1179/1180/1360/1362/1485/1507/24355, nameable now) → TB functions` —
-i.e. **cpu_exec-style re-entry nesting without unwinding** until the JS
-stack limit. Each `invoke_*` layer is a setjmp scope, so something during
-JIT-heavy app launch re-enters guest execution recursively (suspects:
-exception/interrupt handling re-entering cpu_exec, or the backend's helper
-path re-entering TB execution) instead of longjmp-unwinding first.
+**DIAGNOSED same evening — not recursion, stack EXHAUSTION.** The name
+section translated every frame:
 
-Notes for the next session: happened under interactive input (a tap), not
-in any headless run to date; the engine now has a name section, so
-translating indices 1178–1507/24355/32437-32443 is one python pass over
-the name section; check whether the nap fix merely exposed a latent
-recursion by changing timing (the pre-nap engines may reproduce it too —
-or not); Emscripten's default stack per pthread is small
-(-sSTACK_SIZE/DEFAULT_PTHREAD_STACK_SIZE) and raising it is a mitigation
-but the recursion depth is the actual bug.
+```
+rr_cpu_thread_fn → tcg_cpu_exec → cpu_exec → cpu_exec_setjmp   (setjmp #1)
+→ cpu_exec_loop → tb_gen_code → setjmp_gen_code                (setjmp #2)
+→ tcg_gen_code → tcg_optimize   ← overflow here
+```
+
+Two setjmp scopes is NORMAL nesting; the overflow is inside `tcg_optimize`
+while COMPILING a TB. Emscripten pthreads default to a ~64 KiB stack and
+the vCPU thread compiles TBs on its own stack — native QEMU threads get
+MiB-scale stacks. A large-enough Calculator block was simply the first to
+exceed 64 KiB. The day's speedups only found it sooner.
+
+Fix: `-sSTACK_SIZE=8MB` + `-sDEFAULT_PTHREAD_STACK_SIZE=4MB` in
+`configs/meson/emscripten.txt` (~48 MiB of the 2 GiB heap across all
+threads). Verification protocol: resume, tap Calculator, worker must
+survive the compile burst (the tap's UI outcome belongs to the parallel
+button/touch sessions, not this fix).
 
 The `-sSUPPORT_LONGJMP=wasm` attempt exposed a build-system trap that had
 been eating flags since the port began: **configure's
