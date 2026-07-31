@@ -139,21 +139,6 @@ static bool tvout_wa_enabled(void)
     if (cached < 0) {
         const char *e = getenv("IT_TVOUT_WA");
         cached = !(e && e[0] == '0');
-        /*
-         * The window and the SDO field-interrupt model are alternative
-         * answers to the same missing swap completion, and the window is
-         * actively harmful once the completion is real: it swallows the
-         * driver's own in-flight-request write ([swapdev+0x160]) and
-         * forces its reads to zero. So with the model on (the default
-         * since 2026-07-31), no window is placed; IT_TVOUT_SDO=0 brings
-         * the window back exactly as it was.
-         */
-        if (cached && ipod_touch_tvout_sdo_modelled()) {
-            fprintf(stderr, "[TVOUT-WA] swap-device window NOT armed: the "
-                    "SDO field-interrupt model is on (IT_TVOUT_SDO=0 to "
-                    "restore the window)\n");
-            cached = 0;
-        }
     }
     return cached;
 }
@@ -372,6 +357,36 @@ static void ipod_touch_console_line(const char *line)
                     "leaving the window alone (placing it here faults 1.0; "
                     "set IT_TVOUT_WA=0 to remove the window entirely)\n",
                     devname);
+            return;
+        }
+        /*
+         * The window and the SDO field-interrupt model are alternative
+         * answers to the same missing swap completion, and the window is
+         * actively harmful once the completion is real: it swallows the
+         * driver's own in-flight-request write ([swapdev+0x160]) and forces
+         * its reads to zero. So with the model on (the default since
+         * 2026-07-31) the window is never PLACED.
+         *
+         * The suppression lives HERE, at placement, and not in
+         * tvout_wa_enabled(), because builds that never place a window must
+         * keep their old code path byte for byte. Measured, 2026-08-01:
+         * gating the whole workaround changed nothing functional on iPhone
+         * OS 1.0 (which announces AppleH1CLCD, never gets a window, and has
+         * no TVOut driver at all) yet flipped app-button-probe's
+         * 2_touch_in_app from a 35.95% PASS to a 0.31% FAIL, reproducibly,
+         * on 2 runs each way. The mechanism is phase, not function: under
+         * -icount the guest is deterministic while the probe's input is
+         * driven by host wall clock, so dropping this branch's console
+         * prints moved the tap to a different guest instant, and 1.0's
+         * in-app event delivery -- 5 of 6, documented in
+         * IN_APP_BUTTON_INVESTIGATION.md -- dropped it. A model that does
+         * nothing on a board should touch nothing on that board.
+         */
+        if (ipod_touch_tvout_sdo_modelled()) {
+            fprintf(stderr, "[TVOUT-WA] %s swap device announced, but the "
+                    "window is NOT placed: the SDO field-interrupt model is "
+                    "on and the guest completes its own swaps "
+                    "(IT_TVOUT_SDO=0 restores the window)\n", devname);
             return;
         }
         p = strstr(p, "id:");
@@ -2079,9 +2094,7 @@ static void ipod_touch_machine_init(MachineState *machine)
         fprintf(stderr, "[TVOUT-WA] armed but NOT mapped; expecting 0x%08x, "
                 "waiting for the guest to announce a TVOut swap device\n",
                 (uint32_t)tvout_wa_addr);
-    } else if (!ipod_touch_tvout_sdo_modelled()) {
-        /* the SDO-modelled case already announced itself in
-         * tvout_wa_enabled(); this branch is a genuine IT_TVOUT_WA=0 */
+    } else {
         fprintf(stderr, "[TVOUT-WA] disabled by IT_TVOUT_WA=0\n");
     }
     ipod_touch_console_tap_install(ipod_touch_console_line);
