@@ -2790,6 +2790,14 @@ baseline evicts none. Whatever the private free-list does differently from
 emscripten's `freeTableIndexes`, it drives the instance accounting into
 eviction churn, and the churn costs far more than the Map ever did.
 
+**And the failure mode has a name already.** `tcg/wasm64.c`'s own adaptive
+threshold comment records the eviction-churn regime as **692 s / 736 s on
+launchd against 143 s / 146 s healthy**. These runs were 761 s and 687 s
+against a 148 s baseline: the same regime, to the second, not a new failure.
+The adaptive controller sizes the threshold from remaining headroom, so
+anything that makes instances look retained pushes it over and it never
+recovers within a boot.
+
 **Lead for next time, not a dead end:** the win is available (the early
 landmarks prove it) but it has to be taken without disturbing instance
 lifetime. Next thing to measure: whether a table slot freed by `slot_free`
