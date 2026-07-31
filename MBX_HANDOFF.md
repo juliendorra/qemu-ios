@@ -1,10 +1,41 @@
 # MBX (PowerVR) — session handoff: the stub, and the two hacks that stand on it
 
-> **MEASUREMENT WINDOW (2026-07-31, evening): the MBX session is running
-> native M68AP boots + PC-sampling on this machine** (`mbx-composite-probe.py`,
-> §4's gate measurement, then T1 verification runs). Per the shared-machine
-> rule in `BROWSER_WASM_STATUS.md`, no other session should run headless boot
-> benchmarks until this note is replaced with results.
+> **§4 GATE MEASURED (2026-07-31, late evening): software compositing is a
+> SINGLE-DIGIT share of guest CPU — MBX modelling is FIDELITY-ONLY work.**
+> (Measurement window closed; the machine is free.)
+>
+> Two `mbx-composite-probe.py` runs on M68AP 1.1.4, ~100 Hz `info registers`
+> sampling, attribution via the firmware's own prebinding:
+>
+> | phase (what was really on screen) | samples | non-idle | CG+LayerKit, of non-idle | CG+LK, of TOTAL |
+> |---|---|---|---|---|
+> | idle home screen | 1505+1425 | 2.5% / 15.6% | 0% / 3% | ~0% |
+> | lock-screen shimmer (continuous LayerKit animation) | 1790+1882 | 5.7% / 11.8% | 8% / 19% | **0.4-2.2%** |
+> | lock screen + taps (run 1 "appzoom", invalid as zoom) | 2802 | 22.8% | 17% | 3.9% |
+> | wiggle-mode alert (run 2 "appzoom", invalid as zoom) | 2839 | 6.9% | 1% | ~0% |
+>
+> The kernel idle loop (`0xc005a9cc` on 4A102) dominates every phase; even
+> the busiest window put LayerKit+CoreGraphics at **under 4% of guest CPU**.
+> Neither run captured a true app-zoom burst (run 1: a telephony "Repair
+> Needed" alert stranded the lock screen; run 2: **under icount a 0.12 s
+> host-side tap stretches into a guest long-press** — it opened icon-wiggle
+> edit mode plus the "Edit Home Screen" alert instead of an app; that
+> input-duration distortion is a new trap, note it when scripting taps under
+> `-icount`). But a zoom burst is ~1 s of a 6 s cycle and both invalid
+> phases bound compositing from above at a few percent, so the conclusion
+> does not hinge on it. The M68AP UI also already animates at ~55 Hz
+> natively (the dismissal measurements in IN_APP_BUTTON_INVESTIGATION.md),
+> i.e. nothing is performance-starved that MBX offload would rescue.
+>
+> **Per §4/§7, that settles the justification: T1/T2 proceed (if at all) on
+> the fidelity argument alone — deleting the TVOut zero-window and the
+> LK_ENABLE_MBX2D plist edit — not on performance.** Under the wasm/TCI
+> build the RATIO is what transfers, and the ratio is small there too.
+> Stopped here for review, per the session brief. The next concrete step is
+> already staged and is measurement, not device code:
+> `scripts/tvout-swap-probe.py --build 4A102 --kernelcache /tmp/kc114r.raw
+> --logs /tmp/tvout-swap` names the teardown poller and any writer of the
+> faked field in one instrumented boot.
 
 
 > **2026-07-29 — the in-app HOME/POWER bug on iPhone OS 1.0 is an MBX symptom.**

@@ -328,6 +328,13 @@ def main() -> int:
     raw = [{"phase": ph, "pc": pc, "mode": mode}
            for ph, pc, mode in (sampler.samples if sampler else [])]
     (args.logs / "samples.json").write_text(json.dumps(raw))
+    # The kernel idle loop dominates every phase; the interesting number is
+    # the compositing share of the NON-idle samples. The idle-loop PC is
+    # build-specific, so take it as the modal PC of the idle phase
+    # (c005a9cc on 4A102).
+    idle_pcs = Counter(s["pc"] for s in raw if s["phase"] == "idle")
+    idle_pc = idle_pcs.most_common(1)[0][0] if idle_pcs else None
+    report["idle_loop_pc"] = f"{idle_pc:08x}" if idle_pc else None
     for phase in ("idle", "shimmer", "appzoom"):
         pcs = [s for s in raw if s["phase"] == phase]
         mods = Counter(attribute(s["pc"], ranges) for s in pcs)
@@ -335,15 +342,26 @@ def main() -> int:
         user = Counter((attribute(s["pc"], ranges), f"{s['pc']:08x}")
                        for s in pcs if s["pc"] < 0xC0000000)
         n = len(pcs) or 1
+        nonidle = [s for s in pcs if s["pc"] != idle_pc]
+        ni = Counter(attribute(s["pc"], ranges) for s in nonidle)
+        nin = len(nonidle) or 1
+        comp = ni.get("CoreGraphics", 0) + ni.get("LayerKit", 0)
         report["phases"][phase] = {
             "samples": len(pcs),
             "by_module_pct": {m: round(100.0 * c / n, 1)
                               for m, c in mods.most_common(20)},
+            "nonidle_samples": len(nonidle),
+            "nonidle_pct": round(100.0 * len(nonidle) / n, 1),
+            "compositing_pct_of_nonidle": round(100.0 * comp / nin, 1),
+            "nonidle_by_module_pct": {m: round(100.0 * c / nin, 1)
+                                      for m, c in ni.most_common(12)},
             "top_kernel_pcs": kern.most_common(10),
             "top_user_pcs": [[f"{m}:{a}", c]
                              for (m, a), c in user.most_common(15)],
         }
-        print(f"\n=== {phase}: {len(pcs)} samples ===")
+        print(f"\n=== {phase}: {len(pcs)} samples, "
+              f"{100.0 * len(nonidle) / n:.1f}% non-idle, "
+              f"CG+LayerKit {100.0 * comp / nin:.0f}% of non-idle ===")
         for m, c in mods.most_common(12):
             print(f"  {100.0 * c / n:5.1f}%  {m}")
     (args.logs / "composite-probe.json").write_text(
