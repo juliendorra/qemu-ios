@@ -154,8 +154,18 @@ static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
 {
     tvout_wa_reads++;
     if (getenv("IT_FB_TRACE")) {
-        fprintf(stderr, "[TVOUT-WA] rd +0x%x (n=%" PRIu64 ")\n",
-                (uint32_t)addr, tvout_wa_reads);
+        /* pc/lr name the POLLING CODE -- T1 needs to know which AppleMBX
+         * function waits on this field before completion can be modelled
+         * honestly (symbolize with scripts/kernel-addr-symbolize.py). */
+        uint32_t pc = 0, lr = 0;
+        if (current_cpu) {
+            CPUARMState *env = &ARM_CPU(current_cpu)->env;
+            pc = env->regs[15];
+            lr = env->regs[14];
+        }
+        fprintf(stderr, "[TVOUT-WA] rd +0x%x pc=0x%08x lr=0x%08x "
+                "(n=%" PRIu64 ")\n",
+                (uint32_t)addr, pc, lr, tvout_wa_reads);
     }
     return 0;
 }
@@ -163,8 +173,14 @@ static uint64_t tvout_workaround_read(void *opaque, hwaddr addr, unsigned size)
 static void tvout_workaround_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     if (getenv("IT_FB_TRACE")) {
-        fprintf(stderr, "[TVOUT-WA] wr +0x%x = 0x%08x\n",
-                (uint32_t)addr, (uint32_t)value);
+        uint32_t pc = 0, lr = 0;
+        if (current_cpu) {
+            CPUARMState *env = &ARM_CPU(current_cpu)->env;
+            pc = env->regs[15];
+            lr = env->regs[14];
+        }
+        fprintf(stderr, "[TVOUT-WA] wr +0x%x = 0x%08x pc=0x%08x lr=0x%08x\n",
+                (uint32_t)addr, (uint32_t)value, pc, lr);
     }
 }
 

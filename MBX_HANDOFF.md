@@ -1,5 +1,11 @@
 # MBX (PowerVR) — session handoff: the stub, and the two hacks that stand on it
 
+> **MEASUREMENT WINDOW (2026-07-31, evening): the MBX session is running
+> native M68AP boots + PC-sampling on this machine** (`mbx-composite-probe.py`,
+> §4's gate measurement, then T1 verification runs). Per the shared-machine
+> rule in `BROWSER_WASM_STATUS.md`, no other session should run headless boot
+> benchmarks until this note is replaced with results.
+
 
 > **2026-07-29 — the in-app HOME/POWER bug on iPhone OS 1.0 is an MBX symptom.**
 > After the first in-app press, `com.apple.driver.AppleMBX` enters
@@ -28,6 +34,58 @@
 > bounded `tst #0x40` site, so the stub answer is not 1.0-specific -- the working
 > builds simply never reach the unbounded loops. Full record:
 > [`IN_APP_BUTTON_INVESTIGATION.md`](IN_APP_BUTTON_INVESTIGATION.md).
+
+> **2026-07-31 (this session, working log — the MBX modelling thread proper):**
+>
+> * **§1 below is STALE**: the model is no longer a 25-line stub. The in-app
+>   button work grew it measured event registers (0x12C status / 0x130 enable /
+>   0x134 clear), three kick sites (0x6d8, 0x1020 bit 0/8, 0xA00000 fire), an
+>   optional register-sparing RAM backing (`IT_MBX_RAM`), an IRQ line pluggable
+>   via `IT_MBX_IRQ` (12 = the real MBX interrupt, measured on 1.0), and traces
+>   (`IT_MBX_TRACE[=all]`). See the comment blocks in `hw/arm/ipod_touch.c` and
+>   `IN_APP_BUTTON_INVESTIGATION.md` from "FIRST EVER 3_home_returns PASS"
+>   onward. The register-trick moratorium at the end of that file binds this
+>   thread too: completions must be written into the engine-owned guest-RAM
+>   structures (`[1a4]`/`[1a8]`, +0x60) before any event bit is raised.
+> * **§4 measurement**: `scripts/mbx-composite-probe.py` (new) boots M68AP to
+>   the home screen and PC-samples three phases (idle, lock-screen shimmer,
+>   app-zoom), attributing samples through the firmware's own prebinding
+>   (`otool -l` __TEXT ranges; SpringBoard and any app main binary share
+>   0x1000, so that bucket is ambiguous during appzoom). Two traps already
+>   burned: a 4A102 boot without `-icount 1` panics in `IOIpodUSBDevice::start`
+>   (the exact fb-snapshot trap in BROWSER_WASM_STATUS.md), and icount boots
+>   are slow enough that a fixed boot-wait is wrong — the probe now polls for
+>   the home screen.
+> * **The 1.1.4 ISR, read from the RELEASE kernelcache** (AppleMBX at
+>   0xc03ad000..0xc03bf000 in 4A102, ISR at **0xc03b2e5c**; kexts are stripped,
+>   so this was structural): cause = `status(0x12C) & enable(0x130)`, acked
+>   low-16 to 0x134. Dispatches 0x20 (recovery: 20 soft-event-16 retries),
+>   0x400, 0x10 (render complete), 0x4 → latch `[1a4]+0x4c`, 0x8 → latch
+>   `[1a4]+0x24`, 0x40 → latch `[1a8]+0x2c`, 0x100, 0x200, 0x1. **The swap
+>   completion is a THREE-BIT JOIN**: when `[1a8]+0x2c && [1a4]+0x4c &&
+>   [1a4]+0x24` are all latched (bits 0x40+0x4+0x8, across any number of ISR
+>   entries), the ISR clears all three, and calls `[obj+0x23c]->vtbl+0x9c(
+>   [1a8]+0x1c, 0)` — a completion callback into the swap-device side, i.e.
+>   the thing that would clear the field our TVOut window fakes. Unlike 1.0's
+>   ISR, **1.1.4 DOES dispatch bit 0x40**.
+> * `AppleMBX::addSwapDevice` is at 0xc03af104 (1.1.4); the announced `id` is
+>   obtained from the swap device's own vtbl call, so the polled `+0x160`
+>   field lives in a display-driver-owned object, not in AppleMBX.
+> * **The polled field is a swap-request QUEUE slot, decoded from AppleH1CLCD**
+>   (the `AppleH1TVOut` class lives inside the AppleH1CLCD kext,
+>   0xc037f000..0xc0388000 in 4A102). `[swapdev+0x160]` = the in-flight swap
+>   request pointer; `+0x164/+0x168` = a doubly-linked request queue whose
+>   list-head sentinel is `swapdev+0x164` itself (obj+356); the issue function
+>   at 0xc0381b84 refuses to start while `+0x160 != 0`, and the
+>   promote/complete function at 0xc0383b9c clears an armed bit
+>   (`[swapdev+0x1f4] &= ~4`) and advances the queue. So the always-zero
+>   window fakes "no swap in flight", which is why teardown proceeds. The
+>   honest clear is whatever runs on swap completion — in AppleMBX's ISR
+>   that is the three-bit join above ending in `vtbl+0x9c` into this kext.
+> * The TVOut-window MMIO handlers now log **guest pc/lr** under `IT_FB_TRACE`
+>   (both reads and the previously-dropped writes), so one instrumented 1.1.4
+>   boot names the teardown poller and any writer of the field. Not yet run —
+>   the compositing measurement owns the machine first.
 
 **Date:** 2026-07-28 · **Branch:** `ipod_touch_1g` · **State:** nothing started —
 this is the short path *into* the problem, not a report of work done.
