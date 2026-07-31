@@ -46,6 +46,7 @@
 #include "qemu/error-report.h"
 #include "system/runstate.h"
 #include "exec/cpu-common.h"
+#include "qemu/qsp.h"
 #include "hw/arm/ipod_touch_nand.h"
 #include "hw/arm/ipod_touch_lcd.h"
 #include <emscripten.h>
@@ -509,6 +510,46 @@ static void wasm_maybe_resume(void)
     vm_start();
 }
 
+/*
+ * IT_QSP=1 (set by the page from ?qsp=1): QEMU's own sync profiler, driven
+ * without a monitor. The V8 profile can say the vCPU spends ~20% of its
+ * time in futex_wait; only QSP can say on WHICH lock and from WHICH
+ * callsite. Reported to stderr every 10 s, then reset, so each report is a
+ * window and not a lifetime blur.
+ */
+static void wasm_maybe_qsp_report(void)
+{
+    static int enabled = -1;
+    static int64_t next_report_ms;
+    int64_t now;
+
+    if (enabled == -1) {
+        /* A staged file, not an env var: Emscripten's ENV is not exported in
+         * this build, and a file the page writes in preRun needs nothing. */
+        enabled = getenv("IT_QSP") != NULL ||
+                  g_file_test("/fw/qsp", G_FILE_TEST_EXISTS);
+        if (enabled) {
+            qsp_enable();
+            fprintf(stderr, "[QSP] sync profiling enabled\n");
+        }
+    }
+    if (!enabled) {
+        return;
+    }
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (next_report_ms == 0) {
+        next_report_ms = now + 10000;
+        return;
+    }
+    if (now < next_report_ms) {
+        return;
+    }
+    next_report_ms = now + 10000;
+    fprintf(stderr, "[QSP] ---- 10 s window ----\n");
+    qsp_report(12, QSP_SORT_BY_TOTAL_WAIT_TIME, true);
+    qsp_reset();
+}
+
 static void wasm_input_drain(void *opaque)
 {
     uint32_t tail = qatomic_read(&wasm_input_tail);
@@ -518,6 +559,7 @@ static void wasm_input_drain(void *opaque)
     wasm_maybe_pause();
     wasm_maybe_save_overlay();
     wasm_publish_scanout();
+    wasm_maybe_qsp_report();
 
     while (tail != head) {
         wasm_input_dispatch(&wasm_input_ring[tail & WASM_INPUT_RING_MASK]);

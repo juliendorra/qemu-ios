@@ -275,6 +275,11 @@ guest keeps running.">
     if (/\[BTN\]|ONKEY|\[WASM\]/.test(text)) {
       console.log(`[guest] ${text.trim()}`);
     }
+    // ?qsp=1 exists to be read HEADLESSLY, and qsp_report()'s table carries
+    // no greppable marker -- so in that mode mirror every guest line.
+    if (QSP_MODE) {
+      console.log(`[guest] ${text.trim()}`);
+    }
     if (/\[TOUCH\]|\[LCD\] (Touch input|Retained touch)/.test(text)) {
       console.log(`[guest] ${text.trim()}`);
       if (/Touch input ready|Retained touch input ready/.test(text)) {
@@ -430,6 +435,7 @@ guest keeps running.">
   // is exactly the difference between this page and web/bench-b/ (which never
   // paints) on the 1.1.4 chunked boot.
   const PAINT = new URLSearchParams(location.search).get('paint') !== '0';
+  const QSP_MODE = new URLSearchParams(location.search).get('qsp') === '1';
   let displayBroken = false;
   function moduleProp(name) {
     try {
@@ -1174,6 +1180,13 @@ guest keeps running.">
       fsRef = mod.FS;
       globalThis.__mod = mod;        // for poking at the module from the console
       mod.FS.mkdir('/fw');
+      // ?qsp=1: QEMU's sync profiler, reported to the log every 10 s.
+      // Answers "which lock, from which callsite" for the vCPU's futex
+      // waits. A staged FILE, not ENV -- ENV is not an exported runtime
+      // method in this build and touching it aborts the whole module.
+      if (new URLSearchParams(location.search).get('qsp') === '1') {
+        mod.FS.writeFile('/fw/qsp', '1');
+      }
 
       let staged = 0;
       for (const [dst, src] of FILES) {

@@ -302,11 +302,59 @@ static int os_host_main_loop_wait(int64_t timeout)
 
     glib_pollfds_fill(&timeout);
 
+#ifdef EMSCRIPTEN
+    /*
+     * Emscripten's poll() DOES NOT BLOCK on the fds this loop watches
+     * (in-memory pipes/eventfd emulation): measured on a cold boot, ~45,000
+     * iterations/s of which ~93% were handed a timeout >= 1 ms and returned
+     * instantly with nothing ready (~3 genuinely ready fds per second). The
+     * loop degenerated into a spin that took the BQL on every lap, and QSP
+     * measured the vCPU losing 47% of wall time to that lock at cputlb.c's
+     * MMIO path (65k acquisitions/s against 45k contending laps).
+     *
+     * So: when the poll returns empty-handed with time left on the clock,
+     * NAP. The nap is capped at 2 ms, and the cap matters twice over --
+     * timer deadlines shorter than the timeout are already IN `timeout`
+     * (qemu_soonest_timeout above), and a cross-thread qemu_notify_event
+     * lands at worst one nap late. usleep on an Emscripten pthread is a
+     * real futex wait, which is exactly what poll failed to be.
+     */
+    {
+        static uint64_t iters, naps, ready;
+        static int64_t window_start;
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+        iters++;
+        if (window_start == 0) {
+            window_start = now;
+        } else if (now - window_start >= 10000) {
+            fprintf(stderr, "[MLOOP] %llu iters/10s: naps=%llu ready=%llu\n",
+                    (unsigned long long)iters, (unsigned long long)naps,
+                    (unsigned long long)ready);
+            iters = naps = ready = 0;
+            window_start = now;
+        }
+        bql_unlock();
+        replay_mutex_unlock();
+        ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
+        if (ret > 0) {
+            ready++;
+        } else if (timeout > 0) {
+            naps++;
+            g_usleep(MIN(timeout, 2 * SCALE_MS) / SCALE_US);
+        }
+        goto polled;
+    }
+#endif
+
     bql_unlock();
     replay_mutex_unlock();
 
     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
 
+#ifdef EMSCRIPTEN
+polled:
+#endif
     replay_mutex_lock();
     bql_lock();
 
