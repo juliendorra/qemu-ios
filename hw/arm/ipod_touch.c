@@ -809,6 +809,32 @@ static uint8_t *mbx_ram;
 
 #define MBX_RAM_SIZE 0x1000000
 
+/*
+ * IT_MBX_2D_EVENT=<mask>: which event bit the 2D command fire raises.
+ *
+ * The ISR (0xc032ee48) dispatches only bits 0x20 / 0x400 / 0x10 / 0x8 / 0x4;
+ * the DONE bit 6 this model sets is acked and DROPPED, so it can never wake
+ * the thread waiting on a 2D block -- which is why the render falls into the
+ * ~1 s timeout-retry-reinit cycle 33 times. 0x10 is the candidate: it is the
+ * only dispatched bit whose path ends in a wake call (0xc032ef90, taken when
+ * [[obj+0x1a4]+0x20] == 0).
+ *
+ * Default 0 (raise nothing) because two earlier attempts to inject a wake
+ * from the register file wedged the guest outright; the line is still gated
+ * by the guest's own enable mask, so an armed bit is the only thing that can
+ * reach it.
+ */
+static uint32_t mbx_2d_event(void)
+{
+    static int v = -1;
+
+    if (v < 0) {
+        const char *e = getenv("IT_MBX_2D_EVENT");
+        v = (e && e[0]) ? (int)strtol(e, NULL, 0) : 0;
+    }
+    return (uint32_t)v;
+}
+
 static bool mbx_ram_modelled(void)
 {
     static int mode = -1;
@@ -820,9 +846,21 @@ static bool mbx_ram_modelled(void)
     return mode;
 }
 
+/*
+ * The register page is NOT memory. When the store covered the whole window
+ * the guest wedged, and the reason was almost certainly 0x85C: the driver
+ * read-modify-writes it (mask 0x388, kernel 0xc032ad0c) and with the store on
+ * it read back its own value instead of 0. Registers keep answering as
+ * registers; only the window above MBX_REG_LIMIT is memory. Measured layout:
+ * the engine is handed 0x8000 and 0x1b000 (regs 0x608/0x60c), command ranges
+ * at 0x1d000/0x21000 (0x824/0x83c), the 2D command blocks at 0xa00000+.
+ */
+#define MBX_REG_LIMIT 0x2000
+
 static uint8_t *mbx_ram_at(hwaddr addr, unsigned size)
 {
-    if (!mbx_ram_modelled() || addr + size > MBX_RAM_SIZE) {
+    if (!mbx_ram_modelled() || addr < MBX_REG_LIMIT ||
+        addr + size > MBX_RAM_SIZE) {
         return NULL;
     }
     if (!mbx_ram) {
@@ -888,22 +926,34 @@ static uint32_t mbx_status_12c(void)
  * The whole region is a stub, so the only way to learn what the driver actually
  * expects is to watch the accesses. Needed because the completion the guest
  * waits for cannot be modelled honestly without knowing which register kicks
- * the operation and which reports it done. Repeats collapse per register: the
- * first 12 print, then every 1024th, so a poll cannot bury a one-off write.
+ * the operation and which reports it done. Repeats collapse per (address,
+ * direction): the first 12 print, then every 1024th, so a poll cannot bury a
+ * one-off write.
+ *
+ * The collapse used to key on `(addr >> 2) & 0x3FF` -- 1024 slots for a 16 MiB
+ * window, so 0x8000 collided with 0x0, 0x1b000 with 0xc000, and every
+ * aperture-memory access was suppressed early as a "repeat" of an unrelated
+ * register. That silence was then read as "the guest touches nothing while it
+ * waits", which is exactly the question this trace exists to answer. Keyed on
+ * the full address since 2026-07-31.
  */
 static void mbx_trace(const char *dir, hwaddr addr, uint64_t val)
 {
     static int enabled = -1;
-    static uint32_t counts[0x400];
+    static GHashTable *counts;
 
     if (enabled < 0) {
         enabled = getenv("IT_MBX_TRACE") != NULL;
+        if (enabled) {
+            counts = g_hash_table_new(NULL, NULL);
+        }
     }
     if (!enabled) {
         return;
     }
-    uint32_t slot = (uint32_t)((addr >> 2) & 0x3FF);
-    uint32_t n = ++counts[slot];
+    gpointer key = (gpointer)(uintptr_t)((addr << 1) | (dir[0] == 'W'));
+    uint32_t n = (uint32_t)(uintptr_t)g_hash_table_lookup(counts, key) + 1;
+    g_hash_table_insert(counts, key, (gpointer)(uintptr_t)n);
     /* IT_MBX_TRACE=all removes the per-register collapse: the swap command
      * descriptor is written once per swap, so a cap of 12 hides exactly the
      * writes that carry the destination surface. */
@@ -1040,7 +1090,7 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
          */
         case 0xa00000:
             if ((val & 0xf0000000) == 0xf0000000) {
-                mbx_event_status |= MBX_EVENT_DONE;
+                mbx_event_status |= MBX_EVENT_DONE | mbx_2d_event();
                 mbx_update_irq();
             }
             break;

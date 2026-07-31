@@ -1754,3 +1754,106 @@ individual engine-owned words one at a time until the recovery cycle stops
 firing. The measurement that identifies them: with the store ON, the driver
 hangs on the FIRST wait, so a PC sample at that hang names the exact load --
 one address, not a search.
+
+
+## The trace was lying, and what it said once it stopped (2026-07-31, late)
+
+### Instrument trap #6: the MBX trace collapsed 16 MiB into 1024 slots
+
+`mbx_trace` keyed its repeat-collapse on `(addr >> 2) & 0x3FF`. For a register
+page that is fine; for a 16 MiB window it means **0x8000 collides with 0x0**,
+`0x1b000` with `0xc000`, and so on. Aperture accesses were therefore suppressed
+early as "repeats" of unrelated registers, and the resulting silence was read
+as *"the guest touches nothing while it waits"* -- which is precisely the
+question the trace exists to answer. Now keyed on the full address.
+
+### With a truthful trace: there is no polling anywhere
+
+Re-run, same press, same engine. Every read the driver performs, whole run:
+
+| offset | max n |
+|---|---|
+| `0x12c`, `0x130`, `0x85c`, `0x1020` | 12 (the collapse cap; never reached 1024) |
+| `0xf00`, `0xf10`, `0xff0`..`0xffc` | 1 each |
+
+**Zero reads anywhere in the aperture memory, and no register is polled at
+all** -- nothing reaches even n=1024. The driver fires a block, performs a
+handful of register accesses, and then sleeps. So the wait is interrupt-driven,
+full stop.
+
+### Correction to commit a77f845ad3
+
+That commit concluded: *"answering 0 is load-bearing: the driver writes state
+into those words and waits for the ENGINE to change it, and pinned to 0 some
+waits pass trivially."* The **observation** stands -- backing the whole window
+with storage does wedge the guest. The **explanation was wrong**: the driver
+never reads aperture memory at all, so no wait can have been passing trivially
+there.
+
+The likely culprit is a REGISTER read-back, not memory: `0x85C` is
+read-modify-written by the driver (mask `0x388`, kernel `0xc032ad0c`), and a
+whole-window store makes it return its own last value where it used to return
+0. Hence the refinement now under test: store only above `MBX_REG_LIMIT`
+(0x2000), so registers keep answering as registers and only the memory window
+retains data.
+
+### The real reason the 33 timeouts happen: the DONE bit is not dispatched
+
+The ISR at `0xc032ee48` computes its cause as `status(0x12C) & enable(0x130)`
+and dispatches exactly five bits: `0x20`, `0x400`, `0x10`, `0x8`, `0x4`. Bit 6
+(`0x40`) -- `MBX_EVENT_DONE`, the bit this model raises on every kick and the
+bit the *polled* paths spin on -- is acked (`uxth r3, r6; str r3, [r2,#0x134]`)
+and **dropped**. So every completion the model signals is invisible to a
+sleeping waiter, by construction. That is the 33 timeouts, stated exactly.
+
+Supporting map, from the recovery routine and the ISR (they are inverses):
+
+| soft event posted to 0x12C | driver flag the ISR sets |
+|---|---|
+| `0x4` (when `[1a4]+0x4c == 0`) | `[1a4]+0x4c = 1` |
+| `0x8` (when `[1a4]+0x24 == 0`) | `[1a4]+0x24 = 1` |
+| `0x40` (when `[1a8]+0x2c == 0`) | -- not dispatched |
+
+And the word the recovery sleep actually waits on, `[[obj+0x1a4]+0x60]`, is
+**read-only to the entire kext**: of 78 `+0x60` accesses in AppleMBX, every one
+on the `[1a4]` structure is a load (`0xc032d9c4`, `0xc032d9f0`, `0xc032db74`,
+`0xc032dd6c`, `0xc032e074`). Nothing in the driver ever stores it. It is
+engine-owned -- so the completion protocol is memory-side, and that part of
+a77f845ad3 is confirmed rather than corrected.
+
+### Fifth failed fix: raise 0x10 on the 2D fire (`IT_MBX_2D_EVENT`)
+
+`0x10` is the only dispatched bit whose path ends in a wake call (`0xc032ef90`,
+taken when `[[1a4]+0x20] == 0`), so it is the natural candidate. Raised on the
+`0xa00000` fire ONLY -- not on the `0x6d8`/`0x1020` kicks that broke the
+earlier attempts -- and still gated by the guest's own enable mask, so only an
+armed bit can reach the line. **It wedges**: press at t=40.0, zero LCD flips
+afterwards, no dismissal at all. Ships default 0; the knob stays for the next
+candidate bit.
+
+### Six attempts, one pattern
+
+| attempt | result |
+|---|---|
+| complete streamed `0x70000000` terminators | no change |
+| `0x85C` as a command-progress counter | no change |
+| latch bit 4 when the guest arms `0x130` | **wedge** |
+| bit 4 from a 500 us virtual timer after each kick | **wedge** |
+| back the whole aperture with storage | **wedge** |
+| bit 4 on the 2D fire only (`IT_MBX_2D_EVENT=0x10`) | **wedge** |
+
+Every one of these tries to satisfy the driver **from the register file**, and
+the three that actually reach the ISR all wedge for the same reason: the wake
+path reads driver/engine state in memory (`[1a4]`/`[1a8]`), so an interrupt
+delivered against state the model never updated makes the driver's bookkeeping
+diverge and it stops issuing work entirely. An interrupt is not a completion;
+it is the *announcement* of one. Until the memory says an operation finished,
+announcing it is worse than staying silent.
+
+**So the fix is not a register trick, and no further register trick should be
+tried.** It is: learn the guest-physical location of the `[1a4]`/`[1a8]`
+structures, write the completion there (starting with `+0x60`), and only then
+raise the event. The engine addresses (`0x608 = 0x8000`, `0x60c = 0x1b000`) are
+MBX-space, so that translation is the missing piece -- and the register-sparing
+store now under test is what would capture the driver's own page table
+(`0x61c = 0x00020007`) to supply it.
