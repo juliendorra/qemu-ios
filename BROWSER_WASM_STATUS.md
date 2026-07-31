@@ -2763,3 +2763,52 @@ scripts/wasm/stage-assets.py --from-app "/Applications/iPhone 2G (iOS 1.1.4).app
     --board m68ap --firmware 1.1.4
 scripts/wasm/serve.py            # then open http://localhost:8010
 ```
+
+### Dispatcher lever #1 tried and REVERTED: the addFunction Map is not free to remove (2026-08-01)
+
+prof6 named "a JS Map operation on the per-TB path" inside the ~5.6% JS-glue
+slice. It is real and it is `addFunction`: emscripten keeps a
+`functionsInTableMap` so `removeFunction` can dedupe, does a `Map.get` +
+`Map.set` per registration, and rescans the whole table (`updateTableMap`)
+whenever the table grows. Every TB export in `instantiate_wasm` is a fresh
+unique function, so none of that bookkeeping can ever pay off.
+
+Replaced it with a private allocator (chunked `wasmTable.grow`, free-list
+recycling on eviction). **Measured worse, twice, and reverted.**
+
+| run | kernel | BSD root | launchd | wall | compiled | evicted |
+|---|---|---|---|---|---|---|
+| baseline (same dir, same source, patch stashed) | 117 | 128 | **148** | 152.5 | 24,048 | 0 |
+| slot allocator, run 1 | 130 | 143 | **761** | 764.5 | 61,776 | 24,000 |
+| slot allocator, run 2 (quiet machine) | **79** | **87** | **687** | 688.4 | 61,184 | 24,000 |
+
+Note the shape rather than the totals: the EARLY landmarks got FASTER (kernel
+117 -> 79, BSD root 128 -> 87), so removing the Map does help the compile
+path exactly as predicted — and then the run collapses, compiling 2.5x as
+many blocks, saturating the 48,000 instance cap and evicting 24,000 where the
+baseline evicts none. Whatever the private free-list does differently from
+emscripten's `freeTableIndexes`, it drives the instance accounting into
+eviction churn, and the churn costs far more than the Map ever did.
+
+**Lead for next time, not a dead end:** the win is available (the early
+landmarks prove it) but it has to be taken without disturbing instance
+lifetime. Next thing to measure: whether a table slot freed by `slot_free`
+keeps its `WebAssembly.Instance` alive longer than `removeFunction` does —
+the eviction path depends on the `FinalizationRegistry` firing
+(`check_gc_completion`), so anything that delays collection turns the cap
+into a treadmill. Try keeping `addFunction`'s registration but skipping only
+the Map (`functionsInTableMap`), or reuse emscripten's own
+`getEmptyTableSlot()` and drop just the Map lines.
+
+Two harness traps burned in the process, both worth knowing before the next
+wasm A/B:
+
+* **`web/bench-b/` symlinks to `build-wasm-b/`, not `build-wasm/`.** Building
+  the viewer dir and then running `bench-run.py` measures the OLD binary and
+  reports "no change". Rebuild the dir the harness actually points at, or the
+  A/B is meaningless. (Both dirs were rebuilt from the reverted source.)
+* **`WASM64_MEMORY64_2` is NOT defined in this build**, so `wasmTable`'s
+  index type is i64 and `wasmTable.grow(1024)` throws "Cannot convert 1024 to
+  a BigInt" — two runs died at ~1.4 s on exactly that. `ENC_WASM_TABLE_IDX`
+  is a passthrough here, not `Number()`. Probe the index type at runtime
+  (`try { wasmTable.grow(0) }`) rather than guessing it with an `#ifdef`.
