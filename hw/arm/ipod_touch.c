@@ -1198,7 +1198,10 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
 
     if (getenv("IT_KEY_TRACE")) {
-        fprintf(stderr, "[KEYTRACE] keycode=%d pmu=%p active=%d parked=%d "
+        int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+        fprintf(stderr, "[KEYTRACE %3lld.%06lld] ",
+                now / 1000000LL, now % 1000000LL);
+        fprintf(stderr, "keycode=%d pmu=%p active=%d parked=%d "
                 "no_park=%d sup_pwr=%d sup_home=%d oocshdwn=%d\n",
                 keycode, (void *)s->pmu,
                 s->pmu ? s->pmu->prewarm_active : -1,
@@ -1422,7 +1425,9 @@ static void ipod_touch_key_event(void *opaque, int keycode)
         ARMCPU *arm_cpu = ARM_CPU(s->cpu);
         CPUARMState *env = &arm_cpu->env;
         uint32_t cpsr = cpsr_read(env);
-        fprintf(stderr, "[BTN] keycode=%d  PC=0x%08x  I=%d F=%d  power=%d\n",
+        int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+        fprintf(stderr, "[BTN %3lld.%06lld] keycode=%d  PC=0x%08x  I=%d F=%d  power=%d\n",
+                now / 1000000LL, now % 1000000LL,
                 keycode, env->regs[15], (cpsr >> 7) & 1, (cpsr >> 6) & 1, is_power);
     }
 

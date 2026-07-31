@@ -1553,3 +1553,71 @@ polling around a press perturbs delivery itself (BQL + guest-time dilation);
 dismiss-latency runs its verdict polling at 1 s for this reason and still
 shows the effect -- prefer app-button-probe's press-wait-grab shape for
 pass/fail verdicts.
+
+
+## THE "DOWN SWALLOW" WAS NOT REAL: verdict windows shorter than the dismissal (2026-07-31)
+
+The hunt for the press-delivery swallow ends in a retraction -- the fifth
+instrument artifact of this investigation, and the second one reported to the
+user as a finding.
+
+**Measured, with a dedicated probe** (`scripts/home-swallow-probe.py`: boot the
+1.0 bundle, open an app, press HOME repeatedly, reopen the app after every
+dismissal, and correlate each press's verdict with the model's own timestamped
+traces -- `[BTN]`/`[KEYTRACE]`/`[SYSIC]` lines now carry QEMU_CLOCK_VIRTUAL):
+
+* At the standard 16 s verdict window: **2/8 and 2/6 presses "dismissed"** --
+  and the failures were not random. The pattern was strictly periodic:
+  SWALLOWED, SWALLOWED, DISMISSED, after every app-open, twice per run.
+* Model-side, swallowed and dismissed presses are **indistinguishable**. Every
+  press kept a full ~130-149 ms VIRTUAL width (so `-icount` dilation is not
+  the mechanism -- that hypothesis was drafted, implemented, refuted by this
+  measurement, and reverted). The guest ACKed group 1's menu bit within ~1 ms
+  of BOTH edges of every press, and `AppleM68Buttons` sampled the pin register
+  (GPIO 0x2c4, PC 0xc040cb74, five reads per edge -- one per button) reading
+  the correct level each time: 0x7 pressed, 0x6 released.
+* At a 40 s verdict window (`IT_PROBE_WAIT=5`): **4/4 presses dismissed the
+  app.** Every in-app HOME press delivers.
+
+The deterministic S,S,D rhythm was attribution, not delivery: under probe load
+(VNC display client + three trace channels) the dismissal takes ~17-40 s, so
+press 1's dismissal landed inside press 3's verdict window. Press 1 scored
+0.00%, press 3 inherited its repaint. The earlier GSEvent-level "UP arrives,
+DOWN never does, dies at the `_menuButtonTimer == nil` gate" observations were
+sampled while a previous press's dismissal was still in flight -- a press
+landing mid-dismissal is genuinely dropped by a SpringBoard that is busy in the
+snapshot RPC, but that is DOWNSTREAM of the latency, not a delivery bug.
+
+**Instrument trap #5, the generalizable one:** a pass/fail verdict window must
+be longer than the worst-case latency of the thing it judges, or successes
+migrate to later presses and read as a fractional "swallow rate". A periodic
+failure pattern (every Nth attempt works) is the signature of this trap --
+randomness is what real races look like.
+
+What this leaves as the actual user-facing issue: **dismissal latency**, again.
+~7 s on an unloaded host, ~17-40 s with a display client attached and the host
+busy -- in real interactive use the user presses HOME again during that
+window, those mid-dismissal presses do nothing, and the experience reads as
+"the button only works every third press". The open lever is unchanged and
+already recorded: the MBX microkernel re-init loop reading 0xff0..0xffc/0xf10
+as zero.
+
+Fidelity fix landed alongside (found while ruling the model out, kept on its
+own merits): SYSIC `GPIO_INTLEVEL` writes were silently discarded and reads
+always returned 0; the register is now stored, traced (`wr INTLEVEL`), and
+read back. This register is NOT unused: the traces show the button ISR reads
+group 1's INTLEVEL on every edge and toggles the menu pin's polarity bit
+(`0x04003900` pressed-watch <-> `0x04003800` released-watch) -- before this
+fix every one of those reads returned 0, and delivery still worked because the
+driver also samples the pin data register (0x2c4). A/B at 16 s windows shows
+identical behavior with and without the store (same S,S,D attribution
+pattern), so the store changes observability, not behavior -- but any future
+guest that trusts the readback now gets the truth.
+
+Regression with the instrumented engine (standard `app-button-probe`, default
+16 s-class windows, host concurrently running a wasm toolchain build): steps
+1/2/4/5 PASS, `3_home_returns` FAIL 0.00% -- the dismissal did not finish
+inside the window on a loaded host, which is the latency mechanism above, not
+a delivery regression (POWER and HOME-wake still work immediately after). The
+40 s-window 4/4 run on the same engine is the acceptance evidence for press
+delivery.

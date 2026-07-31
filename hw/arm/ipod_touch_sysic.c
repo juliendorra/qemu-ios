@@ -35,8 +35,9 @@ static void sysic_trace(const char *what, uint8_t group, uint32_t value)
     if (n > 24 && (n & 0xFFF) != 0) {
         return;
     }
-    fprintf(stderr, "[SYSIC] %s group %u = 0x%08x (n=%u)\n",
-            what, group, value, n);
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+    fprintf(stderr, "[SYSIC %3lld.%06lld] %s group %u = 0x%08x (n=%u)\n",
+            now / 1000000LL, now % 1000000LL, what, group, value, n);
 }
 
 static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
@@ -60,9 +61,9 @@ static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
         case GPIO_INTLEVEL ... (GPIO_INTLEVEL + GPIO_NUMINTGROUPS * 4):
         {
             uint8_t group = (addr - GPIO_INTLEVEL) / 4;
-            /* NOTE nothing in this model ever SETS gpio_int_level, so this
-             * always reads 0. If a guest consults it to tell press from
-             * release, it is being told "released" every time. */
+            /* Readback of the guest's own INTLEVEL writes (they were
+             * silently DISCARDED until 2026-07-31, so this always read 0 --
+             * "released" -- whatever the guest configured). */
             sysic_trace("rd INTLEVEL", group, s->gpio_int_level[group]);
             return s->gpio_int_level[group];
         }
@@ -106,6 +107,11 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
             break;
         case GPIO_INTLEVEL ... (GPIO_INTLEVEL + GPIO_NUMINTGROUPS * 4):
         {
+            uint8_t group = (addr - GPIO_INTLEVEL) / 4;
+            /* Stored so the trace shows the polarity the guest asked for;
+             * reads still return the stored word (see the read comment). */
+            sysic_trace("wr INTLEVEL", group, (uint32_t)val);
+            s->gpio_int_level[group] = val;
             break;
         }
         case GPIO_INTSTAT ... (GPIO_INTSTAT + GPIO_NUMINTGROUPS * 4):
