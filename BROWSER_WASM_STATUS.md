@@ -299,16 +299,49 @@ final link when this session closed. To finish: wait for the link, boot
 and check whether `emscripten_longjmp` left the vCPU profile. The
 experiment flags are NOT committed.
 
-**VERDICT (2026-07-31, late): DEAD — asyncify hangs on wasm-EH.** With the
-flag verifiably in every compile and the link (2,139 hits in build.ninja),
-all 1998 objects compile, and then `wasm-opt --asyncify ...
+**VERDICT (2026-07-31, late; wording corrected 2026-08-01): BLOCKED ON THE
+ASYNCIFY PASS AT THIS MODULE SIZE — not proven impossible.** With the flag
+verifiably in every compile and the link (2,139 hits in build.ninja), all
+1998 objects compile, and then `wasm-opt --asyncify ...
 --enable-exception-handling` wedges after ~1.3 s of CPU, unkillable
 (kill -9 immune, uninterruptible), stuck at a ~28 MB partial in-place
-rewrite. Reproduced twice; the first stall was misread as disk-full. Since
-`-sASYNCIFY=1` is mandatory (coroutines + the TCG backend's `ffi_call_js`),
-`-sSUPPORT_LONGJMP=wasm` is unusable here. The longjmp lever must reduce
-`cpu_loop_exit` FREQUENCY (why does the vCPU exit so often — icount window
-sizing, interrupt cadence) rather than the unit cost of the longjmp.
+rewrite. Reproduced twice; the first stall was misread as disk-full.
+
+Read that as measured: **the tool hung.** The original wording ("DEAD",
+"`-sASYNCIFY=1` is mandatory, so `SUPPORT_LONGJMP=wasm` is unusable")
+overstated it by fusing a true premise to an unproven conclusion, so it is
+corrected here rather than left to cost a future session a re-derivation.
+
+* TRUE: `-sASYNCIFY=1` cannot simply be dropped. `util/coroutine-wasm.c`
+  builds QEMU's coroutines on `emscripten_fiber_init` and allocates an
+  explicit `asyncify_stack` per coroutine — emscripten fibers ARE an
+  asyncify feature — and QEMU's block layer is coroutine-based throughout.
+  `ASYNCIFY_IMPORTS=ffi_call_js` is TCI's libffi helper-call path.
+* NOT ESTABLISHED: that asyncify and wasm-EH are semantically
+  incompatible. A hang in binaryen on a very large module is a tooling
+  limit, and none of the obvious ways around it were tried.
+
+Untried, cheapest first — and #1 is worth doing on its own merits:
+
+1. **Scope the pass.** There is no `ASYNCIFY_ONLY` / `ASYNCIFY_ADD` /
+   `ASYNCIFY_REMOVE` anywhere in the build, so binaryen instruments the
+   whole transitive closure of a 1998-object binary — exactly the shape
+   that produced the 28 MB rewrite that wedged. A scoped list (the
+   coroutine entry points plus `ffi_call_js`) shrinks the pass enormously
+   AND cuts asyncify's RUNTIME overhead, which is a perf win with or
+   without longjmp.
+2. **Toolchain mechanics.** Binaryen 123 / emcc 4.0.10 here; try a newer
+   binaryen, and write to a separate output file instead of the in-place
+   rewrite that died half-finished.
+3. **JSPI is NOT a drop-in — do not spend a day on it.** `-sJSPI`
+   suspends on async IMPORTS; it does not provide the general fiber-swap
+   API `emscripten/fiber.h` needs. Adopting it means replacing the
+   coroutine backend, not changing a flag.
+
+Independent of all of the above, the frequency argument stands on its own:
+the longjmp lever should reduce `cpu_loop_exit` FREQUENCY (why does the
+vCPU exit so often — icount window sizing, interrupt cadence) rather than
+the unit cost of the longjmp.
 Two zombie wasm-opt processes (PIDs 71876, 92267) may linger until reboot.
 
 Two operational traps from the attempt, both now burned into comments:
