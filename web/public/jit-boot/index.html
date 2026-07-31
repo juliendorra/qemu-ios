@@ -436,6 +436,28 @@ guest keeps running.">
   // paints) on the 1.1.4 chunked boot.
   const PAINT = new URLSearchParams(location.search).get('paint') !== '0';
   const QSP_MODE = new URLSearchParams(location.search).get('qsp') === '1';
+
+  // Safari/JSC dies mid-boot with `RangeError: Maximum call stack size
+  // exceeded` ~20 frames into TB translation: JSC puts wasm frames on the
+  // worker's small NATIVE stack, and its pre-optimizer tiers make very large
+  // frames for very large functions (QEMU's Thumb decoder). No Emscripten
+  // flag reaches that stack (the wasm linear stack IS sized correctly --
+  // that was a different, fixed crash). Say it up front instead of letting
+  // the machine die silently at ~40 s. Feature-detected the boring way: JSC
+  // is the only engine without chrome.* that still reports Safari in the UA.
+  const isJSC = /Safari\//.test(navigator.userAgent)
+    && !/Chrom(e|ium)|Edg\//.test(navigator.userAgent);
+  if (isJSC) {
+    const warn = document.createElement('div');
+    warn.style.cssText = 'background:#7a2020;color:#fff;padding:10px 14px;'
+      + 'margin:8px 0;border-radius:6px;font-weight:bold';
+    warn.textContent = '⚠️ Safari is not supported yet: its JavaScript '
+      + 'engine overflows the native stack while the emulator compiles code '
+      + '(RangeError ~40 s in, machine dies). Use a Chromium browser — '
+      + 'Chrome, Edge, Arc, Brave. Newer Safari versions are untested and '
+      + 'may fare better.';
+    document.body.prepend(warn);
+  }
   let displayBroken = false;
   function moduleProp(name) {
     try {

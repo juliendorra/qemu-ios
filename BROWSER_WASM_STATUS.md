@@ -13,6 +13,15 @@ button problems are fixed elsewhere, followed by 1.0.2 and 1.1.1 as a version
 picker. Assets are prepared offline here and self-hosted. iPod touch (N45AP)
 comes after.
 
+> **⚠️ CHROME-FAMILY ONLY for now (Chrome/Edge/Arc/Brave — anything V8).**
+> **Safari crashes the vCPU mid-boot** with `RangeError: Maximum call stack
+> size exceeded` ~20 frames deep in `disas_t32`: JSC places wasm frames on
+> the worker's small NATIVE stack and its pre-optimizer tiers make huge
+> frames for huge functions. No Emscripten flag reaches that stack. Newer
+> Safari (18+/IPInt) is untested and plausibly better. Details + leads in
+> the 2026-07-31 Safari section below; the viewer page shows a warning on
+> JSC.
+
 ---
 
 ## Session — 2026-07-31: the speed campaign — measurements first, then the display
