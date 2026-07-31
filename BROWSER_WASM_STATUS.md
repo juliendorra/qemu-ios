@@ -226,11 +226,30 @@ exceed 64 KiB. The day's speedups only found it sooner.
 
 Fix: `-sSTACK_SIZE=8MB` + `-sDEFAULT_PTHREAD_STACK_SIZE=4MB` in
 `configs/meson/emscripten.txt` (~48 MiB of the 2 GiB heap across all
-threads). **VERIFIED same evening:** resume, tap Calculator, and the
-worker rode out the whole compile burst — 6,480 blocks and climbing at
+threads). **VERIFIED same evening in Chrome:** resume, tap Calculator, and
+the worker rode out the whole compile burst — 6,480 blocks and climbing at
 t=120 s where the crash had landed at 5,328 — no RangeError, machine
 alive throughout. (The tap's UI outcome belongs to the parallel
 button/touch sessions, not this fix.)
+
+**SAFARI IS A DIFFERENT, UNFIXED STACK.** Safari 17 still dies
+(`RangeError`, ~37 s, compiled=7232 — PAST the old Chrome crash point, so
+the linear-memory fix is present and working). JSC symbolicates the trace:
+`disas_t32 ← thumb_tr_translate_insn ← translator_loop ←
+arm_translate_code ← setjmp_gen_code ← tb_gen_code ← cpu_exec…` — only
+~20 frames deep. That shallow depth means the NATIVE JS call stack
+overflowed, not the wasm linear stack: JSC places wasm frames on the
+worker's native stack, its pre-OMG tiers use very large frames for huge
+functions (QEMU's Thumb decoder is among the largest in the binary), and
+Safari worker stacks are small. No Emscripten flag reaches that stack.
+
+Leads, in order: (1) does it survive on a SECOND visit, when JSC's module
+cache may start from optimized tiers with small frames? (2) JSC honors no
+page-side stack knob — check WebKit trackers for wasm stack sizing on
+workers; (3) shrinking `disas_t32`'s frame (it is one giant switch) is
+upstream surgery — last resort; (4) until then the viewer should detect
+JSC and say plainly that Chrome-family browsers are supported, rather
+than letting the machine die silently mid-boot.
 
 The `-sSUPPORT_LONGJMP=wasm` attempt exposed a build-system trap that had
 been eating flags since the port began: **configure's
