@@ -210,6 +210,23 @@ Day's total: cold boot to the home screen **252 s → 152 s** while the boot
 went from silent-until-launchd to a 60 fps live panel; second-visit resume
 **broken → 3.7 s**.
 
+### Post-BQL re-ranking (prof6, read 2026-08-01): the DISPATCHER is now #1
+
+Same method, vCPU isolate, 78k ticks, after the nap fix: C++ fell 38%→23%
+(the futex share collapsed as designed). New order: ~25% generated TBs;
+**~15% TB dispatch** — `tcg_qemu_tb_exec` 8.5% is the single hottest named
+function, plus `helper_lookup_tb_ptr` 4.3% and `g_tree_lookup`/`tb_tc_cmp`
+~2.4%; ~6% MMU/MMIO; ~5.6% JS glue **including `MapPrototypeSet`/
+`ArrayFrom` builtins — a JS Map operation is on the per-TB path** (look in
+`tcg/wasm64.c`'s EM_JS glue around `instantiate_wasm` and the dispatcher);
+`cpu_io_recompile` grew to 2.4%. Next lever: the dispatcher — the Map op
+first, then a dispatcher-side chain cache so goto_tb exits skip
+helper_lookup_tb_ptr re-entry.
+
+Also parked, for the record: the **4A102 resume snapshot** build remains
+blocked only on host disk (~2 GiB needed; the volume hovers under 1 GiB
+whenever the toolchain has been busy); `?build=4A102` cold-boots meanwhile.
+
 ### OPEN BLOCKER (2026-07-31 evening): vCPU worker dies with a stack overflow on app launch
 
 User-reported, interactive cold boot on the day's final engine (nap fix +
