@@ -201,6 +201,34 @@ Day's total: cold boot to the home screen **252 s → 152 s** while the boot
 went from silent-until-launchd to a 60 fps live panel; second-visit resume
 **broken → 3.7 s**.
 
+### The longjmp experiment — first round was an A/A; real round PENDING
+
+The `-sSUPPORT_LONGJMP=wasm` attempt exposed a build-system trap that had
+been eating flags since the port began: **configure's
+`--extra-cflags`/`--extra-ldflags` never reach an emscripten build.**
+configure passes `configs/meson/emscripten.txt` as a SECOND meson cross
+file, and meson's `[built-in options]` REPLACE rather than merge across
+cross files. `-lnodefs.js`/`-sFETCH` only ever worked because emscripten.txt
+carries its own copies; `--profiling-funcs` never once took effect through
+configure (every name-sectioned binary so far came from the manual
+`keeprsp` relink). The first "experiment" therefore benchmarked the
+baseline against itself — landmarks matched to 0.1 s (83/92/152.2 vs
+84/93/152.1), which doubles as a variance measurement: **~1%**.
+
+Now: `--profiling-funcs` lives permanently in emscripten.txt (where flags
+actually apply), the trap is documented in both files, and the REAL
+experiment build (SUPPORT_LONGJMP=wasm injected into emscripten.txt's
+c_args + c_link_args, fresh `build-wasm-lj`, viewer at
+`/public/jit-boot-lj/`) compiled all 1998 objects cleanly and was in its
+final link when this session closed. To finish: wait for the link, boot
+`/public/jit-boot-lj/` for landmarks vs 84/93/152, `--js-flags=--prof` it,
+and check whether `emscripten_longjmp` left the vCPU profile. The
+experiment flags are NOT committed — re-add `-sSUPPORT_LONGJMP=wasm` to
+emscripten.txt's c_args/cpp_args/c_link_args/cpp_link_args and reconfigure
+fresh to reproduce. If the link failed instead: that is the known
+asyncify-vs-wasm-EH collision, and the lever falls back to reducing
+`cpu_loop_exit` FREQUENCY rather than unit cost.
+
 ---
 
 ## Session — 2026-07-30 (late): iPhone OS 1.1.4 reaches the home screen IN THE VIEWER

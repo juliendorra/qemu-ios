@@ -81,12 +81,15 @@ configure_args=(
     # emscripten_fetch with EMSCRIPTEN_FETCH_SYNCHRONOUS is the supported way
     # to block a worker thread on a network read.
     #
-    # --profiling-funcs keeps the wasm NAME SECTION: without it a CPU profile
-    # of the engine is one anonymous wasm-function[31678] eating 100% and
-    # nothing can be concluded (learned 2026-07-31). Costs binary size only,
-    # not speed; stage-static can strip it if the download ever matters more
-    # than being able to see.
-    "--extra-ldflags='-lnodefs.js -lworkerfs.js -sFETCH --profiling-funcs'"
+    # NB --extra-cflags/--extra-ldflags DO NOT WORK for emscripten builds:
+    # configure passes configs/meson/emscripten.txt as a SECOND meson cross
+    # file after config-meson.cross, and meson's [built-in options] REPLACE
+    # rather than merge across cross files, so everything routed through
+    # here is silently discarded (discovered 2026-07-31 — an A/B ran as A/A).
+    # Compile/link flags that must actually apply belong in emscripten.txt.
+    # The line below is kept only for the harmless -sFETCH duplicate story:
+    # nodefs/workerfs/FETCH work because emscripten.txt carries its own copies.
+    "--extra-ldflags='-lnodefs.js -lworkerfs.js -sFETCH'"
 )
 
 # -sMEMORY64=2 keeps the address space at 32 bits, which the 128 MiB guest never

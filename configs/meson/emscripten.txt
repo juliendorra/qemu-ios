@@ -4,5 +4,14 @@ cpp_args = ['-pthread']
 objc_args = ['-pthread']
 # -sPROXY_TO_PTHREAD link time flag always requires -pthread even during
 # configuration so explicitly add the flag here.
-c_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32']
-cpp_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32']
+# NB this file is passed to meson AFTER config-meson.cross, and meson's
+# [built-in options] REPLACE rather than merge across cross files -- so
+# configure's --extra-cflags/--extra-ldflags never reach an emscripten
+# build's c_args/c_link_args. Flags that must actually apply belong HERE
+# (discovered 2026-07-31 when both --profiling-funcs and a codegen
+# experiment silently vanished and an A/B ran as A/A).
+#
+# --profiling-funcs keeps the wasm name section (+0.9 MB): without it every
+# CPU profile of the engine is one anonymous wasm-function[NNNN].
+c_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32','-lnodefs.js','-lworkerfs.js','--profiling-funcs']
+cpp_link_args = ['-pthread','-sASYNCIFY=1','-sPROXY_TO_PTHREAD=1','-sFORCE_FILESYSTEM','-sALLOW_TABLE_GROWTH','-sTOTAL_MEMORY=2GB','-sWASM_BIGINT','-sEXPORT_ES6=1','-sASYNCIFY_IMPORTS=ffi_call_js','-sFETCH','-sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,TTY,FS,HEAPU8,HEAPU32','-lnodefs.js','-lworkerfs.js','--profiling-funcs']
