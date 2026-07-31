@@ -452,6 +452,7 @@ guest keeps running.">
   const hz30box = document.getElementById('hz30box');
   let lastAcceptMs = 0;
   let fpsCount = 0, fpsWindowStart = 0, fpsShown = 0;
+  let blitMsEwma = null;         // measured cost of one accepted frame
 
   function paint() {
     if (!displayBroken) requestAnimationFrame(paint);
@@ -494,9 +495,14 @@ guest keeps running.">
       imageWords = new Uint32Array(imageData.data.buffer);
     }
 
+    // Timed so the '30 Hz cap saves CPU' claim is a NUMBER, not a hope:
+    // the cap's whole saving is (offers-accepts) × this cost per second.
+    const blitT0 = performance.now();
     const nonBlack = blit(u32, info.ptr >>> 2, info.stride >>> 2,
                           info.width, info.height);
     if (PAINT) ctx.putImageData(imageData, 0, 0);
+    blitMsEwma = blitMsEwma === null ? (performance.now() - blitT0)
+               : blitMsEwma * 0.9 + (performance.now() - blitT0) * 0.1;
     Atomics.store(u32, infoBase + 10, info.seq);   // ack: painted through seq
 
     frames++;
@@ -518,7 +524,8 @@ guest keeps running.">
     fbstatEl.textContent =
       `panel: ${info.width}x${info.height} · ${frames} frames · ${pct}% `
       + `non-black · ${fpsShown.toFixed(1)} fps `
-      + `(${hz30box.checked ? 'cap 30 Hz' : 'vsync'})`;
+      + `(${hz30box.checked ? 'cap 30 Hz' : 'vsync'}) `
+      + `· blit ${blitMsEwma === null ? '—' : blitMsEwma.toFixed(2)} ms`;
     // The native oracle renders 59.0% non-black at 1.0's home screen.
     if (nonBlackPct > 40) mark('home screen (>40% non-black)');
   }
