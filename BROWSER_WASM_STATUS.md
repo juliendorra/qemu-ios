@@ -124,6 +124,46 @@ param is `waitForDebuggerOnStart` (not `waitForDebugger`); multi-MB
 continuations hangs `Profiler.stop` forever — this cost a whole night); every
 CDP call needs a timeout because a dead worker never answers.
 
+### The vCPU thread, finally named (V8 --prof, boot stretch, 2026-07-31)
+
+CDP profiling of the emulator pthreads is STRUCTURALLY impossible — an
+Emscripten pthread never returns to its worker's event loop, so
+`Profiler.stop` can sample but never collect; the four workers that answer
+are pool spares idling in JS. `--js-flags=--prof` is the working method (its
+sampler needs no event loop), plus a name section for the engine. Getting
+that name section: meson CACHES cross-file link args at setup, so adding
+`--profiling-funcs` to configure changes nothing in an existing build dir —
+and a bare `meson setup --reconfigure` poisons the tree with homebrew paths
+(the hermeticity trap again). Working recipe until a fresh setup:
+`ninja -d keeprsp qemu-system-arm.js`, then rerun the link by hand with
+`emcc @qemu-system-arm.js.rsp --profiling-funcs` (+855 KB name section).
+
+The vCPU isolate's budget (65,674 ticks, cold chunked 1A543a boot, 45–110 s):
+
+| share | what it is |
+| --- | --- |
+| ~21% | executing generated TBs (`wasm-function[1..5]` over all TB modules) |
+| ~20% | BLOCKED: `__pthread_mutex_lock → futex_wait` — BQL contention |
+| ~13% | `emscripten_longjmp` — `cpu_loop_exit` via the JS-throw longjmp path |
+| ~13% | TB dispatch: `tcg_qemu_tb_exec` 6.8 + `helper_lookup_tb_ptr` 3.8 + tree lookups ~2.5 |
+| ~5.5% | MMU/MMIO slow paths (`do_ld4_mmu`, `mmu_lookup`, dispatch_read…) |
+| ~5% | JS glue/builtins (helper marshaling, instantiate bookkeeping) |
+| ~1.8% | `cpu_io_recompile` — icount artifact |
+
+**Only ~21% of the busy thread executes guest code.** The engine levers, in
+value order, are now measurements rather than guesses:
+
+1. **BQL contention (~20%)** — find who holds it against the vCPU (the main
+   loop's timer cadence, the 15 ms drain timer, MMIO-under-BQL); a futex
+   wait in wasm is far dearer than native. The main-loop isolate profiles as
+   constant `main_loop_wait`/timer churn, consistent with poll-spinning.
+2. **longjmp (~13%)** — try `-sSUPPORT_LONGJMP=wasm` (wasm-EH instead of JS
+   throws); check interaction with the ASYNCIFY the emscripten cross config
+   carries before trusting a green build.
+3. **Dispatch (~13%)** — direct TB chaining within a module batch;
+   `helper_lookup_tb_ptr`'s jmp-cache misses fall to `g_tree_lookup`.
+4. `cpu_io_recompile` — bounded, revisit only if 1–3 shrink the pie enough.
+
 ### Speed campaign scoreboard (2026-07-31)
 
 | lever | status | effect |
