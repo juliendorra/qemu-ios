@@ -49,10 +49,25 @@
 > natively (the dismissal measurements in IN_APP_BUTTON_INVESTIGATION.md),
 > i.e. nothing is performance-starved that MBX offload would rescue.
 >
-> **Per §4/§7, that settles the justification: T1/T2 proceed (if at all) on
-> the fidelity argument alone — deleting the TVOut zero-window and the
-> LK_ENABLE_MBX2D plist edit — not on performance.** Under the wasm/TCI
-> build the RATIO is what transfers, and the ratio is small there too.
+> **Per §4/§7, that settles the justification NATIVELY: T1/T2 proceed (if
+> at all) on the fidelity argument alone — deleting the TVOut zero-window
+> and the LK_ENABLE_MBX2D plist edit — not on performance.**
+>
+> **The wasm-side caveat (raised in review, and it is real): the number
+> that transfers to the browser is not the 2-4% total share — it is
+> compositing's share of NON-IDLE guest instructions (8-19% here), because
+> TCI compresses idle out of the wall clock.** Against the wasm session's
+> own vCPU profile (BROWSER_WASM_STATUS.md 2026-07-31: only ~21% of the
+> busy vCPU thread executes guest code; the rest is BQL/longjmp/dispatch
+> overhead), an MBX 2D offload today buys ~21% x 8-19% ≈ **2-4% of the
+> wasm vCPU thread** — same single digits, and far below the engine levers
+> being worked there. But that bound RISES as those overheads fall (BQL
+> is already 47% → 8%): if guest execution comes to dominate the thread,
+> the ceiling approaches the non-idle share itself. So T2's performance
+> case is **parked pending the wasm speed campaign, not dead** — re-run
+> this arithmetic (this probe gives the guest-side ratio; the V8 profile
+> gives the thread mix) when the campaign converges. T2 also buys the
+> explicit frame-completion events §5 wants for the display bridge.
 > Stopped here for review, per the session brief. The next concrete step is
 > already staged and is measurement, not device code:
 > `scripts/tvout-swap-probe.py --build 4A102 --kernelcache /tmp/kc114r.raw
