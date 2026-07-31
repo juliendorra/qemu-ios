@@ -1688,3 +1688,69 @@ periodic pmemsave polling around a press SUPPRESSES delivery outright (0/8 at
 0.3 s, 0/1 at 1 s polling vs 4/4, 3/3, 2/2 with no in-window polling). Latency
 must be measured from the model's own timestamped traces, never by polling
 guest RAM. `dismiss-latency.py` grew a `--poll` flag and a warning.
+
+
+### Step 1 done: the wait is a HANG-RECOVERY cycle, and the protocol is in the aperture
+
+Reading the predicate out of the 1.0 RELEASE kernelcache (AppleMBX
+`0xc0329000..0xc033c000`) plus a pc/lr-attributed register trace changes the
+shape of the answer. The per-block second is not one sleep on one bit; it is a
+**timeout -> retry -> full engine re-initialisation cycle**, and the model
+provokes it. One cycle, verbatim from the trace:
+
+```
+242779.295  WR 0x824=0x1d000 0x828=0x22 0x82c=0x25 0x838=1 0x83c=0x21000
+242779.295  WR 0x6d8=0x09000000                      <- command kicked
+242779.296  WR 0xa00040..0xa00068                    <- the 2D block (ends 0x70000000)
+242779.296  WR 0xa00000=0xf0000000                   <- FIRED (model completes this)
+            ... 0.57 s, NO further MBX register traffic at all ...
+242779.865  WR 0x080=0x10, 0x080=0                   <- recovery pulse (0xc032dc0c)
+242779.865  WR 0x824/0x828/0x82c/0x838/0x83c, 0x6d8  <- same command RE-ISSUED
+242779.866  WR 0x608=0x8000 0x60c=0x1b000 0x614 0x61c 0x648 0x6d0 0x680 ...
+                                                     <- the ENGINE IS RE-INITIALISED
+242781.248  WR 0x080=0x101 ... WR 0x830=1            <- and again, 1.38 s later
+```
+
+The recovery routine is `0xc032dfd8` (six call sites, all timeout paths). It
+contains the 1 s constant everyone was looking for -- `mov r1, #0x3e8` at
+`0xc032e098`, a sleep taken when `[[obj+0x1a4]+0x60] != 0` -- and it ends by
+RE-POSTING soft events for whatever the shmem says is not outstanding:
+`[0x1a4]+0x24 == 0 -> 0x12C = 0x8`, `[0x1a4]+0x4c == 0 -> 0x12C = 0x4`,
+`[0x1a8]+0x2c == 0 -> 0x12C = 0x40`. So the driver's own model of the engine
+lives in memory at `[obj+0x1a4]`/`[obj+0x1a8]`, loaded from a descriptor table
+(`[fp+0x28..0x40]`, `0xc032be0c..`).
+
+**Correction to the previous entry (and to commit abb3ae7e94):** registers
+`0x614`/`0x618` do NOT carry pointers to that memory. `0x1e3ce508` is a
+pc-relative LITERAL (`0xc032c8e0`), a configuration constant. The addresses the
+engine is given are `0x608 = 0x8000` and `0x60c = 0x1b000` -- and those are
+offsets **inside the 16 MiB MBX aperture itself**, which is also where the
+command blocks are written (`0xa00040..`). The whole protocol is in the window
+this model already owns.
+
+**Which makes the last experiment the informative one.** Backing the aperture
+with plain storage -- so the guest reads back what it wrote, as device memory
+does -- is strictly more faithful than dropping every write and answering 0.
+It makes the bug WORSE, decisively: the dismissal stops happening at all
+(press at t=40.8, zero LCD flips for the following 660 s of guest time, panel
+black, app unreopenable), where answering 0 gets a complete dismissal in
+33.8 s. So:
+
+> **Answering 0 is load-bearing.** The driver writes state into these words
+> and waits for the ENGINE to change it. Pinned to 0, some waits pass
+> trivially and the render limps through at ~1 s per block; with the guest's
+> own values retained, they can never pass at all.
+
+That is the fourth "obvious" fix to fail (after the two interrupt fakes and the
+progress-counter register), and the three failures agree with each other: every
+one of them was an attempt to satisfy the driver from the register file, and
+the driver is not waiting on the register file.
+
+**What is left, precisely.** Model the words the ENGINE owns: which offsets
+inside `0x8000`/`0x1b000`/`0x1d000`/`0x21000` the microkernel writes on
+completion, and what it writes. The lever is committed but OFF (`IT_MBX_RAM=1`
+turns the backing store on) so the next session can enable it, then override
+individual engine-owned words one at a time until the recovery cycle stops
+firing. The measurement that identifies them: with the store ON, the driver
+hangs on the FIRST wait, so a PC sample at that hang names the exact load --
+one address, not a search.

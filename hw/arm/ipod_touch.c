@@ -774,6 +774,63 @@ static uint32_t mbx_event_status = MBX_EVENT_READY;
 static uint32_t mbx_event_enable;
 static qemu_irq mbx_irq;
 
+/*
+ * The aperture is 16 MiB and the guest uses most of it as MEMORY, not as a
+ * register file: the 2D command blocks arrive as plain word writes at
+ * 0xa00040.., and the driver hands the engine addresses inside the same
+ * window (0x608 = 0x8000, 0x60c = 0x1b000, 0x824 = 0x1d000, 0x83c =
+ * 0x21000). Until now every one of those writes was DROPPED and every read
+ * of them answered 0 -- so the driver wrote a command stream and read back
+ * zeros. That alone is enough to look like a hung engine, which is what it
+ * concludes: measured on the 1.0 dismissal, each 2D block is fired, times
+ * out in ~0.6 s with no further register traffic, is retried, and then the
+ * whole engine is re-initialised (0x608/0x60c/0x614/0x61c rewritten) --
+ * ~1 s per block, ~33 blocks, the fixed 33.8 s.
+ *
+ * Backing the window with storage looks like the obvious repair -- it only
+ * stops the model losing the guest's own data -- and it is OFF, because
+ * measured on 2026-07-31 it makes things WORSE: with it on, the 1.0
+ * dismissal does not take 33.8 s, it never happens at all (press at
+ * t=40.8, zero LCD flips for the next 660 s of guest time, panel black,
+ * app unreopenable).
+ *
+ * That negative result is the most useful thing known about this window,
+ * so the lever is kept: answering 0 is LOAD-BEARING. The driver writes
+ * state into these words and waits for the ENGINE to change it; with
+ * reads pinned to 0 some of those waits pass trivially and the render
+ * limps through in ~1 s per block, and with the guest's own values
+ * retained they can never pass at all. So the completion protocol lives
+ * in this aperture, and modelling it means knowing WHICH words the engine
+ * owns and what it writes there -- not simply remembering all of them.
+ *
+ * IT_MBX_RAM=1 turns the backing store on for that investigation.
+ */
+static uint8_t *mbx_ram;
+
+#define MBX_RAM_SIZE 0x1000000
+
+static bool mbx_ram_modelled(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_RAM");
+        mode = e && e[0] && e[0] != '0';
+    }
+    return mode;
+}
+
+static uint8_t *mbx_ram_at(hwaddr addr, unsigned size)
+{
+    if (!mbx_ram_modelled() || addr + size > MBX_RAM_SIZE) {
+        return NULL;
+    }
+    if (!mbx_ram) {
+        mbx_ram = g_malloc0(MBX_RAM_SIZE);
+    }
+    return mbx_ram + addr;
+}
+
 static bool mbx_events_modelled(void)
 {
     static int mode = -1;
@@ -891,8 +948,17 @@ static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
         case 0x1020:
             r = 0x10000;
             break;
-        default:
+        default: {
+            /* Anything the register logic does not claim is window memory:
+             * give the guest back what it wrote. */
+            const uint8_t *p = mbx_ram_at(addr, size);
+            if (p) {
+                uint32_t v = 0;
+                memcpy(&v, p, size);
+                r = v;
+            }
             break;
+        }
     }
     mbx_trace("rd", addr, r);
     return r;
@@ -901,6 +967,14 @@ static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
 static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     mbx_trace("WR", addr, val);
+
+    /* Window memory first: retain the guest's data whatever mode we are in.
+     * The handled registers below still run and still win on reads. */
+    uint8_t *p = mbx_ram_at(addr, size);
+    if (p) {
+        uint32_t v = (uint32_t)val;
+        memcpy(p, &v, size);
+    }
 
     if (!mbx_events_modelled()) {
         return;             /* the shipped default: registers are inert */
