@@ -164,14 +164,42 @@ value order, are now measurements rather than guesses:
    `helper_lookup_tb_ptr`'s jmp-cache misses fall to `g_tree_lookup`.
 4. `cpu_io_recompile` — bounded, revisit only if 1–3 shrink the pie enough.
 
-### Speed campaign scoreboard (2026-07-31)
+### The BQL fix: the wasm main loop never slept (2026-07-31, later)
+
+QSP (`?qsp=1`, staged `/fw/qsp` flag, report every 10 s to the mirrored
+console) named the wait to the line: the vCPU lost **47% of wall time** on
+the BQL at `cputlb.c:1983` (the MMIO lock), 65k acquisitions/s, while the
+main loop iterated **~45,000 times a second**. The `[MLOOP]` histogram then
+explained the spin: **Emscripten's poll() does not block** on the fds this
+loop watches — 93% of iterations were handed a ≥1 ms timeout and returned
+instantly with nothing ready (~3 real events per second).
+
+Fix (`util/main-loop.c`, EMSCRIPTEN-only): when the poll returns
+empty-handed with time left, `usleep(min(timeout, 2 ms))` — a real futex
+wait. Timer deadlines are already inside `timeout`; a cross-thread notify
+lands at worst one nap late. The `[MLOOP]` counter stays as a canary.
+
+Measured: main loop 45k → **475 iters/s**; vCPU BQL wait 47% → **~8%**; avg
+MMIO lock wait 7.17 µs → **0.37 µs**; the guest performs **3.7× more MMIO
+per second**. Cold chunked boot, one run each: kernel **84 s**, BSD 93 s,
+**home screen 152 s** — against 138/152/232.6 s the same morning and
+276 s/— at the day's start. Panel sustains 60 fps accepted (vsync path)
+even headless. Resume unaffected: home screen 3.7 s in the pane.
+
+### Speed campaign scoreboard (2026-07-31, end of session)
 
 | lever | status | effect |
 | --- | --- | --- |
-| display path | **DONE** (zero-copy) | kernel 276 s → 138 s, at the display-none floor |
+| display path | **DONE** (zero-copy) | kernel 276 s → 138 s |
+| main-loop spin / BQL | **DONE** (the nap) | kernel 138 s → **84 s**, home 232.6 → **152 s**; vCPU wait 47% → 8% |
 | upstream JIT | checked | nothing to pull; graft is ahead |
-| engine (~8× remaining) | NEXT | profile harness ready; needs symbol map, then: inline hot memory helpers vs libffi, async instantiate, TB-exit linking |
-| busy `guestRatio` | 0.05–0.07 | unchanged by display work, as predicted — the engine owns it |
+| longjmp emulation (~13% of vCPU) | next | try `-sSUPPORT_LONGJMP=wasm`; watch the ASYNCIFY interaction |
+| TB dispatch (~13%) | after | direct chaining in a module batch; jmp-cache misses hit `g_tree_lookup` |
+| icount `cpu_io_recompile` (~2%) | parked | bounded; revisit when the pie shrinks |
+
+Day's total: cold boot to the home screen **252 s → 152 s** while the boot
+went from silent-until-launchd to a 60 fps live panel; second-visit resume
+**broken → 3.7 s**.
 
 ---
 
