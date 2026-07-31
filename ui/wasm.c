@@ -361,6 +361,34 @@ EMSCRIPTEN_KEEPALIVE void wasm_request_resume(void)
 }
 
 /*
+ * Pause, for the PROFILER. A vCPU thread executing translated code never
+ * returns to its worker's event loop, so CDP's Profiler.stop -- which is
+ * delivered on that loop -- times out against exactly the thread whose
+ * profile matters (observed 2026-07-31: the only two stop failures were the
+ * only two busy workers). Pausing parks the vCPU, the loop drains, the
+ * profile delivers; wasm_request_resume() then restarts it through the same
+ * drain-timer path a snapshot resume uses.
+ */
+static bool wasm_pause_requested;
+
+EMSCRIPTEN_KEEPALIVE void wasm_request_pause(void)
+{
+    qatomic_set(&wasm_pause_requested, true);
+}
+
+static void wasm_maybe_pause(void)
+{
+    if (!qatomic_read(&wasm_pause_requested)) {
+        return;
+    }
+    qatomic_set(&wasm_pause_requested, false);
+    if (runstate_get() == RUN_STATE_RUNNING) {
+        fprintf(stderr, "[WASM] pause requested; stopping the vcpu\n");
+        vm_stop(RUN_STATE_PAUSED);
+    }
+}
+
+/*
  * The RAW RunState index, not a hand-rolled summary.
  *
  * The first version returned 1/2/3 for running/paused/inmigrate and 0 for
@@ -487,6 +515,7 @@ static void wasm_input_drain(void *opaque)
     uint32_t head = qatomic_load_acquire(&wasm_input_head);
 
     wasm_maybe_resume();
+    wasm_maybe_pause();
     wasm_maybe_save_overlay();
     wasm_publish_scanout();
 

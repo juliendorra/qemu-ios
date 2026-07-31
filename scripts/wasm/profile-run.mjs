@@ -234,6 +234,28 @@ for (const [sid] of workers) {
 console.log(`[profile] sampling for ${DURATION}s...`);
 await sleep(DURATION);
 
+/*
+ * Pause the GUEST before Profiler.stop. A busy vCPU worker never returns to
+ * its event loop, so the stop message for exactly the thread that matters
+ * times out (observed: the only two stop failures were the only two busy
+ * workers). ui/wasm.c services the pause from its drain timer; the vCPU
+ * parks, the loop drains, the profile -- which was SAMPLED while it ran --
+ * can now be delivered. Resumed after collection.
+ */
+const pageSid = [...sessions.entries()].find(([, s]) => s.type === 'page')?.[0];
+async function evalOnPage(expr) {
+  if (!pageSid) return '(no page session)';
+  try {
+    const r = await cdp.call('Runtime.evaluate',
+      { expression: expr, returnByValue: true }, pageSid);
+    return r.result?.value ?? r.result?.description ?? '(no value)';
+  } catch (e) { return `evaluate failed: ${e.message}`; }
+}
+console.log('[profile] pausing the guest:',
+  await evalOnPage(`globalThis.__mod?._wasm_request_pause
+    ? (__mod._wasm_request_pause(), 'requested') : 'export missing'`));
+await sleep(2);
+
 const summaries = [];
 let n = 0;
 for (const [sid, s] of workers) {
@@ -289,6 +311,10 @@ for (const s of summaries) {
     console.log(`    ${t.ms.toFixed(0).padStart(7)} ms  ${t.fn}  ${t.src}`);
   }
 }
+
+console.log('[profile] resuming the guest:',
+  await evalOnPage(`globalThis.__mod?._wasm_request_resume
+    ? (__mod._wasm_request_resume(), 'requested') : 'export missing'`));
 
 writeFileSync(`${OUT}/summary.json`, JSON.stringify(summaries, null, 2));
 console.log(`\n[profile] wrote ${OUT}/summary.json`);
