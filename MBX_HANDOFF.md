@@ -222,6 +222,26 @@
 > block the guest wrote through the aperture, the CPU has its own mapping
 > and the model only needs to READ; if it is empty, aperture writes are the
 > only path and the model must forward them through the page table.
+> **`scripts/mbx-mmu-probe.py` does exactly this run** (written 2026-08-01,
+> not yet executed — the bundle regression batteries had the machine).
+>
+> **And the command format is not a black box either.** The userland
+> `MBX2D.framework` on the 1.0 root filesystem keeps **74 defined symbols**,
+> including the packers themselves:
+>
+> | symbol | what it gives us |
+> |---|---|
+> | `_pack2DCtxBlitCopy` (0x30b3a974) | **the command-block writer** for a copy blit |
+> | `_pack2DCtxBlitColor` (0x30b3994c) | the same for a solid-colour fill |
+> | `_mbx2DCtxSetSourceSurface` / `…SetDestinationSurface` | surface base/stride/format fields |
+> | `_mbx2DCtxSetBlendEquation[Complex]` | the blend/ROP encoding |
+> | `_mbx2DCtxSetScissor` / `…SetScaleFactor` / `…SetRotation` | clip, scale, rotate |
+>
+> So step 3 is *reading a documented packer* against command words we have
+> already traced (`0xa00040..0xa00068`, terminator `0x70000000`, fire
+> `0xf0000000`), not reverse-engineering an undocumented GPU. `pack2D…`
+> computes its block size from context flags (20 or 28 bytes, +12, +24),
+> which matches the variable-length blocks in the trace.
 
 **Date:** 2026-07-28 · **Branch:** `ipod_touch_1g` · **State:** nothing started —
 this is the short path *into* the problem, not a report of work done.
