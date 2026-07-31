@@ -772,15 +772,28 @@ static bool mbx_ready_bit(void)
 
 static void mbx_update_irq(void)
 {
+    /*
+     * READY (bit 8) must NEVER drive the line. The ack handler used to
+     * re-latch READY into status after every host-clear, and once the guest
+     * enabled events the permanently-pending bit held IRQ 12 asserted -- an
+     * interrupt STORM, PC-sampled during the 1.0 dismissal: 40/40 samples in
+     * kernel interrupt paths + the VIC + AppleMBX's ISR, 3+ MILLION
+     * ack/re-poll iterations, one full host core, and an 8-10 s dismissal
+     * (50 s on a loaded host) while a bounded driver retry burned its budget.
+     * Same shape as the exynos UART Tx-storm. READY stays visible to READS
+     * (mbx_status_12c below) so the poll paths still see the identifier bit,
+     * but it is presentation, not a latched event.
+     */
     if (mbx_irq) {
-        qemu_set_irq(mbx_irq, (mbx_event_status & mbx_event_enable) != 0);
+        qemu_set_irq(mbx_irq, (mbx_event_status & ~MBX_EVENT_READY
+                               & mbx_event_enable) != 0);
     }
 }
 
 static uint32_t mbx_status_12c(void)
 {
     if (mbx_events_modelled()) {
-        return mbx_event_status;
+        return mbx_event_status | MBX_EVENT_READY;
     }
     return mbx_ready_bit() ? (MBX_EVENT_READY | MBX_EVENT_DONE)
                            : MBX_EVENT_READY;
@@ -819,8 +832,10 @@ static void mbx_trace(const char *dir, hwaddr addr, uint64_t val)
     if (!all && n > 12 && (n & 0x3FF) != 0) {
         return;
     }
-    fprintf(stderr, "[MBX] %s 0x%05x = 0x%08x (n=%u)\n",
-            dir, (uint32_t)addr, (uint32_t)val, n);
+    /* Host-clock timestamp: the dismissal latency hunt needs to know WHERE
+     * the seconds go, and a conversation without time cannot say. */
+    fprintf(stderr, "[MBX] %9.3f %s 0x%05x = 0x%08x (n=%u)\n",
+            g_get_monotonic_time() / 1e6, dir, (uint32_t)addr, (uint32_t)val, n);
 }
 
 static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
@@ -859,9 +874,9 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             mbx_event_enable = (uint32_t)val;
             mbx_update_irq();
             break;
-        case 0x134:         /* event host clear: write 1s to ack */
+        case 0x134:         /* event host clear: write 1s to ack. READY is not
+                             * re-latched here -- see mbx_update_irq. */
             mbx_event_status &= ~(uint32_t)val;
-            mbx_event_status |= MBX_EVENT_READY;
             mbx_update_irq();
             break;
         /*

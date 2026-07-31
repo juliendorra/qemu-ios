@@ -1509,3 +1509,47 @@ A @12 s run in the same batch desynced on the FIRST-press DOWN swallow (step 2
 already 0.30%) and says nothing about the dismissal; the swallow remains the
 next quirk worth its own hunt, along with shaving the 8-10 s to animation
 speed (lever: the microkernel re-init loop reading 0xff0..0xffc/0xf10 as 0).
+
+
+## THE LATENCY'S CORE REASON: an MBX interrupt STORM of our own making (2026-07-31)
+
+The user reports ~50 s to dismiss in real interactive use; the probe said
+8-10 s. Chased with a new gdb-free probe (`scripts/dismiss-latency.py`,
+framebuffer polling over QMP) plus the timestamped MBX trace and a PC-sampled
+spin (`spin-locate`):
+
+* The timestamped trace looked clean -- until the per-register collapse was
+  read carefully: the `n=` counters on the post-press ack/poll lines were in
+  the MILLIONS (`WR 0x130` n=3,075,072 across 4 s and climbing). The spin
+  never went away; the collapse had hidden it.
+* PC-sampling during the spin: 40/40 samples in kernel interrupt paths, the
+  PL192 VIC, and AppleMBX's ISR (+0x5e94/+0x6198), one full host core.
+* Mechanism: the model's ack handler re-latched READY (`status |= 0x100`)
+  after EVERY host-clear, and with events enabled (`0x130=0xffff` on the
+  dismissal path) the permanently-pending bit held level IRQ 12 asserted --
+  an interrupt storm, exactly the exynos UART Tx-storm shape this project has
+  hit before. The guest's bounded driver retries burned their whole budget at
+  100% CPU, which is why the dismissal took 8-10 s here and ~50 s on a loaded
+  Mac: a storm scales with everything else the host is doing.
+
+Fix: READY is presentation, not an event -- reads of 0x12C still show it
+(`mbx_status_12c` ORs it in), but it is never latched into `mbx_event_status`
+on ack and is excluded from the IRQ computation. With that engine in all three
+bundles:
+
+| board | @8 s window |
+|---|---|
+| m68ap-10 | 1-4 PASS, **3_home_returns 97.19%** -- first pass at 8 s; effective press -> home screen measured ~7 s including the exit animation and dim |
+| m68ap-114 | 5/5 |
+| n45ap | 4/5, same pre-existing wake-screendump artifact |
+
+Remaining, and now clearly the dominant user-facing issue: **press delivery**
+-- a HOME press with an app frontmost is still swallowed roughly half the time
+(model always sees both edges; the DOWN GSEvent never reaches SpringBoard).
+In real use that reads as "I pressed home N times over a minute before it
+worked", which is most of the user's 50 s. Separate hunt, recorded at the
+2026-07-31 acceptance entry. Note for future probes: continuous pmemsave
+polling around a press perturbs delivery itself (BQL + guest-time dilation);
+dismiss-latency runs its verdict polling at 1 s for this reason and still
+shows the effect -- prefer app-button-probe's press-wait-grab shape for
+pass/fail verdicts.
