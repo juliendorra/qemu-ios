@@ -301,6 +301,69 @@ The optimization is on by default. `?io_split=0` restores the generic behavior
 in the same binary; `?exit_profile=1` publishes changed machine-readable exit
 histograms through `/fw/exit-profile-results` and mirrors them to the page log.
 
+### 3.8 Bound direct compiled-TB calls across the dispatcher (2026-08-01)
+
+The next structural target was the return from every generated TB module to
+`tcg_qemu_tb_exec()`, followed by another indirect call into the next module.
+Compiled `goto_tb` already contains QEMU's patched destination TB pointer, and
+the destination header already has an O(1) per-thread `WasmInstanceInfo`; a
+second C lookup cache would only duplicate both.
+
+Generated modules now import Emscripten's shared function table. On a direct
+compiled destination they:
+
+1. require a non-zero per-root-call chain budget;
+2. load the current TCG thread's destination `WasmInstanceInfo`;
+3. validate `info->tb_ptr == destination` because eviction can leave an old
+   info pointer in the TB header;
+4. decrement the budget, reset the target's entry block, and use
+   `call_indirect` to enter its compiled function.
+
+The C dispatcher resets the budget for every root call. `trysleep()` subtracts
+`1 + chain_limit` per root call so the maximum chain cannot reduce browser/GC
+yield cadence. This is deliberately bounded Wasm recursion; it avoids both an
+unbounded native stack and dependence on the tail-call proposal. Runtime
+`?chain=0` is the old path; values above 64 or below zero fall back to 4.
+
+Clean same-binary 1A543a cold tuning runs:
+
+| chain budget | first pixels | kernel | BSD root | home framebuffer |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 (dispatcher control) | 5.7 s | 72.0 s | 88.0 s | 178.7 s |
+| 8 | **1.9 s** | **48.0 s** | **56.0 s** | **128.1 s** |
+| 4 | 3.0 s | 53.0 s | 62.0 s | 131.1 s |
+
+Chain 4 versus the control improves kernel by **26.4%**, BSD root by **29.5%**
+and home by **26.6%**. The control's result POST failed when free disk fell to
+37 MiB, but the Chrome landmark stream contained all four exact numbers; this
+is why the runner now has an independent console-landmark fallback.
+
+The settled 4A102 Calculator guard selected the default:
+
+| chain budget | snapshot home | tap -> Calculator | guest work |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.4 s | 3.6 s | 0.4 s |
+| 8 | **1.3 s** | 4.1 s | 0.4 s |
+| 4 | 2.0 s | **3.5 s** | 0.4 s |
+
+These are one-run tuning points rather than a statistical launch study, but
+chain 8 buys only ~3 s on the 128–131 s cold boot while showing a 0.5 s launch
+regression. **Chain 4 is default**; `?chain=0` remains the same-binary fallback.
+
+The final current-engine acceptance matrix, after rebuilding the concurrent
+device-model fixes as well, is:
+
+| build | mode | kernel | BSD root | home framebuffer |
+| --- | --- | ---: | ---: | ---: |
+| 1A543a | resume | -- | -- | **2.3 s** |
+| 1A543a | cold | 54.0 s | 64.0 s | **142.5 s** |
+| 4A102 | resume | -- | -- | **1.6 s** |
+| 4A102 | cold | 29.0 s | 40.0 s | **122.5 s** |
+
+That table is an acceptance rebaseline, not an optimization A/B: it includes
+engine changes from the shared working tree and used a warm browser asset
+cache. Use the 178.7 -> 131.1 s same-binary pair for chaining attribution.
+
 ---
 
 ## 4. Where the time goes now (V8 `--prof`, vCPU isolate)
@@ -385,6 +448,13 @@ arrive from upstream.
 Tried and reverted (`427cfb972e`): recompile rate 22% (FIFO) → 41%, plus a
 `memory access out of bounds` crash at the cap.
 
+### 5.5 Chain 8 is not the default
+
+It is not a correctness failure: a 1A543a cold boot reached home at 128.1 s.
+It is rejected tuning. Against chain 4 it saved only 3.0 s cold and changed the
+settled 4A102 Calculator result from 3.5 to 4.1 s. Do not increase the default
+without a repeated cold-launch workload that reverses that trade.
+
 ---
 
 ## 6. False assumptions, corrected by data
@@ -441,6 +511,13 @@ was worth ~2×, and closing it exposed that the *main loop* was worth more.
 - **A hidden tab suspends `requestAnimationFrame`**, freezing anything that
   polls painted frames (the calc benchmark's oracle included). Watch the tab or
   run headless.
+- **Chrome 149 no longer produced per-isolate `--prof` files here.** A named
+  `--logfile`, `--logfile-per-isolate`, `--no-prof-browser-mode`, and
+  `--logfile=+` all streamed every renderer/worker isolate into one console
+  log and created no usable isolate files. The interleaved stream is not a
+  profile. One `--js-flags=--help` probe also stayed alive and grew a 144 MiB
+  temporary profile until killed. Do not retry these exact flag combinations
+  without evidence that Chrome's logging behaviour changed.
 
 ---
 
@@ -489,6 +566,18 @@ resort. The viewer detects JSC and says so plainly.
   regen dependency and the regen runs with the caller's environment, leaking
   homebrew paths (`zlib.h` failures, every object dirtied). Always go through
   `scripts/wasm/build-qemu.sh`.
+- **A result POST can stall while the guest is healthy.** The benchmark server
+  also serves thousands of JIT-pack requests. One 4A102 resume logged home at
+  2.3 s but the runner waited 90 s for a POST. `bench-run.py` now consumes the
+  machine-readable Chrome landmark stream incrementally as a fallback.
+- **Pass the workload explicitly.** The first chain-8 "Calculator" run omitted
+  `--sweep calc` and merely idled at home for a minute. The resume touch-gate
+  wait also used to spend a needless 60 s waiting for a message whose state is
+  already in the snapshot; resume now skips that cold-only gate wait.
+- **Low disk can kill only the evidence path.** At 37 MiB free the server could
+  not persist a result POST, while Chrome and the guest continued. Preserve the
+  Chrome log before declaring a run lost; keep at least 1 GiB free for profiles
+  and benchmark output.
 - `pkill -f "a\|b"` does not alternate — kill toolchain stragglers by PID.
 
 ---
@@ -497,16 +586,17 @@ resort. The viewer detects JSC and says so plainly.
 
 | | start of campaign | now |
 | --- | --- | --- |
-| second-visit resume | **broken** (black screen) | **~3 s** to home screen |
-| cold boot → kernel | 276 s | **44 s** |
-| cold boot → home screen | 252 s | **112.7 s** |
+| second-visit resume | **broken** (black screen) | **1.6–2.3 s** to home screen |
+| cold boot → kernel | 276 s | **29 s (4A102), 54 s (1A543a)** current-engine acceptance |
+| cold boot → home screen | 252 s | **122.5 s (4A102), 142.5 s (1A543a)** current-engine acceptance |
 | vCPU time lost to the BQL | 47% | ~8% |
 | guest MMIO throughput | 65.8k/s | 215–245k/s |
 | panel | 10 Hz cap, unmeasured | 60 fps vsync, fps + blit cost on screen |
 | tap → Calculator usable | unmeasured (and it crashed the machine) | **2.6–3.0 s wall / 0.4 s guest** |
 | busy `guestRatio` | ~0.06 | **~0.17–0.20 pre-kernel**; launch case varies by workload |
 
-The headline honesty: **boot and time-to-usable improved 2–3×, and the
+The clean chaining A/B additionally moved 1A543a home from 178.7 to 131.1 s
+(26.6%). The headline honesty: **boot and time-to-usable improved 2–3×, and the
 steady-state execution gap is now the whole remaining story.** The launch
 benchmark puts it at roughly **7× slower than the real device** for an
 interactive action on a settled machine.
@@ -515,25 +605,23 @@ interactive action on a settled machine.
 
 ## 11. Next levers, ranked, with protocol
 
-1. **The dispatcher (~15%, the top lever).** `tcg_qemu_tb_exec` is the hottest
-   named function at 8.5%. The generic `addFunction()` WeakMap work has now
-   been removed from TB instantiation (§3.6); it was compile-time bookkeeping,
-   not proof of a `Map` lookup on every dispatch. Source inspection also rules
-   out the previously proposed second dispatcher lookup cache: compiled
-   `goto_tb` reads its patched destination directly, while
-   `helper_lookup_tb_ptr` serves indirect `goto_ptr` paths. The next structural
-   step is therefore eliminating the return to `tcg_qemu_tb_exec` between
-   compiled TBs (module batching or a proven safe tail-call design), not
-   caching the already O(1) `WasmInstanceInfo` lookup again.
-2. **Re-profile the optimized vCPU.** The old 13% longjmp and 15% dispatcher
-   shares predate learned I/O boundaries. Exit histograms show the repeated
-   `cpu_io_recompile` class is gone; a separable V8 isolate profile is needed
-   before trusting the old percentages.
-3. **Cold-JIT launch behaviour.** The settled launch is 2.7 s; the *cold* one is
+1. **Measure chaining itself.** Add changed machine-readable counters for
+   attempted and successful hops, budget exhaustion, uncompiled destinations,
+   and eviction-owner rejection. The 26.6% same-binary win establishes value;
+   counters say whether the next limit/shape change attacks the common exit.
+2. **Re-profile, if isolate output can be restored.** The old 13% longjmp and
+   15% dispatcher shares predate both learned I/O boundaries and chaining.
+   Chrome 149's current interleaved console stream is unusable (§7); do not
+   quote the old shares as current.
+3. **Tail calls or module batching.** Probe a tiny dynamic module for
+   `return_call_indirect`, then compare it with bounded `call_indirect` using
+   the same `?chain=0|4` seam. Tail calls could remove the recursion bound;
+   module batching is the larger fallback if browser/table support is wrong.
+4. **Cold-JIT launch behaviour.** The settled launch is 2.7–3.5 s; the *cold* one is
    the ~90 s grind users hit. Compile-burst policy (threshold, batching,
    ahead-of-need compilation) is unexplored, and the benchmark can measure it
    by tapping early.
-4. **MBX2D modelling** — running as a separate session (native-first,
+5. **MBX2D modelling** — running as a separate session (native-first,
    measurement-first; see [`MBX_HANDOFF.md`](MBX_HANDOFF.md)). Would move guest
    compositing into compiled C, worth more in the browser than natively — but
    the PC-sample measurement must justify it first.

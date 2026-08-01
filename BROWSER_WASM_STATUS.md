@@ -30,6 +30,77 @@ comes after.
 
 ---
 
+## Session — 2026-08-01: bounded compiled-TB chaining and current-engine matrix
+
+The dispatcher avenue is now implemented. Generated TB modules import
+Emscripten's shared function table and, for an already-compiled direct
+`goto_tb` destination, validate the destination's live `WasmInstanceInfo` and
+enter it through `call_indirect` without first returning to
+`tcg_qemu_tb_exec()`. The owner validation makes the path safe when an evicted
+instance leaves an old pointer in a TB header. A per-root-call budget bounds
+Wasm recursion; the dispatcher resets it and `trysleep()` charges the maximum
+chain so browser/GC yield cadence is preserved.
+
+The runtime seam is `?chain=N`; 0 is the original dispatcher path, accepted
+values are 0..64, and **4 is default**.
+
+Clean same-binary 1A543a cold tuning:
+
+| chain | kernel | BSD root | home framebuffer |
+| ---: | ---: | ---: | ---: |
+| 0 | 72.0 s | 88.0 s | 178.7 s |
+| 8 | **48.0 s** | **56.0 s** | **128.1 s** |
+| 4 | 53.0 s | 62.0 s | 131.1 s |
+
+Chain 4 improves home by **26.6%** versus the same-binary control. Chain 8 was
+not selected: it saved only another 3 s cold and the one-run 4A102 Calculator
+guard moved from 3.6 s (`chain=0`) / 3.5 s (`chain=4`) to 4.1 s. Guest work
+was 0.4 s in all three launch runs.
+
+The build was then fully relinked after the shared working tree's updated
+engine/device-model fixes; the build log explicitly recompiled
+`hw/arm/ipod_touch.c`. Final default-on acceptance, run serially in headless
+Chrome with a shared warm asset cache:
+
+| build | mode | kernel | BSD root | home framebuffer |
+| --- | --- | ---: | ---: | ---: |
+| 1A543a (1.0) | resume | -- | -- | **2.3 s** |
+| 1A543a (1.0) | cold | 54.0 s | 64.0 s | **142.5 s** |
+| 4A102 (1.1.4) | resume | -- | -- | **1.6 s** |
+| 4A102 (1.1.4) | cold | 29.0 s | 40.0 s | **122.5 s** |
+
+This is an acceptance rebaseline, not an A/B attribution, because it includes
+concurrent engine changes and browser-cache state. The clean chaining claim is
+the 178.7 -> 131.1 s same-binary pair above.
+
+The run exposed and fixed two harness gaps. `bench-run.py` now accepts
+`--chain` and `--sweep calc`, and it consumes the machine-readable landmark
+lines from Chrome's log when the result POST is starved behind JIT-pack
+requests. Snapshot sweeps no longer wait a cold-only 60-second touch-gate
+deadline before acting.
+
+Failures and dead ends recorded for the next session:
+
+- Chrome 149 forced fresh V8 `--prof` output from every isolate into one
+  console stream. Named log files, per-isolate logging,
+  `--no-prof-browser-mode`, and `--logfile=+` created no usable separate logs.
+- The first chain-8 Calculator run omitted `--sweep calc` and was invalid.
+- At 37 MiB free, the result POST failed while the guest continued; the chain-0
+  landmarks were recovered from Chrome's log. Disposable browser profiles and
+  reproducible object directories were removed, never firmware or source.
+- The final full link still emits the existing Homebrew native OpenSSL archive
+  warnings. It succeeds and this session did not introduce that meson input.
+
+The next evidence-first steps are: add chain-hop/rejection counters; restore a
+separable vCPU profile if Chrome permits it; then compare a feature-probed
+`return_call_indirect` tail chain with bounded chaining, or pursue module
+batching. The separate user-facing problem is the cold-JIT Calculator race.
+Exact commands and pickup rules are at the top of
+[`BROWSER_WASM_HANDOFF.md`](BROWSER_WASM_HANDOFF.md); full mechanism and failed
+routes are in [`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md) §3.8, §7 and §9.
+
+---
+
 ## Session — 2026-08-01: dynamic-MMIO TB splitting removes repeated longjmps
 
 An Emscripten-only, opt-in exit histogram (`?exit_profile=1`) identified the

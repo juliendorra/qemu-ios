@@ -39,6 +39,11 @@ WebAssembly JIT backend is being adopted rather than shipping TCI.
 Everything below this heading is the state a fresh session should assume. The
 older sections still hold except where this one contradicts them.
 
+Latest implementation commits: `c4781681c0` (bounded compiled-TB chaining)
+and `0a74f41bf8` (benchmark controls and reporting fallback). They follow
+`9f562356b1`, `12ea9b2a39`, `3c317e17d7`, and `4871585559` from the preceding
+dispatcher/MMIO campaign.
+
 ## What works right now
 
 Serve `web/` on :8031 and open `/public/jit-boot/`. A picker at the top
@@ -46,8 +51,14 @@ selects **{1.0, 1.1.4} × {resume, cold boot}** — all four are live.
 
 | | resume | cold boot |
 | --- | --- | --- |
-| **1.0** (1A543a) | ~2–3 s → home screen | **112.7 s** |
-| **1.1.4** (4A102) | **1.7 s** in the latest smoke run | ~220 s, not yet remeasured with I/O splitting |
+| **1.0** (1A543a) | **2.3 s** → home screen | **142.5 s** (kernel 54, BSD 64) |
+| **1.1.4** (4A102) | **1.6 s** → home screen | **122.5 s** (kernel 29, BSD 40) |
+
+These four numbers are the 2026-08-01 final acceptance pass after rebuilding
+the current engine and the WASM changes together. They are a rebaseline, not
+an A/B attribution: the working tree's concurrent device-model fixes changed
+between older runs, and the shared browser asset cache was warm. The clean
+same-binary optimization A/B is recorded below.
 
 Touch works, buttons work, the panel runs at vsync (~60 fps) with measured fps
 and blit cost shown under it. Chrome-family browsers only — **Safari crashes
@@ -92,24 +103,42 @@ the top remaining cost after the BQL fix.
    recurring I/O exits stopped. Calculator passed at 2.7 s wall / 0.4 s guest,
    and a default-on 4A102 resume reached its home framebuffer at 1.7 s. This is
    now default; `?io_split=0` is the same-binary fallback.
-3. **NEXT: direct TB chaining, but at the call boundary.**
-   `tcg_qemu_tb_exec` is the hottest named function (8.5%), and
-   `helper_lookup_tb_ptr` (4.3%) falls into `g_tree_lookup` on a jmp-cache
-   miss. Source inspection corrected an earlier assumption: compiled
-   `goto_tb` already reads QEMU's patched destination TB pointer directly;
-   `helper_lookup_tb_ptr` is used by indirect `goto_ptr` paths. The backend
-   then returns to `tcg_qemu_tb_exec`, resolves the destination TB's existing
-   O(1) `WasmInstanceInfo`, and calls the next module. A second C-side lookup
-   cache would duplicate that mapping and would not remove the profiled tree
-   misses. The structural fix must eliminate the per-TB return/call boundary
-   itself -- most plausibly module batching, or a bounded tail-call design
-   whose browser support and eviction safety are proven first.
+3. **DONE 2026-08-01: bounded compiled-TB chaining across the call boundary.**
+   Generated TB modules now import Emscripten's shared function table. A direct
+   `goto_tb` whose destination is already compiled validates that the
+   destination's `WasmInstanceInfo` still owns the TB (important after
+   eviction), decrements a per-root-call budget, and enters it with
+   `call_indirect`. The C dispatcher resets the budget, and `trysleep()` charges
+   the maximum possible chain so browser/GC cadence cannot be starved. This is
+   bounded recursion, not an unbounded native-stack chain. `?chain=0` restores
+   the old dispatcher path in the same binary; accepted values are 0..64.
 
-**Profiler wrinkle seen 2026-08-01:** this installed Chrome 149 sent every
-renderer/worker V8 `--prof` stream to stdout. Capturing stdout produced a 73 MB
-log with the isolates interleaved, which `node --prof-process` rejected. Do not
-use that combined log as evidence; first restore per-isolate output or use a
-profiler mechanism that can separate the busy pthread.
+   Clean same-binary 1A543a cold A/B: chain 0 reached kernel/BSD/home at
+   72/88/**178.7 s**; chain 4 reached 53/62/**131.1 s** -- **26.6% faster to
+   home**. Chain 8 reached 48/56/128.1 s, only another 3 s cold, but regressed
+   the 4A102 settled Calculator run from 3.6 to 4.1 s. Chain 4 kept Calculator
+   at 3.5 s (0.4 s guest), so **4 is the default**. These are single tuning
+   runs, but the 26% boot separation is far outside the ~1% landmark noise and
+   the fallback is runtime-selectable.
+
+4. **NEXT: prove where the remaining dispatcher/JIT time went, then choose
+   between tail calls and compile policy.** Add low-overhead counters for
+   attempted/successful chain hops, budget exhaustion, uncompiled targets and
+   eviction-owner rejection. The old V8 percentages predate both I/O splitting
+   and chaining. Chrome 149 currently prevents a fresh separable profile (see
+   below), so do not infer a new percentage from the old one. If Chrome's
+   profiler output can be separated, re-profile first. Otherwise test a tiny
+   dynamic module for `return_call_indirect` support and compare a tail-call
+   chain against bounded recursion with `?chain=0|4`; module batching is the
+   larger fallback. Independently, the real user-facing hole is the cold-JIT
+   app-launch race, now scriptable with `--sweep calc`.
+
+**Profiler dead end seen 2026-08-01:** this installed Chrome 149 sent every
+renderer/worker V8 `--prof` stream to one console stream. Fresh probes with a
+named `--logfile`, `--logfile-per-isolate`, `--no-prof-browser-mode`, and
+`--logfile=+` still created no per-isolate files. The interleaved stream cannot
+be processed as one isolate. Do not use it as evidence; first restore
+per-isolate output or use a profiler that can separate the busy pthread.
 
 **Before touching the next lever, read
 [`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md) §5 and §9.** Two plausible
@@ -126,17 +155,22 @@ WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh          # incremental
 WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh --configure  # after flags
 ```
 
-Judge every change on **both** numbers, solo, one run at a time:
+Judge every change on **both** numbers, solo, one run at a time. Current
+default-on rebaseline (current engine, warm asset cache):
 
-- **boot landmarks** — headless Chrome on `/public/jit-boot/`, baseline
-  kernel **84 s**, BSD **93 s**, home screen **152 s** (~1% run variance)
-- **launch latency** — `?resume=1&sweep=calc`, baseline **2.8–3.0 s wall /
-  0.4 s guest**
+- **1A543a cold** — kernel 54 s, BSD 64 s, home **142.5 s**
+- **4A102 cold** — kernel 29 s, BSD 40 s, home **122.5 s**
+- **snapshot resume** — 1A543a 2.3 s, 4A102 1.6 s
+- **settled Calculator** — chain 4: **3.5 s wall / 0.4 s guest**
+
+For chaining attribution, use the cleaner same-binary `?chain=0|4` result
+(178.7 -> 131.1 s), not the cross-engine rebaseline above.
 
 Then confirm the mechanism moved, not just the clock:
 
 ```bash
-# where CPU time goes, by function name (needs the name section, now default)
+# ONLY after proving Chrome creates separate isolate logs again; Chrome 149 on
+# this host currently interleaves them and this command cannot process that.
 "…/Google Chrome" --headless=new --js-flags="--prof" … "http://localhost:8031/public/jit-boot/"
 node --prof-process --ignore-unknown isolate-*-v8.log   # pick the isolate containing tcg_qemu_tb_exec
 
@@ -146,20 +180,43 @@ open "…/public/jit-boot/?qsp=1"     # QSP report every 10 s in the page log
 
 ## Known-open items
 
-- **1.1.4 resume takes ~33 s to first pixels** against 1.0's ~3 s. The stream
-  is only 21% bigger, so that gap is unexplained; it has never been measured
-  solo (the MBX session shared the CPU). **Measure it before theorising.**
+- **The old 1.1.4 resume gap is closed.** The rebuilt engine restores 4A102 to
+  the home framebuffer in 1.6 s, versus 2.3 s for 1A543a.
 - **The 4A102 snapshot was built from a dirty engine tree**
   (`engine_dirty: true` in its provenance). Regenerate after the engine
   settles: `scripts/wasm/build-snapshot.py --build 4A102 --brotli
   --boot-wait 420 --live-timeout 420` — it now unlocks and dismisses 1.1.4's
   first-run alert by itself.
-- **The cold-JIT launch race is unexplored.** A *settled* launch is 2.9 s; the
+- **The cold-JIT launch race is unexplored.** A *settled* launch is 2.7–3.5 s; the
   painful case is tapping while the JIT is still cold (this is what produced a
   ~90 s grind in an interactive session). Compile-burst policy — threshold,
   batching, ahead-of-need compilation — is untouched, and `?sweep=calc` can
   measure it by tapping early.
 - **Safari** is unsupported; leads in `BROWSER_WASM_SPEED.md` §8.
+
+## Next-session pickup checklist
+
+1. Start with `git status --short`. This shared worktree still contains
+   unrelated device-model, NAND, MBX and submodule changes; do not stage them.
+2. Build only with
+   `WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh`. The final artifact
+   was linked at 22:06 on 2026-08-01 and is 55,293,456 bytes. The full rebuild
+   compiled the current `hw/arm/ipod_touch.c`, so the new engine fixes are in
+   the measured binary.
+3. Reproduce the four-mode matrix with `scripts/wasm/bench-run.py --page
+   public --build BUILD [--resume] --until 'home screen (>40% non-black)'`.
+   The runner now consumes Chrome's landmark log as a fallback when the result
+   POST is starved by JIT chunk requests.
+4. Use `--chain 0` for the dispatcher control, `--chain 4` for the shipping
+   arm, and `--sweep calc` for Calculator. One invalid run merely omitted
+   `--sweep calc` and sat at home; do not count it.
+5. Keep at least 1 GiB free before Chrome. This session hit 37 MiB, causing the
+   result POST to fail while the guest kept booting. Only disposable browser
+   profiles and reproducible object directories were removed; benchmark logs
+   remained under `/tmp/wasm-final-matrix-019fbe09` for this machine.
+
+The exact failed routes and tuning tables are in
+[`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md) §3.8, §7 and §9.
 
 ## Parallel sessions — do not collide
 
