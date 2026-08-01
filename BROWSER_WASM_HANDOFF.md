@@ -34,6 +34,104 @@ WebAssembly JIT backend is being adopted rather than shipping TCI.
 
 ---
 
+# START HERE — handoff, 2026-08-01
+
+Everything below this heading is the state a fresh session should assume. The
+older sections still hold except where this one contradicts them.
+
+## What works right now
+
+Serve `web/` on :8031 and open `/public/jit-boot/`. A picker at the top
+selects **{1.0, 1.1.4} × {resume, cold boot}** — all four are live.
+
+| | resume | cold boot |
+| --- | --- | --- |
+| **1.0** (1A543a) | ~3 s → home screen | ~152 s |
+| **1.1.4** (4A102) | ~33 s → clean SpringBoard | ~220 s |
+
+Touch works, buttons work, the panel runs at vsync (~60 fps) with measured fps
+and blit cost shown under it. Chrome-family browsers only — **Safari crashes
+mid-boot** and gets a banner saying so.
+
+## The one live lever: the TB dispatcher
+
+Task: **make the dispatcher cheaper.** It is ~15% of the busy vCPU thread and
+the top remaining cost after the BQL fix. Two concrete threads, in order:
+
+1. **A JS `Map` operation sits on the per-TB path.** The V8 profile shows
+   `MapPrototypeSet` and `ArrayFrom` builtins in the vCPU's hot set — JS
+   bookkeeping charged per translated block. Find it in `tcg/wasm64.c`'s EM_JS
+   glue (start at `instantiate_wasm` and the `helper[]` import construction,
+   which builds a fresh object and walks the import vector on every
+   instantiation) and get it off the hot path.
+2. **Direct TB chaining.** `tcg_qemu_tb_exec` is the hottest named function
+   (8.5%), and `helper_lookup_tb_ptr` (4.3%) falls into `g_tree_lookup` on a
+   jmp-cache miss. A dispatcher-side chain cache so `goto_tb` exits stop
+   re-entering the lookup is the structural fix.
+
+**Before touching either, read
+[`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md) §5 and §9.** Two plausible
+ideas are already dead with evidence (wasm-EH longjmp is toolchain-impossible;
+a bigger `TB_JMP_CACHE_BITS` is measurably *worse*), and §9 has the
+benchmarking rules that make a result trustworthy.
+
+## How to build and measure
+
+```bash
+# ALWAYS build through the script -- never bare ninja after touching
+# configs/meson/emscripten.txt (un-hermetic meson regen leaks homebrew paths)
+WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh          # incremental
+WASM_BUILD_DIR=build-wasm scripts/wasm/build-qemu.sh --configure  # after flags
+```
+
+Judge every change on **both** numbers, solo, one run at a time:
+
+- **boot landmarks** — headless Chrome on `/public/jit-boot/`, baseline
+  kernel **84 s**, BSD **93 s**, home screen **152 s** (~1% run variance)
+- **launch latency** — `?resume=1&sweep=calc`, baseline **2.8–3.0 s wall /
+  0.4 s guest**
+
+Then confirm the mechanism moved, not just the clock:
+
+```bash
+# where CPU time goes, by function name (needs the name section, now default)
+"…/Google Chrome" --headless=new --js-flags="--prof" … "http://localhost:8031/public/jit-boot/"
+node --prof-process --ignore-unknown isolate-*-v8.log   # pick the isolate containing tcg_qemu_tb_exec
+
+# which lock, from which callsite
+open "…/public/jit-boot/?qsp=1"     # QSP report every 10 s in the page log
+```
+
+## Known-open items
+
+- **1.1.4 resume takes ~33 s to first pixels** against 1.0's ~3 s. The stream
+  is only 21% bigger, so that gap is unexplained; it has never been measured
+  solo (the MBX session shared the CPU). **Measure it before theorising.**
+- **The 4A102 snapshot was built from a dirty engine tree**
+  (`engine_dirty: true` in its provenance). Regenerate after the engine
+  settles: `scripts/wasm/build-snapshot.py --build 4A102 --brotli
+  --boot-wait 420 --live-timeout 420` — it now unlocks and dismisses 1.1.4's
+  first-run alert by itself.
+- **The cold-JIT launch race is unexplored.** A *settled* launch is 2.9 s; the
+  painful case is tapping while the JIT is still cold (this is what produced a
+  ~90 s grind in an interactive session). Compile-burst policy — threshold,
+  batching, ahead-of-need compilation — is untouched, and `?sweep=calc` can
+  measure it by tapping early.
+- **Safari** is unsupported; leads in `BROWSER_WASM_SPEED.md` §8.
+
+## Parallel sessions — do not collide
+
+- **MBX2D modelling** runs separately (native-first, measurement-first; see
+  [`MBX_HANDOFF.md`](MBX_HANDOFF.md)). It owns `hw/arm/` MBX work; this thread
+  owns `tcg/wasm64.c`, `ui/wasm.c`, `util/main-loop.c`,
+  `configs/meson/emscripten.txt` and the viewer page.
+- **1.0 button/touch work** is also separate — an in-app Home press and the
+  tap-mapping belong there, not here.
+- **Never run two benchmarks at once.** A contaminated control arm already
+  cost one session an afternoon; announce measurement windows.
+
+---
+
 ## Where things stand
 
 - **Assets: ready for 1.0 and 1.1.4.** Both packs exist, both boot to a verified

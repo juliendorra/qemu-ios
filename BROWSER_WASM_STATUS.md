@@ -2875,9 +2875,12 @@ Two things learned about the METHOD, which outlast the result:
 
 ### 4A102 (1.1.4) resume snapshot, the version picker, and three wrong captures
 
-**Result:** `?build=4A102&resume=1` restores 1.1.4 to a clean SpringBoard in
-seconds. **69.9 MiB stream -> 14.1 MiB on the wire** (20.2%, Brotli q11,
-109 s). With the picker, all four {1.0, 1.1.4} x {resume, cold boot}
+**Result (verified in the viewer):** `?build=4A102&resume=1` restores 1.1.4
+to a **clean, unlocked SpringBoard** -- no lock screen, no first-run alert,
+full icon grid. **69.9 MiB stream -> 14.0 MiB on the wire** (20.1%, Brotli
+q11, 108 s). Capture log, all three steps verified: `panel live at 59.2%` ->
+`after slide: 65.8% (screen changed -- unlocked)` -> `after tap: 47.3%
+(screen changed)`. With the picker, all four {1.0, 1.1.4} x {resume, cold boot}
 combinations are live.
 
 **The picker** (`web/public/jit-boot/index.html`): each option is a LINK, i.e.
