@@ -4058,3 +4058,37 @@ Rules that follow, for anyone touching this probe:
   the park count rather than assuming.
 * The failure the user reports reproduces in the REAL WINDOW. Five VNC
   configurations passed a build that was visibly broken by hand.
+
+### A/B against the PRE-SESSION engine: this session did not cause it
+
+Suspicion worth taking seriously, since the day had touched SYSIC `INTLEVEL`
+and the whole MBX register block: did today's work break the wake? Restored
+the pre-session 1.1.4 binary (md5 `32c092a1...`, saved before any of it) and
+ran the identical probe:
+
+| engine | parks | refused | slide | verdict |
+|---|---|---|---|---|
+| today's build (with the wake fix) | 0 -> 0 | 0 | 0.00% | FAIL |
+| **pre-session `32c092a1`** | 0 -> 0 | 0 | 0.00% | **FAIL, identical** |
+
+So the shallow-path behaviour is **PRE-EXISTING** and none of this session's
+changes caused it. Both bundles now carry the current build (`4640dbe0...`),
+which is strictly better on the deep path (refusals 5 -> 0, no re-park loop)
+and indistinguishable on the shallow one.
+
+### What is still genuinely unknown
+
+Whether the shallow-path result is a BUG AT ALL. The device wakes to the lock
+screen, the model delivers both touch edges, the guest ignores them, and the
+panel is asleep again by ~16 s after the wake. A real iPhone woken to the lock
+screen and then ignored also turns its screen off after ~15-20 s, and a slept
+guest ignoring touch is correct. Distinguishing "correct auto-lock" from "the
+lock screen sleeps far too fast" needs a reference the emulator cannot
+provide: the iPod bundle (which the user reports as immune, and which still
+runs a DIFFERENT binary), or hardware behaviour. Until then this probe's
+shallow-path FAIL should be read as "the device was asleep when the slide
+happened", not as a proven defect.
+
+The DEEP path is not ambiguous: a model that refuses input with "Ignoring
+input until display/driver startup is stable" is broken by construction, and
+that is the part the fix addresses.
