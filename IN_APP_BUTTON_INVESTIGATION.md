@@ -1,8 +1,9 @@
 # The in-app HOME/POWER bug on iPhone OS 1.0 — full record
 
-**Status: FIXED and regression-tested (2026-08-01).** Authoritative record for this investigation; the sections in
-`NEXT_SESSION_HANDOFF.md` are the raw chronological log and several of their
-conclusions are retracted here.
+**Status: production workaround regression-tested; true MBX2D model still
+OPEN (2026-08-01).** Authoritative record for this investigation; the sections
+in `NEXT_SESSION_HANDOFF.md` are the raw chronological log and several of
+their conclusions are retracted here.
 
 Final acceptance on the staged iPhone OS 1.0 bundle is recorded at the end of
 this file. It uses 1.0's software compositor because the old MBX2D
@@ -33,7 +34,7 @@ backing-store renderer during the tested app transition. It is not evidence
 that generic MBX register values or HOME timing are correct for 1.0; it is a
 different guest rendering path.
 
-The compatibility fix makes the emulator's advertised capability truthful for
+The compatibility workaround makes the emulator's advertised capability truthful for
 the affected build. The launcher first clones NAND and NOR for the run. Only
 when NAND provenance says `1A543a`, the security epoch is 0, and the eight
 original bytes of `_mbx2DInitialize` match the known image does it replace the
@@ -47,6 +48,79 @@ and the bundle's master `nand.pack` is never opened for writing.
 backing-store client still initialized and submitted MBX2D work. Failing the
 client initialization itself is the measured decision point that reliably
 selects the software path.
+
+## From broken to fixed: why this took so long
+
+The result looks simple in retrospect—decline an accelerator the emulator does
+not implement—but almost every early observation pointed one layer lower or
+one layer later than the actual fault. This is the chronological path that
+turned the user-visible symptom into the final compatibility decision.
+
+1. **It looked exactly like a button-delivery bug.** HOME and POWER worked on
+   SpringBoard but appeared to stop working with an app frontmost. The natural
+   suspects were SDL key mapping, GPIO edges, SYSIC/VIC delivery, PMU state,
+   and SpringBoard's event routing. Key/IRQ traces eventually proved the guest
+   received HOME promptly and entered its dismissal code; the screen was what
+   stopped progressing.
+2. **The 1.1.4 control was reassuring in the wrong way.** The same emulated
+   board, IRQ wiring, and button code worked immediately on 4A102, suggesting
+   the common hardware path was sound and that 1A543a merely needed a timing or
+   event-bit adjustment. In fact the releases diverge above that layer:
+   1A543a commits its app snapshot to an older MBX2D backing-store renderer,
+   while the tested 4A102 transition does not exercise that failing contract.
+3. **The first automated oracle certified the failure as success.** It waited
+   forty seconds and accepted any large framebuffer difference from the app.
+   After about 33.8 seconds of strip-by-strip recovery timeouts, 1.0 produced
+   wallpaper and dock pixels without the icon grid. That broken partial frame
+   differed from the app by roughly 97%, so the probe printed PASS. POWER was
+   then pressed during the migrated repaint phase, compounding the confusion.
+4. **Ordinary MMIO tracing could not see the real command state.** The MBX
+   driver writes command and queue structures through a CPU mapping of shared
+   DRAM. It programs an eight-entry MBX page directory, then gives the engine
+   virtual addresses such as `0x1b000`, `0x21000`, and `0xa00000`. Consequently
+   there can be no aperture reads or writes for the most important state; a
+   quiet MMIO log did not mean no work existed. An early trace also collapsed
+   distinct aperture addresses onto the same key, hiding the few writes that
+   did occur.
+5. **Register completions made the guest worse because an interrupt is not a
+   completion.** DONE bits, render events, timers, and early/late IRQ variants
+   either changed nothing or wedged the renderer. The guest ISR treats the
+   event as an announcement and then consults microkernel-owned queue state in
+   shared memory. Raising an event without first performing the engine's
+   memory-side retirement violates that ordering.
+6. **The apparent completion word was a pointer.** Live operation-state dumps
+   showed `state1+0x60` points to another structure; it is not a Boolean busy
+   flag. Clearing it could bypass one check while corrupting the queue graph.
+   This explained why seemingly plausible shared-memory writes woke a waiter
+   but never produced a correct frame.
+7. **The MMU walk finally connected the two views.** Registers
+   `0x1000..0x101c` are eight physical page-table roots and `0x1020` enables
+   translation. Walking them located the live command/control pages in guest
+   DRAM and explained both the missing aperture traffic and the failures of a
+   private MMIO backing store. It enabled command capture and an experimental
+   strip copier, but not the larger surface-ring retirement contract.
+8. **A diagnostic initialization failure supplied the decisive A/B.** Changing
+   only `_mbx2DInitialize` in a disposable staged 1A543a NAND made LayerKit use
+   software rendering. The strict probe then returned the complete SpringBoard
+   promptly, with a sub-one-percent difference from its pre-app reference;
+   in-app POWER and wake passed too. Re-enabling initialization restored the
+   timeout/partial-frame behavior.
+9. **The workaround was made narrow and falsifiable.** The launcher applies
+   that decision only after matching epoch 0, provenance build `1A543a`, and
+   the exact original function bytes in its per-launch clone. The probe
+   captures a full icon-filled reference, imposes an eight-second HOME
+   deadline, reopens the app before testing POWER, and runs the identical
+   assertions on 4A102.
+
+Several factors made the investigation unusually expensive: iOS 1.0 took a
+conditional path absent from the apparently equivalent control; virtual time
+under `-icount` made wall-time waits misleading; stale and off-screen
+framebuffers could show changes the user never saw; the failure degraded into
+a plausible partial screen instead of crashing; and the real protocol lived in
+CPU-shared DRAM rather than the MMIO traffic normally used to reverse-engineer
+a device. The long investigation was not caused by HOME being intrinsically
+different on 1.0. It was caused by a successful button event crossing into a
+different, only partially emulated rendering subsystem.
 
 ## The bug
 
@@ -1945,7 +2019,7 @@ captures what the driver writes into MBX-space, including the page table at
 Still off by default -- it changes nothing on its own (neutral is exactly
 what "the guest never reads this memory" predicts).
 
-## CLOSED: prompt HOME and POWER with an app frontmost (2026-08-01)
+## USER-VISIBLE ISSUE CLOSED BY WORKAROUND; MBX2D MODEL OPEN (2026-08-01)
 
 The earlier claim that the +33.8-second dismissal was acceptable is retracted.
 That interval was 1.0 exhausting one legacy MBX2D timeout per backing-store
@@ -1968,10 +2042,10 @@ bytes before changing them; an unexpected artifact fails closed. Set
 `IT_IOS10_SOFTWARE_MBX2D=0` to disable the compatibility path for continued
 MBX protocol investigation.
 
-This is a guarded guest compatibility patch, not a completed emulation of the
-legacy MBX2D engine. It is production-safe with the repository's staged-NAND
-launcher because the bundle's master NAND remains pristine and every run gets
-a fresh clone.
+This is a guarded guest compatibility workaround/hack, not a completed
+emulation of the legacy MBX2D engine. It is production-safe with the
+repository's staged-NAND launcher because the bundle's master NAND remains
+pristine and every run gets a fresh clone.
 
 ### Final hardware-path dead ends (do not repeat)
 
