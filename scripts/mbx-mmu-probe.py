@@ -104,6 +104,20 @@ def main() -> int:
     ap.add_argument("--qemu", type=Path,
                     default=REPO / "build-ipod11" / "qemu-system-arm")
     ap.add_argument("--deadline", type=float, default=600)
+    ap.add_argument("--exercise", action="store_true",
+                    help="after the home screen: tap an app icon, wait, press "
+                         "HOME, and wait out the dismissal before walking the "
+                         "table. On 1.0 the dismissal renders ~33 blocks of "
+                         "2D commands into MBX VA 0xa00000 (aperture writes "
+                         "the model drops), so this is the run that can "
+                         "answer whether those words ALSO land in the DRAM "
+                         "the page table maps -- the trace records every "
+                         "aperture write, and the report diffs them against "
+                         "the translated page.")
+    ap.add_argument("--icon", type=int, nargs=2, default=(277, 258),
+                    metavar=("X", "Y"),
+                    help="icon to open for --exercise (default: the "
+                         "app-button-probe m68ap-10 icon)")
     ap.add_argument("--keep-stage", action="store_true",
                     help="keep the staged NAND clone (~300 MB) after the run; "
                          "by default it is deleted, per the repo's "
@@ -168,6 +182,32 @@ def main() -> int:
         print(f"screen: {kind}")
         report["screen"] = kind
 
+        if args.exercise and kind["kind"] == "home":
+            # Deliberately generous, fixed waits: under -icount guest time
+            # runs slower than wall clock, and the 1.0 dismissal alone is
+            # ~34 s of guest time. No polling between input and verdict
+            # (the dismiss-latency pmemsave trap).
+            x, y = args.icon
+            print(f"exercise: tapping icon ({x},{y}), waiting, HOME, "
+                  f"waiting out the dismissal ...", flush=True)
+            lockprobe._abs(q, x, y)
+            q.cmd("input-send-event", {"events": [
+                {"type": "btn", "data": {"down": True, "button": "left"}}]})
+            time.sleep(0.12)
+            q.cmd("input-send-event", {"events": [
+                {"type": "btn", "data": {"down": False, "button": "left"}}]})
+            time.sleep(60)
+            d, kind = lockprobe.grab(q, args.logs, classify)
+            lockprobe.png(d, args.logs / "in-app.png")
+            print(f"after tap: {kind}")
+            report["in_app"] = kind
+            lockprobe.key(q, "h")
+            time.sleep(90)
+            d, kind = lockprobe.grab(q, args.logs, classify)
+            lockprobe.png(d, args.logs / "after-home.png")
+            print(f"after HOME: {kind}")
+            report["after_home"] = kind
+
         # ---- harvest the page directory from the model's own trace --------
         text = stderr.read_bytes().decode("latin1", "replace")
         entries = {}
@@ -213,6 +253,49 @@ def main() -> int:
                       f"first 32 at target: {head}")
                 (args.logs / f"page_{va:08x}.bin").write_bytes(page)
             report["targets"][f"{va:08x}"] = rec
+
+        # ---- diff every traced aperture WRITE against the mapped DRAM -----
+        # The model DROPS these writes (IT_MBX_RAM off), so if the words are
+        # nevertheless present at the translated addresses, the guest CPU
+        # has its own mapping onto those pages and the aperture was never
+        # the real data path. If they are absent, the aperture IS the write
+        # path and the model must forward it through this table.
+        wr_re = re.compile(r"\[MBX\].*WR 0x([0-9a-f]{4,7}) = 0x([0-9a-f]{8})")
+        text = stderr.read_bytes().decode("latin1", "replace")
+        writes = {}
+        for m in wr_re.finditer(text):
+            a = int(m.group(1), 16)
+            if a >= 0x2000:
+                writes[a] = int(m.group(2), 16)
+        report["aperture_writes"] = len(writes)
+        if writes:
+            match = miss = untrans = 0
+            page_cache = {}
+            for a, v in sorted(writes.items()):
+                pa, how = walk(pmem, directory, a)
+                if pa is None:
+                    untrans += 1
+                    continue
+                pg = pa & ~0xFFF
+                if pg not in page_cache:
+                    page_cache[pg] = pmem(pg, PAGE) or b""
+                data = page_cache[pg]
+                got = int.from_bytes(data[(pa & 0xFFF):(pa & 0xFFF) + 4],
+                                     "little") if data else None
+                if got == v:
+                    match += 1
+                else:
+                    miss += 1
+                    if miss <= 8:
+                        print(f"  MISS MBX 0x{a:07x} -> PA 0x{pa:08x}: "
+                              f"wrote 0x{v:08x}, DRAM has "
+                              f"0x{got:08x}" if got is not None else
+                              f"  MISS MBX 0x{a:07x}: page unreadable")
+            report["aperture_diff"] = {"match": match, "miss": miss,
+                                       "untranslatable": untrans}
+            print(f"\naperture writes vs mapped DRAM: {match} match, "
+                  f"{miss} differ, {untrans} untranslatable "
+                  f"(of {len(writes)} distinct addresses)")
         q.close()
     finally:
         if proc.poll() is None:

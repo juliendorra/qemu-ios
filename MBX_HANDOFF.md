@@ -259,14 +259,42 @@
 >    MMU enable. The completion it currently signals there is spurious;
 >    revisit when the 2D path is modelled.
 >
-> **First experiment for T2** (cheap, no device code): walk the directory
-> from a live guest (`pmemsave` the eight pages, decode PTEs), translate
-> `0xa00000`, and read that DRAM page — if it already holds the 2D command
-> block the guest wrote through the aperture, the CPU has its own mapping
-> and the model only needs to READ; if it is empty, aperture writes are the
-> only path and the model must forward them through the page table.
-> **`scripts/mbx-mmu-probe.py` does exactly this run** (written 2026-08-01,
-> not yet executed — the bundle regression batteries had the machine).
+> **First experiment for T2 — RUN, and the walk WORKS (2026-08-01,
+> `scripts/mbx-mmu-probe.py`, 4A102 at the home screen):**
+>
+> ```
+> directory: 08b1b000 08b1c000 08b5d000 08b5e000 08ba0000 08ba1000 08b82000 08be3000  (all DRAM)
+> MBX 0x08000  -> PA 0x08b4f000  empty
+> MBX 0x1b000  -> PA 0x08ba2000  244 nonzero bytes  e0000000 a7700000 0e000000 d6887610 2222 0e80 ...
+> MBX 0x1d000  -> PA 0x08bc9000  empty
+> MBX 0x21000  -> PA 0x08bad000  24 nonzero bytes   e0000000 a8800000 0e000000 d6887610 2222 0e80 ...
+> MBX 0xa00000 -> PA 0x08be4000  page FULL of 0xBAD43210
+> ```
+>
+> Three verdicts:
+>
+> 1. **The two-level walk is correct** — every PDE and PTE resolves into
+>    DRAM, flags are 0, and the content is sensible.
+> 2. **The CPU shares these pages.** This boot performed ZERO aperture
+>    writes at offsets ≥ 0x2000 (measured, full IT_MBX_TRACE=all), yet
+>    0x1b000/0x21000 hold live driver-written structures at their
+>    translated addresses. The kernel writes them through its own mapping;
+>    the aperture is a second window onto the same memory, exactly what an
+>    MMU predicts.
+> 3. **0xa00000 is the command buffer, allocated and poisoned** — a full
+>    page of `0xBAD43210` ("bad" fill) waiting for commands.
+>
+> **So the T2 model core is: translate every aperture access through the
+> guest's own page table into guest DRAM.** IT_MBX_RAM's private backing
+> was "the wrong memory" precisely because this mapping exists. And the
+> "answering 0 is load-bearing" wedge now has a mechanism: forwarding
+> READS alone would hand the driver its own values back while the
+> engine-owned completion words stay unwritten — forwarding and
+> engine-side completion writes must land together, which is the same
+> conclusion the six failed register tricks converged on from the other
+> side. The probe grew `--exercise` (open app → HOME → wait out the
+> dismissal) to capture the 1.0 command stream in flight and diff every
+> traced aperture write against the mapped DRAM.
 >
 > **And the command format is not a black box either.** The userland
 > `MBX2D.framework` on the 1.0 root filesystem keeps **74 defined symbols**,
