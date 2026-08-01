@@ -101,6 +101,37 @@ def tap(qmp, px: int, py: int, hold: float = 0.30) -> None:
         {"type": "btn", "data": {"down": False, "button": "left"}}])
 
 
+def slide_to_unlock(qmp, steps: int = 12, dwell: float = 0.06) -> None:
+    """Drag across the unlock slider, with motion the guest can track.
+
+    A snapshot captured on the LOCK SCREEN restores to the lock screen, which
+    is not what "instant boot" should mean: 1.1.4's first snapshot did exactly
+    that (2026-08-01) because the device auto-locked during the boot wait and
+    the liveness check -- a wallpaper is well over 40% non-black -- happily
+    accepted it.
+
+    Geometry and cadence are lock-unlock-probe.py's, which measured them: the
+    slider sits at y=430 spanning x=45..280, and the guest needs INTERMEDIATE
+    motion events, not a straight down-up, or it reads no gesture at all.
+    """
+    def at(px, py):
+        qmp.execute("input-send-event", events=[
+            {"type": "abs", "data": {"axis": "x",
+                                     "value": int(px / FB_W * 32768)}},
+            {"type": "abs", "data": {"axis": "y",
+                                     "value": int(py / FB_H * 32768)}}])
+
+    x0, x1, y = 45, 280, 430
+    at(x0, y)
+    qmp.execute("input-send-event", events=[
+        {"type": "btn", "data": {"down": True, "button": "left"}}])
+    for i in range(1, steps + 1):
+        at(x0 + (x1 - x0) * i // steps, y)
+        time.sleep(dwell)
+    qmp.execute("input-send-event", events=[
+        {"type": "btn", "data": {"down": False, "button": "left"}}])
+
+
 def sample(qmp, out: Path, tag: str) -> dict:
     """Scanout plus each candidate framebuffer base, as non-black percentages."""
     out.mkdir(parents=True, exist_ok=True)

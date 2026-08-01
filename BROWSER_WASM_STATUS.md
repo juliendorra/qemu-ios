@@ -2873,23 +2873,60 @@ Two things learned about the METHOD, which outlast the result:
   the cold-JIT race that actually hurts (the ~90 s interactive grind), tap
   EARLY (cold boot + tap as soon as the gate arms), or launch a heavier app.
 
-### 4A102 (1.1.4) resume snapshot exists (2026-08-01)
+### 4A102 (1.1.4) resume snapshot, the version picker, and three wrong captures
 
-Built once disk allowed: **69.47 MiB stream → 13.86 MiB on the wire** (19.9%,
-Brotli q11, 109 s). `?build=4A102&resume=1` works; with the picker, all four
-{1.0, 1.1.4} × {resume, cold boot} combinations are live.
+**Result:** `?build=4A102&resume=1` restores 1.1.4 to a clean SpringBoard in
+seconds. **69.9 MiB stream -> 14.1 MiB on the wire** (20.2%, Brotli q11,
+109 s). With the picker, all four {1.0, 1.1.4} x {resume, cold boot}
+combinations are live.
 
-Two honest differences from 1.0's snapshot, both worth fixing when convenient:
+**The picker** (`web/public/jit-boot/index.html`): each option is a LINK, i.e.
+a page reload, because the build selects epoch, firmware, NAND chunk set and
+snapshot -- all staged in `preRun` before the machine exists, so there is
+nothing to switch live. Other query params (`sweep`, `qsp`, `display`) survive
+a pick. **Snapshot availability is PROBED** (`HEAD state-provenance.json`),
+not assumed: a build without one shows "resume" disabled *with the
+build-snapshot command in its tooltip*, instead of offering a link that dies
+in `preRun`; switching build while in resume mode falls back to cold boot.
+A snapshot appearing later needs no code change. One bug found building it:
+`RESUME` was declared ~70 lines BELOW the picker, putting it in its own
+temporal dead zone -- moved up beside `BUILD`.
 
-- **It resumes to the LOCK SCREEN**, not the home screen — the native boot's
-  panel had gone dark (`panel at 0.0%, waking ...`) and the machine that got
-  captured re-locks shortly after resume. 1.0 lands on the home screen. A
-  nicer capture would unlock first, or snapshot earlier in the live window.
-- **First pixels at ~33 s**, against ~2–3 s for 1.0 — the stream is 21% larger
-  and this run also raced a native MBX-session boot for CPU, so the figure is
-  not clean. Re-measure solo before treating it as the real number.
+**Three captures, each looking correct and each wrong.** Recorded because
+every one produced a healthy build log:
 
-The snapshot itself is gitignored (`web/.gitignore`: `/public/*/snapshots/`);
-the provenance file records engine commit `c666f6f4f7`, and it was built from
-a DIRTY tree (`engine_dirty: true`) — regenerate after the engine settles, or
-a future stale-stream failure will not name its cause.
+1. **Live != usable.** The first snapshot restored to **slide-to-unlock**. The
+   liveness loop asks only "are there pixels", and the lock screen's wallpaper
+   answers 59% against a 40% threshold. The device had auto-locked during the
+   boot wait; the loop's own `wake()` produced the lock screen and accepted it.
+   -> `probe.slide_to_unlock()` after liveness, reusing lock-unlock-probe.py's
+   MEASURED geometry (y=430, x=45->280) and its finding that the guest needs
+   intermediate motion events, not a straight down-up.
+2. **An unverified gesture would ship the same bug.** -> the slide is followed
+   by a screendump; the run prints whether the frame changed ("unlocked" /
+   "was already unlocked") and refuses to write a stream whose panel fell
+   below the threshold. Measured: **59.1% -> 65.8%, "screen changed"**. That
+   check is what makes `--unlock` safe on by default.
+3. **Unlocked is not clean.** Unlocking revealed SpringBoard's REORDER_INFO
+   alert ("Edit Home Screen") over the home screen. **False path avoided:** it
+   looks exactly like something the unlock drag could have caused -- the
+   slide's tail passes over the dock -- but it predates the gesture and was
+   merely hidden behind the lock screen; 1.1.4 raises it on EVERY launch
+   because the bundles clone a pristine NAND, so every launch is a first run.
+   calc-touch-map.py had already measured its Dismiss button at (180, 325).
+   -> `POST_UNLOCK_TAPS = {"4A102": [(180, 325)]}`, overridable with
+   `--dismiss-tap X,Y`, each tap verified the same way.
+
+**Earlier dead end, same build:** the first attempt failed with
+`clonefile failed: No space left on device` after the 882 MB NAND clone. That
+was genuinely the disk (the builder needs ~2 GiB), and it was ALSO briefly
+blamed for the wasm-EH link hang, which had 3.5 GiB free -- see
+[`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md) §6.3. Reclaimed 2.3 GB of
+profiling debris to unblock it.
+
+**Still open:** the stream's provenance records `engine_dirty: true` (built
+from a working tree with uncommitted engine changes) -- regenerate once the
+engine settles, or a future stale-stream failure will not name its cause. The
+snapshot is gitignored (`web/.gitignore`: `/public/*/snapshots/`); first-pixels
+timing has not been re-measured solo since the MBX session shares the CPU.
+

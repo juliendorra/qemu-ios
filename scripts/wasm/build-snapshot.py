@@ -42,6 +42,43 @@ At q11 the snapshot is SMALLER than the chunked cold-boot working set
 ``state.br`` with ``Content-Encoding: br`` and the browser decompresses it on
 the way in, carrying no decoder -- exactly what scripts/wasm/chunk-pack.py's
 output relies on.
+
+What state gets captured -- and why it takes three steps
+--------------------------------------------------------
+A snapshot restores EXACTLY the screen it was taken on, so "the panel is
+live" is not the acceptance condition; "the machine is where a visitor should
+start" is.  4A102 taught this in three rounds on 2026-08-01, each round a
+correct-looking result that was wrong:
+
+1. **Live != usable.**  The first 4A102 snapshot restored to SLIDE-TO-UNLOCK.
+   The liveness loop only asks "are there pixels", and the lock screen's Earth
+   wallpaper answers 59% -- comfortably over ``--live-pct 40``.  The device had
+   auto-locked during ``--boot-wait`` and the loop's own ``wake()`` produced
+   the lock screen, which it then happily accepted.  Fixed by sliding
+   (``probe.slide_to_unlock``) after liveness.
+
+2. **The unlock has to be CHECKED, not assumed.**  A gesture that silently
+   does nothing would ship the same broken snapshot.  So the slide is followed
+   by a screendump, and the run prints whether the frame changed ("unlocked")
+   or not ("it was already unlocked"), and REFUSES to write a stream whose
+   panel fell below ``--live-pct``.  That check is also what makes ``--unlock``
+   safe to leave on by default: on a device already at SpringBoard the drag
+   lands on the dock and changes nothing, which is reported rather than
+   guessed at.
+
+3. **A clean home screen is not the same as an unlocked one.**  Unlocking
+   revealed SpringBoard's REORDER_INFO alert ("Edit Home Screen"), which 1.1.4
+   raises on EVERY launch -- the bundles clone a pristine NAND, so every launch
+   is a first run -- and which had simply been hidden behind the lock screen.
+   *False path worth recording:* the alert looks exactly like something the
+   unlock drag could have caused (the slide's tail passes over the dock), and
+   half an hour could go into "fix the gesture".  It does not: the alert
+   predates the gesture, and calc-touch-map.py had already documented both the
+   alert and its Dismiss button at (180, 325).  Hence ``POST_UNLOCK_TAPS``.
+
+The general rule this leaves: **after any capture, look at the frame you are
+about to freeze.**  Every step here reports what it changed, because each of
+these three failures produced a perfectly healthy-looking build log.
 """
 from __future__ import annotations
 
@@ -74,6 +111,17 @@ probe = _load("snapshot_probe", REPO / "scripts" / "wasm" / "snapshot-probe.py")
 QMP, measure, launch, wake = probe.QMP, probe.measure, probe.launch, probe.wake
 
 
+# Taps to perform after unlocking, per build. 1.1.4 raises SpringBoard's
+# REORDER_INFO alert ("Edit Home Screen") over the home screen on EVERY
+# launch -- the bundles clone a pristine NAND, so every launch is a first run
+# -- and nothing else can be tapped until it is gone. Its Dismiss button was
+# measured at (180, 325) by calc-touch-map.py. Capturing the alert into the
+# snapshot would show it to every visitor on every resume, for ever.
+POST_UNLOCK_TAPS = {
+    "4A102": [(180, 325)],
+}
+
+
 def engine_provenance() -> dict:
     """What produced this stream. The commit is the compatibility key."""
     def git(*args):
@@ -103,6 +151,18 @@ def main() -> int:
     ap.add_argument("--live-pct", type=float, default=40.0,
                     help="non-black percentage that counts as a live panel")
     ap.add_argument("--live-timeout", type=float, default=300.0)
+    # On by default: a snapshot that restores to slide-to-unlock is not what
+    # "instant boot" should mean, and the gesture is verified rather than
+    # assumed (see the unlock block in main).
+    ap.add_argument("--unlock", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="slide to unlock before capturing (default: yes)")
+    ap.add_argument("--unlock-settle", type=float, default=8.0,
+                    help="seconds to let the unlock animation finish")
+    ap.add_argument("--dismiss-tap", action="append", default=None,
+                    metavar="X,Y",
+                    help="tap here after unlocking, repeatable; defaults come "
+                         "from POST_UNLOCK_TAPS (1.1.4's first-run alert)")
     ap.add_argument("--brotli", action="store_true",
                     help="also write state.br (see Delivery in the docstring)")
     ap.add_argument("--quality", type=int, default=11)
@@ -190,6 +250,55 @@ def main() -> int:
             print(f"panel never reached {args.live_pct}% -- refusing to write "
                   "a snapshot of a dark screen", file=sys.stderr)
             return 1
+
+        # A LIVE panel is not necessarily a USABLE one: the liveness test only
+        # asks "are there pixels", and a lock screen's wallpaper passes it
+        # easily. 4A102's first snapshot (2026-08-01) restored to
+        # slide-to-unlock for exactly that reason -- the device auto-locked
+        # during the boot wait, the wake produced the lock screen, and 59%
+        # non-black satisfied the check.
+        #
+        # So: slide, then CHECK. The check is what makes this safe to run
+        # unconditionally -- on a device that was already at SpringBoard the
+        # drag lands on the dock and changes nothing, which is reported rather
+        # than assumed. Refuse to ship a frame the gesture made worse.
+        if args.unlock:
+            before = pct
+            print(f"unlocking (slide) from {before:.1f}% ...", flush=True)
+            probe.slide_to_unlock(qmp)
+            time.sleep(args.unlock_settle)
+            qmp.execute("screendump", filename=str(work / "unlocked.ppm"))
+            after = measure(work / "unlocked.ppm")[0]
+            if after < args.live_pct:
+                print(f"panel fell to {after:.1f}% after the slide -- refusing "
+                      "to write a snapshot of it", file=sys.stderr)
+                return 1
+            print(f"after slide: {after:.1f}% "
+                  + ("(screen changed -- unlocked)"
+                     if abs(after - before) > 1.0
+                     else "(unchanged -- it was already unlocked)"),
+                  flush=True)
+
+            # First-run alerts sit ON TOP of the home screen and would be
+            # captured with it. Tap them away, and report the effect.
+            taps = ([tuple(int(v) for v in s.split(",")) for s in
+                     args.dismiss_tap] if args.dismiss_tap is not None
+                    else POST_UNLOCK_TAPS.get(args.build, []))
+            for (tx, ty) in taps:
+                print(f"dismiss tap at ({tx},{ty}) ...", flush=True)
+                probe.tap(qmp, tx, ty)
+                time.sleep(args.unlock_settle)
+                qmp.execute("screendump", filename=str(work / "dismissed.ppm"))
+                post = measure(work / "dismissed.ppm")[0]
+                print(f"after tap: {post:.1f}% "
+                      + ("(screen changed)" if abs(post - after) > 1.0
+                         else "(unchanged -- nothing was there?)"),
+                      flush=True)
+                if post < args.live_pct:
+                    print(f"panel fell to {post:.1f}% after the tap -- "
+                          "refusing to write it", file=sys.stderr)
+                    return 1
+                after = post
 
         # Stop first. A LIVE migration of this machine aborts on
         # tlb_reset_dirty_range_all's block assertion, because main RAM is
