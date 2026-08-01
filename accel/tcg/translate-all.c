@@ -599,6 +599,21 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
         n = 2;
     }
 
+#ifdef EMSCRIPTEN
+    if (wasm_io_split_enabled()) {
+        /*
+         * Remember the architectural PC of this dynamic MMIO instruction and
+         * discard the TB that placed it before the I/O-safe final slot. The
+         * translator will rebuild the predecessor to stop before this PC and
+         * keep the instruction itself in a one-insn TB. The current unwind is
+         * still required; later executions take the ordinary TB exit instead
+         * of paying another JS-throw longjmp.
+         */
+        wasm_io_split_record(cpu->cc->get_pc(cpu));
+        tb_phys_invalidate(tb, -1);
+    }
+#endif
+
     /*
      * Exit the loop and potentially generate a new TB executing the
      * just the I/O insns. We also limit instrumentation to memory

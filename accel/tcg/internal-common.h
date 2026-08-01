@@ -137,6 +137,13 @@ void page_table_config_init(void);
 G_NORETURN void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
 #endif /* CONFIG_USER_ONLY */
 
+#ifdef EMSCRIPTEN
+bool wasm_io_split_enabled(void);
+bool wasm_io_split_known(vaddr pc);
+void wasm_io_split_record(vaddr pc);
+uint64_t wasm_io_split_learned(void);
+#endif
+
 void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr);
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr);
 

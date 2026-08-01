@@ -155,6 +155,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->plugin_enabled = plugin_enabled;
 
     while (true) {
+#ifdef EMSCRIPTEN
+        bool wasm_io_insn = wasm_io_split_known(db->pc_next);
+#endif
+
         *max_insns = ++db->num_insns;
         ops->insn_start(db, cpu);
         db->insn_start = tcg_last_op();
@@ -192,6 +196,20 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         if (db->is_jmp != DISAS_NEXT) {
             break;
         }
+
+#ifdef EMSCRIPTEN
+        /*
+         * Dynamic MMIO cannot be recognized by the target translator. Once
+         * cpu_io_recompile identifies such a PC, make it the final instruction
+         * of its TB and stop a predecessor before entering it. This preserves
+         * icount's I/O ordering while avoiding the repeated longjmp used to
+         * discover the same boundary on every execution.
+         */
+        if (wasm_io_insn || wasm_io_split_known(db->pc_next)) {
+            db->is_jmp = DISAS_TOO_MANY;
+            break;
+        }
+#endif
 
         /* Stop translation if the output buffer is full,
            or we have executed all of the allowed instructions.  */
