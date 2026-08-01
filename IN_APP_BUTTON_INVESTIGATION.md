@@ -1756,6 +1756,33 @@ hangs on the FIRST wait, so a PC sample at that hang names the exact load --
 one address, not a search.
 
 
+## SUPERSEDED IN PART — read MBX_SDO_MMU_HANDOFF.md (2026-08-01)
+
+The moratorium at the end of this file ("the fix is not a register trick;
+write the completion into the `[1a4]`/`[1a8]` shmem, starting with `+0x60`,
+and only then raise the event") was acted on, and **two of its premises are
+now measured to be wrong**:
+
+* **The op-state structures are NOT in MBX-mapped memory.** The MBX's page
+  table maps only 39 pages; `[obj+0x1a4]` is ordinary kernel heap and
+  `[obj+0x1a8]` is not even kernel-linear. The engine does not reach them
+  through the page table, so a completion write must address them by
+  directly-derived physical address.
+* **`[[obj+0x1a4]+0x60]` is a POINTER, not a completion flag.** Live dump on
+  4A102: it holds `0xc0b85400`, a kernel VA pointing at a sibling structure.
+  Writing 0 there — the obvious next move this file recommends — would
+  corrupt a pointer and become the seventh wedge.
+
+Also relevant to the 33.8 s latency recorded below: on the current engine
+the guest **declines MBX2D altogether** (init takes one FinishSurface
+timeout, tears down, MMU off) and dismisses via LayerKit's software
+fallback, so the 33-block regime is not being paid. That also explains the
+"1.1.4 avoids the MBX path" observation — it is not a per-build branch, it
+is whether `mbx2DInitialize`'s handshake succeeds.
+
+Full record, dead-end table and routes forward:
+[`MBX_SDO_MMU_HANDOFF.md`](MBX_SDO_MMU_HANDOFF.md).
+
 ## The trace was lying, and what it said once it stopped (2026-07-31, late)
 
 ### Instrument trap #6: the MBX trace collapsed 16 MiB into 1024 slots

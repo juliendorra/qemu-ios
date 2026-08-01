@@ -1,5 +1,17 @@
 # MBX (PowerVR) — session handoff: the stub, and the two hacks that stand on it
 
+> **➜ READ [`MBX_SDO_MMU_HANDOFF.md`](MBX_SDO_MMU_HANDOFF.md) FIRST
+> (2026-08-01).** It is the organised record of the session that finished
+> T1 and unblocked T2: what was built, the full dead-end table (fifteen
+> entries, including three that would have wedged the guest), and the two
+> concrete routes forward. **This file's banners below were written
+> incrementally during that session and contain superseded statements** —
+> most importantly, "the zero-window is only armed when the model is off"
+> was a GLOBAL gate that measurably regressed iPhone OS 1.0 and now lives
+> at the placement decision instead. Where the two disagree, that file
+> wins; the detail here (register decodes, ISR maps, measurement tables)
+> is still good.
+
 > **T1 BREAKTHROUGH (2026-07-31, night): 4A102 reaches the HOME SCREEN with
 > the swap-device zero-window REMOVED (`IT_TVOUT_WA=0`), completing the TVOut
 > swap through its own driver.** The missing hardware signal was the **SDO

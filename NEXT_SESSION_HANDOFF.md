@@ -11,6 +11,19 @@
 > ([`M68AP_BUILD_LAYOUT.md`](M68AP_BUILD_LAYOUT.md)), so commands quoted below
 > need their paths translated.
 
+> **2026-08-01 — the MBX thread ran and delivered T1.** The TVOut
+> swap-device zero-window — the last address-dependent hack in the display
+> path — is RETIRED by default: the missing signal was the SDO field
+> interrupt, now modelled, and the guest completes its own swaps. T2 (MBX
+> 2D) is unblocked but not done: the MBX turns out to have an **MMU**, and
+> the model can now translate and forward through it. Full record, with
+> every dead end and both routes forward, in
+> [`MBX_SDO_MMU_HANDOFF.md`](MBX_SDO_MMU_HANDOFF.md). All three app bundles
+> were re-verified on the new engine (5/5 each). Two traps that bit hard
+> and generalise: under `-icount` **host-side timing is a guest input
+> variable** (a model that does nothing on a board must still touch
+> nothing on it), and probes that stage a NAND must clean it up.
+
 > **2026-07-28 — MBX has its own handoff now.** The PowerVR MBX stub is what
 > the TVOut swap-device window and the `LK_ENABLE_MBX2D=0` guest plist edit
 > both stand on (tasks T1/T2). What is known, what is already ruled out, how it
