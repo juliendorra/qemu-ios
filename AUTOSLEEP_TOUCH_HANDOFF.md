@@ -3,6 +3,24 @@
 **Date:** 2026-08-01 · **Branch:** `wasm-jit-graft` · **State:** FIXED and
 scripted against the exact masked-idle failure on iPhone OS 1.0.
 
+## Core root cause
+
+This is separate from the in-app MBX2D problem. During idle, iPhone OS 1.0
+executes WFI with IRQ and FIQ masked, wakes at `_cpu_idle`, runs a settling
+loop, and only then restores interrupt delivery. SYSIC kept the GPIO status bit
+latched but incorrectly drove its group IRQ output as a fixed 100 ms pulse. A
+HOME press could wake the CPU while masked, yet the controller output fell
+before the guest unmasked; the pending status bit alone could not create a new
+delivery edge. Holding the group output according to `INTSTAT & INTEN` until
+the guest ACKs `GPIO_INTSTAT` restores the real interrupt-controller contract.
+
+The remaining apparent touch failure was a second model asymmetry: framebuffer
+RAM keeps its old pixels while the physical panel is off, and the generic LCD
+stability check treated those invisible pixels as proof that input could be
+re-enabled. The gate now requires `panel_off == false`, while retained-resume
+scanout can immediately restore input after a device that was already ready
+reclaims the display.
+
 ## Final result (2026-08-01)
 
 The gating question is answered: `0xc005a2ec` is kernel proper symbol

@@ -10,6 +10,44 @@ shared-surface renderer is not implemented. The installed firmware source is
 never modified; the compatibility change is guarded and applied only to the
 disposable per-launch NAND clone.
 
+## Core root cause and why 1.1.4 never showed it
+
+The keyboard HOME/POWER event and its GPIO interrupt were not the failing
+component. iPhone OS 1.0 received the button and began the normal application
+dismissal/suspension transition. The stall happened later, when its older
+LayerKit path tried to preserve and composite the app's backing store through
+the PowerVR MBX2D client.
+
+The emulator exposes enough of MBX for AppleMBX discovery and bootstrap, so
+`_mbx2DInitialize` reports success. That claim is stronger than the model's
+actual implementation: it has register storage, MMU/event instrumentation and
+basic completion signalling, but it does not execute and retire 1A543a's
+microkernel-owned shared-surface ring. LayerKit therefore submits work to an
+accelerator that was advertised as usable, waits once per backing-store strip,
+and takes the recovery timeout repeatedly. Roughly 33.8 seconds later it can
+expose a partially painted SpringBoard without icons. The button was delivered
+promptly; the renderer blocked the visual handoff.
+
+The same machine model works on 1.1.4 because 4A102 does not enter this legacy
+backing-store renderer during the tested app transition. It is not evidence
+that generic MBX register values or HOME timing are correct for 1.0; it is a
+different guest rendering path.
+
+The compatibility fix makes the emulator's advertised capability truthful for
+the affected build. The launcher first clones NAND and NOR for the run. Only
+when NAND provenance says `1A543a`, the security epoch is 0, and the eight
+original bytes of `_mbx2DInitialize` match the known image does it replace the
+function entry in that disposable clone with `mov r0, #1; bx lr` (return the
+initialization failure). LayerKit then selects its already-present software
+renderer, which produces the exact full SpringBoard without an accelerator
+timeout. An unknown image is refused rather than patched, 4A102 is untouched,
+and the bundle's master `nand.pack` is never opened for writing.
+
+`LK_ENABLE_MBX2D=0` was not sufficient: 1A543a read the variable, but its old
+backing-store client still initialized and submitted MBX2D work. Failing the
+client initialization itself is the measured decision point that reliably
+selects the software path.
+
 ## The bug
 
 On `/Applications/iPhone 2G (iOS 1.0).app`, pressing HOME or POWER while an app
