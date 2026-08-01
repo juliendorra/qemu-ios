@@ -4196,3 +4196,91 @@ a sixth failure mode by injecting a synthetic press into one of them. The
 useful next step is to find out WHY the guest reaches a masked-interrupt spin
 without ever setting `oocshdwn` -- i.e. which sleep the kernel is actually
 performing here -- before adding any more machinery to wake it.
+
+
+# LEDGER: the auto-sleep touch investigation, in full (2026-08-01)
+
+Written because this hunt produced THREE different stories from three sets of
+runs, reverted one of its own fixes, and ended without a user-facing fix. The
+value left behind is the eliminations. Read this before touching wake code.
+
+## The report
+
+User, testing the bundled apps: after the device auto-sleeps from idle, H
+wakes it but **slide-to-unlock does not work** -- and the slider is VISIBLE on
+screen while touch is dead. Seen on 1.0 and 1.1.4; iPod seems immune; waking
+from a MANUAL Power-button sleep is fine. Later clarified: the wake press was
+~30 s after the sleep, the Mac itself did not sleep, no click on the dark
+screen, and they waited a few seconds after the slider appeared before
+dragging.
+
+## Hypotheses, in the order they were tried, and how each ended
+
+| # | hypothesis | fate |
+|---|---|---|
+| 1 | This session's changes broke it (SYSIC `INTLEVEL`, the MBX block) | **KILLED.** Restored the pre-session binary `32c092a1` and ran the identical probe: parks 0->0, 0 refusals, slide 0.00%, FAIL -- byte-identical outcome. Pre-existing. |
+| 2 | It is a NEW regression | **WRONG FRAMING.** The user recalled it working before, and they were right that it is not new -- but it had also never been TESTED: every recorded sleep/wake validation in this repo drives the POWER button. Wake-from-auto-sleep was never in the regression net on any board. |
+| 3 | Long dwell / the host Mac sleeping under an idle emulator | **KILLED.** 5-minute `SIGSTOP`/`SIGCONT` freeze: wakes and unlocks normally. Also moot -- the user's dwell was ~30 s. |
+| 4 | A touch on the DARK screen (what a hand does when the panel blanks) desyncs the multitouch state machine | **KILLED by the user:** they pressed H without touching the screen first. Probe support (`--poke`) written and then never needed. |
+| 5 | The wake landed inside the OOCSHDWN commit window (~30 s), a special-cased path | **KILLED.** Probe wakes at +5-10 s, +30 s, +55 s all pass. |
+| 6 | Guest state carried from prior app use (the user had been opening apps) | **NOT TESTED.** `--pre-app` was written for it and overtaken by the real-window reproduction. Still open, still cheap. |
+| 7 | The wake press is consumed as a PMU wake CAUSE and never delivered as input, so the idle timer never resets | **HALF TRUE, and the half matters.** True on the PARKED path (`sup_home=1`). FALSE on the shallow path: measured `sup_home=0` with both `[BTN]` edges, and the panel wakes correctly. A fix built on the general form was therefore built on a premise that only holds in one of three states. |
+| 8 | Fix: inject a synthetic Home press after a parked wake so the OS sees activity | **REVERTED.** Model counters improved (refusals 5 -> 0, parks 3 -> 1) but the user reported real use got WORSE: sleeps with SpringBoard shown, H blanks the screen, SpringBoard returns, no slide-to-unlock. Now `IT_WAKE_ACTIVITY=1` opt-in, OFF by default. |
+| 9 | `input_ready` asymmetry: DCS 0x10 clears it, but `ipod_touch_lcd.c:221` clears `panel_off` WITHOUT restoring it | **PLAUSIBLE, NOT THE OBSERVED MECHANISM.** The trace shows the gate re-arming fine on that path. Kept on record because the asymmetry is real. |
+| 10 | The gate cannot arm because the lock screen is scanned out from a base absent from `known_bases[]` | **KILLED.** `IT_GATE_TRACE` shows `w1_base=0x0f400000`, `visible=4/6`, gate arms normally. |
+| 11 | **Measured mechanism (1.0):** the guest spins in its kernel sleep path at `0xc005a2ec` with `I=1 F=1` -- IRQ and FIQ MASKED -- while `oocshdwn=0` and `parked=0`, so no wake branch applies and the GPIO interrupt cannot be taken at all | **STANDING.** Not a fix, an explanation: the press is physically incapable of waking that state. |
+
+## Instrument and probe traps (the expensive ones)
+
+* **The VNC harness passed five configurations on a build that was visibly
+  broken by hand.** Wake at +5-10 s, +30 s, +55 s, after a manual pre-cycle,
+  and after a 5-minute host freeze -- all green, all misleading. The failure
+  reproduces in the emulator's REAL WINDOW. A green run from
+  `autosleep-touch-probe.py` proves nothing about this bug.
+* **`--wake-settle 45`, added to make the probe "see" the bug, makes it report
+  FAIL for CORRECT behaviour** on the shallow path: a real iPhone woken to the
+  lock screen and then ignored sleeps again after ~15-20 s, and a slept guest
+  correctly ignores touch. The probe's pixel verdict cannot separate "the
+  model broke" from "the device went back to sleep while you looked at it".
+  Trust the two model-side counters it now prints instead: touches REFUSED,
+  and parks INCREASING after the wake.
+* **`panel_off` blanks the host surface** (`lcd_refresh` memsets it). So a
+  "lit=59.8%" reading from a probe is not evidence the user's symptom
+  reproduced -- check `panel_off` in the log. Every probe failure in this hunt
+  had `panel_off=1`, i.e. a BLACK screen, while the user's symptom is a
+  VISIBLE slider. They were never the same failure.
+* **`input_ready` is not a trustworthy statement about the device.** The
+  generic re-arm counts visible pixels at the known bases and never checks
+  `panel_off`; QEMU never clears guest framebuffer memory, so a slept panel
+  still shows a "visible" last frame and the gate declares touch ready 2 s
+  after ANY panel sleep.
+* **Port collision with a parallel session** (VNC :96) produced a "QMP never
+  appeared" failure that looks like a broken probe. Check `pgrep` before
+  blaming the harness.
+
+## What is solved, and what is not
+
+**Solved:** nothing the user can feel. Say it plainly.
+
+**Understood, and worth the session:** there are THREE distinct post-auto-sleep
+states, not one, and which one a run lands in depends on how far the kernel
+got into its sleep sequence before the press -- pre-warm parked (model refuses
+touch), plain panel sleep (wakes correctly), and the masked-interrupt spin (H
+cannot wake it at all). The model records no distinction between them, which
+is exactly why three sets of runs told three different stories.
+
+**Reverted:** the synthetic-press fix, on the user's report, within minutes of
+it being reported.
+
+**Open, in the order worth doing:**
+
+1. Which sleep is the 1.0 kernel actually performing when it reaches a
+   masked-interrupt spin with `oocshdwn` never set? Until that is known, any
+   wake machinery added is guesswork -- and the model already carries five
+   separate notions of "asleep".
+2. Reproduce the user's exact symptom (panel LIT, touch dead). No run in this
+   session did. Without it there is nothing to verify a fix against.
+3. Hypothesis 6 (prior app usage) is untested and cheap.
+4. Re-test the iPod for genuine immunity: its bundle still runs a DIFFERENT
+   binary from the two iPhone bundles, so "immune" may just mean "older
+   engine".
