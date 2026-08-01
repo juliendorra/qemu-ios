@@ -346,6 +346,22 @@
 > computes its block size from context flags (20 or 28 bytes, +12, +24),
 > which matches the variable-length blocks in the trace.
 >
+> **The block is a REGISTER-WRITE LIST** (read out of `_pack2DCtxBlitColor`,
+> the simpler of the two packers, 2026-08-01):
+>
+> ```
+> [+0x00] = 0xA0000000 | sel     [+0x04] = value
+> [+0x08] = 0x94000000 | sel     [+0x0c] = value
+> [+0x10] = …                    (+0x14, +0x18 conditional)
+> ```
+>
+> i.e. alternating (tagged selector, data) pairs, the classic PowerVR
+> "load register" stream, terminated by a `0x7…` word and fired by
+> rewriting word 0 with `0xf0000000`. Only five tag values appear as OR
+> immediates in the whole framework — `0x3`, `0x6`, `0x8`, `0x9`, `0xa` —
+> so the decoder has a small, closed alphabet to learn, one tag at a time,
+> against a captured block.
+>
 > **The encoding is tagged words.** Inside `_pack2DCtxBlitCopy` each word is
 > built by OR-ing an opcode into the top bits before the store —
 > `0x80000000`, `0xA0000000`, `0x94000000`, `0x30000000` are all visible as
@@ -388,6 +404,21 @@ Related docs:
   currently live thread, which is *not* this one.
 
 ---
+
+## 0. T2 implementation status (2026-08-01)
+
+| step | state |
+|---|---|
+| 1. MMU translation + aperture forwarding | **DONE** (`d3f3f39b5e`, `IT_MBX_MMU=1`). 4A102 boots to the home screen with it on; the guest's MMU enable/disable is visible in the trace. Default off. |
+| 2. Command-stream capture | **DONE** (`IT_MBX_2D_TRACE=1`): dumps the block out of guest memory on the fire word, logging tags rather than interpreting them. |
+| 3. Decode the block | format known (register-write pairs, five tags, `0x7…` terminator); needs one captured stream to confirm. |
+| 4. Software blitter | not started — plain C, no host GL/threads. |
+| 5. Memory-side completion, then the ISR bit | not started; this is the half all six failed register tricks were missing. |
+| 6. Delete `LK_ENABLE_MBX2D=0` and verify by pixels | not started. |
+
+Capturing a stream needs the guest to *use* MBX2D, which on 1.0 is a
+bistable init race (see the note above) — expect to repeat the
+`--exercise` run.
 
 ## 1. What exists today
 
