@@ -2840,3 +2840,29 @@ by the time the gate arms on a resume, most of the needed TBs are already
 compiled, so a settled machine launches fast; the horror stories are
 launches that race the cold JIT. Judge engine experiments on BOTH this and
 the boot landmarks (task #5: the jmp-cache retest is first in line).
+
+### Task #5 answered: the launch benchmark does NOT flip the jmp-cache verdict
+
+Three solo `?resume=1&sweep=calc` runs per config, same engine otherwise:
+
+| `TB_JMP_CACHE_BITS` | tap→ready (wall) | mean | guest |
+| --- | --- | --- | --- |
+| 12 (default) | 3.0, 3.0, 3.0 | 3.00 s | 0.4/0.4/0.5 |
+| 14 | 3.0, 2.8, 3.0 | 2.93 s | 0.4/0.4/0.5 |
+| 16 | not re-run — already ~10% worse on boot | | |
+
+A 0.07 s mean difference against a 0.25 s poll resolution is not a result:
+**the instrument could not resolve it**, and the same 12-bit build produced
+2.8 s earlier and 3.0 s three times today, so run-to-run noise covers the
+whole effect. **Verdict: keep 12.** No config shows a launch win that could
+justify 16's measured boot regression, and 14 buys nothing measurable.
+
+Two things learned about the METHOD, which outlast the result:
+
+- **The poll interval is the resolution.** Now 60 ms (was 250), so a future
+  A/B can resolve ~0.1 s. The blit is sub-millisecond; fast polling is free.
+- **A settled-resume launch is a weak discriminator for JIT changes.** It is
+  ~2.9 s of which 0.4 s is guest work, and most TBs are already compiled by
+  then — exactly the case a lookup-cache change should help least. To exercise
+  the cold-JIT race that actually hurts (the ~90 s interactive grind), tap
+  EARLY (cold boot + tap as soon as the gate arms), or launch a heavier app.

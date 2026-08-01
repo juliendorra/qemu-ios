@@ -873,7 +873,12 @@ guest keeps running.">
     tapWall(122, 247, MIN_PRESS_MS);
     let ready = false, dt = 0;
     for (;;) {
-      await sleep(250);
+      // 60 ms, not 250: the poll interval IS the benchmark's resolution, and
+      // at 250 ms the 12-vs-14-bit jmp-cache A/B (2026-08-01) came back as
+      // 3.0/3.0/3.0 against 3.0/2.8/3.0 -- a 0.07 s mean difference the
+      // instrument could not resolve. The blit is sub-ms, so polling this
+      // fast costs nothing that matters.
+      await sleep(60);
       dt = (performance.now() - t0) / 1000;
       let sum = 0, n = 0;
       for (let y = 60; y < 100; y += 4) {
