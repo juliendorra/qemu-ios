@@ -4092,3 +4092,49 @@ happened", not as a proven defect.
 The DEEP path is not ambiguous: a model that refuses input with "Ignoring
 input until display/driver startup is stable" is broken by construction, and
 that is the part the fix addresses.
+
+### Fix attempt 1 is now OFF BY DEFAULT -- the user reported it made things WORSE
+
+Shipped enabled on the strength of ONE probe run (refusals 5 -> 0, re-park
+loop gone). In real interactive use the user immediately reported worse
+behaviour than before: **the device sleeps with SpringBoard displayed, H
+blanks the screen, SpringBoard comes back, and there is no slide-to-unlock at
+all.** Reverted to opt-in (`IT_WAKE_ACTIVITY=1`) the moment that was
+reported; both bundles reinstalled with it off (`bceeec6e...`).
+
+Two lessons, and the second is the general one:
+
+* Injecting a synthetic Home press into a guest that is still mid-resume
+  perturbs more than it repairs. The measured wins were real but narrow --
+  they were counted from the model's own log, and the model's log cannot see
+  "the OS is now in a state the user finds broken".
+* **One green probe run is not grounds for enabling something by default.**
+  The probe measures two model-side counters; the user measures the device.
+  Anything that changes guest-visible timing needs the second kind of
+  evidence before it becomes the default, not after.
+
+### And the reproduction still does not match the user's symptom
+
+The user sees the slider ON SCREEN with touch dead. Every probe run here had
+`panel_off` already set when the touch arrived -- and `panel_off` blanks the
+host surface (`lcd_refresh`), so those runs were black-screen failures, a
+DIFFERENT bug from the one being reported. Stated plainly so nobody reads the
+probe's FAIL as the user's bug.
+
+**Leading hypothesis for the real one, untested.** `Merlot panel entered
+sleep` (MIPI DCS 0x10, `ipod_touch_lcd_panel.c`) unconditionally does:
+
+```c
+s->lcd->panel_off = true;
+s->lcd->input_ready = false;        /* the touch gate slams shut */
+s->lcd->input_ready_frames = 0;
+```
+
+Sleep Out (0x11) restores both, gated on `relight_input_fast ||
+input_ever_ready`. But `panel_off` is ALSO cleared elsewhere without touching
+`input_ready` -- `ipod_touch_lcd.c:221`, the framebuffer-base path. Any
+relight that goes through THAT path leaves the panel lit and the gate shut:
+slider visible, every touch silently refused. That is exactly the reported
+symptom, it explains why manual P-sleep differs (a different relight path),
+and it is a one-line asymmetry. Verify by logging `input_ready` alongside
+`panel_off` at every transition before changing anything.

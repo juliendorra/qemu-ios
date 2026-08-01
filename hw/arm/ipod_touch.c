@@ -1652,13 +1652,23 @@ static uint32_t ipod_touch_home_irq(void)
 #define WAKE_ACTIVITY_DELAY_NS   (3000 * 1000000LL)   /* let the resume run */
 #define WAKE_ACTIVITY_HOLD_NS    (150 * 1000000LL)    /* a human-length press */
 
+/*
+ * OFF BY DEFAULT since 2026-08-01. It shipped enabled after ONE probe run
+ * that showed it removing the re-park loop and the touch refusals, and the
+ * user immediately reported the device behaving WORSE in real use: sleeping
+ * with SpringBoard displayed, H blanking the screen, then SpringBoard again
+ * with no slide-to-unlock at all. Injecting a synthetic Home press into a
+ * guest that is mid-resume evidently perturbs more than it repairs, and one
+ * green probe run was never enough evidence to enable it by default.
+ * IT_WAKE_ACTIVITY=1 re-enables it for investigation.
+ */
 static bool ipod_touch_wake_activity_enabled(void)
 {
     static int mode = -1;
 
     if (mode < 0) {
         const char *e = getenv("IT_WAKE_ACTIVITY");
-        mode = !(e && e[0] == '0');
+        mode = e && e[0] && e[0] != '0';
     }
     return mode;
 }
