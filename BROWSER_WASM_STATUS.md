@@ -330,6 +330,15 @@ Untried, cheapest first — and #1 is worth doing on its own merits:
    coroutine entry points plus `ffi_call_js`) shrinks the pass enormously
    AND cuts asyncify's RUNTIME overhead, which is a perf win with or
    without longjmp.
+
+   **Use the keeprsp recipe above, not a cross-file edit.** Learned the
+   expensive way on 2026-08-01: `-sASYNCIFY_ADVISE=1` was added to
+   `emscripten.txt`'s link args and a rebuild silently ignored it (0 hits
+   in build.ninja) — meson caches cross-file link args at setup, exactly
+   as the `--profiling-funcs` note says a few paragraphs up. So to get the
+   advice list, or to try `ASYNCIFY_ONLY`, do
+   `ninja -d keeprsp qemu-system-arm.js` and rerun the link by hand with
+   the extra flag appended. No reconfigure, no 1998-object rebuild.
 2. **Toolchain mechanics.** Binaryen 123 / emcc 4.0.10 here; try a newer
    binaryen, and write to a separate output file instead of the in-place
    rewrite that died half-finished.
