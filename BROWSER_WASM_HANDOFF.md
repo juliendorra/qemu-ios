@@ -46,30 +46,72 @@ selects **{1.0, 1.1.4} × {resume, cold boot}** — all four are live.
 
 | | resume | cold boot |
 | --- | --- | --- |
-| **1.0** (1A543a) | ~3 s → home screen | ~152 s |
-| **1.1.4** (4A102) | ~33 s → clean SpringBoard | ~220 s |
+| **1.0** (1A543a) | ~2–3 s → home screen | **112.7 s** |
+| **1.1.4** (4A102) | **1.7 s** in the latest smoke run | ~220 s, not yet remeasured with I/O splitting |
 
 Touch works, buttons work, the panel runs at vsync (~60 fps) with measured fps
 and blit cost shown under it. Chrome-family browsers only — **Safari crashes
 mid-boot** and gets a banner saying so.
 
-## The one live lever: the TB dispatcher
+## The live lever: the TB dispatcher, after fixing icount I/O exits
 
 Task: **make the dispatcher cheaper.** It is ~15% of the busy vCPU thread and
-the top remaining cost after the BQL fix. Two concrete threads, in order:
+the top remaining cost after the BQL fix.
 
-1. **A JS `Map` operation sits on the per-TB path.** The V8 profile shows
-   `MapPrototypeSet` and `ArrayFrom` builtins in the vCPU's hot set — JS
-   bookkeeping charged per translated block. Find it in `tcg/wasm64.c`'s EM_JS
-   glue (start at `instantiate_wasm` and the `helper[]` import construction,
-   which builds a fresh object and walks the import vector on every
-   instantiation) and get it off the hot path.
-2. **Direct TB chaining.** `tcg_qemu_tb_exec` is the hottest named function
-   (8.5%), and `helper_lookup_tb_ptr` (4.3%) falls into `g_tree_lookup` on a
-   jmp-cache miss. A dispatcher-side chain cache so `goto_tb` exits stop
-   re-entering the lookup is the structural fix.
+1. **DONE 2026-08-01: remove Emscripten's duplicate-function map from TB
+   registration.** The profile's `MapPrototypeSet`/`ArrayFrom` did *not* prove
+   that a JS `Map` lookup ran on every dispatch. `ArrayFrom` is also used by
+   Asyncify's export wrapper, while `addFunction()` scanned/seeded a WeakMap
+   and inserted every newly compiled TB export even though TB functions are
+   unique by construction. `instantiate_wasm()` now allocates a table slot and
+   updates Emscripten's table mirror directly; eviction releases the slot by
+   the matching direct path. The first timing pair is **invalid as an A/B**:
+   a separate workspace session changed `hw/arm/` between the control and
+   rebuilt engine, so kernel 88.0 -> 84.0 s, BSD 99.0 -> 98.0 s and framebuffer
+   163.7 -> 167.1 s are provenance only, not evidence for this change. The
+   rebuilt engine did pass Calculator at 2.6 s wall / 0.4 s guest. A runtime
+   seam now makes the old path selectable with `?direct_table=0` in the same
+   binary. Its clean runs were still inconclusive: generic controls reached
+   kernel at 80 and 86 s, while direct took 81 s; direct reached home at
+   147.8 s and the completed generic control at 154.1 s, but the 7.5% same-arm
+   control variance is larger than that apparent win. A corrected
+   `direct_table=1&instantiate=1&max=16&adaptive=0` stress run remained healthy
+   for 75 s. Keep the mechanism, but do not claim a measured speedup.
+2. **DONE 2026-08-01: learn dynamic-MMIO TB boundaries.** The old profile's
+   13% `emscripten_longjmp` bucket was actionable by frequency, not by changing
+   longjmp itself. `?exit_profile=1` proved the pre-kernel stretch performed
+   2,029,568 exits and every one was `cpu_io_recompile`: icount discovered the
+   same dynamic MMIO instruction in the middle of a TB, rewound it, and paid a
+   JS-throw longjmp on every execution. The Emscripten path now remembers each
+   architectural MMIO PC, invalidates the bad TB once, stops its predecessor
+   before that PC, and emits the MMIO instruction as a one-insn TB. I/O remains
+   last in its TB, so deterministic ordering is preserved. Same-binary clean
+   A/B: kernel 85 -> **44 s**, BSD root 94 -> **52 s**, home framebuffer
+   161.6 -> **112.7 s** (30.3% end to end); pre-kernel busy `guestRatio`
+   ~0.094 -> **0.17–0.20**. The profiled arm learned 704 boundaries by home;
+   recurring I/O exits stopped. Calculator passed at 2.7 s wall / 0.4 s guest,
+   and a default-on 4A102 resume reached its home framebuffer at 1.7 s. This is
+   now default; `?io_split=0` is the same-binary fallback.
+3. **NEXT: direct TB chaining, but at the call boundary.**
+   `tcg_qemu_tb_exec` is the hottest named function (8.5%), and
+   `helper_lookup_tb_ptr` (4.3%) falls into `g_tree_lookup` on a jmp-cache
+   miss. Source inspection corrected an earlier assumption: compiled
+   `goto_tb` already reads QEMU's patched destination TB pointer directly;
+   `helper_lookup_tb_ptr` is used by indirect `goto_ptr` paths. The backend
+   then returns to `tcg_qemu_tb_exec`, resolves the destination TB's existing
+   O(1) `WasmInstanceInfo`, and calls the next module. A second C-side lookup
+   cache would duplicate that mapping and would not remove the profiled tree
+   misses. The structural fix must eliminate the per-TB return/call boundary
+   itself -- most plausibly module batching, or a bounded tail-call design
+   whose browser support and eviction safety are proven first.
 
-**Before touching either, read
+**Profiler wrinkle seen 2026-08-01:** this installed Chrome 149 sent every
+renderer/worker V8 `--prof` stream to stdout. Capturing stdout produced a 73 MB
+log with the isolates interleaved, which `node --prof-process` rejected. Do not
+use that combined log as evidence; first restore per-isolate output or use a
+profiler mechanism that can separate the busy pthread.
+
+**Before touching the next lever, read
 [`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md) §5 and §9.** Two plausible
 ideas are already dead with evidence (wasm-EH longjmp is toolchain-impossible;
 a bigger `TB_JMP_CACHE_BITS` is measurably *worse*), and §9 has the

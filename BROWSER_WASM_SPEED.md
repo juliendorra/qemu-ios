@@ -201,6 +201,106 @@ it sooner.
 it had died at 5,328. This retires a class of crashes — any guest code with
 large basic blocks (Safari, YouTube are candidates) would have hit it.
 
+### 3.6 Unique TB exports no longer pay Emscripten's dedup map (2026-08-01)
+
+`instantiate_wasm()` used `addFunction(inst.exports.start, 'ii')` for every
+compiled TB. Emscripten's generic `addFunction()` first seeds and probes a
+`functionsInTableMap` WeakMap, then inserts the function so a future identical
+function can reuse its index. Every TB export is a fresh function from a fresh
+module, so deduplication can never succeed here.
+
+The backend now uses Emscripten's own table-slot allocator and table-mirror
+writer directly, and eviction uses the symmetric direct release path. This
+removes the known `MapPrototypeSet` source without replacing the allocator or
+breaking Emscripten's indirect-call mirror.
+
+The first same-host timing pair looked phase-positive but end-to-end mixed:
+
+| landmark | `addFunction` control | direct slot |
+| --- | ---: | ---: |
+| kernel | 88.0 s | **84.0 s** |
+| BSD root | 99.0 s | **98.0 s** |
+| home-screen framebuffer | **163.7 s** | 167.1 s |
+
+It is **not a valid A/B**. Another workspace session changed `hw/arm/` and the
+input/power path between the control binary and the rebuilt engine, so none of
+the differences in that table can be attributed to TB registration. They are
+retained only so the numbers cannot be mistaken for a clean repeat later.
+
+The rebuilt engine passed the settled Calculator acceptance case at
+**2.6 s wall / 0.4 s guest**. A deliberately tiny
+`instantiate=1,max=16` run initially appeared healthy, but the public viewer
+was not yet staging those tune keys, so that first stress result was invalid.
+
+The fix was a runtime seam rather than another rebuild: `direct_table=0` uses
+the old `addFunction()`/`removeFunction()` pair, while the default
+`direct_table=1` uses direct slots. The public viewer now writes explicitly
+requested `instantiate`, `max`, `adaptive`, and `direct_table` keys to
+`/fw/jit-tune`, letting both arms use the exact same wasm binary.
+
+Same-binary cold runs:
+
+| arm | kernel | BSD root | home framebuffer |
+| --- | ---: | ---: | ---: |
+| generic control 1 | 80 s | 89 s | not run |
+| direct slots | 81 s | 90 s | 147.8 s |
+| generic control 2 | 86 s | 95 s | 154.1 s |
+
+This is **inconclusive**: the two generic controls themselves differ by 7.5%
+at kernel, much larger than the documented 1% quiet-host variance. The direct
+arm's completed-home result is 4% faster than the completed generic run, but
+smaller than the same-arm environmental spread, so no speedup is claimed.
+
+The corrected forced-recycling run
+(`direct_table=1&instantiate=1&max=16&adaptive=0`) slowed busy `guestRatio` to
+~0.02 as expected from extreme churn but stayed alive and advancing for 75 s.
+That validates the matching direct release/reuse path under pressure.
+
+### 3.7 Learn dynamic-MMIO TB boundaries instead of unwinding forever (2026-08-01)
+
+The surviving attack on Emscripten's expensive JS-throw longjmp was reducing
+its frequency. A low-overhead `?exit_profile=1` histogram made the reason mix
+observable through MEMFS because this Chrome build does not forward pthread
+stderr. In the pre-kernel stretch it counted **2,029,568 `cpu_loop_exit()`
+calls, all 2,029,568 from `cpu_io_recompile`** -- roughly 100,000 unwinds per
+second. ARM SVC and other architectural exceptions were zero in that phase.
+
+This is QEMU's correct icount fallback: if a runtime load/store resolves to
+MMIO before the final instruction in a TB, QEMU restores the guest PC and
+reruns the instruction in a one-insn TB so device I/O observes the correct
+instruction count. The generic path does not retain that discovery, however,
+so a polled device register can trigger the same unwind on every iteration.
+That unit cost is modest natively and disastrous when Emscripten implements
+`siglongjmp` as a JS exception crossing the Wasm boundary.
+
+The Emscripten path now keeps a 4096-entry direct-mapped set of architectural
+MMIO PCs. On first discovery it records the PC and invalidates the TB that put
+the instruction too early. The translator subsequently stops a predecessor
+before that PC and makes the known MMIO instruction the last instruction of
+its own TB. This does **not** allow mid-TB I/O or relax icount ordering; it
+turns the repeated exceptional repair into an ordinary TB boundary. Collisions
+only forget a hint and cause the safe slow path to relearn it.
+
+Clean same-binary cold A/B (`io_split=0|1`, no profiling):
+
+| landmark | control | learned I/O boundaries | improvement |
+| --- | ---: | ---: | ---: |
+| kernel | 85.0 s | **44.0 s** | 48.2% |
+| BSD root | 94.0 s | **52.0 s** | 44.7% |
+| launchd | not captured | **65.0 s** | -- |
+| home framebuffer | 161.6 s | **112.7 s** | 30.3% |
+
+Pre-kernel busy `guestRatio` rose from ~0.093–0.096 to ~0.17–0.20. In the
+profiled optimized arm, 704 I/O PCs had been learned at the home framebuffer
+and the I/O-exit count had flattened at 704; later exits were real ARM SVC,
+abort, and halt exceptions and were deliberately untouched. Settled Calculator
+remained **2.7 s wall / 0.4 s guest**. The default-on build also resumed 4A102
+to its home framebuffer in 1.7 s and stayed live through 30 s.
+
+The optimization is on by default. `?io_split=0` restores the generic behavior
+in the same binary; `?exit_profile=1` publishes changed machine-readable exit
+histograms through `/fw/exit-profile-results` and mirrors them to the page log.
+
 ---
 
 ## 4. Where the time goes now (V8 `--prof`, vCPU isolate)
@@ -217,18 +317,21 @@ large basic blocks (Safari, YouTube are candidates) would have hit it.
 | ~5% | JS glue / builtins |
 | ~1.8% | `cpu_io_recompile` (icount artifact) |
 
-**After** (prof6, 78k ticks; C++ share fell 38% → 23% as the futex collapsed):
+**After BQL, before learned I/O boundaries** (prof6, 78k ticks; C++ share fell
+38% → 23% as the futex collapsed):
 
 | share | what |
 | --- | --- |
 | ~25% | executing generated TBs |
 | **~15%** | **dispatch** — `tcg_qemu_tb_exec` **8.5%** (hottest named function), `helper_lookup_tb_ptr` 4.3%, `g_tree_lookup`/`tb_tc_cmp` ~2.4% |
 | ~6% | MMU/MMIO (`do_ld4_mmu`, `mmu_lookup`, `memory_region_dispatch_read`) |
-| ~5.6% | JS glue — **including `MapPrototypeSet`/`ArrayFrom` builtins: a JS Map operation is on the per-TB path** (see the EM_JS glue near `instantiate_wasm` in `tcg/wasm64.c`) |
+| ~5.6% | JS glue — including `MapPrototypeSet`/`ArrayFrom`; §3.6 removed `addFunction()`'s known WeakMap contribution, while `ArrayFrom` is also part of Asyncify's export wrapper |
 | ~2.4% | `cpu_io_recompile` |
 
-**Only about a quarter of the busy vCPU thread executes guest code.** The
-dispatcher is now the top lever.
+That profile predates §3.7 and must not be used as the current percentage
+breakdown: the dominant pre-kernel longjmp source has now been removed. Re-run
+a separable vCPU profile before re-ranking percentages. The dispatcher remains
+the best evidenced structural candidate.
 
 ---
 
@@ -395,13 +498,13 @@ resort. The viewer detects JSC and says so plainly.
 | | start of campaign | now |
 | --- | --- | --- |
 | second-visit resume | **broken** (black screen) | **~3 s** to home screen |
-| cold boot → kernel | 276 s | **84 s** |
-| cold boot → home screen | 252 s | **152 s** |
+| cold boot → kernel | 276 s | **44 s** |
+| cold boot → home screen | 252 s | **112.7 s** |
 | vCPU time lost to the BQL | 47% | ~8% |
 | guest MMIO throughput | 65.8k/s | 215–245k/s |
 | panel | 10 Hz cap, unmeasured | 60 fps vsync, fps + blit cost on screen |
-| tap → Calculator usable | unmeasured (and it crashed the machine) | **2.8–3.0 s wall / 0.4 s guest** |
-| busy `guestRatio` | ~0.06 | ~0.06–0.13 measured; **launch case ~1/7 real time** |
+| tap → Calculator usable | unmeasured (and it crashed the machine) | **2.6–3.0 s wall / 0.4 s guest** |
+| busy `guestRatio` | ~0.06 | **~0.17–0.20 pre-kernel**; launch case varies by workload |
 
 The headline honesty: **boot and time-to-usable improved 2–3×, and the
 steady-state execution gap is now the whole remaining story.** The launch
@@ -413,15 +516,20 @@ interactive action on a settled machine.
 ## 11. Next levers, ranked, with protocol
 
 1. **The dispatcher (~15%, the top lever).** `tcg_qemu_tb_exec` is the hottest
-   named function at 8.5%. Two concrete threads: (a) the **JS `Map` operation
-   on the per-TB path** implied by `MapPrototypeSet`/`ArrayFrom` in the profile
-   — find it in `tcg/wasm64.c`'s EM_JS glue and get it off the hot path;
-   (b) a dispatcher-side chain cache so `goto_tb` exits stop re-entering
-   `helper_lookup_tb_ptr`.
-2. **`cpu_loop_exit` frequency (~13% in longjmp emulation, unit cost
-   unfixable).** Why does the vCPU exit so often? icount window sizing and
-   interrupt cadence are the suspects; `cpu_io_recompile` at 2.4% is related.
-3. **Cold-JIT launch behaviour.** The settled launch is 2.9 s; the *cold* one is
+   named function at 8.5%. The generic `addFunction()` WeakMap work has now
+   been removed from TB instantiation (§3.6); it was compile-time bookkeeping,
+   not proof of a `Map` lookup on every dispatch. Source inspection also rules
+   out the previously proposed second dispatcher lookup cache: compiled
+   `goto_tb` reads its patched destination directly, while
+   `helper_lookup_tb_ptr` serves indirect `goto_ptr` paths. The next structural
+   step is therefore eliminating the return to `tcg_qemu_tb_exec` between
+   compiled TBs (module batching or a proven safe tail-call design), not
+   caching the already O(1) `WasmInstanceInfo` lookup again.
+2. **Re-profile the optimized vCPU.** The old 13% longjmp and 15% dispatcher
+   shares predate learned I/O boundaries. Exit histograms show the repeated
+   `cpu_io_recompile` class is gone; a separable V8 isolate profile is needed
+   before trusting the old percentages.
+3. **Cold-JIT launch behaviour.** The settled launch is 2.7 s; the *cold* one is
    the ~90 s grind users hit. Compile-burst policy (threshold, batching,
    ahead-of-need compilation) is unexplored, and the benchmark can measure it
    by tapping early.

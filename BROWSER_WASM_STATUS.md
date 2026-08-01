@@ -30,6 +30,79 @@ comes after.
 
 ---
 
+## Session — 2026-08-01: dynamic-MMIO TB splitting removes repeated longjmps
+
+An Emscripten-only, opt-in exit histogram (`?exit_profile=1`) identified the
+new avenue precisely. During the pre-kernel phase, all **2,029,568** observed
+`cpu_loop_exit()` calls were `cpu_io_recompile`; no SVC or other architectural
+exception contributed. Under icount, a dynamically resolved MMIO instruction
+must be last in its TB. The generic repair rewinds and reruns it in a one-insn
+TB but does not retain the boundary, so hot register polling repeatedly pays
+Emscripten's JS-throw `siglongjmp`.
+
+The browser TCG path now remembers MMIO PCs, invalidates the offending TB once,
+stops predecessor TBs before those PCs, and emits each known MMIO instruction
+as the final instruction of its own TB. Deterministic I/O ordering is preserved;
+the repeated exceptional repair becomes an ordinary TB exit. The 4096-entry
+direct-mapped hint set is safe under collision: a miss only falls back to
+QEMU's original repair and relearns the PC.
+
+Clean same-binary cold A/B:
+
+| | `io_split=0` | `io_split=1` |
+| --- | ---: | ---: |
+| kernel | 85.0 s | **44.0 s** |
+| BSD root | 94.0 s | **52.0 s** |
+| home framebuffer | 161.6 s | **112.7 s** |
+| pre-kernel busy `guestRatio` | ~0.094 | **~0.17–0.20** |
+
+The profiled arm learned 704 I/O boundaries by home and recurring I/O exits
+stopped. Later SVC/abort/halt exits remain semantically real and untouched.
+Calculator passed at 2.7 s wall / 0.4 s guest. With the optimization default-on,
+4A102 snapshot resume reached the home framebuffer at 1.7 s and remained live
+through 30 s. `?io_split=0` is the fallback; `?exit_profile=1` publishes a
+machine-readable MEMFS snapshot mirrored into the captured page log.
+
+The old V8 percentage profile predates this change. Re-profile before quoting
+its 13% longjmp or 15% dispatcher shares as the current breakdown.
+
+---
+
+## Session — 2026-08-01: remove generic function-map work from TB instantiation
+
+The V8 profile's `MapPrototypeSet`/`ArrayFrom` builtins did not establish a JS
+Map operation on every TB dispatch: `ArrayFrom` also belongs to Asyncify's
+export wrapper. One concrete source was removable, however. Every dynamically
+compiled TB called Emscripten's generic `addFunction()`, which seeds/probes a
+WeakMap and inserts the export for deduplication even though every fresh TB
+module necessarily exports a unique function.
+
+`tcg/wasm64.c` now keeps Emscripten's table-slot allocator and mirror but skips
+the duplicate-function map; eviction releases slots through the symmetric
+direct path. A first cold timing pair (kernel 88.0 -> 84.0 s, BSD 99.0 ->
+98.0 s, final framebuffer 163.7 -> 167.1 s) is invalid as an A/B because
+another workspace session changed `hw/arm/` between the control and rebuilt
+engine. The rebuilt engine did pass Calculator at 2.6 s wall / 0.4 s guest.
+
+A runtime `direct_table=0|1` seam now holds the binary fixed. Generic controls
+reached kernel at 80 and 86 s; direct took 81 s. Direct reached the home
+framebuffer at 147.8 s and the completed generic control at 154.1 s, but the
+7.5% same-arm control variance is larger than the apparent win. A corrected
+`direct_table=1&instantiate=1&max=16&adaptive=0` run stayed healthy for 75 s
+while forcing slot churn. Runtime correctness is established; a speedup is
+not.
+
+The next structural target remains direct TB chaining across the dispatcher
+call boundary. Source inspection shows compiled `goto_tb` already consumes the
+patched destination directly; `helper_lookup_tb_ptr` is on indirect
+`goto_ptr` paths. A second C-side destination cache would therefore duplicate
+the existing O(1) instance mapping rather than remove the profiled tree misses.
+Full measurements and the profiling wrinkle discovered along the way are in
+[`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md) §3.6 and
+[`BROWSER_WASM_HANDOFF.md`](BROWSER_WASM_HANDOFF.md).
+
+---
+
 ## Session — 2026-07-31: the speed campaign — measurements first, then the display
 
 **The goal moved from "boots" to "real-time".** Target restated as a number:
@@ -2932,4 +3005,3 @@ from a working tree with uncommitted engine changes) -- regenerate once the
 engine settles, or a future stale-stream failure will not name its cause. The
 snapshot is gitignored (`web/.gitignore`: `/public/*/snapshots/`); first-pixels
 timing has not been re-measured solo since the MBX session shares the CPU.
-
