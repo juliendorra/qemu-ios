@@ -868,7 +868,7 @@ guest keeps running.">
     tapWall(160, 180, MIN_PRESS_MS);
     await sleep(3000);
     const t0 = performance.now();
-    const g0 = Atomics.load(u32, infoBase + 11);
+    const g0 = guestMs();   // the page's own helper -- u32 is closure-scoped
     console.log('[calcbench] tapping Calculator icon (122,247)');
     tapWall(122, 247, MIN_PRESS_MS);
     let ready = false, dt = 0;
@@ -892,7 +892,7 @@ guest keeps running.">
       }
       if (dt > 600) break;
     }
-    const gs = (Atomics.load(u32, infoBase + 11) - g0) / 1000;
+    const gs = (guestMs() - g0) / 1000;
     const msg = `[calcbench] tap->ready: `
       + `${ready ? dt.toFixed(1) + ' s wall' : 'TIMEOUT'} `
       + `(${gs.toFixed(1)} s guest)`;

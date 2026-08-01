@@ -2829,3 +2829,14 @@ wasm A/B:
   a BigInt" — two runs died at ~1.4 s on exactly that. `ENC_WASM_TABLE_IDX`
   is a passthrough here, not `Number()`. Probe the index type at runtime
   (`try { wasmTable.grow(0) }`) rather than guessing it with an `#ifdef`.
+
+### First calc-launch baseline (2026-08-01, `?resume=1&sweep=calc`, headless, solo)
+
+**Tap → Calculator display visible: 2.8 s wall, 0.4 s guest.** The guest
+figure says a real device launches in ~0.4 s and we render it at ~7× slower
+than real time at that moment — the wall figure is what a user feels.
+Notably far from the ~90 s interactive grind observed the previous evening:
+by the time the gate arms on a resume, most of the needed TBs are already
+compiled, so a settled machine launches fast; the horror stories are
+launches that race the cold JIT. Judge engine experiments on BOTH this and
+the boot landmarks (task #5: the jmp-cache retest is first in line).
