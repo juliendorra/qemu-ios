@@ -4138,3 +4138,61 @@ slider visible, every touch silently refused. That is exactly the reported
 symptom, it explains why manual P-sleep differs (a different relight path),
 and it is a one-line asymmetry. Verify by logging `input_ready` alongside
 `panel_off` at every transition before changing anything.
+
+## 1.0 AUTO-SLEEP: H cannot wake it, because the CPU has interrupts MASKED (2026-08-01)
+
+Measured on the shipped engine (wake-activity injection OFF), iPhone OS 1.0,
+real window, `IT_GATE_TRACE=1`:
+
+```
+[LCD] Merlot panel entered sleep
+[GATE] REFUSING touch: panel_off=1 w1_base=0x0f400000 visible=4/6 ...
+[LCD] Touch input ready (4/6 visible after 120 frames)     <- gate re-arms ANYWAY
+[KEYTRACE] keycode=35  ... parked=0 oocshdwn=0             <- no wake path engaged
+[BTN]      keycode=35  PC=0xc005a2ec  I=1 F=1              <- INTERRUPTS MASKED
+[BTN]      keycode=163 PC=0xc005a2ec  I=1 F=1
+                                       (nothing follows -- no panel wake)
+```
+
+**The guest is spinning in its kernel sleep path at `0xc005a2ec` with IRQ and
+FIQ both masked.** A GPIO interrupt cannot be taken by a CPU in that state, so
+the Home press is physically incapable of waking it, and the model has no
+reason to intervene: `oocshdwn=0` and `prewarm_active=0`, so none of the
+special wake branches in `ipod_touch_key_event()` apply. The press goes down
+the ordinary path, raises the pin, and is ignored.
+
+This is a THIRD distinct failure, and it is not the one the earlier work
+addressed:
+
+| state after auto-sleep | what H does | what touch does |
+|---|---|---|
+| pre-warm PARKED (deep) | resumes, then re-parks | model REFUSES ("Ignoring input") |
+| panel sleep, guest alive | wakes the panel correctly | works, if you beat the re-sleep |
+| **masked-interrupt sleep, no OOCSHDWN (this)** | **nothing at all** | **n/a, screen stays black** |
+
+Which of the three a session lands in depends on how far the guest got into
+its sleep sequence before the press, and NOTHING in the model records that
+distinction -- which is why three sessions of probing produced three different
+stories.
+
+### Second finding from the same trace: the gate re-arms while the panel is OFF
+
+`[GATE] REFUSING touch: panel_off=1 ... visible=4/6` followed by
+`Touch input ready`. The generic path in `lcd_update_input_ready()` counts
+visible pixels at the known bases and never checks `panel_off` -- and QEMU
+never clears guest framebuffer memory, so a slept panel still has a perfectly
+"visible" last frame. The gate therefore declares touch ready 2 s after any
+panel sleep, on the strength of pixels nobody can see. Harmless where the
+guest ignores the touches anyway, but it means `input_ready` is NOT a reliable
+statement about the device, and any future fix that trusts it is building on
+sand.
+
+### What NOT to do next
+
+Do not add another wake heuristic on top of these three. The model already has
+`oocshdwn_fired`, `prewarm_active`, `prewarm_parked`, `wake_reset_pending` and
+`RESUME_STATUS` arming as separate notions of "asleep", and this session added
+a sixth failure mode by injecting a synthetic press into one of them. The
+useful next step is to find out WHY the guest reaches a masked-interrupt spin
+without ever setting `oocshdwn` -- i.e. which sleep the kernel is actually
+performing here -- before adding any more machinery to wake it.

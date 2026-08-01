@@ -500,6 +500,32 @@ static void lcd_update_input_ready(IPodTouchLCDState *lcd)
             }
         }
 
+        /*
+         * IT_GATE_TRACE=1: why is touch refused RIGHT NOW?
+         *
+         * The user-reported failure is "the slide-to-unlock screen is
+         * VISIBLE and touch does nothing", which this gate can cause in a way
+         * no other trace shows: the fallback counts visible pixels only at
+         * known_bases[] above, and 0x0fe00000 is deliberately excluded. A
+         * lock screen scanned out from any other base leaves best_visible
+         * stuck at 0, input_ready_frames never accumulates, and the gate stays
+         * shut for the rest of the session WHILE THE PANEL IS LIT. Printed
+         * once a second so a dead-touch window can be read off directly.
+         */
+        if (getenv("IT_GATE_TRACE")) {
+            static int gate_ticks;
+            if (++gate_ticks % LCD_REFRESH_RATE_FREQUENCY == 0) {
+                fprintf(stderr,
+                        "[GATE] REFUSING touch: panel_off=%d w1_base=0x%08x "
+                        "visible=%d/6 frames=%d retained_wait=%d ever=%d "
+                        "fast=%d\n",
+                        lcd->panel_off, lcd->w1_framebuffer_base,
+                        best_visible_count, lcd->input_ready_frames,
+                        lcd->retained_input_wait, lcd->input_ever_ready,
+                        lcd->relight_input_fast);
+            }
+        }
+
         if (best_visible_count >= 4) {
             lcd->input_ready_frames++;
         } else {
