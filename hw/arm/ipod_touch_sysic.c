@@ -2,10 +2,12 @@
 #include "migration/vmstate.h"
 #include "hw/arm/ipod_touch_pcf50633_pmu.h"
 
-static void gpio_irq_auto_lower(void *opaque)
+static void ipod_touch_sysic_update_group_irq(IPodTouchSYSICState *s,
+                                               unsigned group)
 {
-    GPIOIRQLowerInfo *info = (GPIOIRQLowerInfo *)opaque;
-    qemu_irq_lower(info->sysic->gpio_irqs[info->group]);
+    qemu_set_irq(s->gpio_irqs[group],
+                 (s->gpio_int_status[group] &
+                  s->gpio_int_enabled[group]) != 0);
 }
 
 /*
@@ -122,7 +124,7 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
             // acknowledge the interrupts and clear the corresponding bits
             s->gpio_int_status[group] = s->gpio_int_status[group] & ~val;
 
-            qemu_irq_lower(s->gpio_irqs[group]);
+            ipod_touch_sysic_update_group_irq(s, group);
 
             break;
         }
@@ -131,6 +133,7 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
             uint8_t group = (addr - GPIO_INTEN) / 4;
             sysic_trace("wr INTEN", group, (uint32_t)val);
             s->gpio_int_enabled[group] = val;
+            ipod_touch_sysic_update_group_irq(s, group);
             break;
         }
         case GPIO_INTTYPE ... (GPIO_INTTYPE + GPIO_NUMINTGROUPS * 4):
@@ -162,26 +165,23 @@ static void ipod_touch_sysic_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     for(int grp = 0; grp < GPIO_NUMINTGROUPS; grp++) {
         sysbus_init_irq(sbd, &s->gpio_irqs[grp]);
-        s->gpio_irq_lower_info[grp].sysic = s;
-        s->gpio_irq_lower_info[grp].group = grp;
-        s->gpio_irq_lower_timers[grp] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-            gpio_irq_auto_lower, &s->gpio_irq_lower_info[grp]);
     }
 }
 
 /*
  * Migration. SYSIC owns the GPIO interrupt block, which is the path the
  * multitouch ATN edge takes to reach the guest: the controller sets a bit in
- * gpio_int_status and pulses gpio_irqs[group].
+ * gpio_int_status and holds gpio_irqs[group] asserted until the guest ACKs
+ * GPIO_INTSTAT. This is the interrupt-controller output, not the source pin;
+ * turning it into a timed pulse loses an edge when iPhone OS executes WFI with
+ * IRQ masked and only unmasks after its idle-exit settling loop.
  *
  * Restored at RESET, the enable/type masks are gone, so a frame the model
  * queues raises an edge the guest has no reason to look at -- the tap is
  * delivered, logged, and then simply never collected.
  *
- * The auto-lower timers are NOT migrated: they exist to drop an edge-triggered
- * pulse shortly after it is raised, so the worst a fresh one does is leave a
- * line high that the next pulse re-lowers. Their INFO struct is migrated,
- * because it says which group a pending lower belongs to.
+ * The output level itself is derived from the latched status and is lowered by
+ * the guest's ACK, so no transient timer state needs migration.
  */
 static const VMStateDescription vmstate_ipod_touch_sysic = {
     .name = "ipod-touch-sysic",

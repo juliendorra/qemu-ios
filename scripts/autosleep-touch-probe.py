@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -61,17 +63,17 @@ def main() -> int:
     ap.add_argument("--gate-timeout", type=int, default=420)
     ap.add_argument("--sleep-timeout", type=int, default=300,
                     help="max seconds to wait for the auto-sleep")
-    ap.add_argument("--wake-settle", type=float, default=45,
+    ap.add_argument("--wake-settle", type=float, default=0,
                     help="seconds to WAIT after the panel lights before "
-                         "sliding. THIS is what made five earlier probe "
-                         "configurations pass a broken build: they slid ~10 s "
-                         "after the wake and beat the re-sleep, and the slide "
-                         "itself counts as user activity so the device stayed "
-                         "up. The wake press is consumed as a PMU wake cause "
-                         "and never delivered as input, so the guest's idle "
-                         "timer is never reset and it re-sleeps within "
-                         "seconds. A human looks at the screen first; so does "
-                         "this now.")
+                         "sliding. The wake-detection loop already consumes "
+                         "several seconds; extra delay can run past the lock "
+                         "screen's own short re-sleep timer and turn a correct "
+                         "wake into a false dead-touch result.")
+    ap.add_argument("--require-masked-idle", action="store_true",
+                    help="accept the run only if the HOME press lands in the "
+                         "iOS 1.0 _cpu_idle WFI exit at 0xc005a2e4..0xc005a33c "
+                         "with IRQ and FIQ masked. This is the precise old "
+                         "lost-GPIO reproduction, not merely an auto-sleep.")
     ap.add_argument("--pre-app", action="store_true",
                     help="USE the device before idling into auto-sleep: open "
                          "an app, press HOME, wait for the return. Every "
@@ -137,10 +139,15 @@ def main() -> int:
            "-qmp", f"unix:{qmp_path},server,nowait",
            "-vnc", f"127.0.0.1:{args.vnc_port - 5900}"]
     env = dict(os.environ, IT_LCD_TRACE="1", IT_KEY_TRACE="1",
+               IT_SYSIC_TRACE="1", IT_GATE_TRACE="1",
                S5L8900_HTTP_BRIDGE="0", S5L8900_HTTPS_BRIDGE="0")
     log = open(logp, "wb")
     proc = subprocess.Popen(cmd, env=env, stdout=log,
                             stderr=subprocess.STDOUT, start_new_session=True)
+    report = {"board": args.board, "app": app, "options": dict(vars(args)),
+              "log": str(logp)}
+    # pathlib values are not JSON serializable.
+    report["options"]["logs"] = str(args.logs)
     rc = 1
     try:
         client = lock.DisplayClient(args.vnc_port)
@@ -156,6 +163,7 @@ def main() -> int:
                 gate = True
                 break
         print(f"touch gate armed: {gate}")
+        report["touch_gate_armed"] = gate
         if not gate:
             return 2
 
@@ -173,7 +181,7 @@ def main() -> int:
             time.sleep(ab.WAIT_OPEN)
             idx = ab.scanout_index(logp)
             print(f"pre-app: in-app lit={ab.lit(ab.grab(q, tmp), idx):.1f}%")
-            print("pre-app: HOME to return (1.0 takes ~34 s) ...")
+            print("pre-app: HOME to return promptly ...")
             ab.key(q, "h", 0.15)
             t0 = time.time()
             while time.time() - t0 < 90:
@@ -228,6 +236,9 @@ def main() -> int:
                 slept = True
                 break
         print(f"auto-sleep observed: {slept}  (t={time.time()-t0:.0f}s)")
+        report["auto_sleep"] = {"observed": slept,
+                                "wall_seconds": round(time.time() - t0, 2),
+                                "log_offset": mark}
         if not slept:
             print("no auto-sleep within the window -- run says nothing")
             return 2
@@ -271,6 +282,8 @@ def main() -> int:
 
         time.sleep(5)
         mark = logp.stat().st_size
+        parks_before = logp.read_bytes().decode("utf8", "replace").count(
+            "Pre-warmed wake parked")
         print("pressing H to wake ...")
         ab.key(q, "h", 0.15)
         # A deep wake is a retained-RAM boot and takes tens of seconds; poll
@@ -285,14 +298,37 @@ def main() -> int:
                 break
         idx = ab.scanout_index(logp)
         print(f"after wake (+{time.time()-t0:.0f}s): lit={ab.lit(woke, idx)}%")
+        if woke is not None:
+            ab.png(woke[idx] if idx is not None else woke,
+                   args.logs / "1_after_wake.png")
         time.sleep(4)
         woke = ab.grab(q, tmp)
+
+        wake_seg = logp.read_bytes()[mark:].decode("utf8", "replace")
+        btn_states = []
+        for pc, irq, fiq in re.findall(
+                r"\[BTN\].*?PC=0x([0-9a-fA-F]+)\s+I=([01]) F=([01])",
+                wake_seg):
+            btn_states.append({"pc": f"0x{int(pc, 16):08x}",
+                               "irq_masked": irq == "1",
+                               "fiq_masked": fiq == "1"})
+        masked_idle = any(0xc005a2e4 <= int(s["pc"], 16) <= 0xc005a33c
+                          and s["irq_masked"] and s["fiq_masked"]
+                          for s in btn_states)
+        report["wake"] = {"wall_seconds_to_lit": round(time.time() - t0, 2),
+                          "lit_percent": ab.lit(woke, idx),
+                          "scanout_index": idx,
+                          "button_states": btn_states,
+                          "masked_idle_reproduced": masked_idle,
+                          "log_offset": mark}
+        print(f"masked _cpu_idle press reproduced: {masked_idle}")
+        if args.require_masked_idle and not masked_idle:
+            print("required masked-idle state was not observed -- run is INVALID")
+            return 2
 
         # The definitive signature, independent of what the slide does: did the
         # device PARK AGAIN after we woke it? Counting parks is exact, where a
         # pixel verdict is a judgement call.
-        parks_before = logp.read_bytes().decode("utf8", "replace").count(
-            "Pre-warmed wake parked")
         if args.wake_settle:
             print(f"settling {args.wake_settle:.0f}s before the slide "
                   "(a human looks at the screen first) ...")
@@ -302,6 +338,8 @@ def main() -> int:
         reparked = parks_after > parks_before
         idx = ab.scanout_index(logp)
         settled = ab.grab(q, tmp)
+        ab.png(settled[idx] if idx is not None else settled,
+               args.logs / "2_before_slide.png")
         print(f"after settle: lit={ab.lit(settled, idx):.1f}%  "
               f"parks {parks_before} -> {parks_after}"
               f"{'   *** RE-PARKED: the wake did not stick ***' if reparked else ''}")
@@ -312,8 +350,12 @@ def main() -> int:
         time.sleep(6)
         idx = ab.scanout_index(logp)
         after = ab.grab(q, tmp)
+        ab.png(after[idx] if idx is not None else after,
+               args.logs / "3_after_slide.png")
         d = ab.changed(before, after, idx)
         seg = logp.read_bytes()[mark:].decode("utf8", "replace")
+        sleep_count = seg.count("Merlot panel entered sleep")
+        relit_then_reslept = sleep_count > 0
         touches = [l.strip() for l in seg.splitlines() if "[TOUCH]" in l]
         refused = sum(1 for l in touches if "Ignoring input" in l)
         print(f"slide verdict: screen changed {d:.2f}%  "
@@ -322,7 +364,16 @@ def main() -> int:
               f"({refused} REFUSED BY THE MODEL)")
         for l in touches[:10]:
             print(f"    {l}")
-        ok = d > 20 and not reparked and refused == 0
+        ok = d > 20 and not reparked and not relit_then_reslept and refused == 0
+        report["result"] = {"pass": ok, "screen_changed_percent": d,
+                            "lit_after_settle_percent": ab.lit(settled, idx),
+                            "parks_before": parks_before,
+                            "parks_after": parks_after,
+                            "reparked": reparked,
+                            "relit_then_reslept": relit_then_reslept,
+                            "touch_lines": len(touches),
+                            "touches_refused": refused,
+                            "log_end_offset": logp.stat().st_size}
         print(f"\nVERDICT: {'PASS' if ok else 'FAIL'}"
               f"{' -- re-parked after the wake' if reparked else ''}"
               f"{f' -- {refused} touches refused' if refused else ''}")
@@ -337,6 +388,9 @@ def main() -> int:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+        tmp.unlink(missing_ok=True)
+        (args.logs / "report.json").write_text(json.dumps(report, indent=2))
+        print(f"report: {args.logs / 'report.json'}  (PNGs and qemu.log alongside)")
     return rc
 
 

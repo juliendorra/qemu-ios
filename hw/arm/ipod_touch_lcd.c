@@ -219,6 +219,12 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
                  * 0x0fe00000 scanout, now owns the display again. */
                 s->retained_resume = false;
                 s->panel_off = false;
+                if (s->relight_input_fast || s->input_ever_ready) {
+                    s->relight_input_fast = false;
+                    s->input_ready = true;
+                    s->retained_input_wait = false;
+                    s->input_ready_frames = 0;
+                }
                 s->invalidate = 1;
                 fprintf(stderr,
                         "[LCD] Retained kernel enabled scanout at 0x%08x\n",
@@ -526,7 +532,12 @@ static void lcd_update_input_ready(IPodTouchLCDState *lcd)
             }
         }
 
-        if (best_visible_count >= 4) {
+        /* Framebuffer RAM remains populated while the physical panel sleeps.
+         * Those stale pixels are not visible evidence and must never re-open
+         * the touch gate. This was the residual auto-sleep failure's exact
+         * asymmetry: panel Sleep In closed the gate, then this generic path
+         * re-armed it two seconds later while panel_off was still true. */
+        if (!lcd->panel_off && best_visible_count >= 4) {
             lcd->input_ready_frames++;
         } else {
             lcd->input_ready_frames = 0;

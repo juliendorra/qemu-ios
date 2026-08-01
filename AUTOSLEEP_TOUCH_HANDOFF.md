@@ -1,7 +1,50 @@
 # Auto-sleep touch death — session handoff
 
-**Date:** 2026-08-01 · **Branch:** `wasm-jit-graft` · **State:** NOT FIXED,
-reproduced by hand, three failure modes separated, one of my own fixes reverted.
+**Date:** 2026-08-01 · **Branch:** `wasm-jit-graft` · **State:** FIXED and
+scripted against the exact masked-idle failure on iPhone OS 1.0.
+
+## Final result (2026-08-01)
+
+The gating question is answered: `0xc005a2ec` is kernel proper symbol
+`_cpu_idle`, immediately after the ARM WFI at `0xc005a2e8`; it is not
+OOCSHDWN and not a new deep-sleep state. iOS deliberately executes WFI with
+IRQ/FIQ masked, runs a 1,200-iteration settling loop, then restores its idle
+context. The SYSIC model incorrectly turned the interrupt controller's latched
+GPIO output into a 100 ms pulse. A HOME edge could wake WFI but disappear before
+the guest reached the unmasked delivery point, leaving `GPIO_INTSTAT` pending
+with no controller output asserted.
+
+Production fix: GPIO group outputs now remain asserted until the guest writes
+the corresponding `GPIO_INTSTAT` ACK. This is the controller output, not the
+source-pin waveform. In the fixed trace, a HOME press at `PC=0xc005a2ec,
+I=1,F=1` is followed by the full read-INTSTAT/read-INTLEVEL/ACK conversation,
+Sleep Out, and a working slide.
+
+The residual touch-gate asymmetry is fixed too: the stable-frame gate cannot
+count stale framebuffer pixels while `panel_off` is true; when a retained
+kernel reclaims an OS scanout base, a device that was already interactive
+restores input in the same transition.
+
+`scripts/autosleep-touch-probe.py --require-masked-idle` now emits JSON, three
+PNGs, relevant log offsets, SYSIC/gate traces, and rejects a run that did not
+hit the exact `_cpu_idle` state. It also identifies "relit then re-slept" as
+the lock screen's normal unattended timeout instead of reading stale RAM and
+calling it a visible dead slider.
+
+Final staged-firmware acceptance:
+
+```text
+python3 scripts/autosleep-touch-probe.py --board m68ap-10 \
+  --require-masked-idle
+masked _cpu_idle press reproduced: True
+after wake: lit=59.95%, parks 0 -> 0
+slide changed 73.57%, 0 touches refused
+VERDICT: PASS
+```
+
+Evidence: `/tmp/autosleep-final-10-guarded/report.json`, `1_after_wake.png`,
+`2_before_slide.png`, `3_after_slide.png`, and `qemu.log`. The launcher used
+staged NAND/NOR copies; no installed firmware source was modified.
 
 This is the short path *into* the problem. The full post-mortem — eleven
 hypotheses with their fates, five instrument traps — is the **LEDGER** section
