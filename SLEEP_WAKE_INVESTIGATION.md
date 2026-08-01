@@ -3904,3 +3904,89 @@ the conclusion was still wrong:
 Board-side write-up and the 1.0 open-issue list:
 [`IPHONE_OS_1X_VERSIONS.md`](IPHONE_OS_1X_VERSIONS.md) and
 [`IPHONE_2G_BRINGUP_HANDOFF.md`](IPHONE_2G_BRINGUP_HANDOFF.md) § 2026-07-27.
+
+
+# AUTO-SLEEP WAKE LOOP: touch dies after the FIRST auto-sleep (2026-08-01, iPhone boards)
+
+**User-reported, and REPRODUCED in the emulator's own Cocoa window.** After the
+device auto-sleeps from idle, waking with H leaves touch dead: slide-to-unlock
+does nothing. Reported on 1.0 AND 1.1.4; the iPod appears immune. Waking from a
+MANUAL Power-button sleep is fine.
+
+## It does NOT reproduce through the VNC harness -- five configurations passed
+
+`scripts/autosleep-touch-probe.py` (new) drives boot -> idle -> auto-sleep ->
+H -> slide over VNC. On 1.1.4 it PASSES in all of: wake at +5-10 s (shallow),
+wake at +30 s (the user's timing), wake at +55 s (after the deep-sleep commit),
+a manual P-cycle before the auto-sleep, and a 5-minute host SIGSTOP freeze.
+Every one woke to the slider and unlocked, `[TOUCH] mouse DOWN/UP` delivered.
+
+So the harness cannot see this bug. It reproduces in the REAL WINDOW, which is
+how the user hits it. Any future "auto-sleep wake is fine" claim from that
+probe alone is worth nothing.
+
+## What actually happens (measured, one Cocoa session)
+
+Session totals: **3 pre-warm parks, 5 touches REFUSED, 1 touch ever accepted**
+(the first-launch modal's Dismiss, before any sleep).
+
+```
+[KEYTRACE] keycode=35  active=1 parked=1        <- H resumes the parked pre-warm
+[WAKE] Home completed pre-warmed wake
+[KEYTRACE] keycode=163 ... sup_home=1           <- the RELEASE is SUPPRESSED
+[LCD] Retained kernel enabled scanout at 0x0f496000
+[LCD] Touch input restored after wake (device was already interactive)
+[LCD] Merlot panel entered sleep                <- goes straight back to sleep
+[PMU] RESUME_STATUS write <- 0x80 (armed)
+[PMU] Application processor awaiting power loss
+[WAKE] Pre-warming retained-RAM wake after OOCSHDWN
+[WAKE] Pre-warmed wake parked; awaiting Power/Home     <- RE-PARKED
+[TOUCH] Ignoring input until display/driver startup is stable   <- every touch
+```
+
+The chain, each link measured:
+
+1. **The wake press is consumed as a wake CAUSE, not delivered as input.**
+   `ipod_touch_key_event()`'s pre-warm branch sets `EXTON1R` and
+   `suppress_home_release = true`, so the guest never sees HOME as a button.
+   Its display-idle timer is therefore never reset.
+2. **The guest resumes and immediately finishes the sleep it was parked inside**
+   -- panel sleep, OOCSHDWN, pre-warm, park again. A wake -> re-sleep -> re-park
+   LOOP. The window title flips `QEMU` -> `QEMU [Sleeping]` within seconds.
+3. **Each park is a machine reset, and reset clears `input_ready`**
+   (`s5l8900_lcd_realize`, `input_ready = false`).
+4. **While parked the gate cannot re-arm**: both fast paths in
+   `lcd_update_input_ready()` require `!panel_off`, and the generic path needs
+   120 consecutive visible frames, which a stopped vCPU never produces. So
+   every touch hits `[TOUCH] Ignoring input until display/driver startup is
+   stable` -- **the MODEL refuses them; the guest never sees them.**
+
+A SECOND H press, with the machine already running, IS delivered normally
+(`sup_home=0`, a real `[BTN]` line) -- and does not rescue it: the device
+re-parks anyway.
+
+## Why this is a model bug, not iPhone OS behaviour
+
+Real hardware has no "park". The pre-warm/park machinery exists only because
+iBoot-204 has no resume entry point (finding #82), and it assumes ONE wake per
+park. When the resumed kernel simply continues into the sleep it was already
+committing, the model parks again -- and its touch gate, designed for boot
+overlays, is cleared by the reset and can never re-arm while parked.
+
+## Next steps, in order
+
+1. **Why does the resumed guest re-sleep at once?** Park happens at the type-4
+   commit, i.e. while the kernel is mid-sleep. If the park point is too late,
+   resuming can only finish the sleep. Instrument the resumed kernel's PC to
+   see whether it is completing the old sleep or starting a new one.
+2. **Deliver the wake press as INPUT too**, so the OS sees user activity and
+   restarts its idle timer, instead of consuming it purely as a PMU wake cause.
+   That is the smallest change that could break the loop -- and it needs an
+   A/B, because the suppression exists for a measured reason.
+3. **Make the touch gate survivable**: `input_ever_ready` is already persisted
+   in vmstate, but reset clears `input_ready` and the re-arm paths all require
+   a lit panel. A device that has ever been interactive should not need 120
+   visible frames again after a park.
+4. Re-test the iPod to confirm it is genuinely immune rather than merely
+   running an older engine -- the iPod bundle was NOT updated this session
+   (its binary md5 differs from both iPhone bundles).
