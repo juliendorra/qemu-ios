@@ -104,6 +104,10 @@ def main() -> int:
     ap.add_argument("--qemu", type=Path,
                     default=REPO / "build-ipod11" / "qemu-system-arm")
     ap.add_argument("--deadline", type=float, default=600)
+    ap.add_argument("--keep-stage", action="store_true",
+                    help="keep the staged NAND clone (~300 MB) after the run; "
+                         "by default it is deleted, per the repo's "
+                         "disk-hygiene rule")
     args = ap.parse_args()
 
     paths = m68ap_paths.get(args.build)
@@ -218,6 +222,16 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 pass
         qmp_path.unlink(missing_ok=True)
+        # Disk hygiene, the repo convention (M68AP_RENDER_HANDOFF "Traps"):
+        # a NAND tree is ~300 MB and these probes stage one per run. Leaving
+        # them behind filled this machine's data volume to 100% on
+        # 2026-08-01 and broke an app install mid-flight. Inside the finally
+        # so an early return or a crash still cleans up. --keep-stage keeps
+        # it when a run needs the guest's own writes for post-mortem.
+        if not args.keep_stage:
+            import shutil
+            shutil.rmtree(stage, ignore_errors=True)
+
 
     (args.logs / "mbx-mmu-probe.json").write_text(
         json.dumps(report, indent=2) + "\n")
