@@ -296,6 +296,27 @@
 > dismissal) to capture the 1.0 command stream in flight and diff every
 > traced aperture write against the mapped DRAM.
 >
+> **The second exercise run answered a question nobody had asked: 1.0 can
+> dismiss WITHOUT the MBX at all.** Adaptive wait, dismissal ran to a real
+> home screen — and the trace shows **zero** command-stream writes over ten
+> minutes, with 0xa00000 still full of poison. What it shows instead:
+> MBX2D's init arming (0x108=3, ack 0xfff, arm 0x130=0xffff from the
+> FinishSurface sleep wrapper 0xc032e0xx), ONE timeout disarm
+> (0x130=0 from the thread-call), the capability reads, and then a context
+> TEARDOWN whose final act is `WR 0x1020 = 0x00010000` — the MMU switched
+> off. So userland's MBX2D init failed its first handshake, LayerKit fell
+> back to software, and the dismissal completed anyway. Two consequences:
+>
+> * **The 33-block stream is conditional on MBX2D init surviving its first
+>   FinishSurface round-trip**, which under today's model is a ~1 s timeout
+>   race — the historical 33.8 s dismissals and this run's stream-less one
+>   are the two sides of a bistable init. The ~33.8 s "latency residual"
+>   is therefore not inevitable; the software fallback exists and works.
+> * The aperture-vs-DRAM diff harness in `--exercise` is armed but has not
+>   yet caught a stream in flight; rerun until init lands on the MBX2D
+>   side, or decode from the historical traces (the words are all in
+>   IN_APP_BUTTON_INVESTIGATION.md's captures).
+>
 > **The 1.0 walk matches 4A102 byte for byte** (run 2026-08-01): different
 > physical pages, same structure — 244 nonzero bytes at MBX 0x1b000 with
 > IDENTICAL content (`e0000000 a7700000 0e000000 d6887610 2222 0e80 …`),
