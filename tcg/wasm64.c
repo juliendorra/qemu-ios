@@ -137,7 +137,8 @@ static int jit_threshold;          /* effective; == jit_instantiate_num when off
 EM_JS_PRE(void*, instantiate_wasm, (void *wasm_begin,
                                     int wasm_size,
                                     void *import_vec_begin,
-                                    int import_vec_size),
+                                    int import_vec_size,
+                                    int direct_table),
 {
     const memory_v = new DataView(HEAP8.buffer);
     const wasm = HEAP8.subarray(DEC_PTR(wasm_begin),
@@ -161,7 +162,33 @@ EM_JS_PRE(void*, instantiate_wasm, (void *wasm_begin,
 
     Module.__wasm_tb.inst_gc_registry.register(inst, "tbinstance");
 
+    /*
+     * Every TB export is a new function.  addFunction() nevertheless scans
+     * the main table on first use and records every export in Emscripten's
+     * functionsInTableMap WeakMap so it can deduplicate later additions.
+     * That work can never find a duplicate here and showed up as
+     * MapPrototypeSet in the vCPU profile while the cold JIT was compiling.
+     * Keep Emscripten's slot allocator and table mirror, but skip its
+     * duplicate-function map entirely.
+     */
+    if (direct_table) {
+        const func_idx = getEmptyTableSlot();
+        setWasmTableEntry(func_idx, inst.exports.start);
+        return ENC_PTR(func_idx);
+    }
     return ENC_PTR(addFunction(inst.exports.start, 'ii'));
+});
+
+EM_JS_PRE(void, release_wasm_tb, (void *func_idx_ptr, int direct_table),
+{
+    const func_idx = DEC_PTR(func_idx_ptr);
+
+    if (direct_table) {
+        setWasmTableEntry(func_idx, null);
+        freeTableIndexes.push(func_idx);
+    } else {
+        removeFunction(func_idx);
+    }
 });
 
 __thread uintptr_t tci_tb_ptr;
@@ -804,6 +831,7 @@ static uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
 /* Effective cap: MAX_INSTANCES sizes the static ring, so this may be lowered
  * at run time (max_instances= in /fw/jit-tune) but never raised past it. */
 static int jit_max_instances = MAX_INSTANCES;
+static bool jit_direct_table;
 
 static int instances_global;
 
@@ -894,7 +922,8 @@ static void remove_old_instances(void)
     /* removes the half of the oldest instances in the buffer */
     num /= 2;
     for (int i = 0; i < num; i++) {
-        EM_ASM({ removeFunction($0); }, instances[instances_begin].tb_func);
+        release_wasm_tb((void *)instances[instances_begin].tb_func,
+                        jit_direct_table);
         instances[instances_begin].tb_ptr = NULL;
         instances_begin = (instances_begin + 1) % INSTANCES_BUF_MAX;
         jit_evictions++;
@@ -981,10 +1010,12 @@ static void init_wasm(void)
         jit_max_instances = (cap > 0 && cap <= MAX_INSTANCES) ? (int)cap
                                                               : MAX_INSTANCES;
         jit_adaptive = jit_tunable("IT_WASM_JIT_ADAPTIVE", "adaptive", 1) != 0;
+        jit_direct_table = jit_tunable("IT_WASM_DIRECT_TABLE", "direct_table",
+                                       1) != 0;
         jit_threshold = jit_instantiate_num;
         fprintf(stderr, "[JIT] tuning: instantiate=%d max_instances=%d "
-                "adaptive=%d\n", jit_instantiate_num, jit_max_instances,
-                jit_adaptive);
+                "adaptive=%d direct_table=%d\n", jit_instantiate_num,
+                jit_max_instances, jit_adaptive, jit_direct_table);
     }
     thread_idx = qatomic_fetch_inc(&thread_idx_max);
     ctx.stack = g_malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
@@ -1033,7 +1064,8 @@ uintptr_t tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_ptr)
             tb_func = (wasm_tb_func)instantiate_wasm(header->wasm_ptr,
                                                      header->wasm_size,
                                                      header->import_ptr,
-                                                     header->import_size);
+                                                     header->import_size,
+                                                     jit_direct_table);
             add_instance(tb_func, ctx.tb_ptr);
             res = call_wasm_tb(tb_func, &ctx);
         }
