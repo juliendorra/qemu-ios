@@ -4200,6 +4200,12 @@ performing here -- before adding any more machinery to wake it.
 
 # LEDGER: the auto-sleep touch investigation, in full (2026-08-01)
 
+> **Entry point for this issue: [`AUTOSLEEP_TOUCH_HANDOFF.md`](AUTOSLEEP_TOUCH_HANDOFF.md)** — what to measure first, how to
+> reproduce (the harness does NOT), which of the three states you are in,
+> and what not to do. This section is the post-mortem behind it.
+
+
+
 Written because this hunt produced THREE different stories from three sets of
 runs, reverted one of its own fixes, and ended without a user-facing fix. The
 value left behind is the eliminations. Read this before touching wake code.
