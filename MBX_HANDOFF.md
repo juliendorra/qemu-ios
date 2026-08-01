@@ -34,12 +34,55 @@
 > | 3A109a / 1C28 home render | **BLOCKED — NAND artifacts not on disk** (only nor.bin+ipsw); regenerate per BUILD.md before verifying these two |
 >
 > **DEFAULTS FLIPPED (2026-07-31, end of session): `IT_TVOUT_SDO` defaults
-> ON, and the zero-window is only armed when the model is off.** One knob
-> A/Bs the whole thing: `IT_TVOUT_SDO=0` restores the stub + derived window
-> exactly as before. The window code stays for that A/B and for the two
-> unverified builds. `lock-unlock-probe` grew `--icount` (the 4A102 boot
-> trap), and note it does NOT stage the NAND — clone before pointing it at
-> a build artifact.
+> ON.** One knob A/Bs the whole thing: `IT_TVOUT_SDO=0` restores the stub +
+> derived window exactly as before. The window code stays for that A/B and
+> for the two unverified builds. `lock-unlock-probe` grew `--icount` (the
+> 4A102 boot trap), and note it does NOT stage the NAND — clone before
+> pointing it at a build artifact.
+>
+> ### The bundles, and a real regression the first flip caused (2026-08-01)
+>
+> All three packaged apps were updated to this engine and re-run through
+> `app-button-probe.py`, which drives the BUNDLE through its own launcher.
+> The first version suppressed the window **globally** (in
+> `tvout_wa_enabled()`); that regressed iPhone OS 1.0:
+>
+> | run | result | failing step |
+> |---|---|---|
+> | 1.0, pre-SDO engine (v383) | 5/5 | — |
+> | 1.0, global gate, ×2 | 3/5, 4/5 | `2_touch_in_app`, **0.31% both times** |
+> | 1.0, same engine, `IT_TVOUT_SDO=0` | 4/5 | step 2 **PASSED, 35.95%** |
+> | 1.0, placement-level fix | **5/5** | — (step 2 back to 35.94%) |
+> | 1.1.4, global gate, ×2 | 4/5, 5/5 | `1_open_app` 2.29% / — |
+> | 1.1.4, `IT_TVOUT_SDO=0` | 5/5 | — |
+> | 1.1.4, placement fix | 4/5 | `1_open_app`, 2.29% again |
+> | 1.1.4, placement fix, `IT_PROBE_WAIT=4` | **5/5** | — |
+> | iPod | 5/5 | — |
+>
+> **1.0 has no TVOut driver and never receives a window either way, so the
+> global gate changed NOTHING functional there — and still flipped the
+> result, reproducibly.** The cause is phase: under `-icount` the guest is
+> deterministic while the probe's input rides host wall-clock, so removing
+> that branch's console prints moved the tap to a different guest instant
+> and 1.0's 5-of-6 in-app event delivery dropped it. Hence the rule now
+> encoded in the code: **a model that does nothing on a board must touch
+> nothing on that board.** The suppression moved to the placement decision,
+> after the not-a-TVOut check (`fa5a604c06`).
+>
+> **1.1.4's `1_open_app` is a separate, PRE-EXISTING harness flake** — it
+> failed and passed under *both* configurations, always at exactly 2.29%
+> when it failed, and went 5/5 once the verdict window was widened. Use
+> `IT_PROBE_WAIT=4` on `m68ap-114`; the default 2x is marginal for that
+> build's launch, exactly as the probe's own comment warns for icount.
+>
+> **Disk hygiene, learned the hard way again:** these MBX probes each stage
+> a ~300 MB NAND clone per run; eight runs filled the data volume to 100%
+> and aborted an engine install mid-flight (harmlessly — the installer
+> packs the NAND before it touches the bundle). They now delete the stage
+> in their `finally` by default (`--keep-stage` to preserve). Also: the
+> build directory's binary carries `com.apple.FinderInfo`/`ResourceFork`
+> xattrs, so a hand-copy into a bundle needs `xattr -c` before `codesign`
+> or signing fails with "resource fork ... not allowed".
 
 > **§4 GATE MEASURED (2026-07-31, late evening): software compositing is a
 > SINGLE-DIGIT share of guest CPU — MBX modelling is FIDELITY-ONLY work.**
