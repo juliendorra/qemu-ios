@@ -858,7 +858,7 @@ guest keeps running.">
     // waiting for it would hang for ever. A live panel plus a bounded wait is
     // the right condition: on a cold boot the message always arrives well
     // inside it, and on a resume its absence means "already open", not "shut".
-    const deadline = performance.now() + 60000;
+    const deadline = performance.now() + (RESUME ? 0 : 60000);
     while (!touchReady && performance.now() < deadline) await sleep(2000);
     console.log(touchReady
       ? `[sweep] touch gate armed at ${at()}s`
@@ -1394,6 +1394,7 @@ guest keeps running.">
         ['max', 'max_instances'],
         ['adaptive', 'adaptive'],
         ['direct_table', 'direct_table'],
+        ['chain', 'chain'],
       ];
       const tune = tuneKeys
         .filter(([query]) => tuneParams.has(query))

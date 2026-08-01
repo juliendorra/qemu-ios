@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -49,6 +50,9 @@ CHROME_FLAGS = [
     "--v=0",
     "--window-size=1000,760",
 ]
+
+LANDMARK_RE = re.compile(
+    r'\[bench\] landmark (.+?) at\s+([0-9]+(?:\.[0-9]+)?)s')
 
 
 def port_is_busy(port: int) -> bool:
@@ -93,12 +97,17 @@ def main() -> None:
     parser.add_argument("--io-split", type=int, choices=(0, 1), default=None,
                         help="production viewer: toggle learned MMIO TB "
                              "boundaries in the same wasm binary")
+    parser.add_argument("--chain", type=int, default=None,
+                        help="production viewer: maximum compiled-TB calls "
+                             "before returning to the dispatcher")
     parser.add_argument("--exit-profile", action="store_true",
                         help="production viewer: publish cpu_loop_exit reason "
                              "histograms to the captured Chrome log")
     parser.add_argument("--resume", action="store_true",
                         help="production viewer: restore the selected build's "
                              "snapshot instead of cold booting")
+    parser.add_argument("--sweep", choices=("calc",), default=None,
+                        help="production viewer: run an interactive benchmark")
     parser.add_argument("--cold", action="store_true",
                         help="chunked mode: drop the chunk cache first")
     parser.add_argument("--no-prefetch", action="store_true")
@@ -172,10 +181,14 @@ def main() -> None:
             query += "&writable=0"
         if args.io_split is not None:
             query += f"&io_split={args.io_split}"
+        if args.chain is not None:
+            query += f"&chain={args.chain}"
         if args.exit_profile:
             query += "&exit_profile=1"
         if args.resume:
             query += "&resume=1"
+        if args.sweep:
+            query += f"&sweep={args.sweep}"
         page = "bench-b" if args.page == "bench-b" else "public/jit-boot"
         url = f"http://localhost:{args.port}/{page}/{query}"
 
@@ -193,30 +206,52 @@ def main() -> None:
         latest: dict = {}
         last_print = 0.0
         settling = None
+        console_offset = 0
+        console_tail = ""
+        console_landmarks: dict[str, float] = {}
         try:
             while time.time() - started < args.timeout:
                 time.sleep(2)
+                # Result POSTs share the single-threaded benchmark server with
+                # thousands of JIT-pack requests and can be starved even while
+                # the guest is healthy. Chrome's machine-readable console is an
+                # independent completion channel; consume it incrementally so
+                # a reporting-path stall is not mistaken for a guest stall.
+                with chrome_log_path.open(errors="replace") as console_log:
+                    console_log.seek(console_offset)
+                    console_tail += console_log.read()
+                    console_offset = console_log.tell()
+                console_lines = console_tail.split("\n")
+                console_tail = console_lines.pop()
+                for line in console_lines:
+                    match = LANDMARK_RE.search(line)
+                    if match:
+                        console_landmarks[match.group(1)] = float(match.group(2))
                 if result_path.exists():
                     try:
                         latest = json.loads(result_path.read_text())
                     except json.JSONDecodeError:
-                        continue
-                    if time.time() - last_print > 30:
-                        last_print = time.time()
-                        print(f"  {latest.get('elapsed')}s "
-                              f"{latest.get('counters', {}).get('JIT', '')} "
-                              f"{list(latest.get('landmarks', {}))}", flush=True)
-                    if args.until in latest.get("landmarks", {}):
-                        if not args.settle:
-                            break
-                        if settling is None:
-                            settling = time.time()
-                            print(f"  reached {args.until}; settling "
-                                  f"{args.settle:.0f}s", flush=True)
-                        elif time.time() - settling >= args.settle:
-                            break
+                        # The server replaces this file non-atomically. Keep
+                        # the console completion channel live while a partial
+                        # JSON write is visible.
+                        pass
                     if latest.get("failure"):
                         print(f"  failure: {latest['failure']}", flush=True)
+                        break
+                latest.setdefault("landmarks", {}).update(console_landmarks)
+                if time.time() - last_print > 30:
+                    last_print = time.time()
+                    print(f"  {latest.get('elapsed')}s "
+                          f"{latest.get('counters', {}).get('JIT', '')} "
+                          f"{list(latest.get('landmarks', {}))}", flush=True)
+                if args.until in latest.get("landmarks", {}):
+                    if not args.settle:
+                        break
+                    if settling is None:
+                        settling = time.time()
+                        print(f"  reached {args.until}; settling "
+                              f"{args.settle:.0f}s", flush=True)
+                    elif time.time() - settling >= args.settle:
                         break
                 if chrome.poll() is not None:
                     # NOT necessarily the end of the run: the binary launched
