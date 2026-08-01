@@ -159,6 +159,7 @@ guest keeps running.">
   let fsRef = null;      // MEMFS, captured in preRun so serial.log can be read
   let moduleRef = null;  // the MAIN THREAD's Module -- see the note below
   let serialSeen = 0;    // bytes of guest serial already rendered
+  let exitProfileSeen = '';
   let touchReady = false;  // the guest's input gate has armed
   // bytesFromNetwork, NOT bytesServed: the latter counts cache hits too, so a
   // warm boot would report the full working set and look like it downloaded it.
@@ -189,11 +190,13 @@ guest keeps running.">
   // page that paints can see it.
   let lastReport = 0;
   let reportEndpoint = true;   // cleared on a static host
+  const REPORT_LABEL = new URLSearchParams(location.search).get('label');
   function report(force) {
     const now = performance.now();
     if (!force && now - lastReport < 5000) return;
     lastReport = now;
     const body = JSON.stringify({
+      label: REPORT_LABEL,
       elapsed: Number((now / 1000).toFixed(1)),
       landmarks: Object.fromEntries(
         [...hit].map(([k, v]) => [k, Number(parseFloat(v).toFixed(1))])),
@@ -341,6 +344,20 @@ guest keeps running.">
     for (const text of fresh.split('\n')) {
       if (text.trim()) { note(text); line(text); }
     }
+  }, 1000);
+
+  // Pthread stderr is not forwarded reliably by headless Chrome. Mirror the
+  // changed machine-readable snapshot written by cpu-exec-common.c instead.
+  setInterval(() => {
+    if (!fsRef) return;
+    try {
+      const data = fsRef.readFile('/fw/exit-profile-results',
+                                  { encoding: 'utf8' }).trim();
+      if (data && data !== exitProfileSeen) {
+        exitProfileSeen = data;
+        console.log(data);
+      }
+    } catch (e) { /* diagnostic is disabled or has not emitted yet */ }
   }, 1000);
 
   // ------------------------------------------------------------- display ---
@@ -1358,6 +1375,31 @@ guest keeps running.">
       // method in this build and touching it aborts the whole module.
       if (new URLSearchParams(location.search).get('qsp') === '1') {
         mod.FS.writeFile('/fw/qsp', '1');
+      }
+      if (new URLSearchParams(location.search).get('exit_profile') === '1') {
+        mod.FS.writeFile('/fw/exit-profile', '1');
+      }
+      const ioSplit = new URLSearchParams(location.search).get('io_split');
+      if (ioSplit !== null) {
+        mod.FS.writeFile('/fw/io-split', ioSplit);
+      }
+
+      // Runtime JIT A/B knobs. Only write keys explicitly present in the URL;
+      // absent keys keep tcg/wasm64.c's compiled-in defaults. This makes an
+      // engine comparison use one binary, so a concurrent device-model rebuild
+      // cannot silently become the real variable.
+      const tuneParams = new URLSearchParams(location.search);
+      const tuneKeys = [
+        ['instantiate', 'instantiate'],
+        ['max', 'max_instances'],
+        ['adaptive', 'adaptive'],
+        ['direct_table', 'direct_table'],
+      ];
+      const tune = tuneKeys
+        .filter(([query]) => tuneParams.has(query))
+        .map(([query, key]) => `${key}=${tuneParams.get(query)}`);
+      if (tune.length) {
+        mod.FS.writeFile('/fw/jit-tune', `${tune.join('\n')}\n`);
       }
 
       let staged = 0;

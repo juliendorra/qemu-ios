@@ -4,8 +4,9 @@
 Measuring the JIT by watching a tab does not work, and the failure is not
 obvious: a browser THROTTLES a hidden page, so a run that looks stalled at
 "compiled=352" is often just a backgrounded tab. This launches Chrome with
-background throttling disabled, points it at web/bench-b/, and waits for the
-page to post its landmarks back (scripts/wasm/serve.py --results).
+background throttling disabled, points it at web/bench-b/ or the production
+viewer, and waits for the page to post its landmarks back
+(scripts/wasm/serve.py --results).
 
 One run at a time, on an idle machine: an early A/B ran two browser tabs at
 once, halved the CPU available to each, and invalidated itself.
@@ -13,6 +14,8 @@ once, halved the CPU available to each, and invalidated itself.
     scripts/wasm/bench-run.py --instantiate 50   --label sweep-50
     scripts/wasm/bench-run.py --mode chunked --cold --label chunked-cold
     scripts/wasm/bench-run.py --mode chunked --label chunked-warm
+    scripts/wasm/bench-run.py --page public --io-split 0 --until kernel --label io-control
+    scripts/wasm/bench-run.py --page public --io-split 1 --until kernel --label io-split
 """
 
 from __future__ import annotations
@@ -42,6 +45,8 @@ CHROME_FLAGS = [
     "--disable-renderer-backgrounding",
     "--disable-features=CalculateNativeWinOcclusion",
     "--autoplay-policy=no-user-gesture-required",
+    "--enable-logging=stderr",
+    "--v=0",
     "--window-size=1000,760",
 ]
 
@@ -81,6 +86,19 @@ def main() -> None:
                              "The security epoch travels with it -- a wrong one "
                              "wedges iBoot with an EMPTY serial log")
     parser.add_argument("--mode", choices=("pack", "chunked"), default="pack")
+    parser.add_argument("--page", choices=("bench-b", "public"),
+                        default="bench-b",
+                        help="viewer to exercise; public selects the production "
+                             "public/jit-boot page")
+    parser.add_argument("--io-split", type=int, choices=(0, 1), default=None,
+                        help="production viewer: toggle learned MMIO TB "
+                             "boundaries in the same wasm binary")
+    parser.add_argument("--exit-profile", action="store_true",
+                        help="production viewer: publish cpu_loop_exit reason "
+                             "histograms to the captured Chrome log")
+    parser.add_argument("--resume", action="store_true",
+                        help="production viewer: restore the selected build's "
+                             "snapshot instead of cold booting")
     parser.add_argument("--cold", action="store_true",
                         help="chunked mode: drop the chunk cache first")
     parser.add_argument("--no-prefetch", action="store_true")
@@ -123,8 +141,11 @@ def main() -> None:
             f"(pkill -f 'serve.py --port {args.port}') or pass --port.")
     args.out.mkdir(parents=True, exist_ok=True)
     result_path = args.out / f"{args.label}.json"
+    chrome_log_path = args.out / f"{args.label}.chrome.log"
     if result_path.exists():
         result_path.unlink()
+    if chrome_log_path.exists():
+        chrome_log_path.unlink()
     profile = args.out / f"profile-{args.profile or args.label}"
 
     server = subprocess.Popen(
@@ -149,14 +170,22 @@ def main() -> None:
             query += f"&display={args.display}"
         if args.read_only:
             query += "&writable=0"
-        url = f"http://localhost:{args.port}/bench-b/{query}"
+        if args.io_split is not None:
+            query += f"&io_split={args.io_split}"
+        if args.exit_profile:
+            query += "&exit_profile=1"
+        if args.resume:
+            query += "&resume=1"
+        page = "bench-b" if args.page == "bench-b" else "public/jit-boot"
+        url = f"http://localhost:{args.port}/{page}/{query}"
 
         flags = list(CHROME_FLAGS)
         if not args.headed:
             flags.append("--headless=new")
+        chrome_log = chrome_log_path.open("w")
         chrome = subprocess.Popen(
             [str(CHROME), f"--user-data-dir={profile}", *flags, url],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=chrome_log,
             start_new_session=True)
 
         print(f"[bench] {args.label}: {url}", flush=True)
@@ -206,6 +235,7 @@ def main() -> None:
                 os.killpg(os.getpgid(chrome.pid), signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            chrome_log.close()
 
         try:
             stats = json.loads(urllib.request.urlopen(
@@ -214,6 +244,7 @@ def main() -> None:
             stats = None
         latest["chunkServerStats"] = stats
         latest["label"] = args.label
+        latest["chromeLog"] = str(chrome_log_path)
         latest["wallSeconds"] = round(time.time() - started, 1)
         result_path.write_text(json.dumps(latest, indent=1) + "\n")
         print(json.dumps(latest, indent=1))
