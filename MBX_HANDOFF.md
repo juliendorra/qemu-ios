@@ -296,6 +296,17 @@
 > dismissal) to capture the 1.0 command stream in flight and diff every
 > traced aperture write against the mapped DRAM.
 >
+> **The 1.0 walk matches 4A102 byte for byte** (run 2026-08-01): different
+> physical pages, same structure — 244 nonzero bytes at MBX 0x1b000 with
+> IDENTICAL content (`e0000000 a7700000 0e000000 d6887610 2222 0e80 …`),
+> same 24 bytes at 0x21000, same full-page `0xBAD43210` poison at
+> 0xa00000. The layout is firmware-invariant across the 1.x line, so one
+> decoder serves all builds. (First exercise run caught the dismissal too
+> early — guest time under icount ran ~6× slower than wall clock and the
+> fixed 90 s wait covered ~13 guest seconds; the probe now waits on the
+> trace itself. The HOME press *was* delivered and the dismissal path ran
+> to the 0x12C soft event before the window closed.)
+>
 > **And the command format is not a black box either.** The userland
 > `MBX2D.framework` on the 1.0 root filesystem keeps **74 defined symbols**,
 > including the packers themselves:
