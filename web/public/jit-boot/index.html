@@ -14,8 +14,19 @@
          background: #14161a; color: #d7dae0;
          display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1rem;
          align-items: start; }
-  h1 { font-size: 14px; margin: 0 0 .75rem; color: #9aa4b2; font-weight: 600;
+  h1 { font-size: 14px; margin: 0 0 .5rem; color: #9aa4b2; font-weight: 600;
        grid-column: 1 / -1; }
+  #picker { grid-column: 1 / -1; display: flex; flex-wrap: wrap;
+            align-items: center; gap: .75rem; margin: 0 0 .75rem; }
+  .pickgroup { display: inline-flex; border: 1px solid #2c313a;
+               border-radius: 6px; overflow: hidden; }
+  .pickgroup a { padding: .3rem .7rem; color: #9aa4b2; text-decoration: none;
+                 border-right: 1px solid #2c313a; background: #1a1d23; }
+  .pickgroup a:last-child { border-right: 0; }
+  .pickgroup a:hover { background: #232830; color: #d7dae0; }
+  .pickgroup a.on { background: #2f6feb; color: #fff; }
+  .pickgroup a.off { opacity: .45; cursor: not-allowed; }
+  #pickhint { color: #6d7580; }
   #device { display: flex; flex-direction: column; align-items: center;
             gap: .5rem; }
   /* image-rendering: pixelated keeps the 320x480 panel honest when scaled. */
@@ -51,6 +62,14 @@
   .err { color: #e5a3a0; }
 </style>
 <h1>iPhone OS 1.0 — full boot, WebAssembly JIT</h1>
+<!-- Version/start picker. Every option is a page RELOAD, not a live switch:
+     the build decides the epoch, firmware, NAND chunk set and snapshot, all
+     of which are staged in preRun before the machine exists. -->
+<div id="picker">
+  <span class="pickgroup" id="pickbuild"></span>
+  <span class="pickgroup" id="pickstart"></span>
+  <span id="pickhint"></span>
+</div>
 <div id="device">
   <div id="panelwrap">
     <canvas id="screen" width="320" height="480"></canvas>
@@ -1039,16 +1058,80 @@ guest keeps running.">
     throw new Error(`unknown build ${BUILD}; have ${Object.keys(BUILDS)}`);
   }
   const EPOCH = BUILDS[BUILD].epoch;
+  // Declared HERE, beside BUILD, because the picker below reads it. It used
+  // to live ~70 lines further down, which put the picker in its temporal
+  // dead zone.
+  const RESUME = new URLSearchParams(location.search).get('resume') === '1';
   document.querySelector('h1').textContent =
     `${BUILDS[BUILD].label} (${BUILD}) — WebAssembly JIT`;
+
+  // The four-way picker: {1.0, 1.1.4} x {resume, cold boot}. Each choice is a
+  // link, i.e. a page reload -- the build selects the epoch, firmware, NAND
+  // chunk set and snapshot, all staged in preRun before the machine exists,
+  // so there is nothing to switch live. Other params (sweep, qsp, display...)
+  // are preserved so a picked option keeps whatever mode you were in.
+  //
+  // Snapshot availability is PROBED, not assumed: a build whose snapshot has
+  // not been generated yet (state-provenance.json missing) shows "resume" as
+  // disabled with the reason, instead of offering a link that dies in preRun
+  // with "no snapshot at ...".
+  {
+    const mk = (host, items) => {
+      host.innerHTML = '';
+      for (const it of items) {
+        const a = document.createElement('a');
+        a.textContent = it.text;
+        a.title = it.title || '';        // the ACTIVE item explains itself too
+        if (it.on) a.className = 'on';
+        else if (it.disabled) a.className = 'off';
+        else a.href = it.href;
+        host.appendChild(a);
+      }
+    };
+    const urlFor = (build, resume) => {
+      const p = new URLSearchParams(location.search);
+      p.set('build', build);
+      if (resume) p.set('resume', '1'); else p.delete('resume');
+      return `?${p}`;
+    };
+    const paint = (snapOk) => {
+      mk(document.getElementById('pickbuild'),
+         Object.entries(BUILDS).map(([id, b]) => ({
+           text: b.label.replace('iPhone OS ', ''),
+           on: id === BUILD,
+           href: urlFor(id, RESUME && snapOk[id] !== false),
+           title: `${b.label} (${id})`,
+         })));
+      const snapHere = snapOk[BUILD];
+      mk(document.getElementById('pickstart'), [
+        { text: 'resume', on: RESUME,
+          disabled: snapHere === false,
+          href: urlFor(BUILD, true),
+          title: snapHere === false
+            ? `no snapshot for ${BUILD} yet — build one with `
+              + `scripts/wasm/build-snapshot.py --build ${BUILD} --brotli`
+            : 'start from a post-boot snapshot (seconds)' },
+        { text: 'cold boot', on: !RESUME, href: urlFor(BUILD, false),
+          title: 'boot from scratch (minutes) — the honest boot path' },
+      ]);
+      document.getElementById('pickhint').textContent = RESUME
+        ? 'resumed snapshot — the machine starts at the home screen'
+        : 'cold boot — watch it come up from the bootrom';
+    };
+    const snapOk = {};
+    paint(snapOk);                       // paint immediately, refine on probe
+    for (const id of Object.keys(BUILDS)) {
+      fetch(`snapshots/${id}/state-provenance.json`, { method: 'HEAD' })
+        .then((r) => { snapOk[id] = r.ok; paint(snapOk); })
+        .catch(() => { snapOk[id] = false; paint(snapOk); });
+    }
+  }
   {
     const t = BUILDS[BUILD].tip;
     const top = Math.round(t.a), bot = Math.round(t.a + t.b * 480);
     document.getElementById('tipfixlabel').textContent =
       `correct finger offset (${top === bot ? `${top}` : `${bot}\u2013${top}`} px)`;
   }
-
-  const RESUME = new URLSearchParams(location.search).get('resume') === '1';
 
   // ------------------------------------------------------- persistence ---
   //
