@@ -202,7 +202,26 @@ def main() -> int:
             print(f"after tap: {kind}")
             report["in_app"] = kind
             lockprobe.key(q, "h")
-            time.sleep(90)
+            # Guest time under -icount runs several times slower than wall
+            # clock (measured ~6x on this boot), so a fixed wall-clock wait
+            # undershoots the ~34 s guest-time dismissal -- the first run of
+            # this mode stopped at the 0x12C soft event with zero command
+            # writes captured. Instead, watch the model's own trace: wait
+            # until aperture writes (offset >= 0x2000) appear and stop
+            # growing, with a hard cap.
+            print("waiting for the 2D command stream in the trace ...",
+                  flush=True)
+            wr_re2 = re.compile(rb"WR 0x([0-9a-f]{4,7}) =")
+            last, stable, waited = -1, 0, 0
+            while waited < 600 and stable < 3:
+                time.sleep(30)
+                waited += 30
+                n = sum(1 for m in wr_re2.finditer(stderr.read_bytes())
+                        if int(m.group(1), 16) >= 0x2000)
+                stable = stable + 1 if (n == last and n > 0) else 0
+                last = n
+                print(f"  t+{waited}s: {n} aperture-write trace lines "
+                      f"(stable x{stable})", flush=True)
             d, kind = lockprobe.grab(q, args.logs, classify)
             lockprobe.png(d, args.logs / "after-home.png")
             print(f"after HOME: {kind}")
