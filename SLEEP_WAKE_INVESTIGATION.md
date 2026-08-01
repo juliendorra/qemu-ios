@@ -3990,3 +3990,71 @@ overlays, is cleared by the reset and can never re-arm while parked.
 4. Re-test the iPod to confirm it is genuinely immune rather than merely
    running an older engine -- the iPod bundle was NOT updated this session
    (its binary md5 differs from both iPhone bundles).
+
+## Fix attempt 1: deliver the wake press as INPUT (2026-08-01) -- partial, and it corrects a wrong hypothesis
+
+### What was built
+
+`ipod_touch_wake_activity()` in `hw/arm/ipod_touch.c`. After a parked pre-warm
+wake resumes the machine, a virtual timer (3 s, then a 150 ms hold) injects a
+full Home press+release through the ordinary GPIO path, so the OS sees user
+activity and restarts its display-idle timer. `IT_WAKE_ACTIVITY=0` disables it.
+
+### Measured: it fixes the re-park loop and the touch refusals
+
+Same window, same board (1.1.4), same sequence -- idle to a park, press H,
+settle 45 s, tap:
+
+| | parks | touches REFUSED by the model | touch accepted |
+|---|---|---|---|
+| before | 3 (every wake re-parked) | **5** | only the one before the first sleep |
+| after | **1** (no re-park) | **0** | yes, `[TOUCH] mouse DOWN` logged |
+
+So the wake -> re-sleep -> re-park loop is broken and
+`[TOUCH] Ignoring input until display/driver startup is stable` no longer
+fires. That part of the diagnosis held.
+
+### NOT fixed: the panel still does not light on the park path
+
+After the wake the log still shows `Merlot panel entered sleep` and never
+`Merlot panel woke from sleep`; the window stays black even though the guest
+is running and touch is now accepted. So the user-visible symptom on the deep
+path remains. The next question is why the resumed retained kernel leaves the
+panel asleep, which is a DISPLAY question, not an input one -- separate from
+everything above.
+
+### A hypothesis this KILLED, and a probe trap it exposed
+
+The rationale for the fix was "the wake press is consumed as a PMU wake cause
+and never delivered as input". That is true **only on the parked path**
+(`sup_home=1`). Measured on the shallow path, the same press arrives
+completely normally:
+
+```
+[LCD] Merlot panel entered sleep                     <- panel sleep, no OOCSHDWN
+[KEYTRACE] keycode=35  ... sup_home=0                <- delivered NORMALLY
+[BTN] keycode=35 / keycode=163                       <- both edges
+[LCD] Merlot panel woke from sleep                   <- panel wakes correctly
+[LCD] Merlot panel entered sleep                     <- re-sleeps 45 s later
+```
+
+And the re-sleep there is almost certainly CORRECT: a real iPhone that wakes
+to the lock screen and is then ignored turns the screen off again after ~15-20
+seconds. **So `--wake-settle 45`, added to make the probe "see the bug", makes
+it report a FAIL for ordinary auto-lock behaviour on the shallow path.** It
+found a genuine failure on the deep path and a false one on the shallow path,
+which is worse than useless if read carelessly.
+
+Rules that follow, for anyone touching this probe:
+
+* The unambiguous MODEL-side bug signals are `Ignoring input until
+  display/driver startup is stable` (the model refusing a touch) and a park
+  count that INCREASES after the wake. Both are counted and printed. A pixel
+  verdict alone cannot tell "the model broke" from "the device correctly went
+  back to sleep while you stared at it".
+* The deep path (auto-sleep -> OOCSHDWN -> pre-warm park) and the shallow path
+  (panel sleep only) are DIFFERENT BUGS' territory and behave differently.
+  Which one a run exercises depends on how long the device idles first; check
+  the park count rather than assuming.
+* The failure the user reports reproduces in the REAL WINDOW. Five VNC
+  configurations passed a build that was visibly broken by hand.

@@ -1629,6 +1629,65 @@ static uint32_t ipod_touch_home_irq(void)
     return GPIO_BUTTON_M68AP_MENU_IRQ;
 }
 
+/*
+ * WAKE ACTIVITY -- deliver the wake press to the guest as a real button.
+ *
+ * On hardware, pressing Home while the device sleeps both wakes the SoC AND
+ * is seen by the OS as user input, which restarts its display-idle timer.
+ * This model only did the first half: the pre-warm branch below turns the
+ * press into a PMU wake cause and sets suppress_home_release, so the guest
+ * never receives a button at all. The kernel resumes with an idle timer that
+ * was ALREADY expired when it slept, re-commits to sleep within seconds, and
+ * the machine parks again -- and because each park is a reset that clears the
+ * LCD's input_ready gate (which cannot re-arm while the panel is off), every
+ * subsequent touch is refused by the model with "Ignoring input until
+ * display/driver startup is stable". That is the user-reported "touch is dead
+ * after waking from auto-sleep", reproduced in the Cocoa window 2026-08-01:
+ * 3 parks, 5 touches refused, 1 touch accepted all session.
+ *
+ * So: after the resumed kernel has had a moment to come up, inject a full
+ * press+release through the ordinary GPIO path. IT_WAKE_ACTIVITY=0 disables
+ * it for an A/B.
+ */
+#define WAKE_ACTIVITY_DELAY_NS   (3000 * 1000000LL)   /* let the resume run */
+#define WAKE_ACTIVITY_HOLD_NS    (150 * 1000000LL)    /* a human-length press */
+
+static bool ipod_touch_wake_activity_enabled(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_WAKE_ACTIVITY");
+        mode = !(e && e[0] == '0');
+    }
+    return mode;
+}
+
+static void ipod_touch_wake_activity(void *opaque)
+{
+    IPodTouchMultitouchState *s = opaque;
+    uint32_t home_pin = ipod_touch_home_pin();
+    uint32_t home_irq = ipod_touch_home_irq();
+    int grp = home_irq / NUM_GPIO_PINS;
+    int sel = home_irq % NUM_GPIO_PINS;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!s->gpio_state || !s->sysic) {
+        return;
+    }
+    if (!s->wake_activity_pressed) {
+        s->gpio_state->gpio_state |= (1 << (home_pin & 0xf));
+        s->wake_activity_pressed = true;
+        timer_mod(s->wake_activity_timer, now + WAKE_ACTIVITY_HOLD_NS);
+    } else {
+        s->gpio_state->gpio_state &= ~(1 << (home_pin & 0xf));
+        s->wake_activity_pressed = false;
+    }
+    s->sysic->gpio_int_status[grp] |= (1 << sel);
+    qemu_irq_raise(s->sysic->gpio_irqs[grp]);
+    timer_mod(s->sysic->gpio_irq_lower_timers[grp], now + GPIO_IRQ_PULSE_NS);
+}
+
 static void ipod_touch_key_event(void *opaque, int keycode)
 {
     bool do_irq = false;
@@ -1743,6 +1802,15 @@ static void ipod_touch_key_event(void *opaque, int keycode)
             fprintf(stderr, "[WAKE] %s completed pre-warmed wake\n",
                     keycode == 25 ? "Power" : "Home");
             vm_start();
+            /* The guest has been resumed but has NOT been told a button was
+             * pressed. Give it the press for real, or it re-sleeps within
+             * seconds and parks again -- see ipod_touch_wake_activity(). */
+            if (ipod_touch_wake_activity_enabled() && s->wake_activity_timer) {
+                s->wake_activity_pressed = false;
+                timer_mod(s->wake_activity_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          WAKE_ACTIVITY_DELAY_NS);
+            }
         } else {
             /* The wake boot has not reached its park point yet; the type-4
              * commit will now pass straight through instead of parking. */
@@ -2315,6 +2383,9 @@ static void ipod_touch_machine_init(MachineState *machine)
 
     qemu_register_reset(ipod_touch_cpu_reset, nms);
 
+    spi2_state->mt->wake_activity_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, ipod_touch_wake_activity,
+                     spi2_state->mt);
     qemu_input_handler_register(DEVICE(spi2_state->mt),
                                 &ipod_touch_key_handler);
 }

@@ -61,6 +61,17 @@ def main() -> int:
     ap.add_argument("--gate-timeout", type=int, default=420)
     ap.add_argument("--sleep-timeout", type=int, default=300,
                     help="max seconds to wait for the auto-sleep")
+    ap.add_argument("--wake-settle", type=float, default=45,
+                    help="seconds to WAIT after the panel lights before "
+                         "sliding. THIS is what made five earlier probe "
+                         "configurations pass a broken build: they slid ~10 s "
+                         "after the wake and beat the re-sleep, and the slide "
+                         "itself counts as user activity so the device stayed "
+                         "up. The wake press is consumed as a PMU wake cause "
+                         "and never delivered as input, so the guest's idle "
+                         "timer is never reset and it re-sleeps within "
+                         "seconds. A human looks at the screen first; so does "
+                         "this now.")
     ap.add_argument("--pre-app", action="store_true",
                     help="USE the device before idling into auto-sleep: open "
                          "an app, press HOME, wait for the return. Every "
@@ -277,8 +288,26 @@ def main() -> int:
         time.sleep(4)
         woke = ab.grab(q, tmp)
 
+        # The definitive signature, independent of what the slide does: did the
+        # device PARK AGAIN after we woke it? Counting parks is exact, where a
+        # pixel verdict is a judgement call.
+        parks_before = logp.read_bytes().decode("utf8", "replace").count(
+            "Pre-warmed wake parked")
+        if args.wake_settle:
+            print(f"settling {args.wake_settle:.0f}s before the slide "
+                  "(a human looks at the screen first) ...")
+            time.sleep(args.wake_settle)
+        full = logp.read_bytes().decode("utf8", "replace")
+        parks_after = full.count("Pre-warmed wake parked")
+        reparked = parks_after > parks_before
+        idx = ab.scanout_index(logp)
+        settled = ab.grab(q, tmp)
+        print(f"after settle: lit={ab.lit(settled, idx):.1f}%  "
+              f"parks {parks_before} -> {parks_after}"
+              f"{'   *** RE-PARKED: the wake did not stick ***' if reparked else ''}")
+
         print("sliding to unlock ...")
-        before = woke
+        before = settled
         lock.slide(q, steps=18, dwell=0.05)
         time.sleep(6)
         idx = ab.scanout_index(logp)
@@ -286,12 +315,18 @@ def main() -> int:
         d = ab.changed(before, after, idx)
         seg = logp.read_bytes()[mark:].decode("utf8", "replace")
         touches = [l.strip() for l in seg.splitlines() if "[TOUCH]" in l]
+        refused = sum(1 for l in touches if "Ignoring input" in l)
         print(f"slide verdict: screen changed {d:.2f}%  "
               f"({'UNLOCKED -- touch works' if d > 20 else 'DEAD -- touch lost'})")
-        print(f"[TOUCH] lines after wake: {len(touches)}")
+        print(f"[TOUCH] lines after wake: {len(touches)}  "
+              f"({refused} REFUSED BY THE MODEL)")
         for l in touches[:10]:
             print(f"    {l}")
-        rc = 0 if d > 20 else 1
+        ok = d > 20 and not reparked and refused == 0
+        print(f"\nVERDICT: {'PASS' if ok else 'FAIL'}"
+              f"{' -- re-parked after the wake' if reparked else ''}"
+              f"{f' -- {refused} touches refused' if refused else ''}")
+        rc = 0 if ok else 1
     finally:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)

@@ -257,6 +257,14 @@ typedef struct IPodTouchMultitouchState {
     IPodTouchLCDState *lcd;  // for display wake control
     bool suppress_power_release;
     bool suppress_home_release;
+    /*
+     * The wake press is consumed as a PMU wake CAUSE and never reaches the
+     * guest as a button, so iPhone OS never sees user activity and re-sleeps
+     * within seconds of waking. This timer delivers it for real, once the
+     * resumed kernel is up. See ipod_touch_wake_activity().
+     */
+    QEMUTimer *wake_activity_timer;
+    bool wake_activity_pressed;
     float touch_x;
     float touch_y;
     float prev_touch_x;
