@@ -491,6 +491,37 @@ follow:
 * Whatever updates those words on real hardware, it is not a walk through
   this page table. Do not build the completion path on that premise.
 
+### And `+0x60` is a POINTER, not a completion flag
+
+The structure at `[obj+0x1a4]` (PA 0x08b85600 on this boot), dumped live:
+
+```
+0000  00 20 a5 c0   00 a0 75 f2   d0 9f 86 c0   01 00 00 00
+      ^ 0xc0a52000  ^ 0xf275a000  ^ 0xc0869fd0
+      the device    = [obj+0x1a8]
+0010  01 00 00 00   01 00 00 00   00 00 00 00   2c 81 74 f0
+0050  01 00 00 00   01 00 00 00   00 00 00 00   00 00 00 00
+0060  00 54 b8 c0   01 00 00 00   00 00 00 00   00 80 74 f0
+      ^ +0x60 = 0xc0b85400
+```
+
+`+0x60` holds **0xc0b85400** — a kernel VA, 0x200 below the structure
+itself, i.e. a pointer to a sibling. So the note carried forward from the
+button investigation — *"the recovery sleep is taken when
+`[[obj+0x1a4]+0x60] != 0`, and nothing in the kext writes it, so the
+engine owns it"* — cannot be read as "clear it to signal completion":
+that word is essentially always non-null, and zeroing it would corrupt a
+pointer. Either the offset differs on 4A102 from the 1.0 kext it was
+derived from, or the predicate tests something reached *through* that
+pointer.
+
+**This is why the completion path was not implemented tonight.** Writing
+`0` there was the obvious next move and it would have been the seventh
+wedge. Re-derive the predicate from the disassembly of the sleep site
+against a live dump of `0xc0b85400`'s own structure before any device code
+touches it. `mbx-mmu-probe` now prints both structures on every run, so
+the evidence is one boot away.
+
 ## 1. What exists today
 
 `hw/arm/ipod_touch.c`, `s5l8900_mbx_read` / `s5l8900_mbx_write` — about 25
