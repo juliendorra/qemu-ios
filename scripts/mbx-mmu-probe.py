@@ -315,6 +315,54 @@ def main() -> int:
             print(f"\naperture writes vs mapped DRAM: {match} match, "
                   f"{miss} differ, {untrans} untranslatable "
                   f"(of {len(writes)} distinct addresses)")
+        # ---- locate the op-state structures the completion path polls ----
+        # The recovery routine sleeps on [[obj+0x1a4]+0x60] and re-posts soft
+        # events from [1a4]+0x24/+0x4c and [1a8]+0x2c; nothing in the kext
+        # ever WRITES those words, so the engine owns them -- and the engine
+        # can only reach memory through this page table. The driver object
+        # announces itself on the console ("AppleMBXDevice(0xc0a36800): Init"),
+        # which is all we need to read the two pointers and ask whether they
+        # are mapped. If they are, the model can write completions there;
+        # if not, the completion travels by some other route and that is
+        # worth knowing before any more device code is written.
+        m = re.search(rb"AppleMBXDevice\(0x([0-9a-f]{8})\)",
+                      serial.read_bytes())
+        if m:
+            obj_va = int(m.group(1), 16)
+            obj_pa = (obj_va - 0xC0000000) + RAM_BASE
+            print(f"\nAppleMBXDevice at VA 0x{obj_va:08x} (PA 0x{obj_pa:08x})")
+            report["mbx_device"] = {"va": f"{obj_va:08x}"}
+            # reverse map: every PTE in the eight tables, page -> MBX VA
+            rev = {}
+            for di, pde in enumerate(directory):
+                tbl = pmem(pde & ~0xFFF, PAGE)
+                if not tbl:
+                    continue
+                for ti in range(1024):
+                    pte = int.from_bytes(tbl[ti * 4:ti * 4 + 4], "little")
+                    if pte & ~0xFFF:
+                        rev.setdefault(pte & ~0xFFF,
+                                       (di << 22) | (ti << 12))
+            print(f"page table maps {len(rev)} pages")
+            report["mapped_pages"] = len(rev)
+            for off, name in ((0x1a4, "[obj+0x1a4]"), (0x1a8, "[obj+0x1a8]")):
+                raw = pmem(obj_pa + off, 4)
+                if not raw:
+                    continue
+                ptr = int.from_bytes(raw, "little")
+                pa = (ptr - 0xC0000000) + RAM_BASE if ptr >= 0xC0000000 else ptr
+                mapped = rev.get(pa & ~0xFFF)
+                where = (f"MBX VA 0x{mapped | (pa & 0xFFF):06x}"
+                         if mapped is not None else "NOT MMU-mapped")
+                print(f"  {name} = 0x{ptr:08x} -> PA 0x{pa:08x}: {where}")
+                report.setdefault("op_state", {})[name] = {
+                    "ptr": f"{ptr:08x}", "pa": f"{pa:08x}",
+                    "mbx_va": f"{mapped:06x}" if mapped is not None else None}
+                if mapped is not None:
+                    w = pmem(pa + 0x60, 4)
+                    if w:
+                        print(f"      +0x60 (the word the recovery sleep "
+                              f"waits on) = 0x{int.from_bytes(w, 'little'):08x}")
         q.close()
     finally:
         if proc.poll() is None:
