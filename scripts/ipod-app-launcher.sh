@@ -56,6 +56,11 @@ case "$PROFILE" in
         # (IN_APP_BUTTON_INVESTIGATION.md, 2026-07-31). Overridable for A/Bs.
         export IT_MBX_EVENTS="${IT_MBX_EVENTS:-1}"
         export IT_MBX_IRQ="${IT_MBX_IRQ:-12}"
+        export IT_MBX_MMU="${IT_MBX_MMU:-1}"
+        # The experimental copy-block decoder remains opt-in until its
+        # coordinate/pitch interpretation passes pixel comparison.
+        export IT_MBX_2D_BLIT="${IT_MBX_2D_BLIT:-0}"
+        export IT_MBX_2D_EVENT="${IT_MBX_2D_EVENT:-0x4c}"
         ;;
     *)
         echo "Unsupported S5L8900 profile: $PROFILE" >&2
@@ -111,6 +116,39 @@ if [[ "$PROFILE" == "iphone-2g" && "${S5L8900_STAGE_NAND:-1}" != "0" ]]; then
     cp "$NOR" "$STAGE_DIR/nor.bin"
     NAND="$STAGE_DIR/nand"
     NOR="$STAGE_DIR/nor.bin"
+
+    # iPhone OS 1.0's LayerKit commits to the legacy MBX2D backing-store
+    # renderer when mbx2DInitialize succeeds.  The S5L8900 model can enumerate
+    # MBX (needed during boot) but does not yet execute that renderer's shared
+    # surface-ring protocol.  Advertising success therefore costs one timeout
+    # per strip and eventually exposes a partially painted, iconless
+    # SpringBoard.  1.1.4 never commits to this path on the same model.
+    #
+    # Force the 1A543a guest's existing software fallback by changing ONLY the
+    # disposable per-launch packed-NAND clone.  Guard both the firmware epoch
+    # and the exact original instruction bytes; an unknown artifact fails
+    # closed instead of being corrupted.  The installed firmware source stays
+    # pristine, as required by the staged-firmware policy.  Set
+    # IT_IOS10_SOFTWARE_MBX2D=0 for MBX protocol investigation.
+    IOS10_PROVENANCE="$FIRMWARE_DIR/nand/nand-provenance.json"
+    if [[ "$(tr -cd '0-9' < "$FIRMWARE_DIR/epoch" 2>/dev/null || true)" == "0" &&
+          -r "$IOS10_PROVENANCE" &&
+          "${IT_IOS10_SOFTWARE_MBX2D:-1}" != "0" ]] &&
+          grep -q '"build"[[:space:]]*:[[:space:]]*"1A543a"' "$IOS10_PROVENANCE"; then
+        IOS10_PACK="$NAND/nand.pack"
+        IOS10_MBX2D_OFFSET=$((0x205bf04))
+        IOS10_MBX2D_ORIGINAL="$(dd if="$IOS10_PACK" bs=1 \
+            skip="$IOS10_MBX2D_OFFSET" count=8 2>/dev/null | \
+            od -An -tx1 | tr -d ' \n')"
+        if [[ "$IOS10_MBX2D_ORIGINAL" != "b0402de908708de2" ]]; then
+            echo "Refusing unknown iPhone OS 1.0 MBX2D image at packed offset $IOS10_MBX2D_OFFSET" >&2
+            exit 1
+        fi
+        printf '\001\000\240\343\036\377\057\341' | \
+            dd of="$IOS10_PACK" bs=1 seek="$IOS10_MBX2D_OFFSET" \
+                conv=notrunc 2>/dev/null
+        echo "iPhone OS 1.0: staged LayerKit software-renderer fallback enabled" >&2
+    fi
 fi
 
 BRIDGE_PID=""

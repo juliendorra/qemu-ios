@@ -30,9 +30,10 @@
 #   * lockdownd activation patch      — required; no data-only ark survives
 #                                       boot re-validation without a genuine
 #                                       Apple-signed activation record
-#   * LK_ENABLE_MBX2D=0               — SHORTCUT for the unmodelled MBX 2D
-#                                       (task T2 in M68AP_RENDER_HANDOFF.md);
-#                                       devos50's iPod image ships it too
+#   * legacy 1A543a MBX2D fallback    — the launcher changes only its disposable
+#                                       staged NAND clone so LayerKit selects
+#                                       software rendering; the model does not
+#                                       implement the old shared-surface engine
 #   * reference-shaped data ark       — key names/types mirrored from a real
 #                                       activated device; no Apple material
 #   * HTTPS-bridge CA in the guest    — ALWAYS, no flag needed: the launcher

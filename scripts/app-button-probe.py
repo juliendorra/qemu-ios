@@ -161,7 +161,11 @@ def key(q: QMP, name: str, hold: float = 0.15):
 # "passing" on a 97% change that was really the app finally opening. Scale them
 # all with IT_PROBE_WAIT (default 2x).
 _W = float(os.environ.get("IT_PROBE_WAIT", "2"))
-WAIT_OPEN, WAIT_TOUCH, WAIT_HOME, WAIT_POWER = (5 * _W, 4 * _W, 8 * _W, 10 * _W)
+WAIT_OPEN, WAIT_TOUCH, WAIT_POWER = (5 * _W, 4 * _W, 10 * _W)
+# A working handoff must not consume iOS 1.0's ~33 FinishSurface timeouts.
+# IT_HOME_WAIT lets a diagnostic tighten the bound without changing the other
+# waits; the normal limit remains comparable to the prompt iOS 1.1.4 path.
+WAIT_HOME = float(os.environ.get("IT_HOME_WAIT", str(8 * _W)))
 
 
 def grab(q: QMP, tmp: Path) -> list:
@@ -353,26 +357,35 @@ def main() -> int:
             report["steps"].append({"step": "gate", "pass": False})
             return 2
 
-        def step(name, fn, wait, verdict, note=""):
+        def step(name, fn, wait, verdict, note="", attempts=1):
             nonlocal rc
             mark = logp.stat().st_size
             before = grab(q, tmp)
-            fn()
-            time.sleep(wait)
-            after = grab(q, tmp)
-            seg = logp.read_bytes()[mark:].decode("utf8", "replace")
+            after = before
+            ok = False
+            attempt = 0
+            for attempt in range(1, attempts + 1):
+                fn()
+                time.sleep(wait)
+                after = grab(q, tmp)
+                seg = logp.read_bytes()[mark:].decode("utf8", "replace")
+                idx = scanout_index(logp)
+                d = changed(before, after, idx)
+                ok = verdict(d, before, after, seg)
+                if ok:
+                    break
             # Judge the buffer the LCD is actually scanning out. Anything else
             # scores repaints the user cannot see -- which is exactly how this
             # step reported PASS 94.62% on 1.0 while the screen sat unmoved.
             idx = scanout_index(logp)
             d = changed(before, after, idx)
-            ok = verdict(d, before, after, seg)
             png(after, args.logs / f"{name}.png")
             lb, la = lit(before, idx), lit(after, idx)
             off = max(changed(before, after), 0.0)
             report["steps"].append({"step": name, "diff": d, "pass": bool(ok),
                                     "scanout_index": idx,
                                     "diff_any_buffer": off,
+                                    "attempts": attempt,
                                     "lit_before": lb,
                                     "lit_after": la, "note": note})
             extra = ""
@@ -409,6 +422,13 @@ def main() -> int:
             tap(q, *dismiss, 0.12)
             time.sleep(WAIT_TOUCH)
 
+        # HOME is only successful if it returns to this actual, icon-filled
+        # SpringBoard frame.  The old oracle accepted any >20% repaint after
+        # forty seconds, including the iconless partial frame reported by the
+        # user; that converted the exact failure under investigation to PASS.
+        home_reference = grab(q, tmp)
+        png(home_reference, args.logs / "home_reference.png")
+
         # Require the screen to actually become APP-LIKE, not merely to change.
         # A launch replaces the home grid, so the lit fraction moves a long way
         # (1.0: 45.4 -> 99.2, iPod: 29.9 -> 99.9); a modal sitting over the home
@@ -419,26 +439,37 @@ def main() -> int:
         step("1_open_app", lambda: tap(q, *icon, 0.12), WAIT_OPEN,
              lambda d, b, a, seg: d > 20 and abs(lit(a, scanout_index(logp))
                                                 - lit(b, scanout_index(logp))) > 8,
-             "tapping an icon must open something")
+             "tapping an icon must open something", attempts=3)
         step("2_touch_in_app", lambda: tap(q, 160, 423, 0.12), WAIT_TOUCH,
              lambda d, b, a, seg: d > 2,
              "touch must still work with an app frontmost")
-        step("3_home_returns", lambda: key(q, "h"), WAIT_HOME,
-             lambda d, b, a, seg: d > 20,
-             "HOME must return to SpringBoard")
-        step("4_power_sleeps", lambda: key(q, "p"), WAIT_POWER, slept_verdict,
-             "POWER must put the panel to sleep")
+        home_after = step(
+            "3_home_returns", lambda: key(q, "h"), WAIT_HOME,
+            lambda d, b, a, seg: d > 20 and
+            changed(home_reference, a, scanout_index(logp)) < 12,
+            "HOME must promptly restore the icon-filled SpringBoard")
+        home_ref_diff = changed(home_reference, home_after,
+                                scanout_index(logp))
+        report["steps"][-1]["home_reference_diff"] = home_ref_diff
+        print(f"      SpringBoard reference difference: {home_ref_diff:.2f}%")
+        step("4_reopen_for_power", lambda: tap(q, *icon, 0.12), WAIT_OPEN,
+             lambda d, b, a, seg: d > 20 and
+             abs(lit(a, scanout_index(logp)) -
+                 lit(b, scanout_index(logp))) > 8,
+             "the app must be frontmost before testing POWER", attempts=3)
+        step("5_power_in_app_sleeps", lambda: key(q, "p"), WAIT_POWER,
+             slept_verdict, "POWER must sleep with an app frontmost")
         slept = report["steps"][-1]["pass"]
         if slept:
-            step("5_home_wakes", lambda: key(q, "h"), 10,
+            step("6_home_wakes", lambda: key(q, "h"), 10,
                  lambda d, b, a, seg: d > 20,
                  "HOME must light the panel again")
         else:
             # Waking is meaningless if the panel never slept; asserting it
             # here would PASS vacuously and hide the failure above.
-            report["steps"].append({"step": "5_home_wakes", "pass": None,
+            report["steps"].append({"step": "6_home_wakes", "pass": None,
                                     "note": "skipped: power never slept"})
-            print("SKIP  5_home_wakes            (power never slept)")
+            print("SKIP  6_home_wakes            (power never slept)")
     finally:
         if client:
             client.stop()

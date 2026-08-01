@@ -35,9 +35,11 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import mmap
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -56,7 +58,6 @@ def _load(name, path):
 
 
 lockprobe = _load("lockprobe", REPO / "scripts" / "lock-unlock-probe.py")
-
 PDE_RE = re.compile(r"\[MBX\].*WR 0x0(10[0-9a-f]{2}) = 0x([0-9a-f]{8})")
 
 # MBX virtual addresses the driver hands the engine, from the measured init
@@ -72,6 +73,59 @@ TARGETS = {
 PAGE = 0x1000
 RAM_BASE = 0x08000000
 RAM_END = 0x48000000
+
+
+def force_mbx2d(nand: Path) -> str:
+    """Set SpringBoard's staged LK_ENABLE_MBX2D value to "1" in place.
+
+    The launchd plist is a small binary plist occupying one NAND data page.
+    Keeping the serialized object the same length avoids changing HFS catalog
+    metadata; only the cloned page is dirtied.  The source NAND is never used
+    as the target.
+    """
+    key = b"LK_ENABLE_MBX2D"
+    for page in nand.glob("bank*/*.page"):
+        raw = bytearray(page.read_bytes())
+        data = raw[:0x800]
+        start = data.find(key)
+        if not data.startswith(b"bplist00") or start < 0:
+            continue
+        value = data.find(b"Q0", start + len(key), start + len(key) + 32)
+        if value < 0:
+            raise SystemExit(f"{page}: LK_ENABLE_MBX2D is not string '0'")
+        raw[value + 1] = ord("1")
+        page.write_bytes(raw)
+        return str(page.relative_to(nand))
+
+    # A packed NAND need not carry a sparse override for this page.  The pack
+    # is itself an APFS clone in the stage, so changing one byte here remains
+    # isolated and copy-on-write just like the override case above.
+    pack = nand / "nand.pack"
+    with pack.open("r+b") as fh:
+        mapping = mmap.mmap(fh.fileno(), 0)
+        _magic, _version, page_size, count = struct.unpack_from(
+            "<8sIII", mapping)
+        data_offset = 20 + count * 4
+        pos = mapping.find(key, data_offset)
+        while pos >= 0:
+            entry = (pos - data_offset) // page_size
+            base = data_offset + entry * page_size
+            data = mapping[base:base + 0x800]
+            start = data.find(key)
+            if data.startswith(b"bplist00") and start >= 0:
+                value = data.find(b"Q0", start + len(key),
+                                  start + len(key) + 32)
+                if value < 0:
+                    mapping.close()
+                    raise SystemExit(
+                        f"{pack}: LK_ENABLE_MBX2D is not string '0'")
+                mapping[base + value + 1] = ord("1")
+                mapping.flush()
+                mapping.close()
+                return f"nand.pack entry {entry}"
+            pos = mapping.find(key, pos + len(key))
+        mapping.close()
+    raise SystemExit("SpringBoard launch plist page not found in staged NAND")
 
 
 def walk(pmem, directory, va):
@@ -114,6 +168,19 @@ def main() -> int:
                          "the page table maps -- the trace records every "
                          "aperture write, and the report diffs them against "
                          "the translated page.")
+    ap.add_argument("--force-mbx2d", action="store_true",
+                    help="set LK_ENABLE_MBX2D=1 for SpringBoard in the "
+                         "staged NAND, and enable MBX MMU forwarding plus "
+                         "2D tracing. Combine with --exercise to drive an "
+                         "app dismissal; the installed firmware artifacts "
+                         "are never changed.")
+    ap.add_argument("--exec-trace", action="store_true",
+                    help="record a filtered per-TB trace of the 1.0 MBX open "
+                         "and FinishSurface paths in <logs>/mbx-exec.log; "
+                         "use only for diagnosis because nochain is slow")
+    ap.add_argument("--op-trace", action="store_true",
+                    help="dump AppleMBX operation-state words at waits, event "
+                         "arms and kicks")
     ap.add_argument("--icon", type=int, nargs=2, default=(277, 258),
                     metavar=("X", "Y"),
                     help="icon to open for --exercise (default: the "
@@ -122,6 +189,9 @@ def main() -> int:
                     help="keep the staged NAND clone (~300 MB) after the run; "
                          "by default it is deleted, per the repo's "
                          "disk-hygiene rule")
+    ap.add_argument("--reuse-stage", action="store_true",
+                    help="reuse <logs>/stage from a prior --keep-stage run "
+                         "instead of cloning and patching it again")
     args = ap.parse_args()
 
     paths = m68ap_paths.get(args.build)
@@ -129,20 +199,37 @@ def main() -> int:
     args.logs.mkdir(parents=True, exist_ok=True)
     stage = args.logs / "stage"
     nand = stage / "nand"
-    if nand.exists():
-        import shutil
-        shutil.rmtree(nand)
-    stage.mkdir(exist_ok=True)
-    subprocess.run(["cp", "-Rc", str(paths.nand), str(nand)], check=True)
-    for b in range(8):
-        (nand / f"bank{b}").mkdir(exist_ok=True)
     nor = stage / "nor.bin"
-    subprocess.run(["cp", str(paths.nor), str(nor)], check=True)
+    if args.reuse_stage:
+        if not (nand / "nand.pack").exists() or not nor.exists():
+            raise SystemExit("--reuse-stage needs <logs>/stage/nand/nand.pack "
+                             "and <logs>/stage/nor.bin")
+    else:
+        if nand.exists():
+            import shutil
+            shutil.rmtree(nand)
+        stage.mkdir(exist_ok=True)
+        subprocess.run(["cp", "-Rc", str(paths.nand), str(nand)], check=True)
+        for b in range(8):
+            (nand / f"bank{b}").mkdir(exist_ok=True)
+        subprocess.run(["cp", str(paths.nor), str(nor)], check=True)
+
+    if args.force_mbx2d and not args.reuse_stage:
+        page = force_mbx2d(nand)
+        print(f"staged SpringBoard: LK_ENABLE_MBX2D='1' in "
+              f"{page}; hardware path forced", flush=True)
 
     classify = lockprobe._classifier()
-    qmp_path = Path(f"/tmp/mbxmmu-{os.getpid()}.qmp")
+    # Use the canonical writable temporary root.  On sandboxed macOS runs
+    # /tmp may resolve through a path the QEMU process cannot bind in even
+    # though /private/tmp is available.
+    qmp_path = Path(f"/private/tmp/mbxmmu-{os.getpid()}.qmp")
     serial, stderr = args.logs / "serial.log", args.logs / "stderr.log"
-    vnc_port = 5996
+    # A fixed :96 collides with concurrent or interrupted probes. Binding a
+    # test socket is prohibited in the normal workspace sandbox, so derive a
+    # high display number from this short-lived process instead; the QMP path
+    # uses the same collision-resistant convention.
+    vnc_port = 6100 + os.getpid() % 1000
 
     cmd = [str(args.qemu),
            "-M", (f"iPhone-2G,bootrom={m68ap_paths.BOOTROM},"
@@ -152,14 +239,28 @@ def main() -> int:
            "-serial", f"file:{serial}",
            "-qmp", f"unix:{qmp_path},server,nowait",
            "-vnc", f"127.0.0.1:{vnc_port - 5900}"]
+    if args.exec_trace:
+        cmd += ["-d", "exec,nochain",
+                "-dfilter", "0xc032a000+0xe5d0",
+                "-D", str(args.logs / "mbx-exec.log")]
     (args.logs / "command.txt").write_text(" ".join(cmd) + "\n")
     env = dict(os.environ)
     env.setdefault("IT_M68AP_NO_BASEBAND", "1")
     env["IT_MBX_TRACE"] = "all"
+    if args.force_mbx2d:
+        env["IT_MBX_MMU"] = "1"
+        env["IT_MBX_2D_TRACE"] = "1"
+        env["IT_MBX_EVENTS"] = "1"
+        env["IT_MBX_IRQ"] = "12"
+        env.setdefault("IT_MBX_2D_BLIT", "0")
+        env.setdefault("IT_MBX_2D_EVENT", "0x4c")
+    if args.op_trace:
+        env["IT_MBX_OP_TRACE"] = "1"
     proc = subprocess.Popen(cmd, env=env, stdout=stderr.open("wb"),
                             stderr=subprocess.STDOUT)
 
-    report = {"build": args.build, "targets": {}}
+    report = {"build": args.build, "force_mbx2d": args.force_mbx2d,
+              "targets": {}}
     try:
         client = lockprobe.DisplayClient(vnc_port)
         client.start()
@@ -187,6 +288,21 @@ def main() -> int:
             # runs slower than wall clock, and the 1.0 dismissal alone is
             # ~34 s of guest time. No polling between input and verdict
             # (the dismiss-latency pmemsave trap).
+            if args.build == "4A102":
+                # The pristine 1.1.4 NAND raises SpringBoard's first-launch
+                # informational alert on every cloned boot.  Its modal blocks
+                # icon input until the measured Dismiss button is tapped.
+                lockprobe._abs(q, 160, 324)
+                q.cmd("input-send-event", {"events": [
+                    {"type": "btn", "data": {
+                        "down": True, "button": "left"}}]})
+                time.sleep(0.12)
+                q.cmd("input-send-event", {"events": [
+                    {"type": "btn", "data": {
+                        "down": False, "button": "left"}}]})
+                time.sleep(5)
+                print("exercise: dismissed 4A102 first-launch alert",
+                      flush=True)
             x, y = args.icon
             print(f"exercise: tapping icon ({x},{y}), waiting, HOME, "
                   f"waiting out the dismissal ...", flush=True)
@@ -196,7 +312,10 @@ def main() -> int:
             time.sleep(0.12)
             q.cmd("input-send-event", {"events": [
                 {"type": "btn", "data": {"down": False, "button": "left"}}]})
-            time.sleep(60)
+            # 1.1.4 reaches its app quickly and will auto-sleep if this probe
+            # waits a full minute before HOME.  The slower 1.0 path needs the
+            # original generous wait under icount.
+            time.sleep(8 if args.build == "4A102" else 60)
             d, kind = lockprobe.grab(q, args.logs, classify)
             lockprobe.png(d, args.logs / "in-app.png")
             print(f"after tap: {kind}")
@@ -207,20 +326,21 @@ def main() -> int:
             # undershoots the ~34 s guest-time dismissal -- the first run of
             # this mode stopped at the 0x12C soft event with zero command
             # writes captured. Instead, watch the model's own trace: wait
-            # until aperture writes (offset >= 0x2000) appear and stop
-            # growing, with a hard cap.
+            # until real engine kicks appear and stop growing, with a hard
+            # cap.  The stream is CPU-written shared DRAM: no aperture write
+            # is required, so waiting for one can never complete.
             print("waiting for the 2D command stream in the trace ...",
                   flush=True)
-            wr_re2 = re.compile(rb"WR 0x([0-9a-f]{4,7}) =")
+            kick_re = re.compile(rb"WR 0x0*6d8 =")
             last, stable, waited = -1, 0, 0
-            while waited < 600 and stable < 3:
+            stream_timeout = 180 if args.build == "4A102" else 600
+            while waited < stream_timeout and stable < 3:
                 time.sleep(30)
                 waited += 30
-                n = sum(1 for m in wr_re2.finditer(stderr.read_bytes())
-                        if int(m.group(1), 16) >= 0x2000)
+                n = len(kick_re.findall(stderr.read_bytes()))
                 stable = stable + 1 if (n == last and n > 0) else 0
                 last = n
-                print(f"  t+{waited}s: {n} aperture-write trace lines "
+                print(f"  t+{waited}s: {n} engine kicks "
                       f"(stable x{stable})", flush=True)
             d, kind = lockprobe.grab(q, args.logs, classify)
             lockprobe.png(d, args.logs / "after-home.png")
@@ -280,6 +400,9 @@ def main() -> int:
         # the real data path. If they are absent, the aperture IS the write
         # path and the model must forward it through this table.
         wr_re = re.compile(r"\[MBX\].*WR 0x([0-9a-f]{4,7}) = 0x([0-9a-f]{8})")
+        forwarded_re = re.compile(
+            r"\[MBX-MMU\] WR 0x([0-9a-f]{4,7}) -> PA "
+            r"0x([0-9a-f]{8}) = 0x([0-9a-f]{8})")
         text = stderr.read_bytes().decode("latin1", "replace")
         writes = {}
         for m in wr_re.finditer(text):
@@ -290,11 +413,21 @@ def main() -> int:
         if writes:
             match = miss = untrans = 0
             page_cache = {}
+            forwarded = {}
+            for m in forwarded_re.finditer(text):
+                forwarded[int(m.group(1), 16)] = (
+                    int(m.group(2), 16), int(m.group(3), 16))
             for a, v in sorted(writes.items()):
-                pa, how = walk(pmem, directory, a)
-                if pa is None:
-                    untrans += 1
-                    continue
+                if a in forwarded:
+                    pa, forwarded_v = forwarded[a]
+                    if forwarded_v != v:
+                        miss += 1
+                        continue
+                else:
+                    pa, how = walk(pmem, directory, a)
+                    if pa is None:
+                        untrans += 1
+                        continue
                 pg = pa & ~0xFFF
                 if pg not in page_cache:
                     page_cache[pg] = pmem(pg, PAGE) or b""

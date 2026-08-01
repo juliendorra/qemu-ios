@@ -1,8 +1,14 @@
 # The in-app HOME/POWER bug on iPhone OS 1.0 — full record
 
-**Status: OPEN.** Authoritative record for this investigation; the sections in
+**Status: FIXED and regression-tested (2026-08-01).** Authoritative record for this investigation; the sections in
 `NEXT_SESSION_HANDOFF.md` are the raw chronological log and several of their
 conclusions are retracted here.
+
+Final acceptance on the staged iPhone OS 1.0 bundle is recorded at the end of
+this file. It uses 1.0's software compositor because the old MBX2D
+shared-surface renderer is not implemented. The installed firmware source is
+never modified; the compatibility change is guarded and applied only to the
+disposable per-launch NAND clone.
 
 ## The bug
 
@@ -193,7 +199,7 @@ Do not re-try any of these.
 | Interrupt not delivered / not ACKed | Byte-identical SYSIC sequence to 1.1.4 and the iPod, press and release. |
 | `AppleM68Buttons` differs | Instruction-for-instruction identical between builds; only vtable slot offsets differ. |
 | The guest polls a GPIO we do not drive | 1.1.4 makes ZERO GPIO accesses after the press and works fine. |
-| It is a BOARD problem | 1.1.4 passes all five steps on the same board once its first-launch modal is dismissed. |
+| It is a BOARD problem | 1.1.4 passes the same button assertions on the same board once its first-launch modal is dismissed. |
 | It is just slow / latency | Watched 7 minutes. (This run was later invalidated anyway — it pressed nothing. See below.) |
 | The host presenter stops | Runs 1:1 with the guest frame timer on the cocoa path (`present:8 vsync:8`). VNC-only artifact. |
 | The model raises the wrong LCD interrupt bit | Disassembling `AppleH1CLCD` showed bit 0 IS the frame interrupt. |
@@ -1900,3 +1906,80 @@ captures what the driver writes into MBX-space, including the page table at
 `0x61c = 0x00020007`, which is the translation the memory-side fix needs.
 Still off by default -- it changes nothing on its own (neutral is exactly
 what "the guest never reads this memory" predicts).
+
+## CLOSED: prompt HOME and POWER with an app frontmost (2026-08-01)
+
+The earlier claim that the +33.8-second dismissal was acceptable is retracted.
+That interval was 1.0 exhausting one legacy MBX2D timeout per backing-store
+strip. The result was only a partially painted SpringBoard without app icons;
+the old probe compared it with the app frame and produced a false positive.
+The 1.1.4 control never enters this renderer and returns promptly.
+
+`scripts/app-button-probe.py` now captures a full SpringBoard reference before
+opening the app. HOME has an eight-second bound and passes only if the returned
+frame is within 12% of that reference. It no longer grants the broken timeout
+path forty seconds in which to appear superficially different from the app.
+
+The S5L8900 model can enumerate MBX, which both releases need during boot, but
+does not execute 1A543a's older shared-surface-ring MBX2D renderer. For that
+specific IPSW-derived build, `scripts/ipod-app-launcher.sh` forces LayerKit's
+existing software-rendering fallback by making `_mbx2DInitialize` return
+failure in the disposable per-launch `nand.pack` clone. The launcher checks
+epoch 0, provenance build `1A543a`, and the exact original eight instruction
+bytes before changing them; an unexpected artifact fails closed. Set
+`IT_IOS10_SOFTWARE_MBX2D=0` to disable the compatibility path for continued
+MBX protocol investigation.
+
+This is a guarded guest compatibility patch, not a completed emulation of the
+legacy MBX2D engine. It is production-safe with the repository's staged-NAND
+launcher because the bundle's master NAND remains pristine and every run gets
+a fresh clone.
+
+### Final hardware-path dead ends (do not repeat)
+
+The compatibility path was chosen only after the following staged-firmware
+experiments failed the strict full-SpringBoard oracle. All knobs mentioned here
+remain diagnostic-only; none is needed by the working 1A543a launch path.
+
+| experiment | observed result | conclusion |
+|---|---|---|
+| Reject the MBX identifier from the first probe | boot failure | MBX enumeration is required even when legacy 2D rendering is not. |
+| Reject the identifier only after initialization / on reopen | unchanged timeout cascade | the connection and client decision are cached before app dismissal. |
+| Mark the queued 2D client unavailable | waiter woke into inconsistent shared state or still timed out | changing availability after a command is queued is too late. |
+| Bootstrap soft replies `0`, `1`, `0x40`, and joined `0x4c` | no correct repaint | register events alone do not retire the engine-owned surface ring. |
+| Restore the old d3f register/event configuration | same partial iconless SpringBoard | the regression is not a changed event constant. |
+| Raise `0x400`, including before the waiter arms | unchanged or wedged | it is not the legacy render-complete contract. |
+| Raise render-complete `0x10` immediately or deferred | wedged after the interrupt | announcing completion before shared operation state is coherent is worse than silence. |
+| Clear `state1+0x60` and publish completion bits | waiter bookkeeping diverged; no correct frame | that pointer participates in a larger microkernel-owned ring and is not a standalone busy flag. |
+| Decode and copy the observed strip descriptors (`IT_MBX_2D_BLIT=1`) | incomplete/wrong output; strict oracle failed | the measured stream is only part of the surface protocol; pitch, formats, joins, and retirement remain unresolved. |
+| Disable MBX2D through `LK_ENABLE_MBX2D=0` | variable was present and read, but old backing-store path still ran | this 1.0 path does not use that SpringBoard preference as a hard accelerator veto. |
+| Make `_mbx2DInitialize` return failure in the staged clone | prompt exact SpringBoard, in-app POWER, and wake all pass | initialization failure is the one reliable entry to LayerKit's existing software fallback. |
+
+The decisive comparison is 1.1.4: the same engine, events, IRQ, and display
+model dismiss promptly because 4A102 does not enter this old backing-store
+renderer. That is why tuning generic HOME/GPIO timing never fixed 1A543a.
+
+Strict staged-firmware run (the final harness reopens the app before POWER):
+
+```text
+IT_HOME_WAIT=8 IT_PROBE_WAIT=2 \
+  python3 scripts/app-button-probe.py --board m68ap-10 \
+  --logs /tmp/appbtn-10-final-inapp-power-8s
+PASS  1_open_app       96.91%
+PASS  2_touch_in_app   36.28%
+PASS  3_home_returns   97.07% (SpringBoard reference difference 0.58%)
+PASS  4_reopen_for_power       96.91%
+PASS  5_power_in_app_sleeps    99.2% -> 4.1% lit
+PASS  6_home_wakes             60.47%
+```
+
+Evidence: `/tmp/appbtn-10-final-inapp-power-8s/report.json`, its PNGs, and
+`qemu.log`. All six assertions passed and the HOME frame differed from the
+full SpringBoard reference by 0.59%. The installed master `nand.pack` still
+begins with the original bytes `b0 40 2d e9 08 70 8d e2` at packed offset
+`0x205bf04` after the run.
+
+The identical engine and launcher on 1.1.4 passed the same eight-second test at
+`/tmp/appbtn-114-final-inapp-power-8s-control/report.json`, also with a 0.59%
+HOME reference difference. The 1A543a compatibility path is provenance-gated
+and therefore was not applied to the 4A102 control.

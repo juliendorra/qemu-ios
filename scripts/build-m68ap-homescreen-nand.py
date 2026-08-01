@@ -18,11 +18,7 @@ What it applies, and why each part is needed
    ark survives `determine_activation_state`'s boot re-validation, because a
    genuine Apple-signed, device-bound activation record cannot be synthesised.
    One patch in the activation *authority*, not per-consumer patches.
-2. **`LK_ENABLE_MBX2D=0`** in `com.apple.SpringBoard.plist` — LayerKit
-   otherwise composites through the PowerVR MBX, which the emulator only
-   stubs, and SpringBoard tight-polls forever. devos50's iPod image ships the
-   same setting. (Shortcut: the clean fix is to model MBX 2D — task T2.)
-3. **HTTPS-bridge CA in the guest trust store** — the launcher starts a local
+2. **HTTPS-bridge CA in the guest trust store** — the launcher starts a local
    TLS bridge for this bundle (ports 18543/18542), but Safari rejects every
    certificate it mints unless the bridge's root is trusted. The iPod gets the
    same row via `ipod-nand-trust-ca.py`; that tool's NAND plumbing cannot be
@@ -30,7 +26,7 @@ What it applies, and why each part is needed
    and this NAND is generated with the real two-partition layout), so the row
    goes in while the root image is still a mounted filesystem. Only the public
    certificate is read. Disable with `--no-bridge-ca`.
-4. **Reference-shaped data ark** (`--profile reference-reg`) — key names and
+3. **Reference-shaped data ark** (`--profile reference-reg`) — key names and
    TYPES read off the iPod's own activated device: CFBooleans where a naive
    ark writes CFNumbers, plus the international/SIM/timezone keys without
    which the device has never been "set up" and shows connect-to-iTunes.
@@ -51,7 +47,6 @@ import argparse
 import hashlib
 import json
 import os
-import plistlib
 import shutil
 import subprocess
 import sys
@@ -85,7 +80,6 @@ def root_hfs() -> Path:
 
 ARK_PROFILE = "reference-reg"
 SEED_DATABASES = [True]
-SB_PLIST = "System/Library/LaunchDaemons/com.apple.SpringBoard.plist"
 
 # Where ipod-app-launcher.sh keeps this profile's bridge CA. The default MUST
 # match the launcher's, because a NAND that trusts some other CA is a NAND
@@ -106,28 +100,9 @@ def run(cmd, **kw):
 def patched_root(work: Path) -> Path:
     out = work / "root-patched.img"
     if not out.exists():
-        print("[1/5] lockdownd activation patch")
+        print("[1/4] lockdownd activation patch")
         run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "patch",
              "--root-hfs", root_hfs(), "--out", out])
-    return out
-
-
-def with_software_compositing(root: Path, work: Path) -> Path:
-    out = work / "root-mbx2d.img"
-    if out.exists():
-        return out
-    print("[2/5] SpringBoard LK_ENABLE_MBX2D=0 (software compositing)")
-    tmp = work / "root-mbx2d.tmp.img"      # hdiutil types images by extension
-    shutil.copy2(root, tmp)
-    with attached(tmp, readonly=False) as mnt:
-        plist = Path(mnt) / SB_PLIST
-        job = plistlib.loads(plist.read_bytes())
-        job.setdefault("EnvironmentVariables", {})["LK_ENABLE_MBX2D"] = "0"
-        plist.write_bytes(plistlib.dumps(job, fmt=plistlib.FMT_BINARY))
-        print(f"      set in {plist.name}: "
-              f"{job['EnvironmentVariables']}")
-    tmp.rename(out)
-    root.unlink(missing_ok=True)           # intermediate; disk is scarce here
     return out
 
 
@@ -156,10 +131,10 @@ def with_bridge_ca(root: Path, work: Path, ca_cert: Path | None,
     behaviour the other steps get from their output filename.
     """
     if not enabled:
-        print("[3/5] HTTPS-bridge CA: SKIPPED (--no-bridge-ca); Safari will "
+        print("[2/4] HTTPS-bridge CA: SKIPPED (--no-bridge-ca); Safari will "
               "reject the bridge's certificates")
         return root
-    print("[3/5] HTTPS-bridge CA -> guest system trust store")
+    print("[2/4] HTTPS-bridge CA -> guest system trust store")
     certificate_path = bridge_ca_certificate(state_dir, ca_cert)
     certificate, subject = guest_trust_store.load_ca_certificate(
         certificate_path, work)
@@ -238,7 +213,7 @@ def data_partition(work: Path) -> Path:
     out = work / "data-var.img"
     if out.exists():
         return out
-    print(f"[4/5] data partition: /var from the root template + "
+    print(f"[3/4] data partition: /var from the root template + "
           f"{ARK_PROFILE!r} ark")
     ark = work / "data_ark.plist"
     run([sys.executable, SCRIPTS / "hacktivate-m68ap.py", "build-dataark",
@@ -289,8 +264,6 @@ def declare_recipe(out: Path, args) -> None:
     manifest = json.loads(sidecar.read_text())
     steps = [
         "lockdownd activation patch (hacktivate-m68ap.py patch)",
-        "SpringBoard LK_ENABLE_MBX2D=0 -- forces software compositing, "
-        "because the MBX 2D block is a stub (task T2)",
         "/var built from the root filesystem's own /private/var template, "
         "plus a reference-shaped data ark",
     ]
@@ -308,7 +281,7 @@ def declare_recipe(out: Path, args) -> None:
     # trusts the bridge CA that is actually on this host, rather than one from
     # another machine whose private key nobody here holds.
     if BRIDGE_CA_SHA256[0] is not None:
-        steps.insert(2, "local HTTPS-bridge CA added to the system trust store "
+        steps.insert(1, "local HTTPS-bridge CA added to the system trust store "
                         "(Security.framework/TrustStore.sqlite3)")
         recipe["bridge_ca_sha256"] = BRIDGE_CA_SHA256[0]
         recipe["bridge_ca_profile"] = BRIDGE_PROFILE
@@ -374,13 +347,13 @@ def main() -> int:
                        "the M68AP home-screen NAND")
 
     SEED_DATABASES[0] = not args.no_seed_databases
-    root = with_software_compositing(patched_root(work), work)
+    root = patched_root(work)
     root = with_bridge_ca(root, work, args.ca_cert, state_dir,
                           not args.no_bridge_ca)
     root = without_addressbook(root, work, args.drop_addressbook)
     data = data_partition(work)
 
-    print("[5/5] building the NAND tree")
+    print("[4/4] building the NAND tree")
     # --build carries the FIL/WMR signature word, which is firmware-keyed:
     # 000C for 1.0/1.0.2, 200C for 1.1.1, 300C for 1.1.4. Hardcoding it here
     # was what pinned this recipe to one firmware.

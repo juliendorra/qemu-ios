@@ -791,6 +791,7 @@ MBX
  */
 #define MBX_EVENT_READY   0x100     /* bit 8: what the stub always reported */
 #define MBX_EVENT_DONE    0x040     /* bit 6: the bit AppleMBX spins on */
+#define MBX_EVENT_REPLY   0x04c     /* command + both queue-completion halves */
 /*
  * Bit 4: RENDER COMPLETE, the bit AppleMBX's sleeping wait needs. The
  * kext's real ISR (kernel 0xc032ee48 on 1.0, entered via IRQ 12) decodes
@@ -821,6 +822,191 @@ MBX
 static uint32_t mbx_event_status = MBX_EVENT_READY;
 static uint32_t mbx_event_enable;
 static qemu_irq mbx_irq;
+static uint32_t mbx_device_va;
+static uint32_t mbx_2d_render_pending;
+
+/*
+ * The register-only model cannot execute MBX2D commands or maintain the
+ * microkernel-owned operation state that FinishSurface checks.  Let profiles
+ * suppress the bootstrap reply so MBX2D initialization fails and LayerKit
+ * selects its working software compositor instead of accepting an accelerator
+ * that will time out once per submitted block.
+ */
+static uint32_t mbx_soft_response(void)
+{
+    static int response = -1;
+
+    if (response < 0) {
+        const char *e = getenv("IT_MBX_SOFT_RESPONSE");
+        response = (e && e[0]) ? (int)strtol(e, NULL, 0) : MBX_EVENT_REPLY;
+    }
+    return (uint32_t)response;
+}
+
+static bool mbx_deferred_render_enabled(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_2D_DEFER");
+        mode = e && e[0] && e[0] != '0';
+    }
+    return mode;
+}
+
+static bool mbx_disable_unimplemented_2d(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_DISABLE_2D_CLIENT");
+        mode = e && e[0] && e[0] != '0';
+    }
+    return mode;
+}
+
+static bool mbx_guest_read32(uint32_t va, uint32_t *value);
+static bool mbx_guest_write32(uint32_t va, uint32_t value);
+
+static bool mbx_reject_queued_2d(void)
+{
+    uint32_t state1;
+    uint32_t current;
+    uint8_t disabled = 0;
+
+    if (!mbx_disable_unimplemented_2d() || !mbx_device_va ||
+        !mbx_guest_read32(mbx_device_va + 0x1a4, &state1) ||
+        !mbx_guest_read32(state1 + 0x60, &current) || !current) {
+        return false;
+    }
+    if (current_cpu &&
+        cpu_memory_rw_debug(current_cpu, mbx_device_va + 0x1c4, &disabled,
+                            sizeof(disabled), true) == 0 &&
+        mbx_guest_write32(state1 + 0x60, 0)) {
+        fprintf(stderr, "[MBX-2D] rejected unavailable 2D client with "
+                "operation 0x%08x queued\n", current);
+        return true;
+    }
+    return false;
+}
+
+/*
+ * IT_MBX_OP_TRACE=1 follows the two operation-state pointers from the live
+ * AppleMBXDevice object when the driver starts a FinishSurface wait.  These
+ * are guest VIRTUAL addresses (one is an IOKit mapping, not kernel-linear),
+ * so use the CPU's debug translation rather than guessing a physical address.
+ * This is read-only diagnosis for deriving the shared-memory completion
+ * contract; no guest state is changed.
+ */
+static bool mbx_op_trace_enabled(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_OP_TRACE");
+        mode = e && e[0] && e[0] != '0';
+    }
+    return mode;
+}
+
+static bool mbx_guest_read32(uint32_t va, uint32_t *value)
+{
+    return current_cpu &&
+        cpu_memory_rw_debug(current_cpu, va, (uint8_t *)value,
+                            sizeof(*value), false) == 0;
+}
+
+static bool mbx_guest_write32(uint32_t va, uint32_t value)
+{
+    return current_cpu &&
+        cpu_memory_rw_debug(current_cpu, va, (uint8_t *)&value,
+                            sizeof(value), true) == 0;
+}
+
+static void mbx_capture_device(void)
+{
+    CPUARMState *env;
+    uint32_t candidate, state1, state2;
+
+    if (!current_cpu) {
+        return;
+    }
+    env = &ARM_CPU(current_cpu)->env;
+    candidate = env->regs[4];
+
+    /* Both measured kernels write 0x108 from the AppleMBXDevice power/wait
+     * path with r4=self. Validate the two known state pointers before keeping
+     * it, so unrelated register writes cannot poison completion handling. */
+    if (candidate >= 0xc0000000U &&
+        mbx_guest_read32(candidate + 0x1a4, &state1) &&
+        mbx_guest_read32(candidate + 0x1a8, &state2) &&
+        state1 >= 0xc0000000U && state2 >= 0xc0000000U) {
+        mbx_device_va = candidate;
+    }
+    if (mbx_op_trace_enabled()) {
+        fprintf(stderr, "[MBX-OP] wait-arm r4 candidate=0x%08x%s\n",
+                candidate, mbx_device_va == candidate ? " (accepted)" : "");
+    }
+}
+
+static bool mbx_mark_render_complete(void)
+{
+    uint32_t state1;
+
+    if (!mbx_device_va ||
+        !mbx_guest_read32(mbx_device_va + 0x1a4, &state1)) {
+        return false;
+    }
+    /* state1+0x60 is the engine-owned outstanding-work pointer checked before
+     * FinishSurface's 1000 ms recovery sleep.  The queue itself is tracked by
+     * state1+0x34 and is retired by the 0x04/0x08/0x40 ISR join, so clearing
+     * this completion pointer after the copy does not remove the queue entry. */
+    return mbx_guest_write32(state1 + 0x60, 0);
+}
+
+static void mbx_dump_op_state(const char *why)
+{
+    static const uint8_t offsets[] = {
+        0x08, 0x0c, 0x10, 0x14, 0x20, 0x24, 0x28, 0x2c,
+        0x30, 0x44, 0x48, 0x4c, 0x50, 0x60, 0x68, 0xa4,
+    };
+    uint32_t state[2] = { 0, 0 };
+
+    if (!mbx_op_trace_enabled() || !mbx_device_va) {
+        return;
+    }
+    if (!mbx_guest_read32(mbx_device_va + 0x1a4, &state[0]) ||
+        !mbx_guest_read32(mbx_device_va + 0x1a8, &state[1])) {
+        fprintf(stderr, "[MBX-OP] %s obj=0x%08x: pointer read failed\n",
+                why, mbx_device_va);
+        return;
+    }
+    fprintf(stderr, "[MBX-OP] %s obj=0x%08x state1=0x%08x state2=0x%08x\n",
+            why, mbx_device_va, state[0], state[1]);
+    for (unsigned s = 0; s < ARRAY_SIZE(state); s++) {
+        fprintf(stderr, "[MBX-OP]   state%u:", s + 1);
+        for (unsigned i = 0; i < ARRAY_SIZE(offsets); i++) {
+            uint32_t v;
+            if (mbx_guest_read32(state[s] + offsets[i], &v)) {
+                fprintf(stderr, " +%02x=%08x", offsets[i], v);
+            } else {
+                fprintf(stderr, " +%02x=?", offsets[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    uint32_t sibling;
+    if (mbx_guest_read32(state[0] + 0x60, &sibling) && sibling) {
+        fprintf(stderr, "[MBX-OP]   state1+60 target 0x%08x:", sibling);
+        for (unsigned off = 0; off < 0x40; off += 4) {
+            uint32_t v;
+            if (mbx_guest_read32(sibling + off, &v)) {
+                fprintf(stderr, " +%02x=%08x", off, v);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+}
 
 /*
  * The aperture is 16 MiB and the guest uses most of it as MEMORY, not as a
@@ -994,6 +1180,140 @@ static bool mbx_mmu_translate(hwaddr va, hwaddr *pa)
     return true;
 }
 
+/* Experimental decoder for the legacy A/9/3/6/8 copy blocks.  Kept behind
+ * IT_MBX_2D_BLIT until pixel comparison validates every format variant. */
+#define MBX_2D_STREAM_WORDS 64
+static uint32_t mbx_2d_stream[MBX_2D_STREAM_WORDS];
+static unsigned mbx_2d_stream_count;
+
+static bool mbx_2d_blit_enabled(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_2D_BLIT");
+        mode = e && e[0] && e[0] != '0';
+    }
+    return mode;
+}
+
+static bool mbx_mmu_copy(uint32_t va, uint8_t *buf, size_t size, bool write)
+{
+    while (size) {
+        hwaddr pa;
+        size_t chunk = MIN(size, 0x1000 - (va & 0xfff));
+        if (!mbx_mmu_translate(va, &pa)) {
+            return false;
+        }
+        if (write) {
+            cpu_physical_memory_write(pa, buf, chunk);
+        } else {
+            cpu_physical_memory_read(pa, buf, chunk);
+        }
+        va += chunk;
+        buf += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
+static void mbx_2d_execute(void)
+{
+    const uint32_t *w = mbx_2d_stream;
+    unsigned n = mbx_2d_stream_count;
+    unsigned dst_pitch, src_pitch, sx, sy, x0, y0, x1, y1, width, height;
+    uint32_t dst, src;
+    uint8_t *image;
+
+    if (n < 7 || (w[0] >> 28) != 0xa || (w[2] >> 28) != 9 ||
+        (w[4] >> 28) != 3 || w[n - 1] != 0x70000000) {
+        return;
+    }
+    dst_pitch = w[0] & 0x7fff;
+    dst = w[1];
+    src_pitch = w[2] & 0x7fff;
+    src = w[3];
+    sx = (w[4] >> 14) & 0x1fff;
+    sy = w[4] & 0x1fff;
+    x0 = w[n - 3] >> 16;
+    y0 = w[n - 3] & 0xffff;
+    x1 = w[n - 2] >> 16;
+    y1 = w[n - 2] & 0xffff;
+    if (x1 <= x0 || y1 <= y0 || x1 > 2048 || y1 > 2048) {
+        return;
+    }
+    width = x1 - x0;
+    height = y1 - y0;
+    if (dst_pitch < (x0 + width) * 4) {
+        return;
+    }
+
+    /* pack2DCtxBlitColor emits A/9/3, then the 6 and 8 selectors, the
+     * converted color, and the two rectangle corners.  Its source-address
+     * slot is deliberately zero; interpreting it as an MBX VA copied engine
+     * state into the framebuffer (the measured red/cyan corruption). */
+    if (n == 11 && src == 0 && (w[5] >> 28) == 6 &&
+        (w[6] >> 28) == 8) {
+        uint32_t color = w[7];
+        image = g_malloc((size_t)width * 4);
+        for (unsigned x = 0; x < width; x++) {
+            memcpy(image + x * 4, &color, sizeof(color));
+        }
+        for (unsigned y = 0; y < height; y++) {
+            if (!mbx_mmu_copy(dst + (y0 + y) * dst_pitch + x0 * 4,
+                              image, width * 4, true)) {
+                break;
+            }
+        }
+        g_free(image);
+        return;
+    }
+
+    if (src_pitch < (sx + width) * 4) {
+        return;
+    }
+
+    /* Snapshot the whole source rectangle before writing.  MBX surfaces can
+     * alias; row-at-a-time copying feeds an earlier destination row back as a
+     * later source row and visibly smears the SpringBoard frame. */
+    image = g_malloc((size_t)width * height * 4);
+    for (unsigned y = 0; y < height; y++) {
+        if (!mbx_mmu_copy(src + (sy + y) * src_pitch + sx * 4,
+                          image + (size_t)y * width * 4, width * 4, false)) {
+            g_free(image);
+            return;
+        }
+    }
+    for (unsigned y = 0; y < height; y++) {
+        if (!mbx_mmu_copy(dst + (y0 + y) * dst_pitch + x0 * 4,
+                          image + (size_t)y * width * 4, width * 4, true)) {
+            break;
+        }
+    }
+    g_free(image);
+}
+
+static void mbx_2d_stream_word(hwaddr addr, uint32_t value)
+{
+    if (!mbx_2d_blit_enabled() || addr < 0xa00000 || addr >= 0xa10000) {
+        return;
+    }
+    if ((value >> 28) == 0xa) {
+        mbx_2d_stream_count = 0;
+    }
+    if (!mbx_2d_stream_count && (value >> 28) != 0xa) {
+        return;
+    }
+    if (mbx_2d_stream_count >= MBX_2D_STREAM_WORDS) {
+        mbx_2d_stream_count = 0;
+        return;
+    }
+    mbx_2d_stream[mbx_2d_stream_count++] = value;
+    if (value == 0x70000000) {
+        mbx_2d_execute();
+        mbx_2d_stream_count = 0;
+    }
+}
+
 static bool mbx_events_modelled(void)
 {
     static int mode = -1;
@@ -1146,48 +1466,52 @@ static bool mbx_2d_trace_enabled(void)
     return mode;
 }
 
-static void mbx_2d_dump_block(void)
+static void mbx_2d_dump_words(uint32_t va, const char *name)
 {
     static uint32_t fires;
     uint32_t words[MBX_2D_MAX_WORDS];
-    unsigned n = 0;
+    unsigned n = 0, last_nonpoison = 0;
     hwaddr pa;
 
     if (!mbx_2d_trace_enabled()) {
         return;
     }
     fires++;
-    if (!mbx_mmu_translate(MBX_2D_CMD_BASE, &pa)) {
-        fprintf(stderr, "[MBX-2D] fire #%u but 0x%06x is UNMAPPED "
+    if (!mbx_mmu_translate(va, &pa)) {
+        fprintf(stderr, "[MBX-2D] fire #%u %s 0x%06x is UNMAPPED "
                 "(IT_MBX_MMU=1 needed to follow the stream)\n",
-                fires, MBX_2D_CMD_BASE);
+                fires, name, va);
         return;
     }
     while (n < MBX_2D_MAX_WORDS) {
         hwaddr wpa;
-        if (!mbx_mmu_translate(MBX_2D_CMD_BASE + n * 4, &wpa)) {
+        if (!mbx_mmu_translate(va + n * 4, &wpa)) {
             break;
         }
         cpu_physical_memory_read(wpa, &words[n], sizeof(words[n]));
-        if (words[n] == MBX_2D_POISON) {
-            break;          /* untouched buffer: the block ended earlier */
+        if (words[n] != 0 && words[n] != MBX_2D_POISON) {
+            last_nonpoison = n + 1;
         }
         n++;
-        if (words[n - 1] == MBX_2D_BLOCK_END ||
-            (words[n - 1] & 0xF0000000) == MBX_2D_BLOCK_END) {
-            break;
-        }
     }
-    fprintf(stderr, "[MBX-2D] fire #%u at PA 0x%08x, %u words:\n",
-            fires, (uint32_t)pa, n);
-    for (unsigned i = 0; i < n; i++) {
+    fprintf(stderr, "[MBX-2D] fire #%u %s VA 0x%06x PA 0x%08x, "
+            "%u meaningful words:\n", fires, name, va, (uint32_t)pa,
+            last_nonpoison);
+    for (unsigned i = 0; i < last_nonpoison; i++) {
         fprintf(stderr, "[MBX-2D]   [%02u] 0x%08x  op=0x%x\n",
                 i, words[i], words[i] >> 28);
     }
-    if (!n) {
-        fprintf(stderr, "[MBX-2D]   (buffer still poison -- the guest wrote "
-                "the block somewhere this model did not see)\n");
+    if (!last_nonpoison) {
+        fprintf(stderr, "[MBX-2D]   (zero or poison only)\n");
     }
+}
+
+static void mbx_2d_dump_kick(void)
+{
+    /* 0x824 and 0x83c name these two ranges immediately before 0x6d8. */
+    mbx_2d_dump_words(0x1d000, "command");
+    mbx_2d_dump_words(0x21000, "control");
+    mbx_2d_dump_words(MBX_2D_CMD_BASE, "legacy-a00000");
 }
 
 static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
@@ -1218,6 +1542,9 @@ static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
              * left for the T2 work that will replace it with a real
              * translation. See MBX_HANDOFF.md.
              */
+            /* This is the MMU-present bit, not the accelerator identifier.
+             * Clearing it makes the driver tight-poll forever instead of
+             * declining the optional 2D client. */
             r = 0x10000;
             break;
         default: {
@@ -1255,6 +1582,17 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
 {
     mbx_trace("WR", addr, val);
 
+    if (addr == 0x108) {
+        mbx_capture_device();
+        mbx_dump_op_state("wait arm (0x108)");
+    } else if (addr == 0x130 && val && mbx_op_trace_enabled()) {
+        mbx_dump_op_state("event enable (0x130)");
+    } else if ((addr == 0x6d8 || addr == MBX_2D_CMD_BASE) &&
+               mbx_op_trace_enabled()) {
+        mbx_dump_op_state(addr == 0x6d8 ? "engine kick (0x6d8)" :
+                          "2D fire (0xa00000)");
+    }
+
     /*
      * The MMU page directory is a register file the model must REMEMBER even
      * when it forwards nothing: the translation is what every other piece of
@@ -1265,13 +1603,18 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
         addr < MBX_MMU_PDE_BASE + MBX_MMU_PDE_COUNT * 4 && (addr & 3) == 0) {
         mbx_mmu_pde[(addr - MBX_MMU_PDE_BASE) / 4] = (uint32_t)val;
     } else if (addr == MBX_MMU_CTRL) {
-        bool on = (val & MBX_MMU_ENABLE) != 0;
-        if (on != mbx_mmu_on) {
-            mbx_mmu_on = on;
-            if (mbx_mmu_forwarding()) {
-                fprintf(stderr, "[MBX] MMU %s by the guest (0x1020 = "
-                        "0x%08x)\n", on ? "ENABLED" : "disabled",
-                        (uint32_t)val);
+        /* Bit 8 is the microcode-upload strobe.  Upload writes are 0x10100
+         * and do not alter the independently latched MMU enable bit; only
+         * ordinary control writes (0x10001 / 0x10000) do. */
+        if (!(val & 0x100)) {
+            bool on = (val & MBX_MMU_ENABLE) != 0;
+            if (on != mbx_mmu_on) {
+                mbx_mmu_on = on;
+                if (mbx_mmu_forwarding()) {
+                    fprintf(stderr, "[MBX] MMU %s by the guest (0x1020 = "
+                            "0x%08x)\n", on ? "ENABLED" : "disabled",
+                            (uint32_t)val);
+                }
             }
         }
     }
@@ -1285,6 +1628,10 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
         mbx_mmu_translate(addr, &pa)) {
         uint32_t v = (uint32_t)val;
         cpu_physical_memory_write(pa, &v, size);
+        if (mbx_2d_trace_enabled()) {
+            fprintf(stderr, "[MBX-MMU] WR 0x%07x -> PA 0x%08x = "
+                    "0x%08x\n", (uint32_t)addr, (uint32_t)pa, v);
+        }
     } else {
         uint8_t *p = mbx_ram_at(addr, size);
         if (p) {
@@ -1293,12 +1640,18 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
         }
     }
 
+    if (size == 4) {
+        mbx_2d_stream_word(addr, (uint32_t)val);
+    }
+
     /* The FIRE, traced independently of the event model: understanding the
      * command stream must not require turning on a mode that changes how
      * completions are signalled. */
-    if (addr == MBX_2D_CMD_BASE &&
+    if (addr == 0x6d8) {
+        mbx_2d_dump_kick();
+    } else if (addr == MBX_2D_CMD_BASE &&
         (val & 0xF0000000) == MBX_2D_FIRE) {
-        mbx_2d_dump_block();
+        mbx_2d_dump_words(MBX_2D_CMD_BASE, "legacy-a00000");
     }
 
     if (!mbx_events_modelled()) {
@@ -1307,6 +1660,26 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
     switch (addr) {
         case 0x130:         /* event host enable (mask) */
             mbx_event_enable = (uint32_t)val;
+            if (mbx_event_enable && mbx_reject_queued_2d()) {
+                /* Wake the rejected synchronous command without entering
+                 * the unfinished bit-0x10 render ISR path. */
+                mbx_event_status |= MBX_EVENT_DONE;
+            }
+            if (mbx_event_enable && mbx_2d_render_pending) {
+                if (mbx_mark_render_complete()) {
+                    mbx_2d_render_pending--;
+                    mbx_event_status |= 0x10; /* render complete */
+                    if (mbx_op_trace_enabled()) {
+                        fprintf(stderr,
+                                "[MBX-OP] publishing deferred "
+                                "render-complete 0x010 (%u remain)\n",
+                                mbx_2d_render_pending);
+                    }
+                } else {
+                    fprintf(stderr, "[MBX-2D] could not mark deferred "
+                            "shared completion state\n");
+                }
+            }
             mbx_update_irq();
             break;
         case 0x134:         /* event host clear: write 1s to ack. READY is not
@@ -1315,17 +1688,24 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             mbx_update_irq();
             break;
         /*
-         * A WRITE to the status register is the host RAISING a soft event at
-         * the microkernel. Measured (IT_MBX_TRACE, 1.0 app dismissal): after
-         * the 0x6d8 command completes, the guest writes 0x108=3, enables all
-         * events (0x130=0xffff), writes 0x12C = 0x00000001, and then polls
-         * 0x12C forever for a response bit -- 5.1 million reads in one run.
-         * Ignoring the write is what turned the whole conversation into that
-         * spin. There is no microkernel here, so the soft event "completes"
-         * immediately: reflect the bits back as status.
+         * Host-to-MBX soft event.  The bootstrap command is first submitted
+         * through 0x6d8 and synchronously acknowledged with bit 0x40.  The
+         * driver then arms all events and posts bit 0x1 here.  The real MBX
+         * replies with the three-way queue completion seen by AppleMBX's ISR:
+         * 0x40 sets state2+0x2c, 0x08 sets state1+0x24, and 0x04 sets
+         * state1+0x4c.  Once all three are present the guest's own ISR calls
+         * the queue-retirement routine, which removes state1+0x60 and wakes
+         * the waiter.  Raising only a guessed wake bit bypasses that guest
+         * bookkeeping and wedges; replying with the actual join lets the
+         * guest update all shared state itself.
          */
         case 0x12c:
-            mbx_event_status |= (uint32_t)val;
+            if (val & 1) {
+                mbx_event_status |= mbx_soft_response();
+            }
+            /* The other observed host messages are queue/ready handshakes;
+             * their responses use the same bits in the opposite direction. */
+            mbx_event_status |= (uint32_t)val & (0x004 | 0x008 | 0x400);
             mbx_update_irq();
             break;
         /*
@@ -1365,7 +1745,25 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
          */
         case 0xa00000:
             if ((val & 0xf0000000) == 0xf0000000) {
-                mbx_event_status |= MBX_EVENT_DONE | mbx_2d_event();
+                if (mbx_deferred_render_enabled()) {
+                    mbx_2d_render_pending++;
+                } else {
+                    uint32_t event = mbx_2d_event();
+                    mbx_event_status |= MBX_EVENT_DONE;
+                    if (!(event & 0x10)) {
+                        if (!mbx_mark_render_complete()) {
+                            fprintf(stderr, "[MBX-2D] could not retire "
+                                    "current operation\n");
+                        }
+                        mbx_event_status |= event;
+                    } else if (mbx_mark_render_complete()) {
+                        mbx_event_status |= event;
+                    } else {
+                        fprintf(stderr, "[MBX-2D] suppressed unsafe "
+                                "render-complete event: shared state "
+                                "unavailable\n");
+                    }
+                }
                 mbx_update_irq();
             }
             break;
@@ -1695,7 +2093,6 @@ static void ipod_touch_wake_activity(void *opaque)
     }
     s->sysic->gpio_int_status[grp] |= (1 << sel);
     qemu_irq_raise(s->sysic->gpio_irqs[grp]);
-    timer_mod(s->sysic->gpio_irq_lower_timers[grp], now + GPIO_IRQ_PULSE_NS);
 }
 
 static void ipod_touch_key_event(void *opaque, int keycode)
@@ -1963,10 +2360,6 @@ static void ipod_touch_key_event(void *opaque, int keycode)
         // The VIC / SYSIC handle delivery during normal operation.
         s->sysic->gpio_int_status[gpio_group] |= (1 << gpio_selector);
         qemu_irq_raise(s->sysic->gpio_irqs[gpio_group]);
-
-        // Schedule auto-lower to create an edge-triggered pulse.
-        timer_mod(s->sysic->gpio_irq_lower_timers[gpio_group],
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPIO_IRQ_PULSE_NS);
 
     }
 
