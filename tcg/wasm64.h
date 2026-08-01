@@ -35,14 +35,26 @@ struct WasmContext {
      * Flag indicating whether to initialize the block index(1) or not(0).
      */
     uint32_t do_init;
+
+    /*
+     * Remaining compiled-to-compiled calls before returning to the C
+     * dispatcher. A bounded chain avoids unbounded Wasm recursion while
+     * amortizing the dispatcher boundary across several hot TBs.
+     */
+    uint32_t chain_left;
+
+    /* Byte offset of this TCG thread's entry in WasmTBHeader.info_ptr. */
+    uintptr_t info_offset;
 };
 
 /* Instantiated Wasm function of a TB */
 typedef uintptr_t (*wasm_tb_func)(struct WasmContext *);
 
-static inline uintptr_t call_wasm_tb(wasm_tb_func f, struct WasmContext *ctx)
+static inline uintptr_t call_wasm_tb(wasm_tb_func f, struct WasmContext *ctx,
+                                     uint32_t chain_limit)
 {
     ctx->do_init = 1; /* reset the block index (rewinding will skip this) */
+    ctx->chain_left = chain_limit;
     return f(ctx);
 }
 

@@ -156,6 +156,7 @@ EM_JS_PRE(void*, instantiate_wasm, (void *wasm_begin,
     const inst = new WebAssembly.Instance(mod, {
             "env" : {
                 "memory" : wasmMemory,
+                "table" : wasmTable,
             },
             "helper" : helper,
     });
@@ -832,6 +833,7 @@ static uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
  * at run time (max_instances= in /fw/jit-tune) but never raised past it. */
 static int jit_max_instances = MAX_INSTANCES;
 static bool jit_direct_table;
+static int jit_chain_limit;
 
 static int instances_global;
 
@@ -986,7 +988,8 @@ static inline void trysleep(void)
      * Even during running TBs continuously, try to return the control
      * to the browser periodically and allow browsers doing tasks.
      */
-    if (--exec_cnt == 0) {
+    exec_cnt -= 1 + jit_chain_limit;
+    if (exec_cnt <= 0) {
         if (!can_add_instance()) {
             emscripten_sleep(0);
             check_gc_completion();
@@ -1012,15 +1015,20 @@ static void init_wasm(void)
         jit_adaptive = jit_tunable("IT_WASM_JIT_ADAPTIVE", "adaptive", 1) != 0;
         jit_direct_table = jit_tunable("IT_WASM_DIRECT_TABLE", "direct_table",
                                        1) != 0;
+        long chain = jit_tunable("IT_WASM_CHAIN", "chain", 4);
+
+        jit_chain_limit = (chain >= 0 && chain <= 64) ? (int)chain : 4;
         jit_threshold = jit_instantiate_num;
         fprintf(stderr, "[JIT] tuning: instantiate=%d max_instances=%d "
-                "adaptive=%d direct_table=%d\n", jit_instantiate_num,
-                jit_max_instances, jit_adaptive, jit_direct_table);
+                "adaptive=%d direct_table=%d chain=%d\n",
+                jit_instantiate_num, jit_max_instances, jit_adaptive,
+                jit_direct_table, jit_chain_limit);
     }
     thread_idx = qatomic_fetch_inc(&thread_idx_max);
     ctx.stack = g_malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
     ctx.buf128 = g_malloc(16);
     ctx.tci_tb_ptr = (uint32_t *)&tci_tb_ptr;
+    ctx.info_offset = thread_idx * sizeof(void *);
     init_wasm_js(&instance_done_gc);
 }
 
@@ -1042,7 +1050,7 @@ uintptr_t tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_ptr)
             /*
              * Call the Wasm instance
              */
-            res = call_wasm_tb(tb_func, &ctx);
+            res = call_wasm_tb(tb_func, &ctx, jit_chain_limit);
         } else if (!inc_counter(ctx.tb_ptr)) {
             /*
              * Run it on TCI because the counter value is small
@@ -1067,7 +1075,7 @@ uintptr_t tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_ptr)
                                                      header->import_size,
                                                      jit_direct_table);
             add_instance(tb_func, ctx.tb_ptr);
-            res = call_wasm_tb(tb_func, &ctx);
+            res = call_wasm_tb(tb_func, &ctx, jit_chain_limit);
         }
         if (!ctx.tb_ptr) {
             return res;

@@ -178,6 +178,7 @@ typedef enum {
     OPC_BR = 0x0c,
     OPC_RETURN = 0x0f,
     OPC_CALL = 0x10,
+    OPC_CALL_INDIRECT = 0x11,
     OPC_LOCAL_GET = 0x20,
     OPC_LOCAL_SET = 0x21,
     OPC_LOCAL_TEE = 0x22,
@@ -228,6 +229,7 @@ typedef enum {
     OPC_I32_CLZ = 0x67,
     OPC_I32_CTZ = 0x68,
     OPC_I32_ADD = 0x6a,
+    OPC_I32_SUB = 0x6b,
     OPC_I32_DIV_S = 0x6d,
     OPC_I32_DIV_U = 0x6e,
     OPC_I32_REM_S = 0x6f,
@@ -823,6 +825,74 @@ static void tcg_wasm_out_exit_tb(TCGContext *s, uintptr_t arg)
     tcg_wasm_out_op(s, OPC_RETURN);
 }
 
+static void tcg_wasm_out_try_chain(TCGContext *s, TCGReg target)
+{
+    intptr_t ofs;
+
+    /* A zero budget takes the old dispatcher path. */
+    ofs = tcg_wasm_out_get_ctx(s, CTX_OFFSET(chain_left));
+    tcg_wasm_out_op_ldst(s, OPC_I32_LOAD, 0, ofs);
+    tcg_wasm_out_op_block(s, OPC_IF, BLOCK_NORET);
+
+    /* exit_tb uses a null target; never interpret it as a TB header. */
+    tcg_wasm_out_op_idx(s, OPC_GLOBAL_GET, REG_IDX(target));
+    tcg_wasm_out_op(s, OPC_I64_EQZ);
+    tcg_wasm_out_op(s, OPC_I32_EQZ);
+    tcg_wasm_out_op_block(s, OPC_IF, BLOCK_NORET);
+
+    /* Load target->info_ptr[thread_idx]. */
+    tcg_wasm_out_op_idx(s, OPC_GLOBAL_GET, REG_IDX(target));
+    ofs = tcg_wasm_out_norm_ptr(s, offsetof(struct WasmTBHeader, info_ptr));
+    tcg_wasm_out_op_ldst(s, OPC_I64_LOAD, 0, ofs);
+    ofs = tcg_wasm_out_get_ctx(s, CTX_OFFSET(info_offset));
+    tcg_wasm_out_op_ldst(s, OPC_I64_LOAD, 0, ofs);
+    tcg_wasm_out_op(s, OPC_I64_ADD);
+    ofs = tcg_wasm_out_norm_ptr(s, 0);
+    tcg_wasm_out_op_ldst(s, OPC_I64_LOAD, 0, ofs);
+    tcg_wasm_out_op_idx(s, OPC_LOCAL_TEE, TMP64_LOCAL_0_IDX);
+    tcg_wasm_out_op(s, OPC_I64_EQZ);
+    tcg_wasm_out_op(s, OPC_I32_EQZ);
+    tcg_wasm_out_op_block(s, OPC_IF, BLOCK_NORET);
+
+    /* Eviction leaves the old info pointer behind; validate its owner. */
+    tcg_wasm_out_op_idx(s, OPC_LOCAL_GET, TMP64_LOCAL_0_IDX);
+    ofs = tcg_wasm_out_norm_ptr(s,
+                                offsetof(struct WasmInstanceInfo, tb_ptr));
+    tcg_wasm_out_op_ldst(s, OPC_I64_LOAD, 0, ofs);
+    tcg_wasm_out_op_idx(s, OPC_GLOBAL_GET, REG_IDX(target));
+    tcg_wasm_out_op(s, OPC_I64_EQ);
+    tcg_wasm_out_op_block(s, OPC_IF, BLOCK_NORET);
+
+    /* Decrement the bounded recursion budget. */
+    ofs = tcg_wasm_out_get_ctx(s, CTX_OFFSET(chain_left));
+    tcg_wasm_out_get_ctx(s, CTX_OFFSET(chain_left));
+    tcg_wasm_out_op_ldst(s, OPC_I32_LOAD, 0, ofs);
+    tcg_wasm_out_op_const(s, OPC_I32_CONST, 1);
+    tcg_wasm_out_op(s, OPC_I32_SUB);
+    tcg_wasm_out_op_ldst(s, OPC_I32_STORE, 0, ofs);
+
+    /* The target instance must enter at its first generated block. */
+    ofs = tcg_wasm_out_get_ctx(s, CTX_OFFSET(do_init));
+    tcg_wasm_out_op_const(s, OPC_I32_CONST, 1);
+    tcg_wasm_out_op_ldst(s, OPC_I32_STORE, 0, ofs);
+
+    /* start(ctx), selected from Emscripten's shared function table. */
+    tcg_wasm_out_op_idx(s, OPC_LOCAL_GET, CTX_IDX);
+    tcg_wasm_out_op_idx(s, OPC_LOCAL_GET, TMP64_LOCAL_0_IDX);
+    ofs = tcg_wasm_out_norm_ptr(s,
+                                offsetof(struct WasmInstanceInfo, tb_func));
+    tcg_wasm_out_op_ldst(s, OPC_I64_LOAD, 0, ofs);
+    tcg_wasm_out_op(s, OPC_I32_WRAP_I64);
+    tcg_wasm_out_op_idx(s, OPC_CALL_INDIRECT, 0); /* start function type */
+    tcg_wasm_out_leb128(s, 0);                   /* imported table index */
+    tcg_wasm_out_op(s, OPC_RETURN);
+
+    tcg_wasm_out_op(s, OPC_END); /* valid instance owner */
+    tcg_wasm_out_op(s, OPC_END); /* non-null instance info */
+    tcg_wasm_out_op(s, OPC_END); /* non-null target */
+    tcg_wasm_out_op(s, OPC_END); /* non-zero budget */
+}
+
 static void tcg_wasm_out_goto(TCGContext *s, TCGReg target, int block_depth)
 {
     intptr_t ofs;
@@ -847,6 +917,7 @@ static void tcg_wasm_out_goto(TCGContext *s, TCGReg target, int block_depth)
     ofs = tcg_wasm_out_get_ctx(s, CTX_OFFSET(tb_ptr));
     tcg_wasm_out_op_idx(s, OPC_GLOBAL_GET, REG_IDX(target));
     tcg_wasm_out_op_ldst(s, OPC_I64_STORE, 0, ofs);
+    tcg_wasm_out_try_chain(s, target);
     tcg_wasm_out_op_const(s, OPC_I64_CONST, 0);
     tcg_wasm_out_op(s, OPC_RETURN);
 }
@@ -2570,6 +2641,10 @@ static const uint8_t mod_2[] = {
     0x02, 0x07,                               /* shared mem(64bit) */
     0x00, 0x80, 0x80, 0x10,                   /* min: 0, max: 262144 pages */
 #endif
+    0x03, 0x65, 0x6e, 0x76,                   /* module: "env" */
+    0x05, 0x74, 0x61, 0x62, 0x6c, 0x65,       /* name: "table" */
+    0x01,                                     /* table import */
+    0x70, 0x00, 0x00,                         /* funcref, min 0 */
     0x06, 0x68, 0x65, 0x6c, 0x70, 0x65, 0x72, /* module: "helper" */
     0x01, 0x75,                               /* name: "u" */
     0x00, 0x01,                               /* func type 1 */
@@ -2779,7 +2854,7 @@ static int tcg_out_tb_end(TCGContext *s)
             },
             {
                 MOD_2_PH_IMPORT_VEC_NUM_OFF,
-                HELPER_IDX_START + helpers_len() + 1/* memory */
+                HELPER_IDX_START + helpers_len() + 2/* memory + table */
             },
     }, 2);
     if (res < 0) {
