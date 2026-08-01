@@ -2872,3 +2872,24 @@ Two things learned about the METHOD, which outlast the result:
   then — exactly the case a lookup-cache change should help least. To exercise
   the cold-JIT race that actually hurts (the ~90 s interactive grind), tap
   EARLY (cold boot + tap as soon as the gate arms), or launch a heavier app.
+
+### 4A102 (1.1.4) resume snapshot exists (2026-08-01)
+
+Built once disk allowed: **69.47 MiB stream → 13.86 MiB on the wire** (19.9%,
+Brotli q11, 109 s). `?build=4A102&resume=1` works; with the picker, all four
+{1.0, 1.1.4} × {resume, cold boot} combinations are live.
+
+Two honest differences from 1.0's snapshot, both worth fixing when convenient:
+
+- **It resumes to the LOCK SCREEN**, not the home screen — the native boot's
+  panel had gone dark (`panel at 0.0%, waking ...`) and the machine that got
+  captured re-locks shortly after resume. 1.0 lands on the home screen. A
+  nicer capture would unlock first, or snapshot earlier in the live window.
+- **First pixels at ~33 s**, against ~2–3 s for 1.0 — the stream is 21% larger
+  and this run also raced a native MBX-session boot for CPU, so the figure is
+  not clean. Re-measure solo before treating it as the real number.
+
+The snapshot itself is gitignored (`web/.gitignore`: `/public/*/snapshots/`);
+the provenance file records engine commit `c666f6f4f7`, and it was built from
+a DIRTY tree (`engine_dirty: true`) — regenerate after the engine settles, or
+a future stale-stream failure will not name its cause.
