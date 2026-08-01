@@ -6,6 +6,12 @@ this file records what is actually built and proven.
 
 > **Starting a session? Read [`BROWSER_WASM_HANDOFF.md`](BROWSER_WASM_HANDOFF.md)**
 > — the ordered next steps, their acceptance criteria, and the traps.
+>
+> **Working on SPEED? Read [`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md)** —
+> the full campaign record: the measurement toolchain and how to run it, every
+> fix with its mechanism and numbers, the dead ends (with evidence, so they are
+> not re-run), the false assumptions data corrected, the profiling and
+> benchmarking traps, and the ranked next levers.
 
 **Target:** iPhone 2G (M68AP) running **iPhone OS 1.1.4**, in a browser: fast to
 start (chunked assets) and running at **real-time speed**. Then 1.0, once its

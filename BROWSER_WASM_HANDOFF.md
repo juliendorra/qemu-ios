@@ -15,6 +15,15 @@ origin.
 Real-time speed is a stated requirement, not an aspiration: it is why the
 WebAssembly JIT backend is being adopted rather than shipping TCI.
 
+> **The speed campaign has its own full record:
+> [`BROWSER_WASM_SPEED.md`](BROWSER_WASM_SPEED.md)** (2026-07-31 → 08-01).
+> Boot 252 s → 152 s, kernel 276 s → 84 s, resume fixed, 60 fps panel, and a
+> measurement toolchain (QSP lock profiling, V8 `--prof` with names, the
+> `?sweep=calc` launch benchmark). **Read its §5 dead ends and §9 benchmarking
+> rules before attempting any engine optimisation** — two plausible ideas
+> (wasm-EH longjmp, a bigger jmp cache) are already refuted with evidence, and
+> the browser support position (Chrome-family only; Safari crashes) is there.
+
 > **Split into two parallel sessions (2026-07-29).** See
 > [`BROWSER_WASM_SESSION_A.md`](BROWSER_WASM_SESSION_A.md) — make it visible and
 > interactive (display painting, input, post-boot snapshot) — and
