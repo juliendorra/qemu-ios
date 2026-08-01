@@ -437,7 +437,16 @@ work; SpringBoard's snapshot render falls back to software and the
 dismissal completes. (Incidentally that means the ~33.8 s dismissal
 latency is not being paid in these runs either — worth measuring properly,
 because the "latency residual" in the button investigation may already be
-gone.)
+gone. **One attempt made, 2026-08-01, and DISCARDED:** `dismiss-latency.py
+--board m68ap-10` on the current bundle delivered all 8 ladder presses per
+KEYTRACE yet reported "never settled" — but the big change it caught was
+the auto-lock DIM, its own documented artifact, and its 6-wall-second
+press ladder collapses to ~2 guest seconds under the bundle's icount, so
+the guest got a press burst inside the animation. The instrument predates
+icount pacing; measure instead from the model's virtual-timestamped
+`[LCD]` flips around a SINGLE press, which is what named the 33.76 s
+constant originally. The acceptance battery's clean `3_home_returns` PASS
+on this same bundle bounds the dismissal well under its 80 s window.)
 
 **Consequence for the implementation order.** You cannot decode a format
 you cannot capture, and you cannot capture a stream the guest declines to
