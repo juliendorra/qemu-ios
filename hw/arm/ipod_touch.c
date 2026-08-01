@@ -917,6 +917,83 @@ static uint8_t *mbx_ram_at(hwaddr addr, unsigned size)
     return mbx_ram + addr;
 }
 
+/*
+ * --- The MBX MMU ---------------------------------------------------------
+ *
+ * The PowerVR MBX translates the addresses it is handed. The driver programs
+ * an EIGHT-entry page directory into registers 0x1000..0x101c and enables it
+ * with 0x1020 bit 0 (kernel loop 0xc03b7334 on 4A102: it runs a VA->PA helper
+ * over eight memory descriptors, storing each result at r5 starting from
+ * #4096 and stepping 4, bounded by the literal 0x1020). Each entry is the
+ * guest-PHYSICAL address of a 4 KiB page table of 1024 PTEs, so one entry
+ * covers 4 MiB and the eight cover 32 MiB -- which is exactly the span of the
+ * addresses the driver hands the engine.
+ *
+ * Measured with scripts/mbx-mmu-probe.py on a live guest, 4A102 and 1A543a
+ * (byte-identical layouts, different pages):
+ *
+ *   MBX 0x08000 -> PA 0x08b4f000   engine base (reg 0x608)
+ *   MBX 0x1b000 -> PA 0x08ba2000   engine base (reg 0x60c), 244 live bytes
+ *   MBX 0x21000 -> PA 0x08bad000   command range (reg 0x83c), 24 live bytes
+ *   MBX 0xa00000 -> PA 0x08be4000  2D command buffer, a page of 0xBAD43210
+ *
+ * The decisive detail: the 0x1b000/0x21000 structures are populated in boots
+ * that perform ZERO aperture writes, so the CPU reaches those pages through
+ * its own mapping. Our 16 MiB MMIO window is a SECOND window onto the same
+ * DRAM -- which is why IT_MBX_RAM's private backing store was the wrong
+ * memory, and why dropping aperture writes loses data the guest believes it
+ * has stored.
+ *
+ * IT_MBX_MMU=1 forwards aperture accesses through this translation to the
+ * real pages. Default OFF: it changes what every aperture read returns (0
+ * today), and this subsystem wedges rather than degrades when a guess is
+ * wrong. See MBX_HANDOFF.md.
+ */
+#define MBX_MMU_PDE_BASE  0x1000
+#define MBX_MMU_PDE_COUNT 8
+#define MBX_MMU_CTRL      0x1020
+#define MBX_MMU_ENABLE    0x1
+
+static uint32_t mbx_mmu_pde[MBX_MMU_PDE_COUNT];
+static bool mbx_mmu_on;              /* the guest's own enable bit */
+
+static bool mbx_mmu_forwarding(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_MMU");
+        mode = e && e[0] && e[0] != '0';
+    }
+    return mode;
+}
+
+/*
+ * Translate an MBX virtual address. Returns false when nothing is mapped --
+ * the caller must then behave as before rather than inventing an address.
+ */
+static bool mbx_mmu_translate(hwaddr va, hwaddr *pa)
+{
+    uint32_t di = (uint32_t)(va >> 22);
+    uint32_t ti = (uint32_t)((va >> 12) & 0x3FF);
+    uint32_t pde, pte = 0;
+
+    if (!mbx_mmu_on || di >= MBX_MMU_PDE_COUNT) {
+        return false;
+    }
+    pde = mbx_mmu_pde[di] & ~0xFFFU;
+    if (pde < RAM_MEM_BASE) {
+        return false;
+    }
+    cpu_physical_memory_read(pde + ti * 4, &pte, sizeof(pte));
+    pte &= ~0xFFFU;
+    if (pte < RAM_MEM_BASE) {
+        return false;
+    }
+    *pa = pte | (va & 0xFFF);
+    return true;
+}
+
 static bool mbx_events_modelled(void)
 {
     static int mode = -1;
@@ -1029,6 +1106,90 @@ static void mbx_trace(const char *dir, hwaddr addr, uint64_t val)
             pc, lr, n);
 }
 
+/*
+ * --- The 2D command stream ----------------------------------------------
+ *
+ * IT_MBX_2D_TRACE=1 dumps a command block when the guest FIRES it, reading
+ * the words back out of the guest's own memory through the MMU (so it needs
+ * IT_MBX_MMU=1 to see anything the model itself did not store).
+ *
+ * The format is legible rather than guessed: userland `MBX2D.framework` on
+ * the 1.0 root filesystem keeps 74 defined symbols, and the block writers
+ * are among them -- `_pack2DCtxBlitCopy` (0x30b3a974) and
+ * `_pack2DCtxBlitColor` (0x30b3994c), with `_mbx2DCtxSetSourceSurface`,
+ * `…SetDestinationSurface`, `…SetBlendEquation[Complex]`, `…SetScissor`,
+ * `…SetScaleFactor` and `…SetRotation` defining the fields. Each word is
+ * built by OR-ing an opcode into the top bits before the store (0x80000000,
+ * 0xA0000000, 0x94000000 and 0x30000000 all appear as immediates in the
+ * packer), blocks end at 0x70000000, and word 0 is rewritten with
+ * 0xf0000000 to fire.
+ *
+ * So this LOGS, and logs unknown opcodes loudly, rather than pretending to
+ * understand the stream. Decoding one opcode at a time against a captured
+ * block is the plan; inventing semantics for this engine is what wedged it
+ * six times before (IN_APP_BUTTON_INVESTIGATION.md).
+ */
+#define MBX_2D_CMD_BASE   0xa00000
+#define MBX_2D_FIRE       0xf0000000
+#define MBX_2D_BLOCK_END  0x70000000
+#define MBX_2D_POISON     0xBAD43210
+#define MBX_2D_MAX_WORDS  128
+
+static bool mbx_2d_trace_enabled(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("IT_MBX_2D_TRACE");
+        mode = e && e[0] && e[0] != '0';
+    }
+    return mode;
+}
+
+static void mbx_2d_dump_block(void)
+{
+    static uint32_t fires;
+    uint32_t words[MBX_2D_MAX_WORDS];
+    unsigned n = 0;
+    hwaddr pa;
+
+    if (!mbx_2d_trace_enabled()) {
+        return;
+    }
+    fires++;
+    if (!mbx_mmu_translate(MBX_2D_CMD_BASE, &pa)) {
+        fprintf(stderr, "[MBX-2D] fire #%u but 0x%06x is UNMAPPED "
+                "(IT_MBX_MMU=1 needed to follow the stream)\n",
+                fires, MBX_2D_CMD_BASE);
+        return;
+    }
+    while (n < MBX_2D_MAX_WORDS) {
+        hwaddr wpa;
+        if (!mbx_mmu_translate(MBX_2D_CMD_BASE + n * 4, &wpa)) {
+            break;
+        }
+        cpu_physical_memory_read(wpa, &words[n], sizeof(words[n]));
+        if (words[n] == MBX_2D_POISON) {
+            break;          /* untouched buffer: the block ended earlier */
+        }
+        n++;
+        if (words[n - 1] == MBX_2D_BLOCK_END ||
+            (words[n - 1] & 0xF0000000) == MBX_2D_BLOCK_END) {
+            break;
+        }
+    }
+    fprintf(stderr, "[MBX-2D] fire #%u at PA 0x%08x, %u words:\n",
+            fires, (uint32_t)pa, n);
+    for (unsigned i = 0; i < n; i++) {
+        fprintf(stderr, "[MBX-2D]   [%02u] 0x%08x  op=0x%x\n",
+                i, words[i], words[i] >> 28);
+    }
+    if (!n) {
+        fprintf(stderr, "[MBX-2D]   (buffer still poison -- the guest wrote "
+                "the block somewhere this model did not see)\n");
+    }
+}
+
 static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint64_t r = 0;
@@ -1060,6 +1221,21 @@ static uint64_t s5l8900_mbx_read(void *opaque, hwaddr addr, unsigned size)
             r = 0x10000;
             break;
         default: {
+            hwaddr pa;
+
+            /* The window above the register page is MEMORY, and with
+             * IT_MBX_MMU=1 it is the guest's OWN memory, reached through the
+             * page table the driver programmed. That is strictly more
+             * truthful than answering 0 -- the pages are shared with the
+             * CPU, so 0 is a lie about data the guest can see by another
+             * route. */
+            if (addr >= MBX_REG_LIMIT && mbx_mmu_forwarding() &&
+                mbx_mmu_translate(addr, &pa)) {
+                uint32_t v = 0;
+                cpu_physical_memory_read(pa, &v, size);
+                r = v;
+                break;
+            }
             /* Anything the register logic does not claim is window memory:
              * give the guest back what it wrote. */
             const uint8_t *p = mbx_ram_at(addr, size);
@@ -1079,12 +1255,50 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
 {
     mbx_trace("WR", addr, val);
 
-    /* Window memory first: retain the guest's data whatever mode we are in.
-     * The handled registers below still run and still win on reads. */
-    uint8_t *p = mbx_ram_at(addr, size);
-    if (p) {
+    /*
+     * The MMU page directory is a register file the model must REMEMBER even
+     * when it forwards nothing: the translation is what every other piece of
+     * the 2D work depends on, and it is cheap. Recorded unconditionally;
+     * acted on only under IT_MBX_MMU.
+     */
+    if (addr >= MBX_MMU_PDE_BASE &&
+        addr < MBX_MMU_PDE_BASE + MBX_MMU_PDE_COUNT * 4 && (addr & 3) == 0) {
+        mbx_mmu_pde[(addr - MBX_MMU_PDE_BASE) / 4] = (uint32_t)val;
+    } else if (addr == MBX_MMU_CTRL) {
+        bool on = (val & MBX_MMU_ENABLE) != 0;
+        if (on != mbx_mmu_on) {
+            mbx_mmu_on = on;
+            if (mbx_mmu_forwarding()) {
+                fprintf(stderr, "[MBX] MMU %s by the guest (0x1020 = "
+                        "0x%08x)\n", on ? "ENABLED" : "disabled",
+                        (uint32_t)val);
+            }
+        }
+    }
+
+    /* Window memory. With IT_MBX_MMU=1 the guest's own pages are the
+     * backing store; otherwise fall back to the optional private store.
+     * NOTE the ordering: the fire dump below must run AFTER this store, so
+     * the block it reads back includes the firing word itself. */
+    hwaddr pa;
+    if (addr >= MBX_REG_LIMIT && mbx_mmu_forwarding() &&
+        mbx_mmu_translate(addr, &pa)) {
         uint32_t v = (uint32_t)val;
-        memcpy(p, &v, size);
+        cpu_physical_memory_write(pa, &v, size);
+    } else {
+        uint8_t *p = mbx_ram_at(addr, size);
+        if (p) {
+            uint32_t v = (uint32_t)val;
+            memcpy(p, &v, size);
+        }
+    }
+
+    /* The FIRE, traced independently of the event model: understanding the
+     * command stream must not require turning on a mode that changes how
+     * completions are signalled. */
+    if (addr == MBX_2D_CMD_BASE &&
+        (val & 0xF0000000) == MBX_2D_FIRE) {
+        mbx_2d_dump_block();
     }
 
     if (!mbx_events_modelled()) {
