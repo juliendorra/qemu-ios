@@ -463,6 +463,34 @@ Route (b) is the more principled one and unblocks the latency residual as
 well; route (a) is the faster way to get a stream on the bench. They are
 not exclusive.
 
+### Correction: the op-state structures are NOT MMU-mapped
+
+Measured (4A102, `mbx-mmu-probe` reverse-mapping every PTE against the
+`AppleMBXDevice` address the guest prints on its own console):
+
+```
+AppleMBXDevice at VA 0xc0a52000       page table maps 39 pages
+[obj+0x1a4] = 0xc0b85600 -> PA 0x08b85600   NOT MMU-mapped
+[obj+0x1a8] = 0xf275a000                    NOT MMU-mapped, and not even
+                                            kernel-linear (a separate
+                                            IOKit mapping)
+```
+
+So the assumption that "the engine owns these words, therefore they live
+in MMU-mapped memory" is **wrong**. The MBX's page table maps only 39
+pages (~156 KiB) — the command and state area, nothing else. Two things
+follow:
+
+* A model that writes completions must address `[1a4]` **directly** by
+  physical address, derived at runtime the way this probe does it
+  (console-announced object → kernel-linear PA → read the pointer). That
+  is derivable, not declarable — the pattern this project already trusts
+  for the TVOut window — but `[1a8]`'s pointer is NOT kernel-linear, so
+  its physical address needs a different derivation before anything writes
+  there.
+* Whatever updates those words on real hardware, it is not a walk through
+  this page table. Do not build the completion path on that premise.
+
 ## 1. What exists today
 
 `hw/arm/ipod_touch.c`, `s5l8900_mbx_read` / `s5l8900_mbx_write` — about 25

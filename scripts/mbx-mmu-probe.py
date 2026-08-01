@@ -358,11 +358,25 @@ def main() -> int:
                 report.setdefault("op_state", {})[name] = {
                     "ptr": f"{ptr:08x}", "pa": f"{pa:08x}",
                     "mbx_va": f"{mapped:06x}" if mapped is not None else None}
-                if mapped is not None:
-                    w = pmem(pa + 0x60, 4)
-                    if w:
+                # Dump regardless of mapping. Measured 2026-08-01: these are
+                # NOT MMU-mapped -- [1a4] is ordinary kernel heap and [1a8]
+                # is not even kernel-linear -- so the engine does not reach
+                # them through the page table, and a model that writes
+                # completions must address them directly. Their CONTENT is
+                # what says whether "+0x60 == 0 means idle" is real.
+                blob = pmem(pa & ~0xF, 0x80)
+                if blob:
+                    print(f"      {name} dump (PA 0x{pa & ~0xF:08x}):")
+                    for row in range(0, 0x80, 16):
+                        print("        %04x  %s" % (
+                            row, " ".join(f"{b:02x}"
+                                          for b in blob[row:row + 16])))
+                    off60 = (pa & 0xF) + 0x60
+                    if off60 + 4 <= len(blob):
+                        v = int.from_bytes(blob[off60:off60 + 4], "little")
                         print(f"      +0x60 (the word the recovery sleep "
-                              f"waits on) = 0x{int.from_bytes(w, 'little'):08x}")
+                              f"waits on) = 0x{v:08x}")
+                        report["op_state"][name]["plus60"] = f"{v:08x}"
         q.close()
     finally:
         if proc.poll() is None:
