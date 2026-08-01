@@ -416,9 +416,52 @@ Related docs:
 | 5. Memory-side completion, then the ISR bit | not started; this is the half all six failed register tricks were missing. |
 | 6. Delete `LK_ENABLE_MBX2D=0` and verify by pixels | not started. |
 
-Capturing a stream needs the guest to *use* MBX2D, which on 1.0 is a
-bistable init race (see the note above) — expect to repeat the
-`--exercise` run.
+### The order changed: the guest no longer exercises MBX2D at all
+
+Three `--exercise` runs on 1.0 (one without forwarding, two with) produced
+**zero** command-stream writes, with `0xa00000` still full of poison — and
+the app genuinely opened and dismissed each time (screenshots confirm
+Settings frontmost, then the home screen). So the earlier "bistable init"
+reading was too kind: on this engine the 33-block stream does not happen
+at all. What the guest does instead, from its own console:
+
+```
+AppleMBXUserClient::attach(AppleMBXDevice)      <- userland MBX2D connects
+MPVD Sleep: … AppleMBXDevice::setPowerState(0)  <- then the device idles out
+```
+
+plus, in the register trace, MBX2D's init arm (`0x108=3`, ack `0x134=0xfff`,
+arm `0x130=0xffff`), ONE FinishSurface timeout, and a teardown ending in
+`0x1020 = 0x00010000` (MMU off). The client attaches and never commits
+work; SpringBoard's snapshot render falls back to software and the
+dismissal completes. (Incidentally that means the ~33.8 s dismissal
+latency is not being paid in these runs either — worth measuring properly,
+because the "latency residual" in the button investigation may already be
+gone.)
+
+**Consequence for the implementation order.** You cannot decode a format
+you cannot capture, and you cannot capture a stream the guest declines to
+emit. So the sequence is now:
+
+1. ~~MMU + forwarding~~ **done** — and it is the prerequisite for both
+   remaining paths.
+2. **Make the guest commit to MBX2D**, by either:
+   * **(a) removing `LK_ENABLE_MBX2D=0`** from the guest plist so LayerKit
+     composites through MBX2D — step 6 promoted from "final acceptance" to
+     "development driver", since it is the only reliable stream source.
+     Cheapest route is the extract-HFS → edit → overlay loop
+     (`scripts/extract-hfs-from-nand.py`, `overlay-hfs-into-nand.py`), NOT
+     a full NAND rebuild; or
+   * **(b) making FinishSurface complete**, which is step 5 (memory-side
+     completion) — now tractable because the MMU gives us the addresses.
+     The 244 live bytes at MBX VA 0x1b000 (reg 0x60c, "engine base") are
+     the natural place to look for the op-state words the driver polls;
+     the pc/lr trace names which offsets it reads.
+3. Only then: decode (step 3) and blit (step 4).
+
+Route (b) is the more principled one and unblocks the latency residual as
+well; route (a) is the faster way to get a stream on the bench. They are
+not exclusive.
 
 ## 1. What exists today
 
