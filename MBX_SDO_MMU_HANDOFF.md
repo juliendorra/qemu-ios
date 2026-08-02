@@ -204,8 +204,19 @@ dead-end table 0.2.1 below):
 9. Answered the doorbell (deferred events 0x45d): the unpatched 1.0
    dismissal completes — 26 TA ops consumed, home screen restored.
    A parallel subagent decoded the 3D record layout (MBX_2D_FORMAT.md).
-10. Full strict oracle re-run in flight at session close; TA quad
-    rasterization is the next milestone (pixels for the zoom texture).
+10. Full strict oracle, unpatched 1.0, run 1: steps 1/4/5/6 PASS —
+    dismissal works end to end (step 4 reopened the app FROM the restored
+    home screen; POWER sleeps; HOME wakes). Steps 2 and 3 failed on KNOWN
+    pre-existing artifacts, verified by direct image comparison: step 3's
+    raw scanout grab caught a mid-flip black buffer (lit_after 0.57%,
+    triple-buffer bases cycling at t=308.4s in the LCD trace) while the
+    simultaneous screendump is pixel-identical to the home reference
+    (<0.7% of pixels differ at any threshold; only carrier text + clock
+    changed) — the documented "black screen is scanout" one-shot
+    artifact; step 2 is 1.0's documented bistable in-app delivery (it
+    passed 35.94% in the previous run of the same config). Re-run +
+    product-config control queued. TA quad rasterization remains the
+    next milestone (pixels for the zoom texture).
 
 * **The 2D command-block format is no longer structural guesswork.** The
   packers (`_pack2DCtxBlitColor` 0x30b3994c / `_pack2DCtxBlitCopy`
