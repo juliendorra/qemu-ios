@@ -165,7 +165,47 @@ hash-guarded LayerKit software-renderer fallback for 1A543a until the full
 surface-ring retirement and strict eight-second boot/in-app oracle pass. No
 guest FTL read or storage-validation bypass is used.
 
-### 0.2 The 2026-08-02 session: the block format is DECODED and a rasterizer exists
+### 0.2 The 2026-08-02 session: format decoded, rasterizer built, TA doorbell answered
+
+**Session timeline** (history, in order; details in the bullets and the
+dead-end table 0.2.1 below):
+
+1. Disassembled the 2D packers + setters (MBX2D.framework, full symbols)
+   and MBXConnect's transport → the block grammar and the method-7 record
+   scheme.
+2. Captured a live forced-mode stream (`--force-mbx2d`, mbx-cap10) — the
+   boot fill block matched the decoded grammar word for word; found the
+   forced boot then wedges: guest sleeps on event 0x10 after the ISR eats
+   the 0x4c reply.
+3. Implemented the plain-C rasterizer (`IT_MBX_2D_RASTER`) with a shadow
+   for the fire-clobbered word 0; fixed the rect-axis misread (dead end
+   #16) against the captured fill.
+4. Extracted the kernel side (kc10, −0x2000 slide, dead end #24): ISR bit
+   dispatch, retirement (live c0336988), surface handler (c0337c64),
+   queue-retire (c0337ce8), retire wrapper's 0x6d8 sync kick polling
+   status 0x400 → `0x6d8` now answers `0x40|0x400`.
+5. Re-ran forced mode with raster+ring+0x5c: both boot blocks executed
+   and completed — but the boot froze at the Apple logo. Diagnosed with
+   screendumps: the stalled client is the BOOT PROGRESS PAINTER (dead end
+   #18); found the 0x400 blanket-ack wipe (dead end #17) → event set
+   0x45c.
+6. With 0x45c the boot painter completes, but full-forced
+   (LK_ENABLE_MBX2D=1) SpringBoard still stalls in its userland present
+   path → PARKED; pivoted to the product-relevant unpatched snapshot
+   path (IT_IOS10_SOFTWARE_MBX2D=0).
+7. Strict oracle on the unpatched bundle: steps 1-2 PASS, step 3 froze
+   with ZERO dismissal-time MBX traffic. Built mbx-freeze-driver +
+   dfilter exec tracing (dead end #23 first): userland packs mostly
+   mbx3DCtxBlitCopy records and hangs INSIDE the method-7 ioctl.
+8. Kernel trace named the taWatchdog loop; decoded the parser's 12-entry
+   jump table, the shared 3D handler, and REGISTER 0x680 — the TA
+   doorbell — plus the forever-commandSleep on state2+0x74 and ISR
+   bit-0x1 parse-resume.
+9. Answered the doorbell (deferred events 0x45d): the unpatched 1.0
+   dismissal completes — 26 TA ops consumed, home screen restored.
+   A parallel subagent decoded the 3D record layout (MBX_2D_FORMAT.md).
+10. Full strict oracle re-run in flight at session close; TA quad
+    rasterization is the next milestone (pixels for the zoom texture).
 
 * **The 2D command-block format is no longer structural guesswork.** The
   packers (`_pack2DCtxBlitColor` 0x30b3994c / `_pack2DCtxBlitCopy`
@@ -250,6 +290,25 @@ guest FTL read or storage-validation bypass is used.
   doorbells consumed, home screen restored, screendump-verified.  TA quad
   RASTERIZATION is still pending (logged loudly per op); the visible cost
   is limited to the transient zoom-animation texture.
+### 0.2.1 Dead ends, false paths, and corrections of this session
+
+| # | belief / attempt | how it died | what replaced it |
+|---|---|---|---|
+| 16 | first parser cut read rect words as X-low/Y-high | the captured boot fill's rect `0x014001e0` puts 480 in the LOW half of a 320-px-wide, 0x500-stride surface — rows would overlap | rect words are Y-low/X-high (the packers' arg order is (y, x, …)); the 0x3 src-position word stays X-low/Y<<14 |
+| 17 | "the guest re-raises nothing; one latched 0x400 will do" | trace: guest deliberately acks ONLY 0x40 after the kick, keeping 0x400 latched — then the FinishSurface sleep wrapper's blanket `0x134=0xfff` wipes it before arming; `obj+0x1c4` never set; every later user-client method bails | the engine re-raises 0x400 per completed op: completion set is 0x45c (now 0x45d) |
+| 18 | "the forced-boot stall is SpringBoard's lock screen" then "a telephony Repair-Needed alert" | screendump: the guest sits at iBoot's APPLE LOGO — the stalled client is the boot progress painter, pre-SpringBoard | forced-mode LK_ENABLE_MBX2D=1 full-compositor bring-up is PARKED as a stretch goal; the product-relevant snapshot path was pursued instead |
+| 19 | "0x85c is a fence counter the engine must advance" | the join path read 0x85c and PROCEEDED on 0: reads-as-0 is the completed answer (matches the 2026-07-31 'answering 0 is load-bearing' finding) | left as-is; no fence model needed |
+| 20 | "state2+0x1c/+0x20 are engine-written swap-completion words" (and c032b44c is a 'swap-join checker') | the function logging `waitForHWContext - commandSleep failed` IS live 0xc032b44c: +0x1c/+0x20 are the hardware-3D-context BUSY words, slept on at &state2+0x1c, woken by the ISR join's commandWakeup | relabeled; the freeze was never swap-side |
+| 21 | "retirement is deferred by design, quiescence with state1+0x60 set is fine" | half-true: true for 2D-only quiescence, but the actual dismissal freeze was the un-answered TA doorbell, not retirement | the TA completion (events 0x45d off the 0x680 write) |
+| 22 | static hunt for AppleMBXUserClient's IOExternalMethod table | no such table — the dispatch is switch-based; a 5-word-entry scan finds nothing | the method-7 record parser's own 12-entry jump table at file 0xc032c8e4 |
+| 23 | mbx-mmu-probe --exercise on the artifacts NAND as the snapshot repro | the icon tap never opened the app (in-app frame classified home; zero fires) — run invalid | scripts/mbx-freeze-driver.py: scripted QMP app-open + HOME against the packaged bundle, with dfilter exec tracing |
+| 24 | kernel addresses taken from live traces used directly on kc10r.raw | the restore kernelcache is shifted: file VA = live VA − 0x2000, uniformly (agent burned a pass on 'wrong' addresses that were strings/data) | translate live→file with −0x2000 before disassembling; noted here because every doc's addresses are LIVE |
+
+Operational notes: IOLogs (Graphics Restart spam, EnqueueC…) go to SERIAL,
+which the bundle launcher sets to null — a silent-looking stall can be a
+logging loop; qemu.log only carries stderr. And `-d exec` PC extraction
+must parse the SECOND field of the bracket triple (`[flags/PC/…]`).
+
 * Instrumentation recipe that found this (reusable): freeze-driver
   (scripted app-open + HOME over QMP against the packaged bundle) with
   `-dfilter 0x30b37000+0x9000,0x31baf000+0x2000,0xc032b000+0x11000
