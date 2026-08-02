@@ -252,7 +252,6 @@ def main() -> int:
         env["IT_MBX_2D_TRACE"] = "1"
         env["IT_MBX_EVENTS"] = "1"
         env["IT_MBX_IRQ"] = "12"
-        env.setdefault("IT_MBX_2D_BLIT", "0")
         env.setdefault("IT_MBX_2D_EVENT", "0x4c")
     if args.op_trace:
         env["IT_MBX_OP_TRACE"] = "1"
@@ -265,8 +264,24 @@ def main() -> int:
         client = lockprobe.DisplayClient(vnc_port)
         client.start()
         print(f"booting {args.build} (IT_MBX_TRACE=all) ...", flush=True)
-        time.sleep(60)
-        q = lockprobe.QMP(qmp_path)
+        # QMP is the first observable readiness boundary.  Waiting a fixed
+        # minute hid launch failures (for example, a socket collision) and
+        # wasted a full minute before reporting them.
+        q = None
+        qmp_deadline = time.time() + 120
+        while time.time() < qmp_deadline:
+            if proc.poll() is not None:
+                tail = stderr.read_text(errors="replace")[-2000:]
+                raise SystemExit(
+                    f"QEMU exited before QMP (status {proc.returncode})\n"
+                    f"{tail}")
+            try:
+                q = lockprobe.QMP(qmp_path)
+                break
+            except OSError:
+                time.sleep(1)
+        if q is None:
+            raise SystemExit("QMP did not become ready within 120 seconds")
         deadline = time.time() + args.deadline
         kind = {"kind": "blank"}
         while time.time() < deadline:

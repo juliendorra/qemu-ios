@@ -102,13 +102,59 @@ key is `28c909fc…82d`), producing a 193,613,824-byte HFS+ volume. Inside it:
   `/System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8900xrb`, and
   iBoot-159 contains that same default-boot-path string. `build-m68ap-hfs-payload.sh`
   needs no path change.
-- `LK_ENABLE_MBX2D` **exists** in 1.0's LayerKit, so the MBX-2D software-compositing
-  shortcut (fault 2 of the home-screen fix) ports as-is.
+- `LK_ENABLE_MBX2D` **exists** in 1.0's LayerKit, but the later in-app HOME
+  investigation proved that the software-compositing shortcut does **not**
+  port as-is. It steers the primary LayerKit compositor, while 1A543a's older
+  app-snapshot/backing-store client can still initialize MBX2D and submit work.
+  The product therefore also makes `_mbx2DInitialize` fail in the disposable
+  staged NAND; the installed firmware artifact remains unchanged.
 - lockdownd has the **same activation architecture** — `/Library/Lockdown/data_ark.plist`,
   `ActivationState`, `FactoryActivated`, `ActivationStateAcknowledged`, and the same
   device-certificate validation strings. The hacktivation *strategy* ports; the byte
   patterns do not.
 - Kernel is `Darwin 9.0.0d1 … xnu-933.0.0.178 RELEASE_ARM_S5L8900XRB`.
+
+### LayerKit quirk: 1.0 has a separately surviving MBX2D backing-store path
+
+A **backing store** here is a CoreSurface in guest RAM containing the retained
+pixels of an application window. During HOME dismissal, SpringBoard can reuse
+that surface for the app-to-home transition instead of asking the application
+to redraw. LayerKit copies/converts/composites it with the wallpaper, dock and
+icon grid; it is an intermediate guest surface, not the final LCD framebuffer
+and not a host/QEMU image.
+
+The measured version difference is:
+
+| | 1.0 / 1A543a | 1.1.4 / 4A102 |
+|---|---|---|
+| Primary compositor steering | Reads `LK_ENABLE_MBX2D=0` and selects software compositing. | The prepared product NAND carries the same setting and selects guest software compositing. |
+| App-snapshot/backing-store transition | An older, separately surviving client still calls `_mbx2DInitialize`, submits the legacy shared-surface stream, and waits for MBX retirement despite the primary-compositor setting. | The tested app/HOME transition does not enter that failing legacy client and needs no per-launch `_mbx2DInitialize` patch. |
+| Emulator consequence | The launcher must make `_mbx2DInitialize` report failure in the disposable 1A543a clone so this second consumer also falls back to guest software. | No binary initialization patch is applied. |
+| Pixels in the working product | Original LayerKit software renderer running as guest ARM code. | Original LayerKit software renderer running as guest ARM code. |
+
+Observed 1.0 control flow:
+
+```text
+LK_ENABLE_MBX2D=0
+    -> primary LayerKit compositor selects software
+    -> legacy app-snapshot/backing-store client still calls _mbx2DInitialize
+    -> apparent success submits real MBX2D work
+    -> missing surface-ring retirement causes repeated recovery timeouts
+```
+
+This makes 1.0 look architecturally split while 1.1.4 looks more unified: in
+the tested newer transition, the software/MBX decision covers the rendering
+work without a second legacy client escaping it. Treat “unified” as a
+**supported inference**, not recovered Apple source intent—the proprietary code
+is stripped and no source-level ownership change has been proven. What is
+directly established is the behavioral boundary: `LK_ENABLE_MBX2D=0` is not a
+global ban on all MBX2D consumers in 1A543a, `_mbx2DInitialize` failure stops
+the legacy submissions, and 4A102 does not reproduce them in the same test.
+
+Full traces and the exact workaround guard are in
+[`IN_APP_BUTTON_INVESTIGATION.md`](IN_APP_BUTTON_INVESTIGATION.md#what-backing-store-means-here-and-why-the-ordinary-flag-is-insufficient);
+the current emulator/device boundary is in
+[`MBX_SDO_MMU_HANDOFF.md`](MBX_SDO_MMU_HANDOFF.md#what-the-current-mbx-model-actually-does).
 
 ### Driver-level differences that hit our device models
 

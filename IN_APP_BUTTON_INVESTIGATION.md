@@ -29,10 +29,15 @@ and takes the recovery timeout repeatedly. Roughly 33.8 seconds later it can
 expose a partially painted SpringBoard without icons. The button was delivered
 promptly; the renderer blocked the visual handoff.
 
-The same machine model works on 1.1.4 because 4A102 does not enter this legacy
-backing-store renderer during the tested app transition. It is not evidence
-that generic MBX register values or HOME timing are correct for 1.0; it is a
-different guest rendering path.
+The same machine model works on 1.1.4 because the prepared 4A102 product NAND
+steers LayerKit with `LK_ENABLE_MBX2D=0` and its newer tested app transition
+does not enter this legacy backing-store renderer. The supplied N45AP/iPod NAND
+already carries the same SpringBoard environment setting. Both consequently
+produce pixels with LayerKit's original guest-side software compositor and
+need no per-launch `_mbx2DInitialize` patch. This is not evidence that generic
+MBX register values or HOME timing are correct for 1.0: 1A543a's older backing-
+store client still initializes and submits MBX2D work despite the ordinary
+setting, so its decision point differs.
 
 The compatibility workaround makes the emulator's advertised capability truthful for
 the affected build. The launcher first clones NAND and NOR for the run. Only
@@ -48,6 +53,47 @@ and the bundle's master `nand.pack` is never opened for writing.
 backing-store client still initialized and submitted MBX2D work. Failing the
 client initialization itself is the measured decision point that reliably
 selects the software path.
+
+### What “backing store” means here, and why the ordinary flag is insufficient
+
+A backing store is a guest-memory surface containing the most recently rendered
+pixels of an application window. It lets SpringBoard reuse the application's
+image without asking the application to redraw every control during a window
+transition:
+
+```text
+application renders its window
+    -> pixels retained in a CoreSurface backing store
+    -> SpringBoard/LayerKit can copy, convert and composite that surface later
+```
+
+During the iPhone OS 1.0 HOME dismissal, SpringBoard needs the foreground
+application's retained image for the transition back to the wallpaper, dock
+and icon grid. The legacy LayerKit/CoreSurface backing-store client obtains
+that surface and submits the necessary copies/composites to MBX2D. It is not
+the application, the final LCD framebuffer, or a QEMU-owned image; it is an
+intermediate surface and the guest code that manages it.
+
+`LK_ENABLE_MBX2D=0` steers LayerKit's primary compositor, but the measured
+1A543a backing-store/snapshot path is a separate MBX2D consumer. The guest reads
+the setting and uses software for the main compositor, yet this older client
+still calls `_mbx2DInitialize`. Because the incomplete emulator advertises a
+successful initialization, that client submits shared-surface work and waits
+for retirement the model cannot yet perform. The observed control flow is:
+
+```text
+LK_ENABLE_MBX2D=0
+    -> primary LayerKit compositor selects software
+    -> legacy app-snapshot/backing-store client still calls _mbx2DInitialize
+    -> apparent success causes real MBX2D submissions and timeout recovery
+```
+
+The exact Apple source-level rationale is unavailable, so do not overstate it
+as a known design intent. What is established experimentally is the boundary:
+the environment setting is not a global prohibition on every 1A543a MBX2D
+client, while forcing `_mbx2DInitialize` to fail stops the legacy submissions
+and makes that path use its existing software implementation too. The tested
+4A102 transition does not enter this older backing-store client.
 
 ## From broken to fixed: why this took so long
 

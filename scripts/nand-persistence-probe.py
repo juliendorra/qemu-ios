@@ -212,6 +212,12 @@ def main() -> int:
                          " reaches BSD root in ~12 s, so this only has to be"
                          " comfortably above that -- and every FAILING probe"
                          " pays it in full, which is what sets the runtime.")
+    ap.add_argument("--cycles", type=int, default=1,
+                    help="repeat boot A this many times on the SAME NAND before"
+                         " the final cold boot. One save landing correctly does"
+                         " not prove the next one does -- the FTL appends, so"
+                         " each cycle writes its context further into the"
+                         " control block.")
     ap.add_argument("--keep-nor", action="store_true",
                     help="let boot B inherit boot A's NOR instead of a fresh"
                          " copy -- what a real power cycle does")
@@ -260,13 +266,22 @@ def main() -> int:
         a = {"tag": "a", "booted": True, "reused": str(args.from_written),
              "writes": -1, "multi_writes": -1, "elapsed_s": 0.0}
     else:
-        print("[np] boot A: fresh NAND, writable")
-        a = run_boot(args, nand, nor, args.logs, "a", args.boot_timeout,
-                     settle=args.settle, want_writes=args.want_writes,
-                     until=args.a_until)
-        print(f"[np]   booted={a['booted']} writes={a['writes']} "
-              f"multi={a['multi_writes']} "
-              f"marker={a.get('reached_marker', '-')} ({a['elapsed_s']}s)")
+        cycles = []
+        for cycle in range(max(1, args.cycles)):
+            tag = "a" if cycle == 0 else f"a{cycle + 1}"
+            print(f"[np] boot A cycle {cycle + 1}/{max(1, args.cycles)}"
+                  f"{' : fresh NAND, writable' if cycle == 0 else ''}")
+            a = run_boot(args, nand, nor, args.logs, tag, args.boot_timeout,
+                         settle=args.settle, want_writes=args.want_writes,
+                         until=args.a_until)
+            print(f"[np]   booted={a['booted']} writes={a['writes']} "
+                  f"multi={a['multi_writes']} "
+                  f"marker={a.get('reached_marker', '-')} ({a['elapsed_s']}s)")
+            cycles.append(a)
+            if not a["booted"]:
+                break
+        report["boot_a_cycles"] = cycles
+        a = cycles[-1]
     report["boot_a"] = a
     if not a["booted"]:
         report["verdict"] = "boot A never came up -- nothing to test"

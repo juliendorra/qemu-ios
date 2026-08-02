@@ -104,7 +104,7 @@ def main() -> int:
         index = {struct.unpack_from("<I", mapping, 20 + i * 4)[0]: i
                  for i in range(count)}
 
-        written = missing_spare = 0
+        written = unchanged = missing_spare = 0
         with args.image.open("rb") as image:
             for offset in range(pages):
                 vpn = first_vpn + offset
@@ -122,13 +122,23 @@ def main() -> int:
                 base = data_offset + entry * page_size
                 spare = bytes(mapping[base + DATA_SIZE: base + page_size])
                 out = args.nand / f"bank{bank}" / f"{page}.page"
-                out.write_bytes(image.read(DATA_SIZE) + spare)
+                contents = image.read(DATA_SIZE) + spare
+                # Staging commonly starts with an APFS clone of a complete
+                # NAND tree.  Replacing an identical override would break
+                # clone sharing for every page in the partition and can turn
+                # a one-file guest edit into nearly a gigabyte of writes.
+                # Preserve the clone when the effective page is unchanged.
+                if out.exists() and out.read_bytes() == contents:
+                    unchanged += 1
+                    continue
+                out.write_bytes(contents)
                 written += 1
         mapping.close()
 
     print(f"partition {args.partition}: first_vpn={first_vpn} "
           f"capacity={capacity} pages")
     print(f"wrote {written} page overrides into {args.nand}"
+          + (f" ({unchanged} unchanged)" if unchanged else "")
           + (f" ({missing_spare} skipped: no base page)" if missing_spare
              else ""))
     return 0

@@ -567,10 +567,12 @@ scripts/package-iphone-app.sh --verify-only                  # audit a bundle
 ```
 
 `package-iphone-app.sh` also GENERATES the guest image it installs, via
-`scripts/build-m68ap-homescreen-nand.py` — the lockdownd activation patch,
-`LK_ENABLE_MBX2D=0`, the local HTTPS-bridge CA, and the reference-shaped data
-ark, i.e. the exact combination measured to reach the home screen. Packaging
-can therefore not drift from the verified configuration.
+`scripts/build-m68ap-homescreen-nand.py` — the lockdownd activation patch, the
+local HTTPS-bridge CA, and the reference-shaped data ark. For legacy 1A543a,
+the launcher additionally applies the hash-guarded LayerKit software-renderer
+fallback to its disposable staged NAND clone; installed firmware is untouched.
+These are the exact combinations measured to reach the home screen, so
+packaging cannot silently drift from the verified configuration.
 
 **The HTTPS-bridge CA is per host**, so an iPhone bundle is only fully
 functional on the machine that packaged it — copied elsewhere, HTTPS through

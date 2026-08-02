@@ -57,9 +57,6 @@ case "$PROFILE" in
         export IT_MBX_EVENTS="${IT_MBX_EVENTS:-1}"
         export IT_MBX_IRQ="${IT_MBX_IRQ:-12}"
         export IT_MBX_MMU="${IT_MBX_MMU:-1}"
-        # The experimental copy-block decoder remains opt-in until its
-        # coordinate/pitch interpretation passes pixel comparison.
-        export IT_MBX_2D_BLIT="${IT_MBX_2D_BLIT:-0}"
         export IT_MBX_2D_EVENT="${IT_MBX_2D_EVENT:-0x4c}"
         ;;
     *)
