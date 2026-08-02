@@ -1,4 +1,4 @@
-# The MBX session: SDO lands (T1 done), the MBX MMU is discovered (T2 unblocked)
+# The MBX session: SDO complete; MBX legacy retirement active
 
 **Dates:** 2026-07-31 → 2026-08-01 · **Branch:** `wasm-jit-graft` ·
 **Commits:** `450dd3592f` … `c666f6f4f7` (this thread's only; the wasm
@@ -19,19 +19,90 @@ session and this is the organised version); the pre-history is
 | thing | state |
 |---|---|
 | **T1 — TVOut swap zero-window** | **RETIRED BY DEFAULT.** The missing hardware signal was the SDO field interrupt, now modelled (`hw/arm/ipod_touch_tvout.c`). The guest completes its own swaps; the derived window is only placed under `IT_TVOUT_SDO=0`. |
-| **T2 — MBX 2D** | Foundation implemented (MMU + aperture forwarding + stream capture), format known structurally, **blocked on the guest emitting a stream** (it currently declines MBX2D and falls back to software). |
+| **T2 — MBX 2D** | **ACTIVE.** MMU, aperture forwarding, the real kick, and stream capture are established. Forced hardware mode proves that completion also requires engine-side retirement of the operation and every surface-list node before event `0x10`; direct clearing of `state1+0x60` and IRQ-first completion are invalid. The product keeps LayerKit's verified software compositor until the forced path passes the strict oracle. |
 | §4 performance gate | Measured: compositing is 2–4% of guest CPU natively; the wasm-transferable bound is (8–19% non-idle share) × (guest-code fraction of the wasm vCPU thread, ~21% today). Fidelity-only for now; re-run the arithmetic after the wasm speed campaign. |
 | Packaged apps | All three updated to the new engine and re-verified: iPod 5/5, 1.0 5/5, 1.1.4 5/5 (`IT_PROBE_WAIT=4`). |
 | 3A109a / 1C28 | NOT verified — their NAND artifacts are not on disk (regenerate per BUILD.md). |
 | 1.0 dismissal latency | The 33.8 s regime is not reliably present (the guest takes the software-fallback path), but a clean number was NOT obtained — the only instrument tried is icount-blind and its run was discarded. |
+
+### What the current MBX model actually does
+
+The current implementation is a **hybrid device model**: it contains real MBX
+transport/MMU emulation, but it does not yet contain a complete MBX command
+processor or rasterizer. It is not GPU passthrough and sends no MBX command to
+macOS, Metal, OpenGL, WebGL, or another host graphics API.
+
+There are two materially different execution paths:
+
+1. **Default/product path (working graphics).** All currently packaged guests
+   produce pixels with original guest-side software compositing, but they reach
+   that path at different decision points. None of these controls injects a
+   QEMU renderer. LayerKit's ARM code runs on the emulated CPU and writes pixels
+   into guest surfaces and the framebuffer; the emulated LCD then presents the
+   completed framebuffer.
+
+   ```text
+   LayerKit guest software compositor
+       -> emulated ARM CPU
+       -> guest surface/framebuffer memory
+       -> emulated LCD
+       -> QEMU display window
+   ```
+
+   | guest/build | how it reaches software compositing |
+   |---|---|
+   | **iPod Touch / N45AP** | The supplied devos50 NAND already carries `EnvironmentVariables: LK_ENABLE_MBX2D="0"` in `com.apple.SpringBoard.plist`. LayerKit therefore selects its software compositor without any per-launch binary patch. This setting belongs to the supplied image, not to QEMU's raster code; a newly constructed stock image would need equivalent steering until MBX rasterization is complete. |
+   | **iPhone OS 1.1.4 / 4A102** | The prepared product NAND carries the same `LK_ENABLE_MBX2D="0"` steering (the stock IPSW plist did not). Its newer LayerKit transition also does not enter 1A543a's problematic legacy backing-store renderer in the tested app/HOME path. It therefore needs no `_mbx2DInitialize` patch and renders in guest software. |
+   | **iPhone OS 1.0 / 1A543a** | `LK_ENABLE_MBX2D=0` alone is not sufficient: it steers the primary compositor, but the older app-snapshot/backing-store client still initializes MBX2D and submits shared-surface work. `scripts/ipod-app-launcher.sh` therefore makes `_mbx2DInitialize` report failure only in the disposable staged NAND, unless `IT_IOS10_SOFTWARE_MBX2D=0` explicitly requests protocol investigation. That measured failure point makes the old LayerKit select its existing software renderer. “Backing store” and the separate-client boundary are defined in [`IN_APP_BUTTON_INVESTIGATION.md`](IN_APP_BUTTON_INVESTIGATION.md#what-backing-store-means-here-and-why-the-ordinary-flag-is-insufficient). |
+
+   The difference is therefore **how the guest is steered**, not who draws the
+   pixels. N45AP and 4A102 avoid MBX2D through their prepared SpringBoard
+   configuration/newer path; 1A543a additionally needs a guarded initialization
+   failure because its older backing-store renderer otherwise submits work
+   despite the ordinary LayerKit setting.
+
+2. **Forced MBX2D path (protocol investigation).** With the staged fallback
+   disabled, LayerKit and AppleMBX emit the real legacy command stream. The
+   model receives the MMIO writes, translates MBX virtual addresses through
+   the guest-programmed eight-entry MMU, forwards aperture accesses into the
+   corresponding guest RAM pages, captures the command words, and partially
+   models surface-list retirement and ordered completion events. It currently
+   does **not** turn those command packets into pixels. Therefore forced MBX2D
+   can exercise the device protocol but cannot yet produce a correct screen.
+
+   ```text
+   LayerKit MBX2D -> AppleMBX -> emulated MBX transport/MMU/completion
+                                    -> command captured, no rasterizer yet
+   ```
+
+The boundary by subsystem is:
+
+| subsystem | current implementation |
+|---|---|
+| Register identity/status | Functional compatibility behaviour; some values and immediate transport completions are approximations. |
+| Event mask, acknowledge and IRQ line | Partially modelled hardware behaviour. |
+| Eight-entry MBX MMU | Functional emulation using the guest's own page directory and PTEs. |
+| Shared aperture | Functional forwarding into the translated guest physical RAM pages. |
+| Surface-ring retirement | Partially modelled and still diagnostic (`IT_MBX_2D_RING=1`). |
+| Operation-token unlink/release | Incomplete; `state1+0x60/+0x64` remain the current open boundary. |
+| Legacy command rasterization | Not implemented. The rejected speculative copy/color decoder is not shipped. |
+| Host graphics passthrough | None. The host only displays the guest LCD framebuffer. |
+
+Thus this is more than a register-only mock, but it is not yet full hardware
+emulation. Production currently combines an emulated MBX transport device with
+the guest OS's native software-rendering fallback. The intended next renderer
+is a deterministic, portable command consumer inside QEMU so the same code can
+run natively and under WebAssembly; a macOS-only host API is not required.
 
 ### Environment variables added or changed
 
 | var | default | meaning |
 |---|---|---|
 | `IT_TVOUT_SDO` | **ON** | the SDO field-interrupt model. `=0` restores the old stub AND re-arms the derived zero-window — the one-knob A/B. |
-| `IT_MBX_MMU` | off | forward MBX aperture accesses through the guest's own page table into guest DRAM. |
+| `IT_MBX_MMU` | raw QEMU: off; iPhone launcher: **on** | forward MBX aperture accesses through the guest's own page table into guest DRAM. |
 | `IT_MBX_2D_TRACE` | off | dump a 2D command block out of guest memory when the guest fires it (needs `IT_MBX_MMU=1` to see anything the model didn't store). |
+| `IT_MBX_2D_EVENT` | raw QEMU: 0; iPhone launcher: **0x4c** | event mask for a legacy 2D fire. Bit `0x10` is suppressed unless the diagnostic ring-completion model is enabled and its memory-side preconditions pass. Ordered `0x5c` is the current forced-path experiment. |
+| `IT_MBX_2D_RING` | off | diagnostic surface-list retirement and ordered bit-`0x10` completion; not a rasterizer and not enabled in the product path. |
 | `IT_PROBE_WAIT=4` | (harness) | required for `app-button-probe --board m68ap-114`; the default 2× verdict window is marginal for that build's app launch. |
 
 ### New / extended instruments
@@ -49,6 +120,105 @@ session and this is the organised version); the pre-history is
 * `scripts/lock-unlock-probe.py` grew `--icount`.
 * All three new probes delete their ~300 MB staged NAND clone by default
   (`--keep-stage` to keep) — inside the `finally`, so early exits clean up.
+
+### 0.1 Current continuation: forcing the stream exposed the retirement contract
+
+The earlier blocker was removed without touching the installed firmware:
+`mbx-mmu-probe.py --force-mbx2d` edits the same-length `Q0` → `Q1` value in
+the cloned NAND's binary plist (sparse page or packed entry), then drives the
+whole case through QMP.  On 1A543a this produced the real traffic:
+
+* `0x6d8` is the engine kick; `0x824..0x83c` are its descriptors.
+* `0x1020 = 0x10100` is a microcode-upload strobe, not a kick, and must not
+  clear the independently latched MMU enable.
+* The bootstrap/queue reply is `0x40|0x08|0x04 = 0x4c`.  Raising `0x40`
+  alone leaves the Graphics watchdog restarting the engine; entering the
+  guessed bit-`0x10` render ISR panics because its shared state is absent.
+* `state1+0x60` is a pointer to the live operation entry, not a busy flag.
+  Only the guest's `c0336988` retirement path may clear it, after decrementing
+  `state1+0x64`, unlinking the `entry+0xb8` token, and releasing resources.
+* Event `0x10` enters `c0337c64`, which traverses the surface list at
+  `record+0x34c`. Each node must contain a CPU-traversable page-array pointer
+  before the event is raised. IRQ-first attempts faulted first at `0x8aae`,
+  then at an unretired tail node (`0x8080eb00`).
+* The exact first-pass tail is `{ array=0, next=0x8aae }`; `0x8aae` is the
+  physical page token for the submitted command block. Consuming it by clearing
+  the terminator's `next`, publishing `state2+0x24`, and then raising ordered
+  event `0x5c` eliminates both the panic and the Graphics watchdog restart.
+  The 30-second staged run retained `state1+0x60/+0x64 = operation/1`, so the
+  final operation-token unlink/release boundary is still open; the model does
+  not clear either field directly.
+* 29 distinct writes in the `0xa00000` stream aperture matched the translated
+  DRAM bytes exactly. This validates the MMU and forwarding implementation.
+
+Pixel validation then rejected a tempting partial solution. The first two
+packets are a full-screen color operation and a surface copy, but executing
+only those yields an incomplete/corrupt SpringBoard frame. The old classifier
+mislabelled that image as `home`; direct image inspection caught it. Named
+`MBX2D.framework` packers explain the packets, while the scene content depends
+on the accompanying PowerVR MBX engine work. A correct implementation is thus
+a GPU command processor, not another register or memcpy shim.
+
+Current policy: keep the truthful MMU/transport model and scripted probe, do
+not ship the rejected speculative raster decoder, and retain the staged,
+hash-guarded LayerKit software-renderer fallback for 1A543a until the full
+surface-ring retirement and strict eight-second boot/in-app oracle pass. No
+guest FTL read or storage-validation bypass is used.
+
+### 0.2 The 2026-08-02 session: the block format is DECODED and a rasterizer exists
+
+* **The 2D command-block format is no longer structural guesswork.** The
+  packers (`_pack2DCtxBlitColor` 0x30b3994c / `_pack2DCtxBlitCopy`
+  0x30b3a974) and every `Set*` field writer were fully disassembled
+  (MBX2D.framework, 1A543a root, full symbols), and the decode was verified
+  word-for-word against a live captured forced-mode stream. Full spec in the
+  session scratch (`mbx2d_format_spec.md`) — summary: `0xA`/`0x94` dest/src
+  descriptors (stride|format, then a kernel-resolved MBX-VA address word),
+  `0x3` src position (x low, y<<14), optional `0x2000_0004`+blend, optional
+  scissor (`1`, y-range, x-range), `0x6` scale (1.0=0x20), `0x8` control =
+  blend-en 0x20000 | scissor-en 0x40000 | rotation bits | ROP16 (`F0F0`
+  fill / `CCCC` copy), operand (fill colour in dest format, or 0xFFFFFFFF),
+  two dest-corner words (**Y low half, X high half** — measured off the
+  480-axis), 0x7000_0000 terminators (6 for color, 1 for copy).
+* **Transport understood:** userland packs `{cmd, words, surfIDs, block}`
+  records into a shared buffer (`_mbxGetCommandSpace`), user-client method 7
+  submits, and the KERNEL emits the tagged stream into 0xa00000, patching
+  surface MBX addresses into the descriptors' second words.
+* **A plain-C rasterizer now exists** (`IT_MBX_2D_RASTER=1`,
+  `mbx_2d_execute_stream` in hw/arm/ipod_touch.c): parses fired streams
+  through the MBX MMU, executes F0F0 fills and CCCC copies (scissor,
+  nearest scale) into the guest's own surfaces, executes BEFORE any
+  completion event, logs-and-skips anything outside the decoded grammar.
+  No host graphics API, no threads — wasm-safe by construction.
+* **The retirement mystery is solved.** Full ISR decode (kc10, file base =
+  live − 0x2000): bit 0x40 latches state2+0x2c and the 0x40|0x08|0x04 join
+  clears the latches and runs queue-retire (live c0337ce8); bit 0x10 runs
+  the surface handler (live c0337c64: marks w*h 8-byte entries per
+  record+0x34c node with 0x20000000, sets state2+0xc=1, slot=3). The woken
+  FinishSurface then calls the retire wrapper (live c032f1ec) which **kicks
+  a sync descriptor through 0x6d8 and POLLS STATUS BIT 0x400** (kick live
+  c032e4fc) before unlinking token 0x4000 and clearing state1+0x60. Our
+  model never raised 0x400 on the 0x6d8 kick — that is why the ordered-0x5c
+  experiment survived but left state1+0x60/+0x64 = operation/1 forever.
+  Fixed: 0x6d8 now answers 0x40|0x400.
+* Forced-mode boot with the pre-fix engine wedges at the first real 2D op:
+  the guest fires, the ISR consumes the 0x4c reply, re-arms 0x130=0xffff,
+  and sleeps waiting for 0x10 — measured in /private/tmp/mbx-cap10.
+* **The stalled forced-mode boot is the BOOT PROGRESS PAINTER, not
+  SpringBoard.** The two boot blocks (full-screen fill + bottom-strip blend
+  copy) are the boot spinner's; the guest freezes at the Apple logo right
+  after the first op completes. Cause found in the trace: after the 0x6d8
+  kick the guest deliberately acks only 0x40 and LEAVES 0x400 LATCHED, but
+  the FinishSurface sleep wrapper's blanket `0x134=0xfff` ack wipes the
+  latched 0x400 before arming `0x130=0xffff` — so the ISR never dispatches
+  bit 0x400 and `obj+0x1c4` (the engine-ready byte, set ONLY in the ISR's
+  bit-0x400 path) stays 0, which makes every later user-client method bail
+  out early. On hardware the engine re-raises 0x400 per completed queue op,
+  so the 2D completion event set must include it: `IT_MBX_2D_EVENT=0x45c`.
+* Method c032f6f0 (live): kick_sync → enqueue op (c0336064) → 1 s
+  commandSleep via `[obj+0x218]` vtbl+0xf0 — the wait every op takes.
+* Current experiment: `IT_MBX_2D_EVENT=0x45c IT_MBX_2D_RING=1
+  IT_MBX_2D_RASTER=1` forced-mode boot on 1A543a.
 
 ---
 
