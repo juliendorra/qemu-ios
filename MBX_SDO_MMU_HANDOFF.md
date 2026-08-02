@@ -315,6 +315,9 @@ dead-end table 0.2.1 below):
 | 23 | mbx-mmu-probe --exercise on the artifacts NAND as the snapshot repro | the icon tap never opened the app (in-app frame classified home; zero fires) — run invalid | scripts/mbx-freeze-driver.py: scripted QMP app-open + HOME against the packaged bundle, with dfilter exec tracing |
 | 24 | kernel addresses taken from live traces used directly on kc10r.raw | the restore kernelcache is shifted: file VA = live VA − 0x2000, uniformly (agent burned a pass on 'wrong' addresses that were strings/data) | translate live→file with −0x2000 before disassembling; noted here because every doc's addresses are LIVE |
 
+| 25 | "run the 1.0 oracle at IT_PROBE_WAIT=10 for safety" | the pure-defaults control then failed steps 2/4/5 with DEAD INPUT on a perfectly restored home screen — W=10 stretches every step past 1.0's auto-lock window, reproducing the documented auto-sleep touch death; the verified-5/5 parameter for this board is IT_PROBE_WAIT=4 | verify at the parameters the 5/5 record was set with; W=10 is for 1.1.4's `1_open_app` window only |
+| 26 | "one raw scanout grab is a fair judge for 3_home_returns" | three runs in a row (both engine configs) grabbed a mid-flip black buffer (lit 0.57-0.69%) while the simultaneous screendump was pixel-identical to the reference | app-button-probe `regrabs`: re-SAMPLE without re-acting, verdict unchanged (commit 003646244f) |
+
 Operational notes: IOLogs (Graphics Restart spam, EnqueueC…) go to SERIAL,
 which the bundle launcher sets to null — a silent-looking stall can be a
 logging loop; qemu.log only carries stderr. And `-d exec` PC extraction
