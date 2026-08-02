@@ -57,7 +57,18 @@ case "$PROFILE" in
         export IT_MBX_EVENTS="${IT_MBX_EVENTS:-1}"
         export IT_MBX_IRQ="${IT_MBX_IRQ:-12}"
         export IT_MBX_MMU="${IT_MBX_MMU:-1}"
-        export IT_MBX_2D_EVENT="${IT_MBX_2D_EVENT:-0x4c}"
+        # 2026-08-02: the modeled engine executes the 2D stream (RASTER),
+        # retires the surface ring (RING), and answers the full completion
+        # set 0x45c -- the 0x400 re-raise is what keeps the engine-ready
+        # byte latched through the guest's blanket acks.  The TA doorbell
+        # (reg 0x680) completes 3D operations.  With these, the unpatched
+        # 1A543a snapshot client passes the strict oracle 6/6
+        # (MBX_SDO_MMU_HANDOFF.md section 0.2).  Overridable for A/Bs;
+        # IT_MBX_2D_EVENT=0x4c IT_MBX_2D_RASTER=0 IT_MBX_2D_RING=0
+        # restores the pre-raster engine.
+        export IT_MBX_2D_EVENT="${IT_MBX_2D_EVENT:-0x45c}"
+        export IT_MBX_2D_RASTER="${IT_MBX_2D_RASTER:-1}"
+        export IT_MBX_2D_RING="${IT_MBX_2D_RING:-1}"
         ;;
     *)
         echo "Unsupported S5L8900 profile: $PROFILE" >&2
@@ -125,12 +136,17 @@ if [[ "$PROFILE" == "iphone-2g" && "${S5L8900_STAGE_NAND:-1}" != "0" ]]; then
     # disposable per-launch packed-NAND clone.  Guard both the firmware epoch
     # and the exact original instruction bytes; an unknown artifact fails
     # closed instead of being corrupted.  The installed firmware source stays
-    # pristine, as required by the staged-firmware policy.  Set
-    # IT_IOS10_SOFTWARE_MBX2D=0 for MBX protocol investigation.
+    # pristine, as required by the staged-firmware policy.
+    #
+    # RETIRED BY DEFAULT 2026-08-02: the modeled MBX engine (rasterizer +
+    # completion chain + TA doorbell) carries the unpatched snapshot
+    # client through the strict oracle 6/6, so the fallback is no longer
+    # applied unless IT_IOS10_SOFTWARE_MBX2D=1 explicitly requests the
+    # old behavior for an A/B (MBX_SDO_MMU_HANDOFF.md section 0.2).
     IOS10_PROVENANCE="$FIRMWARE_DIR/nand/nand-provenance.json"
     if [[ "$(tr -cd '0-9' < "$FIRMWARE_DIR/epoch" 2>/dev/null || true)" == "0" &&
           -r "$IOS10_PROVENANCE" &&
-          "${IT_IOS10_SOFTWARE_MBX2D:-1}" != "0" ]] &&
+          "${IT_IOS10_SOFTWARE_MBX2D:-0}" == "1" ]] &&
           grep -q '"build"[[:space:]]*:[[:space:]]*"1A543a"' "$IOS10_PROVENANCE"; then
         IOS10_PACK="$NAND/nand.pack"
         IOS10_MBX2D_OFFSET=$((0x205bf04))

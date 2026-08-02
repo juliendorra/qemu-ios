@@ -204,6 +204,17 @@ dead-end table 0.2.1 below):
 9. Answered the doorbell (deferred events 0x45d): the unpatched 1.0
    dismissal completes — 26 TA ops consumed, home screen restored.
    A parallel subagent decoded the 3D record layout (MBX_2D_FORMAT.md).
+11. **VERIFIED, then RETIRED (2026-08-02, end).** At the parameters the
+    5/5 record was set with (IT_PROBE_WAIT=4) and with the deflaked
+    probe, BOTH configs pass the strict oracle **6/6**: pure-defaults
+    product (no regression) and the unpatched MBX engine
+    (home_reference_diff 0.38%). The launcher's `_mbx2DInitialize`
+    staged patch is now OFF by default (IT_IOS10_SOFTWARE_MBX2D=1
+    re-enables it for A/B) and the iphone-2g profile ships
+    IT_MBX_2D_EVENT=0x45c, IT_MBX_2D_RASTER=1, IT_MBX_2D_RING=1.
+    Earlier same-day runs that failed steps 2/3/4/5 were instrument
+    artifacts, all root-caused: one-shot mid-flip grabs (dead end #26)
+    and the W=10 auto-lock collision (dead end #25).
 10. Full strict oracle, unpatched 1.0, run 1: steps 1/4/5/6 PASS —
     dismissal works end to end (step 4 reopened the app FROM the restored
     home screen; POWER sleeps; HOME wakes). Steps 2 and 3 failed on KNOWN
