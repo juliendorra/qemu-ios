@@ -19,7 +19,7 @@ session and this is the organised version); the pre-history is
 | thing | state |
 |---|---|
 | **T1 — TVOut swap zero-window** | **RETIRED BY DEFAULT.** The missing hardware signal was the SDO field interrupt, now modelled (`hw/arm/ipod_touch_tvout.c`). The guest completes its own swaps; the derived window is only placed under `IT_TVOUT_SDO=0`. |
-| **T2 — MBX 2D** | **SHIPPED (2026-08-02).** Block format decoded and spec'd (MBX_2D_FORMAT.md); plain-C rasterizer executes 2D streams into the guest's own surfaces; completion chain closed (kick 0x40\|0x400, per-op 0x45c, TA doorbell reg 0x680 → 0x45d). The 1A543a `_mbx2DInitialize` staged patch is retired by default; the snapshot client runs on the modeled engine. Final verification: **all three bundles 6/6 on the strict oracle at shipped defaults** (1.0 unpatched-MBX, 1.1.4, iPod; IT_PROBE_WAIT=4, deflaked probe). Open: TA quad rasterization (zoom-texture pixels, logged per op), 2D blend/rotation, forced LK_ENABLE_MBX2D=1 full-compositor mode (parked), 3A109a/1C28 artifacts. |
+| **T2 — MBX 2D** | **SHIPPED (2026-08-02).** Block format decoded and spec'd (MBX_2D_FORMAT.md); plain-C rasterizer executes 2D streams into the guest's own surfaces; completion chain closed (kick 0x40\|0x400, per-op 0x45c, TA doorbell reg 0x680 → 0x45d). The 1A543a `_mbx2DInitialize` staged patch is retired by default; the snapshot client runs on the modeled engine. Final verification: **all three bundles 6/6 on the strict oracle at shipped defaults** (1.0 unpatched-MBX, 1.1.4, iPod; IT_PROBE_WAIT=4, deflaked probe). Open, in order of tractability: TA quad rasterization is **blocked at a documented boundary** — the dest geometry is captured (axis-aligned screen rects, one shared atlas, 26 text-label strips) but the texture base-address + UV encoding are packed PowerVR MBX TA control words that need the TA datasheet; decoding them by guess is what the moratorium forbids, and no shipping frame depends on it (final composite is guest-rendered, oracle diff 0.38%). Also open: 2D blend equations/rotation, forced LK_ENABLE_MBX2D=1 full-compositor mode (parked), 3A109a/1C28 artifacts. |
 | §4 performance gate | Measured: compositing is 2–4% of guest CPU natively; the wasm-transferable bound is (8–19% non-idle share) × (guest-code fraction of the wasm vCPU thread, ~21% today). Fidelity-only for now; re-run the arithmetic after the wasm speed campaign. |
 | Packaged apps | All three updated to the new engine and re-verified: iPod 5/5, 1.0 5/5, 1.1.4 5/5 (`IT_PROBE_WAIT=4`). |
 | 3A109a / 1C28 | NOT verified — their NAND artifacts are not on disk (regenerate per BUILD.md). |
@@ -204,6 +204,23 @@ dead-end table 0.2.1 below):
 9. Answered the doorbell (deferred events 0x45d): the unpatched 1.0
    dismissal completes — 26 TA ops consumed, home screen restored.
    A parallel subagent decoded the 3D record layout (MBX_2D_FORMAT.md).
+13. **TA quad rasterizer: reached its evidence boundary and stopped by
+    policy (2026-08-02, after the ship).** Added engine-register capture
+    (0x600-0x6ff) + doorbell-time dumps of the TA input pages (regs
+    0x608/0x60c) under IT_MBX_2D_TRACE, and captured a full 26-op
+    dismissal (mbx-freeze-driver, /private/tmp/mbx-ta-dump2). Decoded:
+    the region page's last object is the textured quad — TSP/texture
+    words CONSTANT across all ops (one shared atlas), dest quads are
+    axis-aligned screen rects in plain floats, unit perspective w; the
+    26 quads tile the screen as text-label strips. NOT decoded: the
+    texture base-address + per-quad UV mapping, which are packed TA
+    control words needing the PowerVR MBX datasheet. Per the moratorium
+    (don't invent engine semantics), the rasterizer stops here rather
+    than ship guessed sampling; full evidence + the exact restart point
+    are in MBX_2D_FORMAT.md ("TA quad geometry"). No shipping frame
+    depends on it. Re-verified the trace-instrumented engine still passes
+    the oracle (the added code is dump-only + a cheap unconditional
+    register store; completion behaviour unchanged).
 12. **FINAL: all three bundles re-installed with the new engine + launcher
     and verified 6/6 each at shipped defaults** — iPhone OS 1.0
     (snapshot client on the modeled MBX engine, no patch), iPhone OS
