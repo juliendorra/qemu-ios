@@ -101,3 +101,46 @@ Completion contract (modeled): deferred events 0x45d = join 0x4c
 (queue-retire live 0xc0337ce8 + commandWakeup) | 0x10 (render complete,
 clears TA-active state2+0x4c) | 0x400 (engine-ready byte obj+0x1c4) |
 0x1 (re-enter parser for remaining records).
+
+## TA quad geometry (captured 2026-08-02, the honest boundary)
+
+At the TA doorbell (reg 0x680=1) the engine input is two MBX-VA pages the
+kernel programs into regs 0x608 (0x8000, "TA state", 60-64 words) and
+0x60c (0x1b000, "region/parameter page", ~130+ words). Dumped with
+IT_MBX_2D_TRACE=1 (mbx_2d_dump_words_n on the doorbell). Measured on a
+1.0 app dismissal (26 TA ops, mbx-freeze-driver):
+
+Region page object list starts at word 26, entries `0x6xxxxxxx`
+(`ptr = word & 0xFFFF` word-offset, count/type in high bits), terminated
+by 0xf0000000. The LAST object is the textured quad:
+  obj+0     0x22250e80   object header
+  obj+4     TSP word (0xa7718000, constant across all ops)
+  obj+5/6   ISP/texture-address words (0x0e530000, 0xae504ea0 --
+            CONSTANT across all 26 ops: one shared source atlas)
+  obj+8..15 dest quad: 4 (x,y) screen-space float pairs, axis-aligned
+            rectangles (verified: e.g. (120,37)-(200,10))
+  obj+20..23 perspective w per vertex (all 1.0 here -- QuadCopy path)
+Earlier objects (@word 32/45) carry 4096.0 extents and a second header
+(0x22206f80 / 0x22207f80) -- region tiling / clip state.
+
+The 26 dest quads tile the screen as **text-label strips** (a left icon
+block + a text strip per row) -- SpringBoard's home-screen labels drawn
+as textured quads from a glyph/text atlas.
+
+**WHAT IS DECODED:** completion (doorbell -> 0x45d), the engine input
+pages, the dest quads (plain IEEE floats, axis-aligned), and that all
+ops share one source texture.
+
+**WHAT IS NOT (needs the PowerVR MBX TA datasheet):** the texture
+base-address encoding in the TSP/texture words (0xa7718000 / 0xae504ea0)
+and the per-quad UV / atlas-region mapping. These are NOT plain floats in
+the region page; they are packed TA control words. Rendering a quad
+requires knowing which atlas texels map to each dest rect, and inventing
+that mapping is precisely the engine-semantics guessing the button
+investigation's moratorium forbids (six wedges). So the TA quad
+rasterizer stops here by policy, not by capability: the completion is
+honest and shipped, the geometry is captured, and the texture sampling
+is left for a session that has the TA spec (or a longer region-format RE
+campaign). The final composited frame is guest-rendered and already
+pixel-correct (oracle home_reference_diff 0.38%), so no shipping frame
+depends on this path.

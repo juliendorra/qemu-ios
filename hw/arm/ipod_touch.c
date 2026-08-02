@@ -1075,6 +1075,17 @@ static void mbx_legacy_2d_completion_tick(void *opaque)
  */
 #define MBX_TA_COMPLETION_DELAY_NS 200000
 
+/* The engine register file the 3D submit programs (live 0xc032bb24 writes
+ * 0x608/0x60c/0x610/0x614/0x618/0x61c, then 0x640..0x6d0): remembered so
+ * the TA consumer knows where the input stream lives when the doorbell
+ * rings.  Word-indexed over 0x600..0x6ff. */
+static uint32_t mbx_engine_reg[0x40];
+
+static uint32_t mbx_engine_reg_read(unsigned offset)
+{
+    return mbx_engine_reg[(offset - 0x600) / 4];
+}
+
 static void mbx_ta_completion_tick(void *opaque)
 {
     /* Join (0x40|0x8|0x4) -> queue-retire + wakeup; 0x10 clears the
@@ -1541,15 +1552,25 @@ static bool mbx_2d_trace_enabled(void)
     return mode;
 }
 
+static void mbx_2d_dump_words_n(uint32_t va, const char *name, unsigned max);
+
 static void mbx_2d_dump_words(uint32_t va, const char *name)
 {
+    mbx_2d_dump_words_n(va, name, MBX_2D_MAX_WORDS);
+}
+
+static void mbx_2d_dump_words_n(uint32_t va, const char *name, unsigned max)
+{
     static uint32_t fires;
-    uint32_t words[MBX_2D_MAX_WORDS];
+    uint32_t words[512];
     unsigned n = 0, last_nonpoison = 0;
     hwaddr pa;
 
     if (!mbx_2d_trace_enabled()) {
         return;
+    }
+    if (max > ARRAY_SIZE(words)) {
+        max = ARRAY_SIZE(words);
     }
     fires++;
     if (!mbx_mmu_translate(va, &pa)) {
@@ -1558,7 +1579,7 @@ static void mbx_2d_dump_words(uint32_t va, const char *name)
                 fires, name, va);
         return;
     }
-    while (n < MBX_2D_MAX_WORDS) {
+    while (n < max) {
         hwaddr wpa;
         if (!mbx_mmu_translate(va + n * 4, &wpa)) {
             break;
@@ -1984,6 +2005,12 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
                           "2D fire (0xa00000)");
     }
 
+    /* Engine register file 0x600..0x6ff: remembered unconditionally so the
+     * TA consumer can find its input when the doorbell rings. */
+    if (addr >= 0x600 && addr < 0x700 && (addr & 3) == 0) {
+        mbx_engine_reg[(addr - 0x600) / 4] = (uint32_t)val;
+    }
+
     /*
      * The MMU page directory is a register file the model must REMEMBER even
      * when it forwards nothing: the translation is what every other piece of
@@ -2101,6 +2128,19 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
         case 0x680:
             /* The TA doorbell.  See mbx_ta_completion_tick above. */
             if (val & 1) {
+                if (mbx_2d_trace_enabled()) {
+                    fprintf(stderr, "[MBX-TA] doorbell: 608=%08x 60c=%08x "
+                            "610=%08x 614=%08x 61c=%08x 640=%08x 648=%08x\n",
+                            mbx_engine_reg_read(0x608),
+                            mbx_engine_reg_read(0x60c),
+                            mbx_engine_reg_read(0x610),
+                            mbx_engine_reg_read(0x614),
+                            mbx_engine_reg_read(0x61c),
+                            mbx_engine_reg_read(0x640),
+                            mbx_engine_reg_read(0x648));
+                    mbx_2d_dump_words_n(mbx_engine_reg_read(0x608), "ta-608", 128);
+                    mbx_2d_dump_words_n(mbx_engine_reg_read(0x60c), "ta-60c", 448);
+                }
                 fprintf(stderr, "[MBX-TA] doorbell rung; completing the "
                         "3D operation WITHOUT rasterization\n");
                 timer_mod(mbx_ta_completion_timer,
