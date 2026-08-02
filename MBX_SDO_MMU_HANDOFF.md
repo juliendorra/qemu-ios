@@ -1,6 +1,6 @@
 # The MBX session: SDO complete; MBX legacy retirement active
 
-**Dates:** 2026-07-31 → 2026-08-01 · **Branch:** `wasm-jit-graft` ·
+**Dates:** 2026-07-31 → 2026-08-02 · **Branch:** `iphone_2g_ios1x` (renamed from `wasm-jit-graft`) ·
 **Commits:** `450dd3592f` … `c666f6f4f7` (this thread's only; the wasm
 session's commits interleave on the same branch)
 

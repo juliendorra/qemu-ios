@@ -399,7 +399,7 @@ git fetch --depth=1 --no-tags https://github.com/ktock/qemu-wasm wasm64-tcg-b
 git checkout FETCH_HEAD -- tcg/wasm64 tcg/wasm64.c tcg/wasm64.h
 ```
 
-Plus five hooks, all already applied on the `wasm-jit-graft` branch: remove
+Plus five hooks, all already applied on the `iphone_2g_ios1x` branch (renamed from `wasm-jit-graft`): remove
 upstream's "WebAssembly host requires --enable-tcg-interpreter" error, build
 `wasm64.c` with libffi in `tcg/meson.build`, and extend three
 `CONFIG_TCG_INTERPRETER` guards (`helper-info.h`, `tcg.c` ×4, `tcg.h`) with

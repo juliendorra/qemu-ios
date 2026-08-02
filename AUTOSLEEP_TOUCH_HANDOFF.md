@@ -1,6 +1,6 @@
 # Auto-sleep touch death — session handoff
 
-**Date:** 2026-08-01 · **Branch:** `wasm-jit-graft` · **State:** FIXED and
+**Date:** 2026-08-01 · **Branch:** `iphone_2g_ios1x` (renamed from `wasm-jit-graft`) · **State:** FIXED and
 scripted against the exact masked-idle failure on iPhone OS 1.0.
 
 ## Core root cause
