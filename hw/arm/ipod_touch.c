@@ -830,6 +830,7 @@ static bool mbx_2d_completion_pending;
 static uint32_t mbx_2d_deferred_event;
 static QEMUTimer *mbx_2d_completion_timer;
 static unsigned mbx_2d_completion_polls;
+static QEMUTimer *mbx_ta_completion_timer;
 
 #define MBX_2D_COMPLETION_POLL_NS 50000
 #define MBX_2D_COMPLETION_MAX_POLLS 200
@@ -1046,6 +1047,44 @@ static void mbx_legacy_2d_completion_tick(void *opaque)
     timer_mod(mbx_2d_completion_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               MBX_2D_COMPLETION_POLL_NS);
+}
+
+/*
+ * TA (3D) completion.  The 3D command handler (1A543a live 0xc032ebf0,
+ * commands 6-9/11/12 of the method-7 parser at live 0xc032e77c) programs
+ * the engine registers from the record (live 0xc032bb24), runs the sync
+ * descriptor, marks state1+0x34 = 1 3D-active / +0x40 = 0xabcdabcd
+ * sentinel, and rings REGISTER 0x680 = 1 -- the TA doorbell.  The parser
+ * then sleeps FOREVER (commandSleep on state2+0x74, timeout -1) waiting
+ * for the ISR join to run queue-retire (live 0xc0337ce8), whose
+ * commandWakeup resumes it; ISR bit 0x1 additionally re-enters the parser
+ * for the remaining records.  Without an engine-side completion the whole
+ * dismissal hangs in that sleep while the taWatchdog logs Graphics
+ * Restarts -- measured 2026-08-02, freeze-driver exec traces.
+ *
+ * The completion is raised from a virtual-clock timer, not inline in the
+ * doorbell write: the submit path arms its sleep AFTER ringing, and an
+ * event latched too early is wiped by the blanket 0x134=0xfff ack (the
+ * same race the 2D path's deferred completion answers).
+ *
+ * Rasterization of the TA quad stream is NOT yet performed here; the
+ * consumed operation is logged loudly.  The visible cost is limited to
+ * the transient zoom-animation texture -- the final frames are composited
+ * by the guest's own renderer -- and the honest quad rasterizer is the
+ * next step on this path.
+ */
+#define MBX_TA_COMPLETION_DELAY_NS 200000
+
+static void mbx_ta_completion_tick(void *opaque)
+{
+    /* Join (0x40|0x8|0x4) -> queue-retire + wakeup; 0x10 clears the
+     * TA-active flag in the ISR; 0x400 keeps the engine-ready byte
+     * latched; 0x1 resumes record parsing. */
+    mbx_event_status |= 0x45d;
+    mbx_update_irq();
+    if (mbx_op_trace_enabled()) {
+        mbx_dump_op_state("TA completion published (timer)");
+    }
 }
 
 static void mbx_capture_device(void)
@@ -2059,6 +2098,16 @@ static void s5l8900_mbx_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
          *
          * i.e. a command descriptor at 0x824..0x83c followed by a kick at 0x6d8.
          */
+        case 0x680:
+            /* The TA doorbell.  See mbx_ta_completion_tick above. */
+            if (val & 1) {
+                fprintf(stderr, "[MBX-TA] doorbell rung; completing the "
+                        "3D operation WITHOUT rasterization\n");
+                timer_mod(mbx_ta_completion_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          MBX_TA_COMPLETION_DELAY_NS);
+            }
+            break;
         case 0x6d8:
             /* Transport completion, PLUS the sync bit: the retirement
              * wrapper (1A543a live 0xc032f1ec) kicks a sync descriptor
@@ -3048,6 +3097,8 @@ static void ipod_touch_machine_init(MachineState *machine)
     memory_region_add_subregion(sysmem, MBX_MEM_BASE, iomem);
     mbx_2d_completion_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, mbx_legacy_2d_completion_tick, NULL);
+    mbx_ta_completion_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, mbx_ta_completion_tick, NULL);
     /*
      * The MBX event line. The S5L8900 IRQ map in ipod_touch.h has no MBX entry
      * -- only LCD (0xD), TVOUT_SDO (0x1E) and TVOUT_MIXER (0x26) -- and T1's

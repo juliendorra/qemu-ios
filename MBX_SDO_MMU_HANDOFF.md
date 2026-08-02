@@ -217,8 +217,44 @@ guest FTL read or storage-validation bypass is used.
   so the 2D completion event set must include it: `IT_MBX_2D_EVENT=0x45c`.
 * Method c032f6f0 (live): kick_sync → enqueue op (c0336064) → 1 s
   commandSleep via `[obj+0x218]` vtbl+0xf0 — the wait every op takes.
-* Current experiment: `IT_MBX_2D_EVENT=0x45c IT_MBX_2D_RING=1
-  IT_MBX_2D_RASTER=1` forced-mode boot on 1A543a.
+* With `0x45c` the boot-time init test blits complete and SpringBoard
+  boots normally on the PRODUCT config with the `_mbx2DInitialize` patch
+  DISABLED — the strict oracle then passes `1_open_app` and
+  `2_touch_in_app`, and fails `3_home_returns` frozen.
+* **The dismissal freeze is decoded (exec-trace, three instrumented
+  runs).** The snapshot render packs a large stream that is mostly
+  `_mbx3DCtxBlitCopy` (the 3D QUAD path — LayerKit uses textured quads
+  for scaled blits), submits it via user-client method 7, and the kernel
+  never returns from the ioctl: `waitForHWContext - commandSleep` waits
+  for a hardware 3D context the engine never frees, while the taWatchdog
+  timer loops `Graphics Restart. TA hung while completing.` (live loop
+  0xc032b340..b400; watchdog fields: state2+0x44 = tick, +0x48 =
+  phase-start tick, +0x4c = TA-active — cleared by the ISR bit-0x10 case).
+  The 2D rasterizer alone therefore cannot pass the oracle: the missing
+  piece is a TA/3D-QUAD SUBSET — decode the `mbx3D*` packers (full
+  symbols on the 1.0 root) + the kernel 3D emit ("3D blit region header /
+  object data surface"), execute textured-quad copies in plain C, and
+  complete the TA phase protocol (context slots, +0x48/+0x4c, TA events).
+* **THE DISMISSAL WORKS (2026-08-02, late).** The 3D path decoded to the
+  end: the method-7 parser (live 0xc032e77c, jump table cmd 1..12; 4/5 =
+  2D, 6-9/11/12 = shared 3D handler live 0xc032ebf0, 10 = its own) programs
+  the engine from the record (live 0xc032bb24: 0x608/0x60c/0x614/0x61c),
+  runs the sync descriptor, sets state1+0x34=1 / +0x40=0xabcdabcd, and
+  rings **register 0x680 = 1 — the TA doorbell**; it then commandSleeps
+  FOREVER on state2+0x74, woken only by queue-retire from the ISR join,
+  and ISR bit 0x1 re-enters the parser for the remaining records.  The
+  model now answers the doorbell with a deferred (virtual-clock, 200 us)
+  event raise of 0x45d — join + render-complete + engine-ready + parse-
+  resume.  With that, the UNPATCHED 1.0 snapshot client (the
+  _mbx2DInitialize patch disabled) completes a full app dismissal: 26 TA
+  doorbells consumed, home screen restored, screendump-verified.  TA quad
+  RASTERIZATION is still pending (logged loudly per op); the visible cost
+  is limited to the transient zoom-animation texture.
+* Instrumentation recipe that found this (reusable): freeze-driver
+  (scripted app-open + HOME over QMP against the packaged bundle) with
+  `-dfilter 0x30b37000+0x9000,0x31baf000+0x2000,0xc032b000+0x11000
+  -d exec,nochain` — userland MBX2D/MBXConnect + the AppleMBX kext.
+  IOLogs go to serial, not stderr; the bundle launcher uses -serial null.
 
 ---
 
