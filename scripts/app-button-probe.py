@@ -357,7 +357,7 @@ def main() -> int:
             report["steps"].append({"step": "gate", "pass": False})
             return 2
 
-        def step(name, fn, wait, verdict, note="", attempts=1):
+        def step(name, fn, wait, verdict, note="", attempts=1, regrabs=0):
             nonlocal rc
             mark = logp.stat().st_size
             before = grab(q, tmp)
@@ -372,6 +372,23 @@ def main() -> int:
                 idx = scanout_index(logp)
                 d = changed(before, after, idx)
                 ok = verdict(d, before, after, seg)
+                # A one-shot raw grab can land mid-flip and judge a buffer
+                # the guest is between paints on: measured 2026-08-02, the
+                # 3_home_returns grab read 0.57-0.69% lit while the
+                # simultaneous screendump was pixel-identical to the home
+                # reference (<0.7% of pixels off) and step 4 reopened the
+                # app from that same home screen.  `regrabs` re-SAMPLES
+                # (never re-runs fn) with the verdict unchanged, so the
+                # content gates stay as strict as before -- only the
+                # single-sample timing luck is removed.
+                for _ in range(regrabs):
+                    if ok:
+                        break
+                    time.sleep(1.0)
+                    after = grab(q, tmp)
+                    idx = scanout_index(logp)
+                    d = changed(before, after, idx)
+                    ok = verdict(d, before, after, seg)
                 if ok:
                     break
             # Judge the buffer the LCD is actually scanning out. Anything else
@@ -447,7 +464,8 @@ def main() -> int:
             "3_home_returns", lambda: key(q, "h"), WAIT_HOME,
             lambda d, b, a, seg: d > 20 and
             changed(home_reference, a, scanout_index(logp)) < 12,
-            "HOME must promptly restore the icon-filled SpringBoard")
+            "HOME must promptly restore the icon-filled SpringBoard",
+            regrabs=6)
         home_ref_diff = changed(home_reference, home_after,
                                 scanout_index(logp))
         report["steps"][-1]["home_reference_diff"] = home_ref_diff
