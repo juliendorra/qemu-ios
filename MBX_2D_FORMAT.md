@@ -68,3 +68,36 @@ NOTE dest rect is 480x320 (landscape) while LCD is 320x480.
 - scale != 1.0 sampling rule (nearest?)
 - whether LayerKit's compositing submits 3D quad work (mbx3D*) too — check
   the exercise-phase capture
+
+## 3D path (method-7 records, decoded 2026-08-02 late)
+
+Transport: same `_mbxGetCommandSpace` records. cmd 8 = 3D copy (no blend,
+extra=0x90 bytes), cmd 9 = 3D copy blended (extra=0xb8); nwords=1 (the SRC
+surface ID), nsurf=1 (the DST surface ID). Kernel dispatch: parser live
+0xc032e77c, jump table cmds 1..12 (4/5 = 2D emit, 6-9/11/12 = shared 3D
+handler live 0xc032ebf0, 10 = own handler).
+
+3D record extra block (both mbx3DCtxBlitCopy and QuadCopyPerspective):
++0x00..0x0c  four floats: clip rect (scissor as floats when ctx+0x4c,
+             else src rect (BlitCopy) or {0,0,8192.0,8192.0} (Quad))
++0x10  dest format tag: 0x48000->0, 0x50000->0x4000, 0x38000->0x8000,
+       0x60000->0x18000
++0x14  dest stride/bpp (must be a multiple of 8 texels)
++0x18  dest texel-format enum: 0x48000->3, 0x50000->1, 0x38000->2,
+       0x60000->6
++0x1c.. (BlitCopy) mirrored src format block (+0x30 tag, +0x34 stride)
++0x78  flip/quirk flag word (0x80000000 or 0)
++0x7c  blend equation repack ((ctx+0x24 & 0xff000) << 12)
++0x80..0xac  per-format TA/ISP control words (0xd0007000/0xa8004800/
+             0xb0005000 family) -- bitfields not yet decoded
+QuadCopyPerspective args: (ctx, float dstXY[4][2], float *arg2,
+float w[4], ..., flag); mbx3DQuadCopy passes w = {1,1,1,1}.
+srcFmt 0x70000 (YUV420) is legal only via the quad path (_mbxYUV4203DBlit).
+
+Kernel 3D submit: engine regs 0x608/0x60c/0x614/0x618/0x61c programmed
+from the record, sync descriptor, state1+0x34=1 / +0x40=0xabcdabcd, then
+REGISTER 0x680 = 1 (TA doorbell); parser commandSleeps on state2+0x74.
+Completion contract (modeled): deferred events 0x45d = join 0x4c
+(queue-retire live 0xc0337ce8 + commandWakeup) | 0x10 (render complete,
+clears TA-active state2+0x4c) | 0x400 (engine-ready byte obj+0x1c4) |
+0x1 (re-enter parser for remaining records).
